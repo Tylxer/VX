@@ -1,0 +1,20 @@
+# 构建产物
+build/
+.gradle/
+*.apk
+*.aab
+*.dex
+
+# 本地临时文件与缓存（Gradle 分发包约 134MB，务必排除）
+_cache/
+_*.txt
+_*.json
+
+# Android / IDE
+local.properties
+*.iml
+.idea/
+.cxx/
+
+# 工作区内部数据
+.workbuddy/
