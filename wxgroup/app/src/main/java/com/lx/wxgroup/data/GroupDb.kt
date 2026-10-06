@@ -14,7 +14,8 @@ import android.database.sqlite.SQLiteOpenHelper
  *    所以 filesDir 就是 /data/data/com.tencent.mm/files/ —— 不要换成模块自己的包名目录，
  *    那是另一个 uid，hook 代码读不到。
  * 2. 主键必须是 wxid（Contact.username）。昵称会重复、备注会被改，都不可靠。
- * 3. group_member 用 (group_id, wxid) 复合主键 —— 支持一个好友同时属于多个分组。
+ * 3. group_member 以 wxid 为**单列主键** —— 一个好友只能属于一个分组（成员独占）。
+ *    v3 及以前是 (group_id, wxid) 复合主键（允许一人多组），v4 迁移时已重建表收敛为一组。
  * 4. 所有 SQL 一律参数绑定。
  */
 /**
@@ -36,12 +37,13 @@ class GroupDb private constructor(context: Context) :
 
     companion object {
         const val DB_NAME = "wxgroup.db"
-        private const val DB_VERSION = 3
+        private const val DB_VERSION = 4
 
         private const val T_GROUP = "groups"
         private const val T_MEMBER = "group_member"
         private const val T_FRIEND = "friend_cache"
         private const val T_KV = "kv"
+        private const val T_DND = "auto_dnd_done"
 
         @Volatile
         private var instance: GroupDb? = null
@@ -68,6 +70,7 @@ class GroupDb private constructor(context: Context) :
                 name       TEXT    NOT NULL UNIQUE,
                 color      INTEGER NOT NULL DEFAULT 0,
                 sort_order INTEGER NOT NULL DEFAULT 0,
+                pinned     INTEGER NOT NULL DEFAULT 0,
                 created_at INTEGER NOT NULL
             )
             """.trimIndent()
@@ -76,18 +79,19 @@ class GroupDb private constructor(context: Context) :
             """
             CREATE TABLE IF NOT EXISTS $T_MEMBER (
                 group_id     INTEGER NOT NULL,
-                wxid         TEXT    NOT NULL,
+                wxid         TEXT    NOT NULL PRIMARY KEY,
                 wxid_type    INTEGER NOT NULL DEFAULT 0,
                 display_name TEXT,
-                added_at     INTEGER NOT NULL,
-                PRIMARY KEY (group_id, wxid)
+                added_at     INTEGER NOT NULL
             )
             """.trimIndent()
         )
-        db.execSQL("CREATE INDEX IF NOT EXISTS idx_member_wxid ON $T_MEMBER(wxid)")
+        // wxid 已是主键（自带索引），不再单独建 idx_member_wxid
         db.execSQL("CREATE INDEX IF NOT EXISTS idx_member_name ON $T_MEMBER(display_name)")
+        db.execSQL("CREATE INDEX IF NOT EXISTS idx_member_group ON $T_MEMBER(group_id)")
         createFriendTable(db)
         createKvTable(db)
+        createDndTable(db)
     }
 
     override fun onUpgrade(db: SQLiteDatabase, oldVersion: Int, newVersion: Int) {
@@ -98,6 +102,54 @@ class GroupDb private constructor(context: Context) :
         if (oldVersion < 3) {
             createKvTable(db)
         }
+        if (oldVersion < 4) {
+            // ① 分组置顶字段
+            db.execSQL("ALTER TABLE $T_GROUP ADD COLUMN pinned INTEGER NOT NULL DEFAULT 0")
+            // ② 成员独占：主键由 (group_id, wxid) 改为 wxid
+            //    SQLite 改不了主键，只能重建表。一人多组的旧数据用 OR IGNORE 只留第一条，
+            //    其余自动移出 —— 这正是「一个好友只能属于一个分组」要的效果。
+            db.execSQL(
+                """
+                CREATE TABLE IF NOT EXISTS ${T_MEMBER}_v4 (
+                    group_id     INTEGER NOT NULL,
+                    wxid         TEXT    NOT NULL PRIMARY KEY,
+                    wxid_type    INTEGER NOT NULL DEFAULT 0,
+                    display_name TEXT,
+                    added_at     INTEGER NOT NULL
+                )
+                """.trimIndent()
+            )
+            db.execSQL(
+                """
+                INSERT OR IGNORE INTO ${T_MEMBER}_v4
+                    (group_id, wxid, wxid_type, display_name, added_at)
+                SELECT group_id, wxid, wxid_type, display_name, added_at FROM $T_MEMBER
+                """.trimIndent()
+            )
+            db.execSQL("DROP TABLE IF EXISTS $T_MEMBER")
+            db.execSQL("ALTER TABLE ${T_MEMBER}_v4 RENAME TO $T_MEMBER")
+            db.execSQL("CREATE INDEX IF NOT EXISTS idx_member_name ON $T_MEMBER(display_name)")
+            db.execSQL("CREATE INDEX IF NOT EXISTS idx_member_group ON $T_MEMBER(group_id)")
+            // ③ 已自动设过免打扰的群
+            createDndTable(db)
+        }
+    }
+
+    /**
+     * 已自动设过免打扰的群。
+     *
+     * 用于「新加群自动免打扰」只设一次：用户手动关掉某个群的免打扰后，
+     * 模块下次扫描到它时不该再给打开，否则就是跟用户对着干。
+     */
+    private fun createDndTable(db: SQLiteDatabase) {
+        db.execSQL(
+            """
+            CREATE TABLE IF NOT EXISTS $T_DND (
+                chatroom_id TEXT    PRIMARY KEY,
+                handled_at  INTEGER NOT NULL
+            )
+            """.trimIndent()
+        )
     }
 
     private fun createKvTable(db: SQLiteDatabase) {
@@ -166,7 +218,7 @@ class GroupDb private constructor(context: Context) :
 
     fun listGroups(): List<Group> {
         readableDatabase.query(
-            T_GROUP, null, null, null, null, null, "sort_order ASC, id ASC"
+            T_GROUP, null, null, null, null, null, "pinned DESC, sort_order ASC, id ASC"
         ).use { cursor ->
             return buildList {
                 while (cursor.moveToNext()) add(cursor.toGroup())
@@ -178,6 +230,32 @@ class GroupDb private constructor(context: Context) :
         readableDatabase.rawQuery("SELECT COUNT(*) FROM $T_GROUP", null).use { cursor ->
             return if (cursor.moveToFirst()) cursor.getInt(0) else 0
         }
+    }
+
+    /** 置顶 / 取消置顶。排序时置顶的分组排在前面（见 listGroups 的 ORDER BY） */
+    fun setGroupPinned(id: Long, pinned: Boolean): Boolean {
+        val values = ContentValues().apply { put("pinned", if (pinned) 1 else 0) }
+        return writableDatabase.update(T_GROUP, values, "id=?", arrayOf(id.toString())) > 0
+    }
+
+    // ------------------------------------------------- 新加群自动免打扰（只设一次）
+
+    /** 这个群是否已经自动设过免打扰 */
+    fun isDndHandled(chatroomId: String): Boolean {
+        readableDatabase.query(
+            T_DND, arrayOf("chatroom_id"), "chatroom_id=?", arrayOf(chatroomId),
+            null, null, null
+        ).use { return it.moveToFirst() }
+    }
+
+    /** 记下「已经给这个群设过免打扰」。之后用户手动关掉，模块不再自动打开 */
+    fun markDndHandled(chatroomId: String) {
+        if (chatroomId.isBlank()) return
+        val values = ContentValues().apply {
+            put("chatroom_id", chatroomId)
+            put("handled_at", System.currentTimeMillis())
+        }
+        writableDatabase.insertWithOnConflict(T_DND, null, values, SQLiteDatabase.CONFLICT_IGNORE)
     }
 
     // ---------------------------------------------------------------- 成员
@@ -221,6 +299,14 @@ class GroupDb private constructor(context: Context) :
         return writableDatabase.run {
             beginTransaction()
             try {
+                // 成员独占：先把这批人从**任何**分组里摘掉，再插进目标组。
+                // 不做这一步，已在别的组的人会因 wxid 主键冲突被静默跳过，
+                // 用户会以为勾选没生效。
+                val ids = friends.map { it.wxid }.filter { it.isNotBlank() }
+                if (ids.isNotEmpty()) {
+                    val ph = ids.joinToString(",") { "?" }
+                    delete(T_MEMBER, "wxid IN ($ph)", ids.toTypedArray())
+                }
                 val values = ContentValues()
                 var n = 0
                 for (f in friends) {
