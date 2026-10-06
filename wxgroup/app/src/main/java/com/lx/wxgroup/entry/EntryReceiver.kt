@@ -178,6 +178,7 @@ object EntryReceiver {
                 LogX.i(
                     "ENTRY BACKUP restore ok path=$path replace=$replace schema=${snap.schema}" +
                         " groupsAdded=${st.groupsAdded} membersAdded=${st.membersAdded}" +
+                        " membersSkipped=${st.membersSkipped}" +
                         " settingsApplied=${st.settingsApplied}"
                 )
                 GroupBar.refreshAll()
@@ -214,6 +215,7 @@ object EntryReceiver {
                         " members=${r.members}/${snap.memberCount}" +
                         " kv=${r.settings}/${snap.settings.size}" +
                         " reimport_added=${st.groupsAdded}/${st.membersAdded}" +
+                        " membersSkipped=${st.membersSkipped}" +
                         " settingsApplied=${st.settingsApplied}"
                 )
             }

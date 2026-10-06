@@ -362,6 +362,21 @@ class GroupDb private constructor(context: Context) :
         }
     }
 
+    /**
+     * 已经被分进**任何**分组的 wxid 全集。
+     *
+     * 备份合并时要靠它判断"这个人已经属于别的组了" —— 成员独占下，
+     * 一次查询比逐组问快得多，也避免漏判。
+     */
+    fun allMemberWxids(): Set<String> {
+        readableDatabase.query(T_MEMBER, arrayOf("wxid"), null, null, null, null, null)
+            .use { cursor ->
+                val out = HashSet<String>()
+                while (cursor.moveToNext()) out.add(cursor.getString(0))
+                return out
+            }
+    }
+
     fun membersOf(groupId: Long): List<GroupMember> {
         readableDatabase.query(
             T_MEMBER, null, "group_id=?", arrayOf(groupId.toString()),
