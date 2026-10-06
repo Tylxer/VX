@@ -1,8 +1,9 @@
 package com.lx.wxgroup.data
 
 import android.content.Context
+import android.net.Uri
 import android.os.Environment
-import com.google.gson.Gson
+import com.google.gson.JsonPrimitive
 import com.lx.wxgroup.core.HostContext
 import com.lx.wxgroup.util.LogX
 import java.io.File
@@ -11,78 +12,42 @@ import java.util.Date
 import java.util.Locale
 
 /**
- * M5 备份与恢复：分组数据 <-> JSON 文件。
+ * K5 备份与恢复：文件读写 + 落库（JSON 编解码在 [BackupCodec]）。
  *
  * 为什么要它：库在 /data/data/com.tencent.mm/files/wxgroup.db，
- * 卸载模块或换手机就没了，而分组是用户一条条加出来的，丢了只能重来。
+ * 卸载模块或换手机就没了，而分组是用户一条条加出来的、配置是一个个开关调出来的，
+ * 丢了只能重来。
  *
- * 三条设计约束：
- * 1. **格式自描述**：文件带 format/version 字段，扫描时靠它认文件，
- *    免得把目录下无关的 json 也当备份列出来。
- * 2. **按分组名匹配，不按 id**：分组 id 是自增主键，换机后不可能对上；
+ * 五条设计约束：
+ * 1. **按分组名匹配，不按 id**：分组 id 是自增主键，换机后不可能对上；
  *    分组名有 UNIQUE 约束，是天然的业务主键。成员仍然以 wxid 为键。
- * 3. **默认合并、覆盖要显式选**：覆盖会删掉用户现有数据，必须二次确认。
+ * 2. **默认合并**：分组按名取并集、配置只覆盖文件里有的项（决策 #10）。
+ *    覆盖（replace）会删掉用户现有数据，必须由 UI 显式二次确认后才传 true。
+ * 3. **损坏文件中止，不写半个**：解析失败 / 读不出分组 → 返回错误原因，
+ *    UI 弹窗提示，一个字节都不写进库（B5：备份导入损坏文件的行为）。
+ * 4. **主路径是 SAF**（用户自己选目录与文件名），目录导出只是 adb 调试
+ *    与无 SAF 时的兜底 —— 后者一定可写，导出不会失败，只是文件不好找。
+ * 5. 不备份 `friend_cache`（决策 #10）：昵称头像能在微信进程内重新扫描重建，
+ *    带进文件只会让它变大、导入变慢。
  */
-object BackupFormat {
-    const val TAG = "wxgroup-backup"
-    const val VERSION = 1
-}
-
-/**
- * 备份文件的数据模型。
- *
- * 字段全部声明成**可空**：Gson 反序列化走的是 Unsafe 分配、不调构造器，
- * Kotlin 的非空默认值（`= ""`）根本不会生效，文件里缺字段时就是 null。
- * 声明成可空再统一清洗（见 [BackupIO.hydrate]），比到处加判空可靠得多。
- */
-data class BackupPayload(
-    val format: String? = null,
-    val version: Int? = null,
-    val exported_at: Long? = null,
-    val groups: List<BackupGroup>? = null,
-)
-
-data class BackupGroup(
-    val name: String? = null,
-    val color: Int? = null,
-    val sort_order: Int? = null,
-    val members: List<BackupMember>? = null,
-)
-
-data class BackupMember(
-    val wxid: String? = null,
-    val display_name: String? = null,
-    val wxid_type: Int? = null,
-)
-
-/** 清洗后的备份内容，字段全部非空，业务代码只认这个 */
-data class Snapshot(
-    val exportedAt: Long,
-    val groups: List<GroupSnap>,
-) {
-    val groupCount: Int get() = groups.size
-    val memberCount: Int get() = groups.sumOf { it.members.size }
-}
-
-data class GroupSnap(
-    val name: String,
-    val color: Int,
-    val sortOrder: Int,
-    val members: List<MemberSnap>,
-)
-
-data class MemberSnap(
-    val wxid: String,
-    val displayName: String,
-    val wxidType: Int,
-)
 
 /** 扫描到的一个备份文件（已解析，列表上要显示组数/人数） */
 data class BackupEntry(val file: File, val snap: Snapshot)
 
-data class ExportResult(val file: File, val groups: Int, val members: Int)
+/** 导出结果。`file` 在 SAF 模式下是 Uri 的包装（仅用于显示），不代表磁盘文件 */
+data class ExportResult(
+    val file: File,
+    val groups: Int,
+    val members: Int,
+    val settings: Int = 0,
+)
 
-data class RestoreStats(val groupsAdded: Int, val membersAdded: Int, val groupsInFile: Int)
+data class RestoreStats(
+    val groupsAdded: Int,
+    val membersAdded: Int,
+    val groupsInFile: Int,
+    val settingsApplied: Int = 0,
+)
 
 object BackupIO {
 
@@ -90,49 +55,113 @@ object BackupIO {
     private const val FILE_PREFIX = "wxgroup-backup-"
     private const val MAX_SCAN = 30
 
-    private val gson by lazy { Gson() }
+    /** 上一次失败的原因。导出/导入返回 null 时 UI 拿它弹窗 */
+    @Volatile
+    var lastError: String? = null
+        private set
+
+    private fun fail(reason: String): Nothing? {
+        lastError = reason
+        return null
+    }
 
     // ---------------------------------------------------------------- 导出
 
     /**
-     * 导出到第一个能写成功的目录，并把该目录记下来（下次优先写它，
-     * 免得每次都在几个候选目录里试一遍）。
+     * 组装备份内容：分组 + 成员 + 全量配置。
+     *
+     * 配置走 `Kv.exportAll()` —— 它遍历 `Prefs.ALL` 而不是查 kv 全表，
+     * 所以导出的 key 必然是当前版本已定义的，不会把废弃 key 带进文件。
      */
-    fun export(ctx: Context, db: GroupDb): ExportResult? {
-        val groups = db.listGroups()
-        val payload = BackupPayload(
-            format = BackupFormat.TAG,
-            version = BackupFormat.VERSION,
-            exported_at = System.currentTimeMillis(),
-            groups = groups.map { g ->
+    fun buildPayload(db: GroupDb): BackupPayload {
+        val now = System.currentTimeMillis()
+        return BackupPayload(
+            schema = BackupFormat.SCHEMA,
+            format = BackupFormat.TAG,   // 保留旧标记，老版本模块也能认出这是自己的文件
+            module = BackupFormat.MODULE,
+            version = BackupFormat.SCHEMA,
+            exported_at = JsonPrimitive(BackupCodec.isoTime(now)),
+            kv = Kv.exportAll(),
+            groups = db.listGroups().map { g ->
                 BackupGroup(
                     name = g.name,
                     color = g.color,
                     sort_order = g.sortOrder,
+                    pinned = if (g.pinned) 1 else 0,
                     members = db.membersOf(g.id).map { m ->
-                        BackupMember(m.wxid, m.displayName, m.wxidType)
+                        BackupMember(
+                            wxid = m.wxid,
+                            display_name = m.displayName,
+                            wxid_type = m.wxidType,
+                        )
                     },
                 )
             },
         )
-        val json = runCatching { gson.toJson(payload) }.getOrNull() ?: run {
-            LogX.e("BACKUP serialize failed")
-            return null
+    }
+
+    /** 导出到候选目录里第一个能写成功的目录（adb 调试 / 无 SAF 时的兜底路径） */
+    fun export(ctx: Context, db: GroupDb): ExportResult? {
+        val payload = buildPayload(db)
+        val json = runCatching { BackupCodec.toJson(payload) }.getOrElse {
+            LogX.e("BACKUP serialize failed", it)
+            return fail("生成备份内容失败：${it.message}")
         }
         val dir = pickWritableDir(db) ?: run {
             LogX.e("BACKUP no writable dir")
-            return null
+            return fail("找不到可写入的目录")
         }
-        val file = File(dir, FILE_PREFIX + stamp(payload.exported_at ?: 0L) + ".json")
+        val file = File(dir, suggestFileName(BackupCodec.parseExportedAt(payload.exported_at)))
         runCatching { file.writeText(json) }.onFailure {
             LogX.e("BACKUP write failed: ${file.absolutePath}", it)
-            return null
+            return fail("写入失败：${it.message}")
         }
         db.setPref(PrefKeys.BACKUP_DIR, dir.absolutePath)
-        val snap = hydrate(payload) ?: Snapshot(0L, emptyList())
-        LogX.i("BACKUP export ${file.absolutePath} groups=${snap.groupCount} members=${snap.memberCount}")
-        return ExportResult(file, snap.groupCount, snap.memberCount)
+        val snap = BackupCodec.hydrate(payload)
+        lastError = null
+        LogX.i("BACKUP export ${file.absolutePath} groups=${snap?.groupCount} members=${snap?.memberCount}")
+        return ExportResult(
+            file = file,
+            groups = snap?.groupCount ?: 0,
+            members = snap?.memberCount ?: 0,
+            settings = payload.kv?.size ?: 0,
+        )
     }
+
+    /**
+     * 导出到用户通过 SAF 选择的位置（ACTION_CREATE_DOCUMENT 拿到的 Uri）。
+     *
+     * 走的是 contentResolver，目的地可能是网盘、Downloads 或任意目录，
+     * 所以这里不能做任何「这个目录能不能写」的猜测 —— 写失败就是失败，报出来。
+     */
+    fun exportToUri(ctx: Context, db: GroupDb, uri: Uri): ExportResult? {
+        val payload = buildPayload(db)
+        val json = runCatching { BackupCodec.toJson(payload) }.getOrElse {
+            LogX.e("BACKUP serialize failed", it)
+            return fail("生成备份内容失败：${it.message}")
+        }
+        return try {
+            val out = ctx.contentResolver.openOutputStream(uri)
+                ?: return fail("无法打开选择的位置")
+            out.use { it.write(json.toByteArray(Charsets.UTF_8)) }
+            val snap = BackupCodec.hydrate(payload)
+            lastError = null
+            LogX.i("BACKUP export uri=$uri groups=${snap?.groupCount} members=${snap?.memberCount}")
+            ExportResult(
+                file = File(uri.toString()),
+                groups = snap?.groupCount ?: 0,
+                members = snap?.memberCount ?: 0,
+                settings = payload.kv?.size ?: 0,
+            )
+        } catch (t: Throwable) {
+            LogX.e("BACKUP export uri failed: $uri", t)
+            fail("导出失败：${t.message ?: t.javaClass.simpleName}")
+        }
+    }
+
+    /** 建议的文件名，UI 传给 SAF 的 Intent 作为初始名 */
+    fun suggestFileName(ms: Long = System.currentTimeMillis()): String =
+        FILE_PREFIX + stamp(ms) + ".json"
 
     // ---------------------------------------------------------------- 扫描
 
@@ -152,39 +181,38 @@ object BackupIO {
     }
 
     /** 读一个备份文件；不是我们的格式（或坏了）就返回 null */
-    fun read(file: File): Snapshot? {
-        val text = runCatching { file.readText() }.getOrNull() ?: return null
-        val payload = runCatching { gson.fromJson(text, BackupPayload::class.java) }.getOrNull()
-            ?: return null
-        if (payload.format != BackupFormat.TAG) return null
-        return hydrate(payload)
+    fun read(file: File): Snapshot? = readDetailed(file).snapshot
+
+    /** 读文件并带上失败原因，UI 用它决定弹什么 */
+    fun readDetailed(file: File): ReadResult {
+        val res = runCatching { BackupCodec.parse(file.readText()) }.getOrElse {
+            LogX.e("BACKUP read failed: ${file.absolutePath}", it)
+            return ReadResult(null, "读不到这个文件")
+        }
+        if (res.snapshot == null) lastError = res.error
+        return res
     }
 
-    /** 把「可能缺字段」的解析结果洗成字段全非空的快照 */
-    private fun hydrate(p: BackupPayload): Snapshot? {
-        val groups = p.groups ?: return null
-        return Snapshot(
-            exportedAt = p.exported_at ?: 0L,
-            groups = groups.mapNotNull { g ->
-                val name = g.name?.trim().orEmpty()
-                if (name.isEmpty()) return@mapNotNull null
-                GroupSnap(
-                    name = name,
-                    color = g.color ?: 0,
-                    sortOrder = g.sort_order ?: 0,
-                    members = (g.members ?: emptyList()).mapNotNull { m ->
-                        val wxid = m.wxid?.trim().orEmpty()
-                        if (wxid.isEmpty()) return@mapNotNull null
-                        MemberSnap(
-                            wxid = wxid,
-                            // 名字只是给人看的，丢了就退回 wxid，不影响分组关系
-                            displayName = m.display_name?.trim().orEmpty().ifEmpty { wxid },
-                            wxidType = m.wxid_type ?: GroupDb.WxidType.FRIEND,
-                        )
-                    },
-                )
-            },
-        )
+    /** 读 SAF 选中的文件（导入走 ACTION_OPEN_DOCUMENT） */
+    fun readFromUri(ctx: Context, uri: Uri): Snapshot? = readDetailedFromUri(ctx, uri).snapshot
+
+    fun readDetailedFromUri(ctx: Context, uri: Uri): ReadResult {
+        val text = try {
+            val stream = ctx.contentResolver.openInputStream(uri)
+                ?: run {
+                    lastError = "读不到这个文件"
+                    return ReadResult(null, lastError)
+                }
+            stream.use { it.readBytes().toString(Charsets.UTF_8) }
+        } catch (t: Throwable) {
+            LogX.e("BACKUP read uri failed: $uri", t)
+            val msg = "读取失败：${t.message ?: t.javaClass.simpleName}"
+            lastError = msg
+            return ReadResult(null, msg)
+        }
+        val res = BackupCodec.parse(text)
+        if (res.snapshot == null) lastError = res.error
+        return res
     }
 
     // ---------------------------------------------------------------- 恢复
@@ -192,8 +220,16 @@ object BackupIO {
     /**
      * 恢复。
      *
-     * @param replace false=合并（同名分组补进缺的成员，现有数据不动）；
-     *                true=覆盖（先删光所有分组再按备份重建）
+     * @param replace false=**合并**（默认）：同名分组补进缺的成员（取并集），
+     *                现有成员、以及文件里没有的配置项都不动；
+     *                true=**覆盖**：先删光所有分组再按备份重建。会丢数据，
+     *                必须由 UI 二次确认后才传。
+     *
+     * ⚠️ 成员独占（v4 起 wxid 是 group_member 主键）：被并入的成员会从原分组
+     * 自动移出，这是 `addMembers` 内部的既有行为，不是 bug。
+     *
+     * 配置只在文件带配置段时才写（决策 #10），且只覆盖文件里出现的 key
+     * （`Kv.importSome` 会忽略未登记的 key）。
      */
     fun restore(db: GroupDb, snap: Snapshot, replace: Boolean): RestoreStats {
         if (replace) {
@@ -212,6 +248,8 @@ object BackupIO {
                     continue
                 }
                 groupsAdded++
+                // 置顶只在新建组时应用：合并语义下不该推翻用户现有的置顶状态
+                if (gs.pinned) db.setGroupPinned(gid, true)
                 byName[gs.name] = Group(gid, gs.name, gs.color, gs.sortOrder, System.currentTimeMillis())
             }
             val have = db.memberWxids(gid)
@@ -224,8 +262,10 @@ object BackupIO {
                 )
             }
         }
-        LogX.i("BACKUP restore replace=$replace groupsAdded=$groupsAdded membersAdded=$membersAdded")
-        return RestoreStats(groupsAdded, membersAdded, snap.groupCount)
+
+        val settingsApplied = if (snap.hasSettings) Kv.importSome(snap.settings) else 0
+        LogX.i("BACKUP restore replace=$replace groupsAdded=$groupsAdded membersAdded=$membersAdded settingsApplied=$settingsApplied")
+        return RestoreStats(groupsAdded, membersAdded, snap.groupCount, settingsApplied)
     }
 
     // ---------------------------------------------------------------- 目录
@@ -236,6 +276,8 @@ object BackupIO {
      * 前两个是公共目录 —— Android 11+ 上大概率写不进去（微信有没有
      * MANAGE_EXTERNAL_STORAGE 因版本而异），所以后面必须留 app 私有目录兜底：
      * 那两个目录**一定**可写，导出永远不会失败，只是用户得花点工夫找。
+     *
+     * 正常路径是 SAF（用户自己选位置），这里只是 adb 调试和无 SAF 时的兜底。
      */
     @Suppress("DEPRECATION")
     private fun candidateDirs(ctx: Context): List<File> {

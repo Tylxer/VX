@@ -141,11 +141,11 @@ object EntryReceiver {
                 val ctx = HostContext.app() ?: context
                 val r = BackupIO.export(ctx, db)
                 if (r == null) {
-                    LogX.w("ENTRY BACKUP export failed")
+                    LogX.w("ENTRY BACKUP export failed: ${BackupIO.lastError}")
                 } else {
                     LogX.i(
                         "ENTRY BACKUP export ok path=${r.file.absolutePath}" +
-                            " groups=${r.groups} members=${r.members}"
+                            " groups=${r.groups} members=${r.members} settings=${r.settings}"
                     )
                 }
             }
@@ -167,18 +167,55 @@ object EntryReceiver {
                     LogX.w("ENTRY BACKUP restore needs --es file")
                     return
                 }
-                val snap = BackupIO.read(File(path))
+                val res = BackupIO.readDetailed(File(path))
+                val snap = res.snapshot
                 if (snap == null) {
-                    LogX.w("ENTRY BACKUP unreadable or bad format: $path")
+                    LogX.w("ENTRY BACKUP unreadable: $path reason=${res.error}")
                     return
                 }
                 val replace = intent.getBooleanExtra(EXTRA_REPLACE, false)
                 val st = BackupIO.restore(db, snap, replace)
                 LogX.i(
-                    "ENTRY BACKUP restore ok path=$path replace=$replace" +
-                        " groupsAdded=${st.groupsAdded} membersAdded=${st.membersAdded}"
+                    "ENTRY BACKUP restore ok path=$path replace=$replace schema=${snap.schema}" +
+                        " groupsAdded=${st.groupsAdded} membersAdded=${st.membersAdded}" +
+                        " settingsApplied=${st.settingsApplied}"
                 )
                 GroupBar.refreshAll()
+            }
+            /**
+             * 自检：导出 → 读回 → 比对 → 再合并导入一次。
+             *
+             * 一条 adb 就能验证整条备份链路（含配置段与幂等性），
+             * 不用在 UI 上点来点去再 adb pull 文件看内容。
+             */
+            "selftest" -> {
+                val ctx = HostContext.app() ?: context
+                val r = BackupIO.export(ctx, db)
+                if (r == null) {
+                    LogX.w("ENTRY BACKUP selftest export failed: ${BackupIO.lastError}")
+                    return
+                }
+                val res = BackupIO.readDetailed(r.file)
+                val snap = res.snapshot
+                if (snap == null) {
+                    LogX.w("ENTRY BACKUP selftest read back failed: ${res.error}")
+                    return
+                }
+                val consistent = snap.groupCount == r.groups &&
+                    snap.memberCount == r.members &&
+                    snap.settings.size == r.settings
+                // 自己导出的文件再合并导回来，一条都不该新增 —— 幂等
+                val st = BackupIO.restore(db, snap, false)
+                val idempotent = st.groupsAdded == 0 && st.membersAdded == 0
+                LogX.i(
+                    "ENTRY BACKUP selftest ${if (consistent && idempotent) "PASS" else "FAIL"}" +
+                        " file=${r.file.absolutePath} schema=${snap.schema}" +
+                        " groups=${r.groups}/${snap.groupCount}" +
+                        " members=${r.members}/${snap.memberCount}" +
+                        " kv=${r.settings}/${snap.settings.size}" +
+                        " reimport_added=${st.groupsAdded}/${st.membersAdded}" +
+                        " settingsApplied=${st.settingsApplied}"
+                )
             }
             else -> LogX.w("ENTRY BACKUP unknown op=$op")
         }

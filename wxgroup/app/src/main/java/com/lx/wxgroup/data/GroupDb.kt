@@ -573,6 +573,7 @@ class GroupDb private constructor(context: Context) :
         color = getInt(getColumnIndexOrThrow("color")),
         sortOrder = getInt(getColumnIndexOrThrow("sort_order")),
         createdAt = getLong(getColumnIndexOrThrow("created_at")),
+        pinned = getInt(getColumnIndexOrThrow("pinned")) != 0,
     )
 
     private fun Cursor.toMember(): GroupMember = GroupMember(
@@ -604,6 +605,8 @@ data class Group(
     val color: Int,
     val sortOrder: Int,
     val createdAt: Long,
+    /** 手动置顶。置顶的分组排在会话列表最前（见 listGroups 的 ORDER BY） */
+    val pinned: Boolean = false,
 )
 
 data class GroupMember(

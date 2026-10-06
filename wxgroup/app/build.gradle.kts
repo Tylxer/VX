@@ -58,4 +58,8 @@ dependencies {
     // M0 暂不调用，M1 接入 DexKit 时直接开写，不用再改依赖
     implementation("org.luckypray:dexkit:2.2.0")
     implementation("com.google.code.gson:gson:2.11.0")
+
+    // 纯 JVM 单测：只覆盖不依赖 Android 的逻辑（备份 JSON 编解码）。
+    // 版本兼容这种「写错了要等换机才发现」的逻辑，必须能在没连手机时验证。
+    testImplementation("junit:junit:4.13.2")
 }
