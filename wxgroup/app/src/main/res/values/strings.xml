@@ -1,0 +1,5 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">WXGroup</string>
+    <string name="xposed_description">微信好友自定义分组 — 目标 Google Play 版 8.0.72</string>
+</resources>

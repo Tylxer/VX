@@ -1,0 +1,197 @@
+package com.lx.wxgroup.entry
+
+import android.content.BroadcastReceiver
+import android.content.Context
+import android.content.Intent
+import android.content.IntentFilter
+import android.os.Build
+import android.os.Handler
+import android.os.Looper
+import com.lx.wxgroup.core.HostContext
+import java.io.File
+import com.lx.wxgroup.data.BackupIO
+import com.lx.wxgroup.data.GroupDb
+import com.lx.wxgroup.feature.ConvFilter
+import com.lx.wxgroup.feature.GroupBar
+import com.lx.wxgroup.feature.GroupDetailPage
+import com.lx.wxgroup.feature.GroupManager
+import com.lx.wxgroup.util.LogX
+
+/**
+ * 广播入口：不发广播就开管理页，模块本身没有可启动的 Activity。
+ *
+ * 触发方式（验证脚本用的就是这个）：
+ *   adb shell am broadcast -a com.lx.wxgroup.action.OPEN_GROUPS -p com.tencent.mm
+ *   adb shell am broadcast -a com.lx.wxgroup.action.OPEN_GROUPS -p com.tencent.mm --el group_id 1
+ *
+ * 三个坑：
+ * 1. **必须动态注册**（registerReceiver），Manifest 静态注册在 Android 8+ 收不到隐式广播。
+ * 2. **Android 13+ 必须用 RECEIVER_EXPORTED 注册**，否则默认不导出，
+ *    adb shell（uid 2000）发过来的广播会被 AMS 直接丢掉，表现为「发了没反应」。
+ *    这里写的是字面量 2 而不是 Context.RECEIVER_EXPORTED —— 那个常量 API 33 才有，
+ *    在旧系统上读它会抛 NoSuchFieldError。
+ * 3. **微信在后台时没有前台 Activity**，这时候弹 Dialog 会 BadTokenException。
+ *    所以先把微信拉回前台，延迟 1.5s 再弹。
+ */
+object EntryReceiver {
+
+    const val ACTION = "com.lx.wxgroup.action.OPEN_GROUPS"
+    const val EXTRA_GROUP_ID = "group_id"
+
+    /** M3：强制重画聊天页顶部的分组条（新建/删除分组后不想等自动刷新时用） */
+    const val ACTION_BAR = "com.lx.wxgroup.action.BAR"
+
+    /** M3：切换分组显示模式。--es mode bar|list（横条 <-> 聊天列表内分组行） */
+    const val ACTION_MODE = "com.lx.wxgroup.action.MODE"
+    const val EXTRA_MODE = "mode"
+
+    /** M4-C：只看某个分组的会话（--el group_id N，0 = 显示全部） */
+    const val ACTION_FILTER = "com.lx.wxgroup.action.FILTER"
+
+    /** M5：备份与恢复。--es op export|list|restore [--es file 绝对路径] [--ez replace true] */
+    const val ACTION_BACKUP = "com.lx.wxgroup.action.BACKUP"
+    const val EXTRA_OP = "op"
+    const val EXTRA_FILE = "file"
+    const val EXTRA_REPLACE = "replace"
+
+    /** Context.RECEIVER_EXPORTED 的值，写成字面量是为了兼容低版本（见注释 2） */
+    private const val FLAG_EXPORTED = 2
+
+    private const val RELAUNCH_DELAY_MS = 1500L
+
+    fun register(context: Context) {
+        val receiver = object : BroadcastReceiver() {
+            override fun onReceive(c: Context, intent: Intent) {
+                runCatching { handle(c, intent) }
+                    .onFailure { LogX.e("ENTRY handle failed", it) }
+            }
+        }
+        val filter = IntentFilter(ACTION)
+        filter.addAction(ACTION_BAR)
+        filter.addAction(ACTION_MODE)
+        filter.addAction(ACTION_FILTER)
+        filter.addAction(ACTION_BACKUP)
+        runCatching {
+            if (Build.VERSION.SDK_INT >= 33) {
+                context.registerReceiver(receiver, filter, FLAG_EXPORTED)
+            } else {
+                @Suppress("DEPRECATION")
+                context.registerReceiver(receiver, filter)
+            }
+            LogX.i("ENTRY registered $ACTION")
+        }.onFailure { LogX.e("ENTRY register failed", it) }
+    }
+
+    private fun handle(context: Context, intent: Intent) {
+        when (intent.action) {
+            ACTION_BAR -> {
+                LogX.i("ENTRY BAR refresh")
+                GroupBar.refreshAll()
+                return
+            }
+            ACTION_MODE -> {
+                val mode = intent.getStringExtra(EXTRA_MODE) ?: return
+                LogX.i("ENTRY MODE -> $mode")
+                GroupBar.setMode(mode)
+                return
+            }
+            ACTION_FILTER -> {
+                val id = intent.getLongExtra(EXTRA_GROUP_ID, 0L)
+                LogX.i("ENTRY FILTER -> $id")
+                ConvFilter.setGroup(id)
+                return
+            }
+            ACTION_BACKUP -> {
+                val op = intent.getStringExtra(EXTRA_OP) ?: return
+                backup(context, op, intent)
+                return
+            }
+            ACTION -> Unit
+            else -> return
+        }
+        val groupId = intent.getLongExtra(EXTRA_GROUP_ID, -1L)
+        LogX.i("ENTRY received group=$groupId")
+
+        if (HostContext.activity() == null) {
+            LogX.i("ENTRY no foreground activity, bringing WeChat to front")
+            runCatching {
+                val launch = context.packageManager.getLaunchIntentForPackage(context.packageName)
+                launch?.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                context.startActivity(launch)
+            }.onFailure { LogX.w("ENTRY relaunch failed: ${it.javaClass.simpleName}") }
+            Handler(Looper.getMainLooper()).postDelayed({ open(groupId) }, RELAUNCH_DELAY_MS)
+        } else {
+            open(groupId)
+        }
+    }
+
+    /**
+     * M5 备份恢复的命令行入口。
+     *
+     * 验证脚本靠它跑（UI 上点导出拿不到绝对路径），以后要做定时自动备份也得走这里。
+     */
+    private fun backup(context: Context, op: String, intent: Intent) {
+        val db = GroupDb.current()
+        if (db == null) {
+            LogX.w("ENTRY BACKUP db not ready")
+            return
+        }
+        when (op) {
+            "export" -> {
+                val ctx = HostContext.app() ?: context
+                val r = BackupIO.export(ctx, db)
+                if (r == null) {
+                    LogX.w("ENTRY BACKUP export failed")
+                } else {
+                    LogX.i(
+                        "ENTRY BACKUP export ok path=${r.file.absolutePath}" +
+                            " groups=${r.groups} members=${r.members}"
+                    )
+                }
+            }
+            "list" -> {
+                val ctx = HostContext.app() ?: context
+                val all = BackupIO.scan(ctx)
+                LogX.i("ENTRY BACKUP list count=${all.size}")
+                for (e in all) {
+                    LogX.i(
+                        "ENTRY BACKUP item ${e.file.absolutePath}" +
+                            " groups=${e.snap.groupCount} members=${e.snap.memberCount}" +
+                            " at=${e.snap.exportedAt}"
+                    )
+                }
+            }
+            "restore" -> {
+                val path = intent.getStringExtra(EXTRA_FILE)
+                if (path.isNullOrBlank()) {
+                    LogX.w("ENTRY BACKUP restore needs --es file")
+                    return
+                }
+                val snap = BackupIO.read(File(path))
+                if (snap == null) {
+                    LogX.w("ENTRY BACKUP unreadable or bad format: $path")
+                    return
+                }
+                val replace = intent.getBooleanExtra(EXTRA_REPLACE, false)
+                val st = BackupIO.restore(db, snap, replace)
+                LogX.i(
+                    "ENTRY BACKUP restore ok path=$path replace=$replace" +
+                        " groupsAdded=${st.groupsAdded} membersAdded=${st.membersAdded}"
+                )
+                GroupBar.refreshAll()
+            }
+            else -> LogX.w("ENTRY BACKUP unknown op=$op")
+        }
+    }
+
+    private fun open(groupId: Long) {
+        if (groupId <= 0) {
+            GroupManager.show()
+            return
+        }
+        val db = GroupDb.current()
+        val name = db?.listGroups()?.firstOrNull { it.id == groupId }?.name ?: "分组#$groupId"
+        // M3：带 group_id 打开的是独立分组页（成员列表），不再是 M2-C 的成员管理页
+        GroupDetailPage.open(HostContext.activity(), groupId, name)
+    }
+}
