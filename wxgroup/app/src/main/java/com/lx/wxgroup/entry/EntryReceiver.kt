@@ -57,6 +57,9 @@ object EntryReceiver {
      */
     const val ACTION_PANEL = "com.lx.wxgroup.action.PANEL"
 
+    /** 定位探针。--es op convtime  → 打印会话对象的全部字段，用于找会话时间字段（S10） */
+    const val ACTION_PROBE = "com.lx.wxgroup.action.PROBE"
+
     /** M5：备份与恢复。--es op export|list|restore [--es file 绝对路径] [--ez replace true] */
     const val ACTION_BACKUP = "com.lx.wxgroup.action.BACKUP"
     const val EXTRA_OP = "op"
@@ -80,6 +83,8 @@ object EntryReceiver {
         filter.addAction(ACTION_MODE)
         filter.addAction(ACTION_FILTER)
         filter.addAction(ACTION_BACKUP)
+        filter.addAction(ACTION_PROBE)
+        filter.addAction(ACTION_PANEL)
         runCatching {
             if (Build.VERSION.SDK_INT >= 33) {
                 context.registerReceiver(receiver, filter, FLAG_EXPORTED)
@@ -113,6 +118,18 @@ object EntryReceiver {
             ACTION_BACKUP -> {
                 val op = intent.getStringExtra(EXTRA_OP) ?: return
                 backup(context, op, intent)
+                return
+            }
+            ACTION_PROBE -> {
+                val op = intent.getStringExtra(EXTRA_OP) ?: return
+                when (op) {
+                    "convtime" -> {
+                        for (line in com.lx.wxgroup.probe.ConvTimeProbe.dump()) {
+                            LogX.i("PROBE $line")
+                        }
+                    }
+                    else -> LogX.w("ENTRY PROBE unknown op=$op")
+                }
                 return
             }
             ACTION_PANEL -> {

@@ -1,0 +1,65 @@
+#!/bin/sh
+# 开发回路脚本（Git Bash 下运行）
+#   sh dev.sh build     编译 debug APK
+#   sh dev.sh install   安装 + 同步 LSPosed 模块路径 + 确保启用
+#   sh dev.sh restart   杀微信进程让它重新加载模块
+#   sh dev.sh log       只看本模块日志
+#   sh dev.sh all       build + install + restart（最常用）
+#
+# 用法前先修 PATH（WorkBuddy 的 Bash 工具 PATH 是坏的）：
+#   export PATH="/usr/bin:/bin:/mingw64/bin:/usr/local/bin:$PATH"
+
+export PATH="/usr/bin:/bin:/mingw64/bin:/usr/local/bin:C:/Windows/System32:C:/Windows:$PATH"
+export JAVA_HOME="C:/Users/lx/WorkBuddy/2026-09-29-20-23-21/_cache/jdk21"
+export GRADLE_USER_HOME="C:/Users/lx/WorkBuddy/2026-09-29-20-23-21/_cache/gradlehome"
+
+ADB="C:/Users/lx/AppData/Local/Android/Sdk/platform-tools/adb.exe"
+ROOT="C:/Users/lx/WorkBuddy/2026-09-29-20-23-21"
+PY="C:/Users/lx/.workbuddy/binaries/python/versions/3.13.12/python.exe"
+PKG=com.lx.wxgroup
+HOST=com.tencent.mm
+APK="$ROOT/wxgroup/app/build/outputs/apk/debug/app-debug.apk"
+
+case "$1" in
+build)
+    cd "$ROOT/wxgroup" && sh gradlew :app:assembleDebug --no-daemon --console=plain 2>&1 | grep -E "^e:|BUILD|FAILED" | head -30
+    ;;
+install)
+    "$ADB" install -r "$APK" 2>&1 | tail -2
+    sh "$0" sync
+    ;;
+sync)
+    # 只读检查：确认 LSPosed 里本模块的 apk_path / enabled / scope 是否正确。
+    # ⚠️ 绝对不要写回这个 db！LSPosed 用 WAL 模式，只覆盖主 db 而留下旧 -wal
+    # 会让 Android 端判定 "database disk image is malformed"，lspd 守护进程
+    # 崩溃后不再注入任何进程（模块的日志会彻底消失，极难查）。
+    # 实测 LSPosed 会在 APK 安装时自动更新 apk_path，所以通常无需手工干预；
+    # 真要改就用手机上的 LSPosed 管理器勾选。
+    P=$("$ADB" shell pm path $PKG | tr -d '\r' | sed 's/^package://')
+    echo "当前 APK 路径: $P"
+    "$ADB" shell "su -c 'cp /data/adb/lspd/config/modules_config.db /sdcard/_m.db && chmod 666 /sdcard/_m.db'" >/dev/null 2>&1
+    "$ADB" pull /sdcard/_m.db "$ROOT/_cache/_m.db" >/dev/null 2>&1
+    PKGNAME=$PKG APKPATH="$P" HOSTPKG=$HOST "$PY" "$ROOT/_cache/_check.py"
+    ;;
+restart)
+    # 这台设备没有 pidof，pkill/killall 也杀不掉微信（有守护拉起），
+    # 只有 am force-stop 有效；再用 monkey 把它拉回前台。
+    "$ADB" shell am force-stop $HOST 2>/dev/null
+    sleep 2
+    "$ADB" shell "monkey -p $HOST -c android.intent.category.LAUNCHER 1" >/dev/null 2>&1
+    sleep 8
+    echo "微信已重启"
+    ;;
+log)
+    "$ADB" logcat -v time -s WXGroup:* 2>&1
+    ;;
+panel)
+    "$ADB" shell am broadcast -a $PKG.action.PANEL -p $HOST 2>&1 | tail -3
+    ;;
+all)
+    sh "$0" build && sh "$0" install && sh "$0" restart
+    ;;
+*)
+    echo "用法: sh dev.sh build|install|sync|restart|log|panel|all"
+    ;;
+esac

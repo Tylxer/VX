@@ -16,6 +16,7 @@ import com.lx.wxgroup.entry.EntryReceiver
 import com.lx.wxgroup.feature.ConvFilter
 import com.lx.wxgroup.feature.ConvMenu
 import com.lx.wxgroup.feature.GroupBar
+import com.lx.wxgroup.hook.PlusMenu
 import com.lx.wxgroup.probe.ChatListProbe
 import com.lx.wxgroup.probe.ChatOpenProbe
 import com.lx.wxgroup.probe.DexProbe
@@ -133,6 +134,11 @@ class HookEntry : IXposedHookLoadPackage {
         runCatching {
             ChatOpenProbe.install(lpparam)
         }.onFailure { LogX.e("ChatOpenProbe install failed", it) }
+
+        // ---- S3：主界面右上角「+」菜单底部加一行「分组模块」 ----
+        runCatching {
+            PlusMenu.install(lpparam)
+        }.onFailure { LogX.e("PlusMenu install failed", it) }
 
         // ---- M2-C 入口：广播开分组管理页（模块没有可启动的 Activity）----
         runCatching {
