@@ -15,6 +15,8 @@ import com.lx.wxgroup.feature.ConvFilter
 import com.lx.wxgroup.feature.GroupBar
 import com.lx.wxgroup.feature.GroupDetailPage
 import com.lx.wxgroup.feature.GroupManager
+import com.lx.wxgroup.feature.MainPage
+import com.lx.wxgroup.ui.Panel
 import com.lx.wxgroup.util.LogX
 
 /**
@@ -47,6 +49,13 @@ object EntryReceiver {
 
     /** M4-C：只看某个分组的会话（--el group_id N，0 = 显示全部） */
     const val ACTION_FILTER = "com.lx.wxgroup.action.FILTER"
+
+    /**
+     * 打开模块主界面（六行）。锚点 S3（微信「+」菜单）定位前，这是唯一的入口：
+     *   adb shell am broadcast -a com.lx.wxgroup.action.PANEL -p com.tencent.mm
+     * S3 打通后由菜单直接调 `Panel.open(MainPage)`，这个广播入口随之删除。
+     */
+    const val ACTION_PANEL = "com.lx.wxgroup.action.PANEL"
 
     /** M5：备份与恢复。--es op export|list|restore [--es file 绝对路径] [--ez replace true] */
     const val ACTION_BACKUP = "com.lx.wxgroup.action.BACKUP"
@@ -106,23 +115,35 @@ object EntryReceiver {
                 backup(context, op, intent)
                 return
             }
+            ACTION_PANEL -> {
+                LogX.i("ENTRY PANEL open")
+                withForeground(context) { Panel.open(MainPage) }
+                return
+            }
             ACTION -> Unit
             else -> return
         }
         val groupId = intent.getLongExtra(EXTRA_GROUP_ID, -1L)
         LogX.i("ENTRY received group=$groupId")
+        withForeground(context) { open(groupId) }
+    }
 
-        if (HostContext.activity() == null) {
-            LogX.i("ENTRY no foreground activity, bringing WeChat to front")
-            runCatching {
-                val launch = context.packageManager.getLaunchIntentForPackage(context.packageName)
-                launch?.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
-                context.startActivity(launch)
-            }.onFailure { LogX.w("ENTRY relaunch failed: ${it.javaClass.simpleName}") }
-            Handler(Looper.getMainLooper()).postDelayed({ open(groupId) }, RELAUNCH_DELAY_MS)
-        } else {
-            open(groupId)
+    /**
+     * 微信在后台时没有前台 Activity，这时候弹 Dialog 会 BadTokenException，
+     * 所以先把微信拉回前台，等 1.5s 再执行。
+     */
+    private fun withForeground(context: Context, block: () -> Unit) {
+        if (HostContext.activity() != null) {
+            block()
+            return
         }
+        LogX.i("ENTRY no foreground activity, bringing WeChat to front")
+        runCatching {
+            val launch = context.packageManager.getLaunchIntentForPackage(context.packageName)
+            launch?.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+            context.startActivity(launch)
+        }.onFailure { LogX.w("ENTRY relaunch failed: ${it.javaClass.simpleName}") }
+        Handler(Looper.getMainLooper()).postDelayed({ block() }, RELAUNCH_DELAY_MS)
     }
 
     /**
