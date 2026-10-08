@@ -241,6 +241,41 @@ class GroupDb private constructor(context: Context) :
     // ------------------------------------------------- 新加群自动免打扰（只设一次）
 
     /** 这个群是否已经自动设过免打扰 */
+    /**
+     * ▲▼ 排序：与相邻分组交换 sort_order（v6.2 定的手动排序方式，比拖拽好实现得多）。
+     *
+     * 不跨置顶边界 —— pinned 不同的两组交换 sort_order 界面上看不出变化
+     * （listGroups 是 pinned 优先），所以直接拒绝，免得用户以为按钮坏了。
+     */
+    fun moveGroup(id: Long, up: Boolean): Boolean {
+        val list = listGroups()
+        val idx = list.indexOfFirst { it.id == id }
+        if (idx < 0) return false
+        val to = if (up) idx - 1 else idx + 1
+        if (to < 0 || to >= list.size) return false
+        val a = list[idx]
+        val b = list[to]
+        if (a.pinned != b.pinned) return false
+        val db = writableDatabase
+        db.beginTransaction()
+        try {
+            db.update(
+                T_GROUP,
+                ContentValues().apply { put("sort_order", b.sortOrder) },
+                "id=?", arrayOf(a.id.toString())
+            )
+            db.update(
+                T_GROUP,
+                ContentValues().apply { put("sort_order", a.sortOrder) },
+                "id=?", arrayOf(b.id.toString())
+            )
+            db.setTransactionSuccessful()
+            return true
+        } finally {
+            db.endTransaction()
+        }
+    }
+
     fun isDndHandled(chatroomId: String): Boolean {
         readableDatabase.query(
             T_DND, arrayOf("chatroom_id"), "chatroom_id=?", arrayOf(chatroomId),

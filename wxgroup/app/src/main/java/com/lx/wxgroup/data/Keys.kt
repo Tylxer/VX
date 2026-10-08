@@ -70,6 +70,7 @@ object Keys {
     // —— 群发域 ——
     const val BROADCAST_INTERVAL_S = "broadcast.interval_s"
     const val BROADCAST_LAST_TEXT = "broadcast.last_text"
+    const val BROADCAST_TARGETS = "broadcast.targets"
 
     // —— 调试 ——
     const val DEBUG_LOG = "debug.log"
@@ -123,6 +124,7 @@ object Prefs {
             min = 1, max = 600, unit = "秒"
         ),
         PrefSpec(Keys.BROADCAST_LAST_TEXT, PrefKind.TEXT, "", "群发", "消息内容"),
+        PrefSpec(Keys.BROADCAST_TARGETS, PrefKind.ENTER, "[]", "群发", "选择发送目标"),
 
         // 调试
         PrefSpec(Keys.DEBUG_LOG, PrefKind.SWITCH, "false", "调试", "调试日志")

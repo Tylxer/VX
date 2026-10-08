@@ -8,11 +8,13 @@ import com.lx.wxgroup.data.GroupDb
 import com.lx.wxgroup.data.Keys
 import com.lx.wxgroup.data.Kv
 import com.lx.wxgroup.data.PrefKind
+import com.lx.wxgroup.data.PrefSpec
 import com.lx.wxgroup.data.Prefs
 import com.lx.wxgroup.ui.Panel
 import com.lx.wxgroup.ui.PanelPage
 import com.lx.wxgroup.ui.Rows
 import com.lx.wxgroup.ui.UiKit
+import com.lx.wxgroup.util.LogX
 
 /**
  * 模块主界面：六行入口（G2 / G3）。
@@ -35,6 +37,9 @@ object MainPage : PanelPage {
     private val C_MMT = 0xFF576B95.toInt()
     private val C_BAK = 0xFF4B8FF7.toInt()
     private val C_BC = 0xFF8B5CF6.toInt()
+
+    /** 分组项在选择器里的 id 前缀，用来跟好友 wxid 区分开 */
+    private const val GROUP_PREFIX = "g:"
 
     private data class Entry(
         val title: String,
@@ -70,6 +75,61 @@ object MainPage : PanelPage {
         return if (on == 0) "未开启" else "$on / ${switches.size} 项已开启"
     }
 
+    // ------------------------------------------------------------ 名单选择
+
+    /**
+     * 所有 `ENTER` 类配置项（名单、群发目标）的点击入口 —— 都推同一个 [PickerPage]。
+     *
+     * 群发目标是「混合选」：模块分组 + 好友各一段；其余名单只有好友一段。
+     * 微信标签段等锚点定位后再补（旧项目确认 `field_contactLabelIds` 只读，得另找数据源）。
+     */
+    private fun onEnterSpec(spec: PrefSpec): Boolean {
+        val db = GroupDb.current()
+        if (db == null) {
+            toast("数据库还没准备好")
+            return true
+        }
+        val mixed = spec.key == Keys.BROADCAST_TARGETS
+        val friends = db.allRealFriends()
+
+        val sections = ArrayList<PickerPage.Section>()
+        if (mixed) {
+            val groups = db.listGroups().map {
+                PickerPage.Item(
+                    id = "$GROUP_PREFIX${it.id}",
+                    title = it.name,
+                    subtitle = "分组 · ${db.countMembers(it.id)} 人",
+                )
+            }
+            if (groups.isNotEmpty()) sections.add(PickerPage.Section("我的分组", groups))
+        }
+        if (friends.isNotEmpty()) {
+            sections.add(
+                PickerPage.Section(
+                    "好友",
+                    friends.map { PickerPage.Item(it.wxid, it.displayName, it.wxid) }
+                )
+            )
+        }
+        if (sections.isEmpty()) {
+            toast("好友缓存为空，先去通讯录滚一遍再回来")
+            return true
+        }
+
+        Panel.push(
+            PickerPage(
+                title = spec.title,
+                sections = sections,
+                initial = Kv.getList(spec.key),
+                hint = if (mixed) "分组与好友可混选，发送时会展开成具体的人并去重" else null,
+            ) { ids ->
+                Kv.putList(spec.key, ids)
+                LogX.i("PREF ${spec.key} = ${ids.size} 项")
+            }
+        )
+        return true
+    }
+
     // ------------------------------------------------------------ 各二级页
 
     fun antirevokePage(): PanelPage = SettingPage(
@@ -82,17 +142,18 @@ object MainPage : PanelPage {
     /**
      * 聊天域：顶部补一行「分组管理」（它不是配置项，进不了 `Prefs.ALL`）。
      *
-     * 分组管理目前还是独立弹窗（旧项目 `GroupManager`）。等 K1 全量接入后
-     * 会改造成 PanelPage 走页面栈，届时这里从 `show()` 改成 `Panel.push(...)`。
+     * 分组管理目前还是独立弹窗（旧项目 `GroupManager`）。等它改造成 PanelPage 后
+     * 这里从 `show()` 换成 `Panel.push(...)`。
      */
     fun chatPage(): PanelPage = SettingPage(
         title = "聊天",
         domain = "聊天",
         head = listOf(
             SettingPage.Row("分组管理", { "${GroupDb.current()?.countGroups() ?: 0} 个分组" }) {
-                GroupManager.show()
+                Panel.push(GroupManagerPage())
             }
         ),
+        onEnter = { onEnterSpec(it) },
         footnote = "免打扰的开始与结束时间相同时，视为不生效（不是全天）。时段内除微信电话外，提示音与震动都会被掐断。",
     )
 
@@ -105,25 +166,27 @@ object MainPage : PanelPage {
     fun momentsPage(): PanelPage = SettingPage(
         title = "朋友圈",
         domain = "朋友圈",
+        onEnter = { onEnterSpec(it) },
         footnote = "导出目录为微信应用专属目录，模块可直接写入，无需额外存储权限。",
     )
 
     /**
      * 群发页。执行链路依赖底层发送接口（锚点 S9，未定位），
-     * 所以「选择目标」和「开始群发」现在都是占位 —— 界面与配置先就位，
-     * S9 打通后只需要把这两个 onClick 换成真实调用。
+     * 所以「开始群发」还是占位 —— 界面与配置先就位，
+     * S9 打通后只需要把这个 onClick 换成真实调用。
      */
     fun broadcastPage(): PanelPage = SettingPage(
         title = "群发",
         domain = "群发",
-        head = listOf(
-            SettingPage.Row("选择发送目标", { "模块分组 / 微信标签" }) {
-                toast("目标选择器（K3）待接入")
-            }
-        ),
+        onEnter = { onEnterSpec(it) },
         tail = listOf(
             SettingPage.Row("开始群发", asButton = true) {
-                toast("发送接口（S9）未定位，暂不能群发")
+                val n = Kv.getList(Keys.BROADCAST_TARGETS).size
+                if (n == 0) {
+                    toast("还没选发送目标")
+                } else {
+                    toast("发送接口（S9）未定位，暂不能群发")
+                }
             }
         ),
         footnote = "全自动后台执行，失败重试 1 次后跳过，全部结束弹「完成 n/m」；连续失败 5 条自动中止。",
