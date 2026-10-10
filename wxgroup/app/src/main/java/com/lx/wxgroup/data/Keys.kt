@@ -43,6 +43,16 @@ object Keys {
     const val CHAT_MUTE_AT_ENABLED = "chat.mute_at_enabled"
     const val CHAT_MUTE_AT_ALLOW = "chat.mute_at_allow"
     const val CHAT_MUTE_AT_EXCLUDE = "chat.mute_at_exclude"
+
+    /**
+     * 自己的昵称 / 群昵称，用于判断「这条消息是不是 @了我」。
+     *
+     * 微信把 @ 渲染进通知正文（如 `verity: @V 3`），要认出 `@V` 里的 V 是不是自己，
+     * 必须知道自己的昵称。模块目前没有读微信自身昵称的锚点（S8 里「自身 wxid」未定位），
+     * 所以这一项由用户填。多个用逗号分隔（各群群昵称不同时可以都写上）。
+     * **留空时只认 `@所有人`** —— 宁可漏判也不把 @别人 的消息静音。
+     */
+    const val CHAT_AT_ALIASES = "chat.at_aliases"
     const val CHAT_DND_ENABLED = "chat.dnd_enabled"
     const val CHAT_DND_START = "chat.dnd_start"
     const val CHAT_DND_END = "chat.dnd_end"
@@ -90,6 +100,8 @@ object Prefs {
         PrefSpec(Keys.CHAT_MUTE_AT_ENABLED, PrefKind.SWITCH, "false", "聊天", "开启防止被@"),
         PrefSpec(Keys.CHAT_MUTE_AT_ALLOW, PrefKind.ENTER, "[]", "聊天", "设置允许名单"),
         PrefSpec(Keys.CHAT_MUTE_AT_EXCLUDE, PrefKind.ENTER, "[]", "聊天", "设置排除名单"),
+        // 判断「@我」用。留空则只认 @所有人（见 Keys.CHAT_AT_ALIASES 的注释）
+        PrefSpec(Keys.CHAT_AT_ALIASES, PrefKind.TEXT, "", "聊天", "我的昵称（判断@我）"),
         PrefSpec(Keys.CHAT_DND_ENABLED, PrefKind.SWITCH, "false", "聊天", "免打扰"),
         // 起止相等 = 不生效，不是全天（决策 #7）
         PrefSpec(Keys.CHAT_DND_START, PrefKind.TIME, "23:00", "聊天", "开始时间"),

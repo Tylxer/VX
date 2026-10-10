@@ -128,6 +128,23 @@ object EntryReceiver {
                             LogX.i("PROBE $line")
                         }
                     }
+                    // K9 验证期临时入口：设备里没有 sqlite3，改配置只能从模块内部写 Kv。
+                    // 验证完随本分支一起删除。
+                    "kvset" -> {
+                        val key = intent.getStringExtra("key") ?: return
+                        val v = intent.getStringExtra("val") ?: ""
+                        com.lx.wxgroup.data.Kv.putString(key, v)
+                        LogX.i("PROBE kvset $key=$v -> now=${com.lx.wxgroup.data.Kv.getString(key)}")
+                    }
+                    "kvget" -> {
+                        for (k in listOf(
+                            com.lx.wxgroup.data.Keys.CHAT_DND_ENABLED,
+                            com.lx.wxgroup.data.Keys.CHAT_DND_START,
+                            com.lx.wxgroup.data.Keys.CHAT_DND_END,
+                            com.lx.wxgroup.data.Keys.CHAT_MUTE_AT_ENABLED,
+                            com.lx.wxgroup.data.Keys.CHAT_AT_ALIASES,
+                        )) LogX.i("PROBE kv $k = ${com.lx.wxgroup.data.Kv.getString(k)}")
+                    }
                     // A13 探针 convtop / A7 探针 marktest 已用完，随 ConvTopProbe 一起删除：
                     // 结论已固化在 ConvLayout 与 MarkRead 的注释里。
                     // 滚动探针 listgeom/dragarm（ListGeomProbe + DragProbe）也已用完删除，

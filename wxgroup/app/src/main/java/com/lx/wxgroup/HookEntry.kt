@@ -10,6 +10,7 @@ import de.robv.android.xposed.callbacks.XC_LoadPackage
 import com.lx.wxgroup.core.ContactSync
 import com.lx.wxgroup.core.DexKitLocator
 import com.lx.wxgroup.core.HostContext
+import com.lx.wxgroup.core.NotifyMute
 import com.lx.wxgroup.core.VersionGate
 import com.lx.wxgroup.data.GroupDb
 import com.lx.wxgroup.entry.EntryReceiver
@@ -38,6 +39,7 @@ class HookEntry : IXposedHookLoadPackage {
         if (!lpparam.isFirstApplication) return
 
         val processName = lpparam.processName
+
         if (!VersionGate.isMainProcess(processName)) {
             LogX.d("skip process=$processName (not main)")
             return
@@ -135,6 +137,12 @@ class HookEntry : IXposedHookLoadPackage {
         runCatching {
             ScrollDock.install(lpparam)
         }.onFailure { LogX.e("ScrollDock install failed", it) }
+
+        // ---- K9：通知静音过滤器（防止被@ + 免打扰时段 + 微信来电放行）----
+        // 只在主进程装：实测通知就是主进程发的，:push 进程连一条 notify 都没有。
+        runCatching {
+            NotifyMute.install(lpparam)
+        }.onFailure { LogX.e("NotifyMute install failed", it) }
 
         // ---- M2-C 入口：广播开分组管理页（模块没有可启动的 Activity）----
         runCatching {
