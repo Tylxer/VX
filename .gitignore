@@ -9,6 +9,11 @@ build/
 _cache/
 _*.txt
 _*.json
+# 真机调试产物：截图 / uiautomator dump / 拉回来的库 / 验证脚本
+_*.png
+_*.xml
+_*.db
+_*.sh
 
 # Android / IDE
 local.properties

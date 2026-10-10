@@ -25,9 +25,19 @@ object ConvReader {
     private const val F_USERNAME = "field_username"
     private const val F_TIME = "field_conversationTime"
 
+    /**
+     * 未读数 / 摘要：这两个字段**没有实机 dump 佐证**（还没跑探针定位），
+     * 所以按名字逐个试，读不到就返回默认值（0 / 空串）——
+     * 宁可分组行少显示一点内容，也不能让列表渲染崩掉。
+     */
+    private val F_UNREAD_CANDIDATES = arrayOf("field_unReadCount", "field_unreadCount", "field_unRead")
+    private val F_DIGEST_CANDIDATES = arrayOf("field_digest", "field_content", "field_msgContent")
+
     /** 类 → 字段，找到一次就缓存；找不到缓存 null，避免每次都做昂贵的反射遍历 */
     private val usernameCache = ConcurrentHashMap<Class<*>, Field?>()
     private val timeCache = ConcurrentHashMap<Class<*>, Field?>()
+    private val unreadCache = ConcurrentHashMap<Class<*>, Field?>()
+    private val digestCache = ConcurrentHashMap<Class<*>, Field?>()
 
     fun username(conv: Any?): String {
         conv ?: return ""
@@ -45,6 +55,44 @@ object ConvReader {
             is Int -> v.toLong()
             else -> 0L
         }
+    }
+
+    /** A7：未读数。读不到返回 0（分组行的角标就不显示，不影响别的） */
+    fun unread(conv: Any?): Int {
+        conv ?: return 0
+        val f = firstField(conv.javaClass, F_UNREAD_CANDIDATES, unreadCache) ?: return 0
+        val v = runCatching { f.get(conv) }.getOrNull() ?: return 0
+        return when (v) {
+            is Int -> v
+            is Long -> v.toInt()
+            is Short -> v.toInt()
+            else -> 0
+        }
+    }
+
+    /** A4-b：最后一条消息的摘要。读不到返回空串 */
+    fun digest(conv: Any?): String {
+        conv ?: return ""
+        val f = firstField(conv.javaClass, F_DIGEST_CANDIDATES, digestCache) ?: return ""
+        return runCatching { f.get(conv) as? String }.getOrNull()?.orEmpty() ?: ""
+    }
+
+    /** 按候选名依次找，命中一个就缓存；全都没命中缓存 null */
+    private fun firstField(
+        cls: Class<*>,
+        names: Array<String>,
+        cache: ConcurrentHashMap<Class<*>, Field?>,
+    ): Field? {
+        cache[cls]?.let { return it }
+        for (n in names) {
+            val f = field(cls, n, ConcurrentHashMap())
+            if (f != null) {
+                cache[cls] = f
+                return f
+            }
+        }
+        cache[cls] = null
+        return null
     }
 
     private fun field(cls: Class<*>, name: String, cache: ConcurrentHashMap<Class<*>, Field?>): Field? {

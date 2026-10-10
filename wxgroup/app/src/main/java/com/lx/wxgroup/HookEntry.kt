@@ -94,27 +94,17 @@ class HookEntry : IXposedHookLoadPackage {
         val apkPaths = DexKitLocator(lpparam).apkPaths()
         apkPaths.forEachIndexed { index, path -> LogX.i("host apk[$index]=$path") }
 
-        // ---- M1 探针：定位通讯录 Fragment / Adapter / 联系人字段 ----
-        // UiProbe 靠纯反射，不依赖 DexKit，是当前的主力；
-        // DexProbe 用 DexKit 在 dex 层搜候选，失败也不影响 UiProbe。
-        runCatching {
-            UiProbe.install(lpparam)
-        }.onFailure { LogX.e("UiProbe install failed", it) }
-
-        // ---- M2-B 探针：通讯录条目长按链路 ----
-        runCatching {
-            MenuProbe.install(lpparam)
-        }.onFailure { LogX.e("MenuProbe install failed", it) }
+        // ---- 定位阶段的探针已全部摘除 ----
+        // UiProbe / MenuProbe / ChatListProbe 当初用来定位 Fragment / Adapter / 字段，
+        // 锚点结论已经写进各自的业务类注释里，探针本身对成品零贡献；
+        // 而且它们 hook 了 Fragment.performResume / onHiddenChanged / setUserVisibleHint
+        // 这些**tab 切换热路径**（ChatListProbe 每次还要枚举上千个 Activity 类），
+        // 会明显拖慢宿主页面切换 —— 一律不再安装。
 
         // ---- M3：会话列表顶部注入「我的分组」条 ----
         runCatching {
             GroupBar.install(lpparam)
         }.onFailure { LogX.e("GroupBar install failed", it) }
-
-        // ---- M3 探针：会话列表控件形态 + 单聊 Activity 类名 ----
-        runCatching {
-            ChatListProbe.install(lpparam)
-        }.onFailure { LogX.e("ChatListProbe install failed", it) }
 
         // ---- M4：长按会话 → 菜单里多一项「加入分组 / 移出分组」----
         // （M4-A 的定位探针 ConvProbe 已完成使命，锚点结论写进了 ConvMenu 注释，不再安装）
@@ -145,15 +135,9 @@ class HookEntry : IXposedHookLoadPackage {
             EntryReceiver.register(context)
         }.onFailure { LogX.e("EntryReceiver register failed", it) }
 
-        val hostApk = apkPaths.firstOrNull() ?: pkgInfo.applicationInfo?.sourceDir.orEmpty()
-        if (hostApk.isEmpty()) {
-            LogX.w("no host apk path, DexProbe skipped")
-        } else {
-            runCatching { DexProbe.runAsync(context, hostApk) }
-                .onFailure { LogX.e("DexProbe start failed", it) }
-        }
-
-        LogX.i("M0 boot completed. M1 probe armed - now open WeChat Contacts tab.")
+        // DexProbe 依赖 dexkit 的 libdexkit.so，本机一直加载不到（日志：
+        // "libdexkit.so unavailable"），留着只是每次启动白跑一趟；锚点早已确定，摘除。
+        LogX.i("boot completed. hooks: GroupBar/ConvMenu/ConvFilter/PlusMenu")
     }
 
     private fun hostPackageInfo(context: Context): PackageInfo? = runCatching {

@@ -21,6 +21,8 @@ import de.robv.android.xposed.callbacks.XC_LoadPackage
 import com.lx.wxgroup.core.HostContext
 import com.lx.wxgroup.data.Group
 import com.lx.wxgroup.data.GroupDb
+import com.lx.wxgroup.data.Keys
+import com.lx.wxgroup.data.Kv
 import com.lx.wxgroup.data.PrefKeys
 import com.lx.wxgroup.ui.AvatarCompose
 import com.lx.wxgroup.ui.UiKit
@@ -64,8 +66,17 @@ object GroupBar {
     /** 顶部横条模式：胶囊横排，常驻 ActionBar 下沿（旧） */
     const val MODE_BAR = "bar"
 
-    /** 列表模式：分组行插进聊天列表顶部，随列表滚动（新，默认） */
+    /** 列表模式：分组行插进聊天列表顶部，随列表滚动（旧机制：真·header） */
     const val MODE_LIST = "list"
+
+    /**
+     * 不注入任何 UI —— 分组行由 `ConvFilter` 在 adapter 内部插入（A1/A2/A6）。
+     *
+     * 这里仍然**登记列表**（`bars[list]`），因为 `conversationList()` 是
+     * `ConvMenu`（A15 长按加入分组）和几个探针发现会话列表的唯一途径，
+     * 不能连它一起停掉。只是不再往列表里塞 header / 浮层，避免两套分组行并存。
+     */
+    const val MODE_NONE = "none"
 
     private val mainHandler by lazy { Handler(Looper.getMainLooper()) }
 
@@ -159,7 +170,9 @@ object GroupBar {
         hookSetPadding(lpparam)
         hookDispatchTouch(lpparam)
         hookTrackMotionScroll(lpparam)
-        PanelDiag.install(lpparam)
+        // PanelDiag（下拉面板诊断，hook 了 View.layout / setLayoutParams 等超热路径）
+        // 是临时脚手架，已摘除 —— 它 600ms 窗口外虽然只做一次时间比较，但
+        // 拦在所有 View 的 layout 上，冷启动时是白白的开销。
     }
 
     /** 当前已注入的会话列表（给会话长按绑定用） */
@@ -365,7 +378,15 @@ object GroupBar {
         }
         val ctx = HostContext.activity() ?: list.context
         val db = GroupDb.current() ?: return
-        val mode = db.getPref(PrefKeys.BAR_MODE, MODE_LIST)
+
+        // A1/A2/A6 落地后，分组行归 ConvFilter 管（adapter 内插行，能跟会话按时间混排），
+        // 这里的 header 横条是旧机制 —— 两套并存会出现两份分组行，所以默认让位。
+        // 关掉「启用分组行」开关则退回旧行为，等于留了一条可回退的路。
+        val mode = if (runCatching { Kv.getBool(Keys.CHAT_GROUP_ROW_ENABLED) }.getOrDefault(true)) {
+            MODE_NONE
+        } else {
+            db.getPref(PrefKeys.BAR_MODE, MODE_LIST)
+        }
         val bar = build(ctx, db, list, parent, mode)
 
         // cr0 = 微信会话行的资源 id，行背景采样和滚动锚点都靠它（两种模式都要）
@@ -373,6 +394,14 @@ object GroupBar {
             list.resources.getIdentifier("cr0", "id", "com.tencent.mm")
         }.getOrDefault(0)
 
+        if (mode == MODE_NONE) {
+            // 只登记、不注入：分组行由 ConvFilter 在 adapter 内插入。
+            // 必须在这里 return —— 后面的 place/settle 是给「注入了 UI」的两种模式
+            // 做布局补偿的，对本模式没有任何意义。
+            bars[list] = bar
+            LogX.i("BAR mode=none, ConvFilter owns group rows (list=${list.javaClass.simpleName})")
+            return
+        }
         if (mode == MODE_LIST && attachHeader(bar)) {
             // 原生 header：分组行就是列表自己的一部分，不需要任何补偿机制。
             // wantPadTop / groupsH 保持 0，全部 hook 自动短路。
