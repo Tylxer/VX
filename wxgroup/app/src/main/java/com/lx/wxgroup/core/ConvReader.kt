@@ -70,6 +70,17 @@ object ConvReader {
         }
     }
 
+    /**
+     * 这个会话对象上**实际命中的**未读字段名（A7 标记已读要按它写回）。
+     *
+     * 必须走这里拿名字，不能在调用方写死 `field_unReadCount`：候选是逐个试出来的，
+     * 换版本命中的可能是另一个，写死就会改错字段。
+     */
+    fun unreadFieldName(conv: Any?): String? {
+        conv ?: return null
+        return firstField(conv.javaClass, F_UNREAD_CANDIDATES, unreadCache)?.name
+    }
+
     /** A4-b：最后一条消息的摘要。读不到返回空串 */
     fun digest(conv: Any?): String {
         conv ?: return ""

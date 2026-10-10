@@ -1530,7 +1530,6 @@ object GroupBar {
 
     /** 供外部（分组页关闭后）触发重画 */
     fun refreshAll() {
-        PanelDiag.arm()
         mainHandler.post {
             runCatching {
                 bars.values.toList().forEach { bar ->

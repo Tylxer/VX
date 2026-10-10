@@ -130,6 +130,14 @@ object ConvFilter {
         override fun initialValue(): Boolean = false
     }
 
+    /**
+     * 长按回调的**重入标记**（区别于 wrapping：那是防 set 时套娃，这是防调用时套娃）。
+     * 详见 [LongClickRemap] 里的说明 —— 缺了它长按任意会话都会栈溢出崩掉微信。
+     */
+    private val inLongClick = object : ThreadLocal<Boolean>() {
+        override fun initialValue(): Boolean = false
+    }
+
     // ------------------------------------------------------------ 安装
 
     fun install(lpparam: XC_LoadPackage.LoadPackageParam) {
@@ -426,6 +434,26 @@ object ConvFilter {
         }
     }
 
+    /**
+     * A7：取当前会话列表里属于这些 wxid 的**微信会话对象**。
+     *
+     * 标记已读只能改微信自己的对象，模块造不出来，必须从 adapter 里拿。
+     * 没聊过天的人没有会话对象，自然也不在结果里（他们本来也没有未读）。
+     */
+    fun convItemsOf(wxids: Set<String>): List<Any> {
+        if (wxids.isEmpty()) return emptyList()
+        val seen = HashSet<String>()
+        val out = ArrayList<Any>()
+        eachWrapper { fa, _ ->
+            for (conv in fa.itemsOf(wxids)) {
+                val w = ConvReader.username(conv)
+                if (w.isBlank() || !seen.add(w)) continue
+                out.add(conv)
+            }
+        }
+        return out
+    }
+
     /** 确保这个列表已经装上包装（幂等） */
     fun ensure(list: ListView) {
         if (wrappers[list] != null) return
@@ -596,11 +624,30 @@ object ConvFilter {
         override fun onItemLongClick(
             parent: AdapterView<*>?, view: View?, position: Int, id: Long
         ): Boolean {
-            // 分组行：自己消费掉，不转交微信（A5/A8 长按菜单以后挂这里）
-            if (groupIdAt(list, position) != ConvLayout.Layout.NOT_A_GROUP) return true
-            val real = realPosition(list, position)
-            if (real < 0) return true
-            return runCatching { orig.onItemLongClick(parent, view, real, id) }.getOrDefault(true)
+            // ⚠️ 重入守卫（没有它微信必崩）。
+            //
+            // 微信的 `com.tencent.mm.ui.conversation.z2`（它的长按监听实现）在
+            // onItemLongClick **内部**会回头调 `list.getOnItemLongClickListener()`
+            // —— 拿到的正是我们这一层。于是 wrapper → z2 → wrapper → z2 无限套娃，
+            // 主线程栈溢出，微信直接崩（真机 crash 栈里 500+ 帧全是这两行交替）。
+            //
+            // `unwrapLongClick` 只解决「set 的时候别套多层」，解决不了这种
+            // **调用期**的回环：只要我们把 z2 包在里面，z2 一回调就必然再进来。
+            // 所以这里按线程记一次「我已经在处理了」，重入直接不做事。
+            //
+            // 重入必须返回 **true**（已消费），返回 false 会让微信以为长按没人处理，
+            // 抬手时 AbsListView 补一次 performItemClick —— 表现是「长按直接打开聊天页」。
+            if (inLongClick.get() == true) return true
+            inLongClick.set(true)
+            return try {
+                // 分组行：自己消费掉，不转交微信（A5 菜单由 GroupRowView 的长按自己弹）
+                if (groupIdAt(list, position) != ConvLayout.Layout.NOT_A_GROUP) return true
+                val real = realPosition(list, position)
+                if (real < 0) return true
+                runCatching { orig.onItemLongClick(parent, view, real, id) }.getOrDefault(true)
+            } finally {
+                inLongClick.set(false)
+            }
         }
     }
 
@@ -640,6 +687,18 @@ object ConvFilter {
         /** 原始会话下标 -> wxid（诊断用：核对点击有没有点错人） */
         fun wxidOf(convIndex: Int): String = snaps.getOrNull(convIndex)?.wxid ?: ""
 
+        /** A7 标记已读用：这些 wxid 在列表里对应的微信会话对象 */
+        fun itemsOf(wxids: Set<String>): List<Any> {
+            if (wxids.isEmpty()) return emptyList()
+            val out = ArrayList<Any>(wxids.size)
+            for (i in snaps.indices) {
+                if (snaps[i].wxid !in wxids) continue
+                val item = runCatching { wrapped.getItem(i) }.getOrNull() ?: continue
+                out.add(item)
+            }
+            return out
+        }
+
         /** 尾部占几行（恒 1，常量只是为了让 [getCount] 读起来自解释） */
         private val tailRows = 1
 
@@ -662,7 +721,14 @@ object ConvFilter {
             val enabled = runCatching { Kv.getBool(Keys.CHAT_GROUP_ROW_ENABLED) }.getOrDefault(true)
             val filterId = currentGroupId()
 
-            val stamp = "$n|$enabled|$filterId|${cachedMembers.hashCode()}"
+            // ⚠️ 指纹**必须包含分组本身**：置顶 / 重命名 / 删分组改的是分组表，
+            // 会话数和成员集都没变 —— 少了这一项，改完置顶列表纹丝不动
+            // （真机实测：DB 里 pinned 已经是 1，分组行还留在原位）。
+            // Group 是 data class，hashCode 覆盖 id/name/pinned/sortOrder，够用了。
+            val groups = if (db == null) emptyList()
+            else runCatching { db.listGroups() }.getOrDefault(emptyList())
+
+            val stamp = "$n|$enabled|$filterId|${cachedMembers.hashCode()}|${groups.hashCode()}"
             if (snaps.isNotEmpty() && stamp == lastStamp) return@synchronized
             lastStamp = stamp
 
@@ -675,7 +741,6 @@ object ConvFilter {
                     ConvLayout.filtered(snaps, cachedMembers)
                 }
                 else -> {
-                    val groups = runCatching { db.listGroups() }.getOrDefault(emptyList())
                     if (groups.isEmpty()) {
                         ConvLayout.build(snaps, emptyList(), emptyMap(), enabled = false)
                     } else {
@@ -797,9 +862,14 @@ object ConvFilter {
             val gid = layout.groupIdAt(position)
             if (gid != ConvLayout.Layout.NOT_A_GROUP) {
                 if (ctx == null) return placeholder(parent)
-                return GroupRowView.build(ctx, modelOf(gid)) {
-                    runCatching { setGroup(gid) }
-                }
+                return GroupRowView.build(
+                    ctx,
+                    modelOf(gid),
+                    onTap = { runCatching { setGroup(gid) } },
+                    // ctx 就是创建列表的那个 Activity（View.getContext 必是 Activity），
+                    // 直接传下去 —— 比 HostContext.activity() 可靠得多（见 [GroupRowMenu]）
+                    onLongTap = { GroupRowMenu.show(ctx, gid) },
+                )
             }
 
             val r = layout.convIndexOf(position)

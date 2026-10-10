@@ -128,6 +128,8 @@ object EntryReceiver {
                             LogX.i("PROBE $line")
                         }
                     }
+                    // A13 探针 convtop / A7 探针 marktest 已用完，随 ConvTopProbe 一起删除：
+                    // 结论已固化在 ConvLayout 与 MarkRead 的注释里。
                     else -> LogX.w("ENTRY PROBE unknown op=$op")
                 }
                 return

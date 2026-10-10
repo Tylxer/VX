@@ -47,7 +47,7 @@ object GroupRowView {
         val memberNames: List<String> = emptyList(),
     )
 
-    fun build(ctx: Context, m: Model, onTap: () -> Unit): View {
+    fun build(ctx: Context, m: Model, onTap: () -> Unit, onLongTap: () -> Unit): View {
         val d = ctx.resources.displayMetrics.density
         val pad = (12 * d).toInt()
 
@@ -129,6 +129,14 @@ object GroupRowView {
         // 触发 overscroll —— 微信把 overscroll 解释成「下拉打开小程序」，
         // 实测现象就是：点一下分组行，界面跳到小程序面板（功能虽生效但体验全毁）。
         row.setOnClickListener { row.post { onTap() } }
+
+        // A5：长按分组行 → 我们自己的菜单（置顶/重命名/管理成员/标记已读/删除）。
+        // 不复用微信的会话长按菜单：那个菜单是 PopupWindow 且没有可挂的入口
+        // （见 ConvMenu 的头注释），分组行本来也是我们自己的 View，直接自己弹。
+        //
+        // 返回值必须是 true：否则长按会继续冒泡到 ListView 的
+        // OnItemLongClickListener，微信会把这个位置当成会话去弹「删除该聊天」。
+        row.setOnLongClickListener { onLongTap(); true }
         return row
     }
 

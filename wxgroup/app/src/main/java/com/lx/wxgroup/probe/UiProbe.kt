@@ -3,6 +3,7 @@ package com.lx.wxgroup.probe
 import android.view.View
 import android.view.ViewGroup
 import de.robv.android.xposed.XC_MethodHook
+import de.robv.android.xposed.XposedBridge
 import de.robv.android.xposed.XposedHelpers
 import de.robv.android.xposed.callbacks.XC_LoadPackage
 import com.lx.wxgroup.core.Anchors848
@@ -113,25 +114,30 @@ object UiProbe {
     }
 
     private fun hookActivities(lpparam: XC_LoadPackage.LoadPackageParam) {
-        runCatching {
-            XposedHelpers.findAndHookMethod(
-                "android.app.Activity",
-                lpparam.classLoader,
-                "onResume",
-                object : XC_MethodHook() {
-                    override fun afterHookedMethod(param: MethodHookParam) {
-                        runCatching {
-                            val act = param.thisObject as? android.app.Activity ?: return
-                            // M2-B：弹分组选择框需要宿主的 Activity 上下文
-                            HostContext.setActivity(act)
-                            val name = act.javaClass.name
-                            if (seenActivities.add(name)) LogX.i("ACT $name")
-                        }
-                    }
+        val cb = object : XC_MethodHook() {
+            override fun afterHookedMethod(param: MethodHookParam) {
+                runCatching {
+                    val act = param.thisObject as? android.app.Activity ?: return
+                    // M2-B：弹分组选择框需要宿主的 Activity 上下文
+                    HostContext.setActivity(act)
+                    val name = act.javaClass.name
+                    if (seenActivities.add(name)) LogX.i("ACT $name")
                 }
-            )
-            LogX.i("UiProbe: Activity.onResume hooked")
-        }.onFailure { LogX.e("UiProbe: hook Activity failed", it) }
+            }
+        }
+        // ⚠️ 只挂 `onResume` 是不够的：hook 基类方法对**覆写了它的子类不生效**
+        // （微信的 LauncherUI 就是），真机上 `HostContext.activity()` 一直是 null，
+        // 弹窗直接 BadTokenException。`performResume` 由 Instrumentation 调用、
+        // 子类一般不覆写，用它兜底才能稳稳拿到当前 Activity。
+        // 用 hookAllMethods：这个方法各版本签名不一样（Android 12+ 多一个参数）。
+        for (m in arrayOf("onResume", "performResume")) {
+            runCatching {
+                XposedBridge.hookAllMethods(
+                    XposedHelpers.findClass("android.app.Activity", lpparam.classLoader), m, cb
+                )
+                LogX.i("UiProbe: Activity.$m hooked")
+            }.onFailure { LogX.w("UiProbe: hook Activity.$m failed: ${it.javaClass.simpleName}") }
+        }
     }
 
     /**
