@@ -16,6 +16,7 @@ import com.lx.wxgroup.entry.EntryReceiver
 import com.lx.wxgroup.feature.ConvFilter
 import com.lx.wxgroup.feature.ConvMenu
 import com.lx.wxgroup.feature.GroupBar
+import com.lx.wxgroup.feature.ScrollDock
 import com.lx.wxgroup.hook.PlusMenu
 import com.lx.wxgroup.probe.ChatListProbe
 import com.lx.wxgroup.probe.ChatOpenProbe
@@ -129,6 +130,11 @@ class HookEntry : IXposedHookLoadPackage {
         runCatching {
             PlusMenu.install(lpparam)
         }.onFailure { LogX.e("PlusMenu install failed", it) }
+
+        // ---- K7 补：会话列表顶部停靠位守卫（下拉不再把内容推下去推不回来）----
+        runCatching {
+            ScrollDock.install(lpparam)
+        }.onFailure { LogX.e("ScrollDock install failed", it) }
 
         // ---- M2-C 入口：广播开分组管理页（模块没有可启动的 Activity）----
         runCatching {

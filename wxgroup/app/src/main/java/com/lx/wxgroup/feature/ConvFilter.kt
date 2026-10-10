@@ -385,6 +385,15 @@ object ConvFilter {
         return cachedId.coerceAtLeast(0)
     }
 
+    /**
+     * 列表「停在顶部」时 `child0.top` 的值（[headerAnchor]），null = 还没抓到。
+     * [ScrollDock] 用它当「内容不允许再往下」的上限。
+     */
+    fun anchor(): Int? = headerAnchor
+
+    /** 这个列表是不是已经装了我们的包装 adapter（[ScrollDock] 只在包装生效时干活） */
+    fun wraps(v: View?): Boolean = v != null && wrappers.containsKey(v)
+
     /** 切换筛选：再点同一个分组 = 回到收纳态 */
     fun toggle(id: Long) {
         val cur = currentGroupId()
@@ -484,12 +493,27 @@ object ConvFilter {
     //
     // 所以：**重建前后保持 child0.top 不变**，微信看不到任何滚动变化，也就不会弹面板。
 
-    /** 重建前抓锚点：列表停在顶部（第一个 item 就是 header）时记下当前 top */
+    /**
+     * 重建前抓锚点：列表停在顶部（第一个 item 就是 header）时记下当前 top。
+     *
+     * ⚠️ **只认「藏得最到位」的那一次**（取更负的值），不能无条件覆盖：
+     * `firstVisiblePosition == 0` 时 `child0.top` 的可动区间是 `[dock, 0]`
+     * （dock ≈ -2713）。用户往下拉露出 header 之后停在 -1500 也是
+     * `firstVisiblePosition == 0`，此时如果 [refresh] 跑一次，锚点就会被污染成
+     * -1500，之后 [restoreAnchor] 和 [ScrollDock] 会把列表**永久钉在 header 露出
+     * 1862px 的状态**。取 min 之后：污染值进不来；反过来就算先被污染了，
+     * 下一次真正停在 -2713 时还能自愈。
+     */
     private fun rememberAnchor(list: ListView) {
         runCatching {
             if (list.firstVisiblePosition != 0) return
             val c0 = list.getChildAt(0) ?: return
-            if (c0.top < 0) headerAnchor = c0.top
+            if (c0.top >= 0) return
+            val cur = headerAnchor
+            if (cur == null || c0.top < cur) {
+                headerAnchor = c0.top
+                LogX.i("K7 anchor ${cur ?: "(first)"} -> ${c0.top}")
+            }
         }
     }
 
@@ -501,10 +525,13 @@ object ConvFilter {
      * 等价于「什么都不滚」，而不是硬拉回 0。
      *
      * 列表当前不在顶部（用户滚下去了）时回到顶部即可 —— 此时也需要 anchor，
-     * 用 [headerAnchor]；还没抓到就退回 0（只在冷启动第一帧可能发生）。
+     * 用 [headerAnchor]。
+     *
+     * ⚠️ 锚点还没抓到时**什么都不做**，不要退回 0：`setSelectionFromTop(0, 0)`
+     * 会把微信那个 3046px 的 header 整个顶出来，等于制造一次假下拉。
      */
     private fun restoreAnchor(list: ListView) {
-        val anchor = headerAnchor ?: 0
+        val anchor = headerAnchor ?: return
         runCatching { list.setSelectionFromTop(0, anchor) }
             .onFailure { LogX.d("K7: restoreAnchor n/a ${it.javaClass.simpleName}") }
     }
@@ -532,8 +559,8 @@ object ConvFilter {
         }
 
         // ListView 的 RecycleBin 是按「换 adapter 之前」的 viewTypeCount 建的回收池。
-        // 我们的包装多了「分组行 / 尾部填充行」两个类型 → 池子数量对不上，
-        // 会把尾部那行的高 View 当成会话行的 convertView 递进来（真机实测）→
+        // 我们的包装多了一个「分组行」类型 → 池子数量对不上，
+        // 会把分组行当成会话行的 convertView 递进来（真机实测）→
         // 微信强转 convertView 直接抛，会话行整片空白。换完 adapter 立刻把
         // 池子按新的类型数量重建一次。
         runCatching {
@@ -699,19 +726,14 @@ object ConvFilter {
             return out
         }
 
-        /** 尾部占几行（恒 1，常量只是为了让 [getCount] 读起来自解释） */
-        private val tailRows = 1
-
         /**
          * 视图类型编号。
          *
-         * 分组行和尾部行**必须各占一个类型**：ListView 的类型复用的是「同类型才能
+         * 分组行**必须单独占一个类型**：ListView 的类型复用的是「同类型才能
          * 回收给同类型」，串类型会把分组行的内容复用到会话行上（真机踩过）。
          */
         private val groupType: Int
             get() = runCatching { wrapped.viewTypeCount }.getOrDefault(1).coerceAtLeast(1)
-
-        private val tailType: Int get() = groupType + 1
 
         fun rebuild() = synchronized(lock) {
             val n = runCatching { wrapped.count }.getOrDefault(0)
@@ -839,11 +861,22 @@ object ConvFilter {
         // `getItemAtPosition(p)` 去取会话，那条路最终打到本类的
         // `getItem(p - headersCount)`。**所以这里的入参是原始下标**，
         // 若再拿它去查 layout（筛选后的序列），取到的就是另一条会话。
-        // 真机日志实锤：`K7 click conv pos=16 headers=14 real=18`
+        // 真机日志实锤（当时的行数，尾部填充行还没删）：
+        // `K7 click conv pos=16 headers=14 real=18`
         // 之后微信按 18 取数据，取到 null → 聊天页压根不打开。
 
-        override fun getCount(): Int =
-            if (layout.size == 0) 0 else layout.size + tailRows
+        /**
+         * ⚠️ 这里**不能再多挂一行**（v0.2.2 之前挂过一行「尾部填充行」，已移除）。
+         *
+         * 那行是为了骗过 `ListView.correctTooHigh`（详见文件末尾「为什么不再需要
+         * 尾部填充行」），但它带来一个更糟的副作用：把内容底部撑到列表底部之后，
+         * `AbsListView.trackMotionScroll` 的
+         * `cannotScrollUp = firstPos + n == mItemCount && lastBottom <= end`
+         * 就再也成立不了（footer 永远挂不上、lastBottom 恒等于 end），
+         * 于是**上拉一路到底**，屏幕上只剩那行透明的填充 View + 微信的 footer，
+         * 表现为「页面空白」。现在改成 hook 吞掉 `correctTooHigh`，见 [ScrollDock]。
+         */
+        override fun getCount(): Int = layout.size
 
         override fun getItem(position: Int): Any? =
             runCatching { wrapped.getItem(position) }.getOrNull()
@@ -855,8 +888,6 @@ object ConvFilter {
             runCatching { wrapped.hasStableIds() }.getOrDefault(false)
 
         override fun getView(position: Int, convertView: View?, parent: ViewGroup?): View {
-            if (isTail(position)) return buildTail(parent)
-
             val ctx = parent?.context ?: HostContext.app()
 
             val gid = layout.groupIdAt(position)
@@ -904,11 +935,12 @@ object ConvFilter {
                 .getOrDefault(Int.MIN_VALUE)
         }
 
-        // -------------------------------------------------- 尾部填充行
+        // -------------------------------------------------- 为什么不再需要尾部填充行
         //
-        // ★ 「点分组行 → 整页下移 2000px + 小程序面板被顶出来」的**真正的解** ★
+        // v0.2.2 为了屏蔽 `ListView.correctTooHigh` 曾在列表末尾补一行「把缺口填满」
+        // 的透明行。**那行已经删掉了**，原因是它破坏了滚动边界：
         //
-        // 读 AOSP `ListView.correctTooHigh(childCount)`（sources/android-35）：
+        // AOSP `ListView.correctTooHigh(childCount)`（sources/android-35）：
         //
         //     int lastPosition = mFirstPosition + childCount - 1;
         //     if (lastPosition == mItemCount - 1 && childCount > 0) {
@@ -923,60 +955,36 @@ object ConvFilter {
         //
         // 微信把顶部栏做成会话列表 3046px 的巨型 header，列表靠停在
         // `child0.top = -2713` 才显示正常（header 只露最后 333px，会话行从 333 开始）。
-        // 这个状态下 **`childCount == mItemCount`、`firstTop(-2713) < 0`、
-        // `lastBottom(≈1110) < end(3104)`** —— 三个条件全中，于是被下移 ≈1994px。
-        // `fillSpecific()` 里也调 `correctTooHigh`，所以**任何 `setSelectionFromTop`
-        // 复位都会被再次下移**（实测：notify 前复位 → 布局后 c0top 从 -2713 变 -662）。
+        // 内容不足一屏时 `firstTop(-2713) < padTop` 且 `bottomOffset > 0`，
+        // 条件全中 → 整块内容被下移 ≈1994px（「点分组行整页下移」的元凶）。
         //
-        // 唯一出路是让 `bottomOffset <= 0`：在最后补一行「把缺口填满」的透明行。
-        //  - 内容本来够长时它高度算出来是 0，退化成一个 0 高 View，无影响；
-        //  - 内容不够时它正好补到列表底部，`bottomOffset == 0`，下移逻辑不成立。
+        // 填充行能让 `bottomOffset` 恒为 0，把上面这段彻底屏蔽 —— 但它同时让
+        // `lastBottom` 恒等于 `end`，于是
+        // `cannotScrollUp = firstPos + n == mItemCount && lastBottom <= end`
+        // 再也成立不了（footer 挂不上，`firstPos + n` 永远差 1）→ **上拉一路到底**，
+        // 屏幕上只剩那行透明填充 View + 微信 footer，表现就是「页面空白」。
         //
-        // 高度是**现算的**而不是写死：`fillDown` 是顺序挂 child 的，轮到本行时
-        // 前面所有真实行都已量好放好，直接读最后一个 child 的 bottom 就知道差多少。
-
-        private fun isTail(position: Int): Boolean = position >= layout.size
-
-        /**
-         * 还差多少像素才顶到列表底部。差 0 就返回 0（内容够长，本行不产生任何高度）。
-         */
-        private fun tailHeight(list: ListView?): Int {
-            if (list == null) return 0
-            val n = list.childCount
-            if (n <= 0) return 0
-            val lastBottom = list.getChildAt(n - 1).bottom
-            val end = list.height - list.paddingBottom
-            return (end - lastBottom).coerceAtLeast(0)
-        }
-
-        private fun buildTail(parent: ViewGroup?): View {
-            val ctx = parent?.context ?: HostContext.app()
-            val v = View(ctx)
-            v.isClickable = false
-            v.isFocusable = false
-            v.layoutParams = AbsListView.LayoutParams(
-                AbsListView.LayoutParams.MATCH_PARENT,
-                tailHeight(parent as? ListView),
-            )
-            return v
-        }
+        // 现在的做法（三件套，缺一不可，见 [ScrollDock]）：
+        //  1. 直接 hook 吞掉 `correctTooHigh`（真机验证过这个 hook 点确实会被调到）；
+        //  2. 不再补行 → 内容不足一屏时 `firstPos + n == mItemCount` 且
+        //     `lastBottom <= end` 成立 → `cannotScrollUp` 为真 → 上拉被自然禁掉；
+        //  3. `cannotScrollDown` 因为 `firstTop(-2713) < padTop` 永远为假，
+        //     下拉不受限 → 由 [ScrollDock] 事后钳制回停靠位。
 
         override fun getItemViewType(position: Int): Int {
-            if (isTail(position)) return tailType
             if (layout.isGroupRow(position)) return groupType
             val r = layout.convIndexOf(position)
             if (r < 0) return 0
             return runCatching { wrapped.getItemViewType(r) }.getOrDefault(0)
         }
 
-        override fun getViewTypeCount(): Int = groupType + 2
+        override fun getViewTypeCount(): Int = groupType + 1
 
         override fun isEmpty(): Boolean = layout.size == 0
 
         override fun areAllItemsEnabled(): Boolean = false
 
         override fun isEnabled(position: Int): Boolean {
-            if (isTail(position)) return false
             if (layout.isGroupRow(position)) return true
             val r = layout.convIndexOf(position)
             if (r < 0) return false

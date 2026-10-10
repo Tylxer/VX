@@ -130,6 +130,8 @@ object EntryReceiver {
                     }
                     // A13 探针 convtop / A7 探针 marktest 已用完，随 ConvTopProbe 一起删除：
                     // 结论已固化在 ConvLayout 与 MarkRead 的注释里。
+                    // 滚动探针 listgeom/dragarm（ListGeomProbe + DragProbe）也已用完删除，
+                    // 结论固化为 ScrollDock 与 ConvFilter「为什么不再需要尾部填充行」的注释。
                     else -> LogX.w("ENTRY PROBE unknown op=$op")
                 }
                 return
