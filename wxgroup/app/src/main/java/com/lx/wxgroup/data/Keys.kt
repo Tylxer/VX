@@ -49,6 +49,15 @@ object Keys {
     const val CHAT_CONV_MENU_ENABLED = "chat.conv_menu_enabled"
 
     /**
+     * 会话长按菜单顶部显示会话名（header）。
+     *
+     * 独立开关是保险：header 布局由系统在**微信主题**下 inflate
+     * （解析 `?attr/textAppearancePopupMenuHeader`），万一某 ROM 解析失败会崩微信，
+     * 直接把它关掉即可，不用改代码。
+     */
+    const val CHAT_MENU_HEADER = "chat.menu_header"
+
+    /**
      * 诊断开关：开着时每次会话长按会把**菜单的全部内容** dump 到
      * `wxgroup_dbg.txt`（含每项的 groupId / itemId / 标题 / 可见性）。
      *
@@ -116,6 +125,10 @@ object Prefs {
         PrefSpec(
             Keys.CHAT_CONV_MENU_ENABLED, PrefKind.SWITCH, "true", "聊天",
             "长按会话菜单加「加入分组」（追加在微信菜单末尾，不顶掉原生项）"
+        ),
+        PrefSpec(
+            Keys.CHAT_MENU_HEADER, PrefKind.SWITCH, "true", "聊天",
+            "长按菜单顶部显示会话名"
         ),
         PrefSpec(
             Keys.CHAT_MENU_DIAG, PrefKind.SWITCH, "false", "聊天",

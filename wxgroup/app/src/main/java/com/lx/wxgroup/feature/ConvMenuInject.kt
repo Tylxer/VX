@@ -81,6 +81,9 @@ object ConvMenuInject {
      */
     private const val ORDER_TAIL = 1000
 
+    /** 菜单标题最多几个字：header 布局是 singleLine + 跑马灯，太长会糊成一坨 */
+    private const val HEADER_MAX = 20
+
     fun install(lpparam: XC_LoadPackage.LoadPackageParam) {
         runCatching {
             XposedHelpers.findAndHookMethod(
@@ -251,6 +254,20 @@ object ConvMenuInject {
             ?: titleOf(view).takeIf { it.isNotBlank() }
             ?: wxid
         LogX.i("CMI hit view=${view.javaClass.name} pos=$pos wxid=$wxid joined=${joined.size}")
+
+        // 菜单头：显示当前操作的是哪个会话。
+        // ⚠️ 实测微信在会话列表里没有注册任何 context menu 项（16 层 View 链全空），
+        // 所以这个菜单平时只有我们两项 —— 有个标题才知道自己长按的是谁。
+        // 若哪天微信自己往里加了项，这个 header 也只是多一行，不影响它们。
+        //
+        // ⚠️ 独立开关 + runCatching 双保险：header 布局是系统在**微信主题**下 inflate 的
+        // （`popup_menu_header_item_layout`，解析 `?attr/textAppearancePopupMenuHeader`），
+        // 万一某 ROM/主题下解析失败会沿 performLongClick 把微信带崩。
+        // 所以留了 `chat.menu_header` 开关，出问题直接关掉即可，不用改代码。
+        if (Kv.getBool(Keys.CHAT_MENU_HEADER)) {
+            runCatching { menu.setHeaderTitle(name.take(HEADER_MAX)) }
+                .onFailure { LogX.w("CMI setHeaderTitle failed: ${it.javaClass.simpleName}") }
+        }
 
         val joinLabel = if (joined.isEmpty()) "加入分组" else "分组管理（已加入 ${joined.size} 个）"
         menu.add(GROUP_ID, ID_JOIN, ORDER_TAIL, joinLabel)
