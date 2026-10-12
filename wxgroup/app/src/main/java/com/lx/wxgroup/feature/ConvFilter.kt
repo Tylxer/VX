@@ -349,6 +349,26 @@ object ConvFilter {
         wrapping.set(true)
         try {
             runCatching {
+                // ⚠️ 对照实验开关（默认开）。关掉 = 完全不碰微信的长按链路。
+                //
+                // 为什么要它：真机发现「模块启用后微信自己的 4 项会话菜单不再弹出」，
+                // 而 dump 证明微信那 4 项**不走 MenuBuilder.add**，所以不是被我们顶掉，
+                // 而是被包装层挡住了 —— z2 内部会回头调 `getOnItemLongClickListener()`
+                // （拿到的是我们的 wrapper），我们重入时返回 false，微信据此不弹菜单。
+                // 关掉这一层就能验证：微信菜单是否恢复。
+                if (!Kv.getBool(Keys.CHAT_CONV_LONGCLICK_REMAP)) {
+                    // ⚠️ 光「不再包一层」不够：已经装上去的 wrapper 还在链上，
+                    // 开关就形同没关（会得出「包装不是元凶」的错误结论）。
+                    // 这里主动把它剥回微信的原始 listener。
+                    val cur = list.onItemLongClickListener
+                    if (cur is LongClickRemap) {
+                        list.onItemLongClickListener = unwrapLongClick(cur)
+                        LogX.i("K7 unwrap long (remap switch off)")
+                    } else {
+                        LogX.i("K7 wrap long SKIPPED (remap switch off, no wrapper)")
+                    }
+                    return
+                }
                 val long = unwrapLongClick(list.onItemLongClickListener)
                 if (long != null) {
                     list.onItemLongClickListener = LongClickRemap(list, long)

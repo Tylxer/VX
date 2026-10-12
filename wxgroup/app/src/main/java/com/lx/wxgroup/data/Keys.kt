@@ -42,20 +42,12 @@ object Keys {
     /**
      * 长按普通会话时，往**微信自己的菜单**里加「加入分组 / 标记已读」两项。
      *
-     * 注入点是 `View.createContextMenu`（详见 [com.lx.wxgroup.feature.ConvMenuInject]）：
-     * 微信原生的删除 / 置顶 / 免打扰**全部保留**，我们只是追加在菜单末尾。
+     * 注入点是微信自己那个菜单 PopupWindow（详见
+     * [com.lx.wxgroup.feature.ConvMenuInject]）：微信原生的
+     * 标为未读 / 置顶 / 不显示该聊天 / 删除该聊天**全部保留**，我们只是追加在末尾。
      * 关掉则完全不干预长按，交回微信原生行为。
      */
     const val CHAT_CONV_MENU_ENABLED = "chat.conv_menu_enabled"
-
-    /**
-     * 会话长按菜单顶部显示会话名（header）。
-     *
-     * 独立开关是保险：header 布局由系统在**微信主题**下 inflate
-     * （解析 `?attr/textAppearancePopupMenuHeader`），万一某 ROM 解析失败会崩微信，
-     * 直接把它关掉即可，不用改代码。
-     */
-    const val CHAT_MENU_HEADER = "chat.menu_header"
 
     /**
      * 诊断开关：开着时每次会话长按会把**菜单的全部内容** dump 到
@@ -64,6 +56,19 @@ object Keys {
      * 只在模块加载时读一次，改完要重启微信。取证完记得关掉。
      */
     const val CHAT_MENU_DIAG = "chat.menu_diag"
+
+    /**
+     * K7 是否包装会话列表的 `OnItemLongClickListener`。
+     *
+     * ⚠️ **真机已验证它就是元凶**：包装会介入微信 `conversation.z2` 的调用回环
+     * （z2 内部会回头调 `list.getOnItemLongClickListener()`，拿到的就是我们这一层），
+     * 微信自己的 4 项菜单（标为未读 / 置顶 / 不显示 / 删除）因此**不再弹出**；
+     * 把开关置 false 后菜单立刻恢复。→ 默认 false，长按链路零干预。
+     *
+     * 分组行（A5）不受影响：它有自己的 `View.OnLongClickListener` 且 return true，
+     * 本来就不经过 ListView 的 OnItemLongClickListener。
+     */
+    const val CHAT_CONV_LONGCLICK_REMAP = "chat.conv_longclick_remap"
 
     const val CHAT_SHOW_UNREAD = "chat.show_unread"
     const val CHAT_DISABLE_PAT = "chat.disable_pat"
@@ -127,12 +132,12 @@ object Prefs {
             "长按会话菜单加「加入分组」（追加在微信菜单末尾，不顶掉原生项）"
         ),
         PrefSpec(
-            Keys.CHAT_MENU_HEADER, PrefKind.SWITCH, "true", "聊天",
-            "长按菜单顶部显示会话名"
-        ),
-        PrefSpec(
             Keys.CHAT_MENU_DIAG, PrefKind.SWITCH, "false", "聊天",
             "调试：dump 会话长按菜单内容到 wxgroup_dbg.txt（重启微信生效）"
+        ),
+        PrefSpec(
+            Keys.CHAT_CONV_LONGCLICK_REMAP, PrefKind.SWITCH, "false", "聊天",
+            "包装会话列表长按监听（开着会让微信原生会话菜单消失，别开）"
         ),
         PrefSpec(Keys.CHAT_SHOW_UNREAD, PrefKind.SWITCH, "true", "聊天", "显示未读"),
         PrefSpec(Keys.CHAT_DISABLE_PAT, PrefKind.SWITCH, "false", "聊天", "关闭拍一拍"),

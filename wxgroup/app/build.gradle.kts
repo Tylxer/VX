@@ -17,7 +17,7 @@ android {
         // 一堆与自己无关的行为变更（包可见性、后台启动限制等）
         targetSdk = 33
         versionCode = 1
-        versionName = "0.2.7"
+        versionName = "0.2.8"
     }
 
     compileOptions {
