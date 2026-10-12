@@ -13,14 +13,18 @@ import com.lx.wxgroup.core.HostContext
 import com.lx.wxgroup.core.NotifyMute
 import com.lx.wxgroup.core.VersionGate
 import com.lx.wxgroup.data.GroupDb
+import com.lx.wxgroup.data.Keys
+import com.lx.wxgroup.data.Kv
 import com.lx.wxgroup.entry.EntryReceiver
 import com.lx.wxgroup.feature.ConvFilter
+import com.lx.wxgroup.feature.ConvMenuInject
 import com.lx.wxgroup.feature.GroupBar
 import com.lx.wxgroup.feature.ScrollDock
 import com.lx.wxgroup.hook.PlusMenu
 import com.lx.wxgroup.probe.ChatListProbe
 import com.lx.wxgroup.probe.ChatOpenProbe
 import com.lx.wxgroup.probe.DexProbe
+import com.lx.wxgroup.probe.MenuHuntProbe
 import com.lx.wxgroup.probe.MenuProbe
 import com.lx.wxgroup.probe.UiProbe
 import com.lx.wxgroup.util.LogX
@@ -87,6 +91,10 @@ class HookEntry : IXposedHookLoadPackage {
             }
         }
 
+        // A15 取证探针：只留 classLoader，不打任何钩子（平时零开销）。
+        // 需要取证时发广播 op=menuhunt sub=on 才临时装钩，off 会全部 unhook。
+        MenuHuntProbe.prepare(lpparam)
+
         ContactSync.init(context)
         HostContext.setApp(context)
         val db = GroupDb.open(context)
@@ -108,9 +116,15 @@ class HookEntry : IXposedHookLoadPackage {
             GroupBar.install(lpparam)
         }.onFailure { LogX.e("GroupBar install failed", it) }
 
-        // ---- A15：长按会话 → 「加入分组 / 标记已读」菜单 ----
-        // 由 ConvFilter 的长按包装直接触发（那里已经拿到了换算好的会话 wxid），
-        // 不需要自己的 hook —— 早期那套「注入微信菜单」的 install 已随探针一起删掉。
+        // ---- A15：长按会话 → 往**微信原生菜单**里加「加入分组 / 标记已读」----
+        // hook `View.createContextMenu`：微信自己的菜单就是标准 AOSP ContextMenu，
+        // 在它 add 完自己的项之后我们再 add 两项即可（详见 ConvMenuInject 的类注释）。
+        // 长按事件本身完全不干预，微信的删除/置顶/免打扰全部保留。
+        runCatching {
+            // 诊断开关只在加载时读一次（改完要重启微信），关着时不装诊断钩、不 dump
+            ConvMenuInject.diag = Kv.getBool(Keys.CHAT_MENU_DIAG)
+            ConvMenuInject.install(lpparam)
+        }.onFailure { LogX.e("ConvMenuInject install failed", it) }
 
         // ---- M4-C 探针：会话列表 adapter 结构 + 点击监听（定位已完成，不再安装）----
         // （结论：内层是 com.tencent.mm.ui.conversation.p3，点击监听 o2 靠位置取会话）

@@ -136,6 +136,13 @@ object EntryReceiver {
                         com.lx.wxgroup.data.Kv.putString(key, v)
                         LogX.i("PROBE kvset $key=$v -> now=${com.lx.wxgroup.data.Kv.getString(key)}")
                     }
+                    // A15 全量 hook 点取证（临时的，结论固化后随探针一起删除）：
+                    // --es sub on|off|flush|tree|win|clear [--es sec 30]
+                    "menuhunt" -> {
+                        val sub = intent.getStringExtra("sub") ?: "on"
+                        val sec = intent.getIntExtra("sec", 30)
+                        com.lx.wxgroup.probe.MenuHuntProbe.command(sub, sec)
+                    }
                     "kvget" -> {
                         for (k in listOf(
                             com.lx.wxgroup.data.Keys.CHAT_DND_ENABLED,

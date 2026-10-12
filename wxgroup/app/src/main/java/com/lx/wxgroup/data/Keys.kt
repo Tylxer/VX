@@ -40,13 +40,21 @@ object Keys {
     const val CHAT_GROUP_ROW_ENABLED = "chat.group_row_enabled"
 
     /**
-     * 长按普通会话时弹我们的菜单（加入分组 / 标记已读）。
+     * 长按普通会话时，往**微信自己的菜单**里加「加入分组 / 标记已读」两项。
      *
-     * 打开后**会顶掉微信自己的会话长按菜单**（原生的「删除该聊天 / 置顶」看不到）
-     * —— 详见 [com.lx.wxgroup.feature.ConvMenu] 里为什么没法往微信菜单里塞一行。
+     * 注入点是 `View.createContextMenu`（详见 [com.lx.wxgroup.feature.ConvMenuInject]）：
+     * 微信原生的删除 / 置顶 / 免打扰**全部保留**，我们只是追加在菜单末尾。
      * 关掉则完全不干预长按，交回微信原生行为。
      */
     const val CHAT_CONV_MENU_ENABLED = "chat.conv_menu_enabled"
+
+    /**
+     * 诊断开关：开着时每次会话长按会把**菜单的全部内容** dump 到
+     * `wxgroup_dbg.txt`（含每项的 groupId / itemId / 标题 / 可见性）。
+     *
+     * 只在模块加载时读一次，改完要重启微信。取证完记得关掉。
+     */
+    const val CHAT_MENU_DIAG = "chat.menu_diag"
 
     const val CHAT_SHOW_UNREAD = "chat.show_unread"
     const val CHAT_DISABLE_PAT = "chat.disable_pat"
@@ -107,7 +115,11 @@ object Prefs {
         PrefSpec(Keys.CHAT_GROUP_ROW_ENABLED, PrefKind.SWITCH, "true", "聊天", "启用分组行"),
         PrefSpec(
             Keys.CHAT_CONV_MENU_ENABLED, PrefKind.SWITCH, "true", "聊天",
-            "长按会话弹分组菜单（会顶掉微信原生菜单）"
+            "长按会话菜单加「加入分组」（追加在微信菜单末尾，不顶掉原生项）"
+        ),
+        PrefSpec(
+            Keys.CHAT_MENU_DIAG, PrefKind.SWITCH, "false", "聊天",
+            "调试：dump 会话长按菜单内容到 wxgroup_dbg.txt（重启微信生效）"
         ),
         PrefSpec(Keys.CHAT_SHOW_UNREAD, PrefKind.SWITCH, "true", "聊天", "显示未读"),
         PrefSpec(Keys.CHAT_DISABLE_PAT, PrefKind.SWITCH, "false", "聊天", "关闭拍一拍"),

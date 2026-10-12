@@ -380,6 +380,23 @@ object ConvFilter {
     // ------------------------------------------------------------ 对外接口
 
     /** 当前筛选的分组 id（0 = 收纳态） */
+    /**
+     * A15 注入版用：ListView 的**原始 position**（含 header、含我们自己插的分组行）
+     * → 该行的会话 wxid。
+     *
+     * 非会话行（header / 分组行 / 不是我们包装过的列表）一律返回 null ——
+     * 注入菜单时靠这个把「长按的不是会话」的情况挡在外面，避免拿错人。
+     */
+    fun wxidAt(list: ListView, rawPosition: Int): String? {
+        val fa = wrappers[list] ?: return null
+        if (groupIdAt(list, rawPosition) != ConvLayout.Layout.NOT_A_GROUP) return null
+        val real = realPosition(list, rawPosition)
+        if (real < 0) return null
+        // ⚠️ 必须实时取（wxidNow），不能用快照 wxidOf —— 快照只在会话条数变化时重算，
+        // 收消息重排后条数不变，快照是旧顺序，会把「加入分组」加到别人头上。
+        return fa.wxidNow(real - headerCount(list)).takeIf { it.isNotBlank() }
+    }
+
     fun currentGroupId(): Long {
         if (cachedId < 0) refreshCache()
         return cachedId.coerceAtLeast(0)
@@ -694,28 +711,20 @@ object ConvFilter {
                     return runCatching { orig.onItemLongClick(parent, view, position, id) }
                         .getOrDefault(false)
                 }
-                val wxid = wrappers[list]?.wxidOf(real - headers).orEmpty()
-                if (!Kv.getBool(Keys.CHAT_CONV_MENU_ENABLED) || wxid.isBlank()) {
-                    // 开关关掉（或拿不到 wxid）：完全还原微信原生长按。
-                    //
-                    // ⚠️ 必须**原样透传**微信的返回值，不能自己兜成 true。真机实测
-                    // 微信的会话菜单不靠它的 OnItemLongClickListener 弹（z2 返回 false），
-                    // 而是走 AOSP `AbsListView.performLongPress` 里的
-                    // `if (!handled) showContextMenuForChild(...)`。我们一旦返回 true，
-                    // 那句兜底就永远不执行。
-                    val r = runCatching { orig.onItemLongClick(parent, view, real, id) }
-                        .onFailure { LogX.w("K7 longclick orig threw: ${it?.javaClass?.simpleName}") }
-                        .getOrDefault(false)
-                    LogX.i("K7 longclick orig returned=$r -> passthrough")
-                    return r
-                }
-                // A15：弹我们自己的菜单（详见 [ConvMenu] 里为什么不用注入）。
-                // 返回 true 表示已消费，抬手时 AbsListView 不会再补一次 performItemClick
-                // —— 否则表现是「长按弹完菜单，手指一松又进了聊天页」。
-                val name = ConvMenu.titleOf(view).takeIf { it.isNotBlank() } ?: wxid
-                LogX.i("K7 longclick -> ConvMenu wxid=$wxid name=$name")
-                ConvMenu.show(list.context, wxid, name)
-                true
+                // A15 注入版：这里**不弹任何菜单**，一律原样转交微信。
+                // 我们的项是在 `View.createContextMenu` 里塞进**微信原生菜单**的
+                // （见 [ConvMenuInject]），长按链路保持完全透明 —— 微信原生的
+                // 「删除 / 置顶 / 免打扰」全部保留。
+                //
+                // ⚠️ 必须**原样透传**微信的返回值（z2 返回 false），绝不能兜成 true：
+                // 真机实测微信的会话菜单正是靠 AOSP `AbsListView.performLongPress` 里的
+                // `if (!handled) showContextMenuForChild(...)` 这条兜底弹出来的，
+                // 我们一旦返回 true，兜底不执行，菜单就不弹了。
+                val r = runCatching { orig.onItemLongClick(parent, view, real, id) }
+                    .onFailure { LogX.w("K7 longclick orig threw: ${it?.javaClass?.simpleName}") }
+                    .getOrDefault(false)
+                LogX.i("K7 longclick orig returned=$r -> passthrough")
+                return r
             } finally {
                 inLongClick.set(false)
             }
@@ -758,13 +767,29 @@ object ConvFilter {
         /** 原始会话下标 -> wxid（诊断用：核对点击有没有点错人） */
         fun wxidOf(convIndex: Int): String = snaps.getOrNull(convIndex)?.wxid ?: ""
 
+        /**
+         * 原始会话下标 -> wxid，**实时**读微信 adapter。
+         *
+         * ⚠️ 需要「现在这一行的真实 wxid」时必须用这个，不能用 [wxidOf]：
+         * [snaps] 只在**会话条数变化**时才重算（[rebuild] 里 `snaps.size != n`），
+         * 而收新消息导致的置顶/重排**条数不变** —— 快照会一直停在旧顺序上，
+         * 长按加分组就会加到别人头上。这里单次 `getItem` 读一次会话对象，
+         * 主线程开销可忽略。
+         */
+        fun wxidNow(convIndex: Int): String = runCatching {
+            ConvReader.username(wrapped.getItem(convIndex))
+        }.getOrDefault("")
+
         /** A7 标记已读用：这些 wxid 在列表里对应的微信会话对象 */
         fun itemsOf(wxids: Set<String>): List<Any> {
             if (wxids.isEmpty()) return emptyList()
             val out = ArrayList<Any>(wxids.size)
-            for (i in snaps.indices) {
-                if (snaps[i].wxid !in wxids) continue
+            // ⚠️ 实时遍历，不能按 [snaps] 的下标取：快照顺序可能已过期（收消息重排后
+            // 条数不变），按旧下标 getItem 会拿到**别人**的会话对象，标记已读就标错了。
+            val n = wrapped.count
+            for (i in 0 until n) {
                 val item = runCatching { wrapped.getItem(i) }.getOrNull() ?: continue
+                if (ConvReader.username(item) !in wxids) continue
                 out.add(item)
             }
             return out
