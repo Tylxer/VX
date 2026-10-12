@@ -15,7 +15,6 @@ import com.lx.wxgroup.core.VersionGate
 import com.lx.wxgroup.data.GroupDb
 import com.lx.wxgroup.entry.EntryReceiver
 import com.lx.wxgroup.feature.ConvFilter
-import com.lx.wxgroup.feature.ConvMenu
 import com.lx.wxgroup.feature.GroupBar
 import com.lx.wxgroup.feature.ScrollDock
 import com.lx.wxgroup.hook.PlusMenu
@@ -109,11 +108,9 @@ class HookEntry : IXposedHookLoadPackage {
             GroupBar.install(lpparam)
         }.onFailure { LogX.e("GroupBar install failed", it) }
 
-        // ---- M4：长按会话 → 菜单里多一项「加入分组 / 移出分组」----
-        // （M4-A 的定位探针 ConvProbe 已完成使命，锚点结论写进了 ConvMenu 注释，不再安装）
-        runCatching {
-            ConvMenu.install(lpparam)
-        }.onFailure { LogX.e("ConvMenu install failed", it) }
+        // ---- A15：长按会话 → 「加入分组 / 标记已读」菜单 ----
+        // 由 ConvFilter 的长按包装直接触发（那里已经拿到了换算好的会话 wxid），
+        // 不需要自己的 hook —— 早期那套「注入微信菜单」的 install 已随探针一起删掉。
 
         // ---- M4-C 探针：会话列表 adapter 结构 + 点击监听（定位已完成，不再安装）----
         // （结论：内层是 com.tencent.mm.ui.conversation.p3，点击监听 o2 靠位置取会话）
@@ -151,7 +148,7 @@ class HookEntry : IXposedHookLoadPackage {
 
         // DexProbe 依赖 dexkit 的 libdexkit.so，本机一直加载不到（日志：
         // "libdexkit.so unavailable"），留着只是每次启动白跑一趟；锚点早已确定，摘除。
-        LogX.i("boot completed. hooks: GroupBar/ConvMenu/ConvFilter/PlusMenu")
+        LogX.i("boot completed. hooks: GroupBar/ConvFilter/PlusMenu")
     }
 
     private fun hostPackageInfo(context: Context): PackageInfo? = runCatching {

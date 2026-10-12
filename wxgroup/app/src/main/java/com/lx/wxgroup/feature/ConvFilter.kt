@@ -660,18 +660,62 @@ object ConvFilter {
             //
             // `unwrapLongClick` 只解决「set 的时候别套多层」，解决不了这种
             // **调用期**的回环：只要我们把 z2 包在里面，z2 一回调就必然再进来。
-            // 所以这里按线程记一次「我已经在处理了」，重入直接不做事。
+            // 所以这里按线程记一次「我已经在处理了」，重入不再转发（否则就是一个
+            // wrapper→z2→wrapper 的死循环，主线程栈溢出崩微信）。
             //
-            // 重入必须返回 **true**（已消费），返回 false 会让微信以为长按没人处理，
-            // 抬手时 AbsListView 补一次 performItemClick —— 表现是「长按直接打开聊天页」。
-            if (inLongClick.get() == true) return true
+            // ⚠️ 重入必须返回 **false**（未消费）。
+            // 早期这里返回 true，真机实测的后果是**微信的会话长按菜单再也不弹了**
+            // （z2 拿到 true 就认为「外层已经处理了」，直接跳过自己弹菜单的逻辑）。
+            // 返回 false 才让 z2 继续走它自己的菜单流程。
+            if (inLongClick.get() == true) {
+                LogX.i("K7 longclick REENTRY pos=$position -> false")
+                return false
+            }
             inLongClick.set(true)
             return try {
-                // 分组行：自己消费掉，不转交微信（A5 菜单由 GroupRowView 的长按自己弹）
-                if (groupIdAt(list, position) != ConvLayout.Layout.NOT_A_GROUP) return true
+                val headers = headerCount(list)
+                val gid = groupIdAt(list, position)
                 val real = realPosition(list, position)
-                if (real < 0) return true
-                runCatching { orig.onItemLongClick(parent, view, real, id) }.getOrDefault(true)
+                // 长按链路的每一步都要留痕：菜单弹不出来时，光看现象分不清是
+                // 「分组行自己吃了」「位置换算成 -1 被吞了」还是「微信压根没弹」。
+                LogX.i(
+                    "K7 longclick conv pos=$position headers=$headers gid=$gid real=$real " +
+                        "wxid=${wrappers[list]?.wxidOf(real - headers)} size=${wrappers[list]?.size}"
+                )
+                // 分组行：自己消费掉，不转交微信（A5 菜单由 GroupRowView 的长按自己弹）
+                if (gid != ConvLayout.Layout.NOT_A_GROUP) {
+                    LogX.i("K7 longclick group row gid=$gid -> consumed")
+                    return true
+                }
+                if (real < 0) {
+                    // 位置换算不出来（header 区 / 越界）：原样转交微信，不干预，
+                    // 也不自作主张消费 —— 拿错误 position 交给微信会对错的会话弹菜单。
+                    LogX.w("K7 longclick real<0 (pos=$position headers=$headers) -> passthrough")
+                    return runCatching { orig.onItemLongClick(parent, view, position, id) }
+                        .getOrDefault(false)
+                }
+                val wxid = wrappers[list]?.wxidOf(real - headers).orEmpty()
+                if (!Kv.getBool(Keys.CHAT_CONV_MENU_ENABLED) || wxid.isBlank()) {
+                    // 开关关掉（或拿不到 wxid）：完全还原微信原生长按。
+                    //
+                    // ⚠️ 必须**原样透传**微信的返回值，不能自己兜成 true。真机实测
+                    // 微信的会话菜单不靠它的 OnItemLongClickListener 弹（z2 返回 false），
+                    // 而是走 AOSP `AbsListView.performLongPress` 里的
+                    // `if (!handled) showContextMenuForChild(...)`。我们一旦返回 true，
+                    // 那句兜底就永远不执行。
+                    val r = runCatching { orig.onItemLongClick(parent, view, real, id) }
+                        .onFailure { LogX.w("K7 longclick orig threw: ${it?.javaClass?.simpleName}") }
+                        .getOrDefault(false)
+                    LogX.i("K7 longclick orig returned=$r -> passthrough")
+                    return r
+                }
+                // A15：弹我们自己的菜单（详见 [ConvMenu] 里为什么不用注入）。
+                // 返回 true 表示已消费，抬手时 AbsListView 不会再补一次 performItemClick
+                // —— 否则表现是「长按弹完菜单，手指一松又进了聊天页」。
+                val name = ConvMenu.titleOf(view).takeIf { it.isNotBlank() } ?: wxid
+                LogX.i("K7 longclick -> ConvMenu wxid=$wxid name=$name")
+                ConvMenu.show(list.context, wxid, name)
+                true
             } finally {
                 inLongClick.set(false)
             }
