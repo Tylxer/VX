@@ -90,13 +90,33 @@ object Keys {
     const val CHAT_DND_END = "chat.dnd_end"
     const val CHAT_AUTO_DND_NEW_GROUP = "chat.auto_dnd_new_group"
 
-    // —— 防撤回域（6 项，v6.3 定：全部默认关闭）——
+    // —— 防撤回域（6 项，v6.3 定：全部默认关闭；+ 2 个辅助开关）——
     const val ANTIREVOKE_MSG = "antirevoke.msg"
     const val ANTIREVOKE_SNS = "antirevoke.sns"
     const val ANTIREVOKE_SNS_DELETED_TAG = "antirevoke.sns_deleted_tag"
     const val ANTIREVOKE_COMMENT = "antirevoke.comment"
     const val ANTIREVOKE_COMMENT_DELETED_TAG = "antirevoke.comment_deleted_tag"
     const val ANTIREVOKE_SHOW_HINT = "antirevoke.show_hint"
+
+    /**
+     * 「恢复默认显示」：开启期间，被防撤回救下的消息**显示成正常撤回**的样子
+     * （看起来跟没装模块一样）；关掉后恢复显示原文。
+     *
+     * ⚠️ 它只是**显示层的伪装**，不是真的撤回：
+     * - 防撤回**照常在拦**，消息原文一直躺在库里（存在 `rescued` 表）；
+     * - 开关只改「看起来是什么样」，关掉就全回来，**不会丢内容**；
+     * - 开启期间新拦下的也一样显示成撤回，关掉后同样恢复。
+     */
+    const val ANTIREVOKE_RESTORE_VIEW = "antirevoke.restore_view"
+
+    /**
+     * 调试开关：连**自己撤回**也一起拦。
+     *
+     * 正常逻辑只拦他人撤回（需求 6.2 的作用域条款），但「他人撤回」要有小号配合才能验，
+     * 平时不方便。开着这个开关就能用自己的撤回验证拦截链路到底通不通。
+     * ⚠️ 验证完记得关掉，否则你自己也撤不回消息了。
+     */
+    const val ANTIREVOKE_DEBUG_SELF = "antirevoke.debug_self"
 
     // —— 红包域 ——
     const val REDPACKET_AUTO_OPEN = "redpacket.auto_open"
@@ -159,6 +179,11 @@ object Prefs {
         PrefSpec(Keys.ANTIREVOKE_COMMENT, PrefKind.SWITCH, "false", "防撤回", "防止评论撤回"),
         PrefSpec(Keys.ANTIREVOKE_COMMENT_DELETED_TAG, PrefKind.SWITCH, "false", "防撤回", "显示评论[已删除]标签"),
         PrefSpec(Keys.ANTIREVOKE_SHOW_HINT, PrefKind.SWITCH, "false", "防撤回", "显示撤回提示"),
+        PrefSpec(Keys.ANTIREVOKE_RESTORE_VIEW, PrefKind.SWITCH, "false", "防撤回", "恢复默认显示"),
+        PrefSpec(
+            Keys.ANTIREVOKE_DEBUG_SELF, PrefKind.SWITCH, "false", "防撤回",
+            "调试：连自己撤回也拦（验证拦截是否生效用，测完关掉）"
+        ),
 
         // 红包域
         PrefSpec(Keys.REDPACKET_AUTO_OPEN, PrefKind.SWITCH, "false", "红包", "自动点击拆红包"),

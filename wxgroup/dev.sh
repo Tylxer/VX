@@ -9,7 +9,12 @@
 # 用法前先修 PATH（WorkBuddy 的 Bash 工具 PATH 是坏的）：
 #   export PATH="/usr/bin:/bin:/mingw64/bin:/usr/local/bin:$PATH"
 
-export PATH="/usr/bin:/bin:/mingw64/bin:/usr/local/bin:C:/Windows/System32:C:/Windows:$PATH"
+# ⚠️ 绝对不要在这里拼 $PATH！本机 PATH 里有被 Git Bash 转坏、带空格的条目
+# （…\Program Files\WorkBuddy\resources\vendor\PortableGit\Program）。
+# Gradle 启动 test worker 时会把整个 PATH 塞进 -Djava.library.path，
+# 参数在空格处断裂 → worker 报 ClassNotFoundException: Files\WorkBuddy\...\Program
+# （表现为：编译全过、只有 test 任务失败，极难查）。
+export PATH="/usr/bin:/bin:/mingw64/bin:/usr/local/bin:C:/Windows/System32:C:/Windows"
 export JAVA_HOME="C:/Users/lx/WorkBuddy/2026-09-29-20-23-21/_cache/jdk21"
 export GRADLE_USER_HOME="C:/Users/lx/WorkBuddy/2026-09-29-20-23-21/_cache/gradlehome"
 
@@ -40,6 +45,13 @@ sync)
     "$ADB" shell "su -c 'cp /data/adb/lspd/config/modules_config.db /sdcard/_m.db && chmod 666 /sdcard/_m.db'" >/dev/null 2>&1
     "$ADB" pull /sdcard/_m.db "$ROOT/_cache/_m.db" >/dev/null 2>&1
     PKGNAME=$PKG APKPATH="$P" HOSTPKG=$HOST "$PY" "$ROOT/_cache/_check.py"
+    ;;
+test)
+    # JVM 单测：只跑纯 Kotlin 逻辑（不依赖 Android/Xposed 的部分，如 SQL 改写）。
+    # ⚠️ PATH 不能有空格，否则 gradle 把整个 PATH 塞进 -Djava.library.path 后
+    # 参数在空格处断裂，test worker 报 ClassNotFoundException（见用户级记忆）。
+    cd "$ROOT/wxgroup" && sh gradlew :app:testDebugUnitTest --no-daemon --console=plain 2>&1 \
+        | grep -E "^e:|BUILD|FAILED|tests? completed|AntiRevokeHint" | head -30
     ;;
 restart)
     # 这台设备没有 pidof，pkill/killall 也杀不掉微信（有守护拉起），

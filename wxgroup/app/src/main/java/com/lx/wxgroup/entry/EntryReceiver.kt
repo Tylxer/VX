@@ -71,6 +71,21 @@ object EntryReceiver {
 
     private const val RELAUNCH_DELAY_MS = 1500L
 
+    /**
+     * 把「要读写微信消息库」的诊断动作丢到后台线程。
+     *
+     * ⚠️ BroadcastReceiver 的 `onReceive` 跑在**主线程**，而 ardump / arins / archeck /
+     * ardel 都要去查/写微信几十万行的 `message` 表，同步干会把微信卡出 ANR ——
+     * 而且这类 ANR 只在你手动敲 adb 命令时才会出现，极容易被当成「微信自己抽风」。
+     */
+    private fun io(block: () -> Unit) {
+        Thread {
+            runCatching(block).onFailure {
+                LogX.w("PROBE io failed: ${it.javaClass.simpleName}")
+            }
+        }.start()
+    }
+
     fun register(context: Context) {
         val receiver = object : BroadcastReceiver() {
             override fun onReceive(c: Context, intent: Intent) {
@@ -135,6 +150,19 @@ object EntryReceiver {
                         val v = intent.getStringExtra("val") ?: ""
                         com.lx.wxgroup.data.Kv.putString(key, v)
                         LogX.i("PROBE kvset $key=$v -> now=${com.lx.wxgroup.data.Kv.getString(key)}")
+                        // 改完立刻重读，不用重启微信（防撤回的开关走这条）
+                        runCatching { com.lx.wxgroup.feature.AntiRevoke.refresh() }
+                        // 「显示撤回提示」也是反着生效的开关（关=隐藏），同样要立刻重读。
+                        // ⚠️ 用 invalidate 而不是 refresh：清单可能刚增删过提示行，缓存要失效
+                        runCatching { com.lx.wxgroup.feature.AntiRevokeHint.invalidate() }
+                        // 「恢复默认显示」要立刻把库里那些消息改写/还原一次（内部走后台线程）。
+                        // ⚠️ 走 sync 而不是直接 applyView：sync 内部有「目标状态已对齐」判断，
+                        // 重复调用不会把库反复改写两遍
+                        if (key == com.lx.wxgroup.data.Keys.ANTIREVOKE_RESTORE_VIEW) {
+                            runCatching {
+                                com.lx.wxgroup.feature.RevokeRescue.sync(v == "true")
+                            }
+                        }
                     }
                     // A15 全量 hook 点取证（临时的，结论固化后随探针一起删除）：
                     // --es sub on|off|flush|tree|win|clear [--es sec 30]
@@ -142,6 +170,64 @@ object EntryReceiver {
                         val sub = intent.getStringExtra("sub") ?: "on"
                         val sec = intent.getIntExtra("sec", 30)
                         com.lx.wxgroup.probe.MenuHuntProbe.command(sub, sec)
+                    }
+                    // S5① 防撤回取证：抓「撤回」的写库与提示渲染调用栈
+                    // --es sub on|off|flush|stat|clear [--ei sec 90]
+                    "revoke" -> {
+                        val sub = intent.getStringExtra("sub") ?: "on"
+                        val sec = intent.getIntExtra("sec", 90)
+                        com.lx.wxgroup.probe.RevokeHuntProbe.command(sub, sec)
+                    }
+                    // 防撤回调试：不打搅用户也能看清 message 表的 type / isSend 语义
+                    // --es sub all = 不看撤回、直接列最近的普通消息；--ei n 12 = 条数
+                    //
+                    // ⚠️ 下面几个 op 都要读/写**微信的消息库**，而 BroadcastReceiver
+                    // 跑在主线程 —— 直接在 onReceive 里干会卡住微信（ANR）。全部丢后台线程。
+                    "ardump" -> {
+                        val sub = intent.getStringExtra("sub") ?: ""
+                        val n = intent.getIntExtra("n", 8)
+                        io {
+                            for (line in com.lx.wxgroup.feature.AntiRevoke.dumpRecent(
+                                n, sub != "all"
+                            )) LogX.i("ARDUMP $line")
+                        }
+                    }
+                    // 手动往微信库插一条提示行，用来验证「显示撤回提示」的插入链路通不通
+                    // --es talker <wxid> [--es text "测试提示"]
+                    "arins" -> {
+                        val t = intent.getStringExtra("talker") ?: ""
+                        val x = intent.getStringExtra("text") ?: "测试提示"
+                        io {
+                            val id = com.lx.wxgroup.feature.RevokeRescue.insertHint(t, x)
+                            LogX.i("ARINS msgId=$id talker=${t.take(12)} text=${x.take(24)}")
+                        }
+                    }
+                    // 删掉我们自己插进去的提示行（**安全阀**）。
+                    // ⚠️ 提示行是写进微信库的，卸载模块也不会消失，必须留一个手动清理的入口。
+                    // 用法：--ei id -1 删单条；不带 id 则删全部（负 msgId 全是我们自己的行）
+                    "ardel" -> {
+                        // ⚠️ 不能用 getLongExtra 配 `--ei id N`：adb 的 --ei 存的是 Integer，
+                        // 而 getLongExtra 遇到非 Long 会**静默返回默认值 0** ——
+                        // 结果「删单条」变成「删全部」，白跑一轮还删错东西。
+                        // 手动解析，三种类型都认。
+                        val id = when (val raw = intent.extras?.get("id")) {
+                            is Long -> raw
+                            is Int -> raw.toLong()
+                            is String -> raw.toLongOrNull() ?: 0L
+                            else -> 0L
+                        }
+                        io { LogX.i("ARDEL " + com.lx.wxgroup.feature.RevokeRescue.deleteHints(id)) }
+                    }
+                    // 「隐藏撤回提示」自检：区分「条件没命中行」和「命中了但界面有缓存」
+                    // --es talker <wxid> [--ei n 58]
+                    "archeck" -> {
+                        val t = intent.getStringExtra("talker") ?: ""
+                        val n = intent.getIntExtra("n", 58)
+                        io {
+                            for (line in com.lx.wxgroup.feature.AntiRevoke.checkHide(t, n)) {
+                                LogX.i("ARCHK $line")
+                            }
+                        }
                     }
                     "kvget" -> {
                         for (k in listOf(

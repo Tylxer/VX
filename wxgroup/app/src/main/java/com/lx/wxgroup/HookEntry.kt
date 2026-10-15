@@ -17,6 +17,8 @@ import com.lx.wxgroup.data.Keys
 import com.lx.wxgroup.data.Kv
 import com.lx.wxgroup.entry.EntryReceiver
 import com.lx.wxgroup.feature.ConvFilter
+import com.lx.wxgroup.feature.AntiRevoke
+import com.lx.wxgroup.feature.AntiRevokeHint
 import com.lx.wxgroup.feature.ConvMenuInject
 import com.lx.wxgroup.feature.GroupBar
 import com.lx.wxgroup.feature.ScrollDock
@@ -26,6 +28,7 @@ import com.lx.wxgroup.probe.ChatOpenProbe
 import com.lx.wxgroup.probe.DexProbe
 import com.lx.wxgroup.probe.MenuHuntProbe
 import com.lx.wxgroup.probe.MenuProbe
+import com.lx.wxgroup.probe.RevokeHuntProbe
 import com.lx.wxgroup.probe.UiProbe
 import com.lx.wxgroup.util.LogX
 
@@ -91,9 +94,10 @@ class HookEntry : IXposedHookLoadPackage {
             }
         }
 
-        // A15 取证探针：只留 classLoader，不打任何钩子（平时零开销）。
-        // 需要取证时发广播 op=menuhunt sub=on 才临时装钩，off 会全部 unhook。
+        // 取证探针：只留 classLoader，不打任何钩子（平时零开销）。
+        // 需要取证时发广播 op=menuhunt / op=revoke sub=on 才临时装钩，off 会全部 unhook。
         MenuHuntProbe.prepare(lpparam)
+        RevokeHuntProbe.prepare(lpparam)
 
         ContactSync.init(context)
         HostContext.setApp(context)
@@ -148,6 +152,20 @@ class HookEntry : IXposedHookLoadPackage {
         runCatching {
             ScrollDock.install(lpparam)
         }.onFailure { LogX.e("ScrollDock install failed", it) }
+
+        // ---- 防撤回（6.2）：拦住「把原消息改写成撤回提示」的那次写库 ----
+        // 锚点是真机取证抓到的：updateWithOnConflict("message", type=0x10000000|10000,
+        // content="…撤回了一条消息")，详见 feature/AntiRevoke.kt 的类注释。
+        runCatching {
+            AntiRevoke.install(lpparam)
+        }.onFailure { LogX.e("AntiRevoke install failed", it) }
+
+        // ---- 防撤回·隐藏撤回提示（6.2 最后一项）：读取侧把他人撤回提示过滤掉 ----
+        // 与上面是两件事：上面让撤回不发生，这里让**已经躺在库里的**提示不显示
+        // （防撤回关着时、以及装模块之前的历史提示）。落点是 rawQueryWithFactory。
+        runCatching {
+            AntiRevokeHint.install(lpparam)
+        }.onFailure { LogX.e("AntiRevokeHint install failed", it) }
 
         // ---- K9：通知静音过滤器（防止被@ + 免打扰时段 + 微信来电放行）----
         // 只在主进程装：实测通知就是主进程发的，:push 进程连一条 notify 都没有。

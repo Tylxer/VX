@@ -37,13 +37,14 @@ class GroupDb private constructor(context: Context) :
 
     companion object {
         const val DB_NAME = "wxgroup.db"
-        private const val DB_VERSION = 4
+        private const val DB_VERSION = 6
 
         private const val T_GROUP = "groups"
         private const val T_MEMBER = "group_member"
         private const val T_FRIEND = "friend_cache"
         private const val T_KV = "kv"
         private const val T_DND = "auto_dnd_done"
+        private const val T_RESCUED = "rescued"
 
         @Volatile
         private var instance: GroupDb? = null
@@ -92,6 +93,7 @@ class GroupDb private constructor(context: Context) :
         createFriendTable(db)
         createKvTable(db)
         createDndTable(db)
+        createRescuedTable(db)
     }
 
     override fun onUpgrade(db: SQLiteDatabase, oldVersion: Int, newVersion: Int) {
@@ -133,6 +135,164 @@ class GroupDb private constructor(context: Context) :
             // ③ 已自动设过免打扰的群
             createDndTable(db)
         }
+        if (oldVersion < 5) {
+            createRescuedTable(db)
+        }
+        if (oldVersion < 6) {
+            // rescued 表补两列快照：
+            // - revoke_extra：微信撤回写入的完整字段（含 lvbuffer / isSend / reserved），
+            //   伪装时完整重放 —— 只写 type+content 真机实测会整页空白。
+            // - orig_extra：拦截瞬间该行原状的完整字段（isSend / lvbuffer / reserved），
+            //   还原时写回 —— 不然伪装写进去的 lvbuffer/reserved/isSend 残留在行上清不掉。
+            // v5 时代建的表没有这两列，用 ALTER 补上（runCatching 兜底，重复执行也不会炸）。
+            runCatching {
+                db.execSQL("ALTER TABLE $T_RESCUED ADD COLUMN revoke_extra TEXT")
+                db.execSQL("ALTER TABLE $T_RESCUED ADD COLUMN orig_extra TEXT")
+            }
+        }
+    }
+
+    /**
+     * 被防撤回救下来的消息。
+     *
+     * 「恢复默认显示」要靠它才能来回切：
+     * - [orig_type] / [orig_content]：消息**原本**的样子（撤回被我们拦下，所以库里一直是原样）
+     * - [revoke_content]：微信**本来打算**写进去的撤回文案（`'"昵称" 撤回了一条消息'`）
+     * - [hint_msg_id]：我们额外插入的「已阻止」提示行（0 = 没插）
+     *
+     * ⚠️ 这里是模块自己的库（AOSP SQLite），**不走 wcdb**，所以读写它不会触发
+     * 我们挂在微信库上的任何钩子。
+     */
+    private fun createRescuedTable(db: SQLiteDatabase) {
+        db.execSQL(
+            """
+            CREATE TABLE IF NOT EXISTS $T_RESCUED (
+                msg_id         INTEGER NOT NULL PRIMARY KEY,
+                talker         TEXT    NOT NULL,
+                orig_type      INTEGER NOT NULL,
+                orig_content   TEXT,
+                revoke_content TEXT,
+                revoke_extra   TEXT,
+                orig_extra     TEXT,
+                hint_msg_id    INTEGER NOT NULL DEFAULT 0,
+                at             INTEGER NOT NULL
+            )
+            """.trimIndent()
+        )
+        db.execSQL("CREATE INDEX IF NOT EXISTS idx_rescued_at ON $T_RESCUED(at)")
+    }
+
+    // ---------------------------------------------------------------- 防撤回：被救下的消息
+
+    data class Rescued(
+        val msgId: Long,
+        val talker: String,
+        val origType: Int,
+        val origContent: String?,
+        val revokeContent: String?,
+        /** 微信撤回写入的**完整字段快照**（[com.lx.wxgroup.feature.CvCodec] 编码），null = 老记录没存 */
+        val revokeExtra: String?,
+        /** 拦截瞬间该行**原状**的完整字段快照（isSend/lvbuffer/reserved），还原时写回 */
+        val origExtra: String?,
+        val hintMsgId: Long,
+    )
+
+    fun hasRescued(msgId: Long): Boolean {
+        if (msgId <= 0) return false
+        readableDatabase.query(
+            T_RESCUED, arrayOf("msg_id"), "msg_id=?", arrayOf(msgId.toString()),
+            null, null, null
+        ).use { return it.moveToFirst() }
+    }
+
+    /**
+     * 登记一条被救下的消息，**已存在就不覆盖**。
+     *
+     * ⚠️ 这里必须是「首记录为准」，绝不能用 CONFLICT_REPLACE：
+     * 拦下撤回后微信会重试同一条 update 上千次，超过 `BLOCK_TTL` 后会**二次完整判定**
+     * 并再登记一次；而那时库里那行可能已经被「恢复默认显示」伪装成撤回文案了。
+     * 用 REPLACE 会把**真原文**冲成撤回文案 —— 消息原文就此永久丢失。
+     *
+     * @return true = 台账里现在有这条的可信备份（新插入的，或本来就有的）
+     */
+    fun recordRescued(
+        msgId: Long,
+        talker: String,
+        origType: Int,
+        origContent: String?,
+        revokeContent: String?,
+        revokeExtra: String? = null,
+        origExtra: String? = null,
+    ): Boolean {
+        if (msgId <= 0) return false
+        if (hasRescued(msgId)) return true
+        val values = ContentValues().apply {
+            put("msg_id", msgId)
+            put("talker", talker)
+            put("orig_type", origType)
+            put("orig_content", origContent)
+            put("revoke_content", revokeContent)
+            put("revoke_extra", revokeExtra)
+            put("orig_extra", origExtra)
+            put("at", System.currentTimeMillis())
+        }
+        return writableDatabase.insert(T_RESCUED, null, values) > 0
+    }
+
+    /**
+     * @param limit 条数上限。⚠️ 默认取大值：这个列表直接决定「恢复默认显示」关掉时
+     *              能还原多少条，取小了会有消息**永远卡在撤回状态**。
+     */
+    fun listRescued(limit: Int = 5000): List<Rescued> {
+        val out = ArrayList<Rescued>()
+        readableDatabase.query(
+            T_RESCUED, null, null, null, null, null, "at DESC", limit.toString()
+        ).use { c ->
+            while (c.moveToNext()) {
+                out.add(
+                    Rescued(
+                        msgId = c.getLong(c.getColumnIndexOrThrow("msg_id")),
+                        talker = c.getString(c.getColumnIndexOrThrow("talker")) ?: "",
+                        origType = c.getInt(c.getColumnIndexOrThrow("orig_type")),
+                        origContent = c.getString(c.getColumnIndexOrThrow("orig_content")),
+                        revokeContent = c.getString(c.getColumnIndexOrThrow("revoke_content")),
+                        revokeExtra = c.getString(c.getColumnIndexOrThrow("revoke_extra")),
+                        origExtra = c.getString(c.getColumnIndexOrThrow("orig_extra")),
+                        hintMsgId = c.getLong(c.getColumnIndexOrThrow("hint_msg_id")),
+                    )
+                )
+            }
+        }
+        return out
+    }
+
+    fun getRescued(msgId: Long): Rescued? {
+        if (msgId <= 0) return null
+        readableDatabase.query(
+            T_RESCUED, null, "msg_id=?", arrayOf(msgId.toString()), null, null, null
+        ).use { c ->
+            if (!c.moveToFirst()) return null
+            return Rescued(
+                msgId = c.getLong(c.getColumnIndexOrThrow("msg_id")),
+                talker = c.getString(c.getColumnIndexOrThrow("talker")) ?: "",
+                origType = c.getInt(c.getColumnIndexOrThrow("orig_type")),
+                origContent = c.getString(c.getColumnIndexOrThrow("orig_content")),
+                revokeContent = c.getString(c.getColumnIndexOrThrow("revoke_content")),
+                revokeExtra = c.getString(c.getColumnIndexOrThrow("revoke_extra")),
+                origExtra = c.getString(c.getColumnIndexOrThrow("orig_extra")),
+                hintMsgId = c.getLong(c.getColumnIndexOrThrow("hint_msg_id")),
+            )
+        }
+    }
+
+    /** 记下我们为这条消息插入的「已阻止」提示行，关掉「显示撤回提示」时要靠它隐藏 */
+    fun setRescuedHint(msgId: Long, hintMsgId: Long) {
+        val values = ContentValues().apply { put("hint_msg_id", hintMsgId) }
+        writableDatabase.update(T_RESCUED, values, "msg_id=?", arrayOf(msgId.toString()))
+    }
+
+    fun deleteRescued(msgId: Long) {
+        writableDatabase.delete(T_RESCUED, "msg_id=?", arrayOf(msgId.toString()))
     }
 
     /**
