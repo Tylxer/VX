@@ -327,6 +327,16 @@ object EntryReceiver {
                         val sub = intent.getStringExtra("sub") ?: "stat"
                         LogX.i("REDPK " + com.lx.wxgroup.feature.RedPacket.probe(sub))
                     }
+                    // ---- 6.6 强制转发（ForceForward）----
+                    // --es sub stat = 状态与计数；on|off = 运行时开关（真机反向对照用，
+                    // 不写库不进设置，需求 6.6 明确不加开关）；dump = 最近一次聊天消息
+                    // 菜单文案清单（认人判据取证）；pick = 跳过长按直接打开选择器自检。
+                    "forward" -> {
+                        val sub = intent.getStringExtra("sub") ?: "stat"
+                        LogX.i(
+                            "FORWARD " + com.lx.wxgroup.feature.ForceForward.probe(sub)
+                        )
+                    }
                     // 防撤回调试：不打搅用户也能看清 message 表的 type / isSend 语义
                     // --es sub all = 不看撤回、直接列最近的普通消息；--ei n 12 = 条数
                     //
