@@ -435,9 +435,11 @@ object MomentsExport {
                 "$TAG export triggered running=$running"
             }
             "img" -> {
-                val rows = GroupDb.current()?.listSnsArchive(n).orEmpty()
+                // ⚠️ n 来自广播 --ei，必须钳位后再进 SQL LIMIT（OOM 防护，见 clampProbeN）
+                val nn = MomentsLogic.clampProbeN(n)
+                val rows = GroupDb.current()?.listSnsArchive(nn).orEmpty()
                 for (r in rows) logImgProbe(r, nickOf(r.userName, HashMap()))
-                "$TAG img probe rows=${rows.size}"
+                "$TAG img probe rows=${rows.size} n=$nn"
             }
             "scan" -> {
                 val ids = scanExportedIds(File(cfg().root))

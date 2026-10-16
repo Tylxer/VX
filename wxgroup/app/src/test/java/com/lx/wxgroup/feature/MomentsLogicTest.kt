@@ -272,6 +272,16 @@ class MomentsLogicTest {
     }
 
     @Test
+    fun clampProbeNBounds() {
+        // 广播 --ei n 是外人可控的：0/负数兜底成 1，999999 这种必须钳到 50 防 SQL LIMIT OOM
+        assertEquals(1, MomentsLogic.clampProbeN(0))
+        assertEquals(1, MomentsLogic.clampProbeN(-7))
+        assertEquals(MomentsLogic.MAX_PROBE_N, MomentsLogic.clampProbeN(999_999))
+        assertEquals(5, MomentsLogic.clampProbeN(5))
+        assertEquals(MomentsLogic.MAX_PROBE_N, MomentsLogic.clampProbeN(MomentsLogic.MAX_PROBE_N))
+    }
+
+    @Test
     fun envOkIsOrOfChargingAndWifi() {
         assertTrue(MomentsLogic.envOk(charging = true, wifi = false))
         assertTrue(MomentsLogic.envOk(charging = false, wifi = true))

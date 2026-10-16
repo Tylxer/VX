@@ -399,10 +399,14 @@ object SnsGuard {
 
     /** 归档清单（读我们自己的库，不碰微信库） */
     fun listArchived(limit: Int = 20): List<String> {
-        val list = runCatching { GroupDb.current()?.listSnsArchive(limit) }
+        // ⚠️ limit 来自广播 --ei n（外人可控），直进 listSnsArchive 的 SQL LIMIT 会把
+        // content/attr_buf/post_buf 三个 BLOB 全捞进内存（真机 OOM）。入口钳位，
+        // 一并覆盖将来新增的调用方（与 MomentsExport.probe img 分支同一防护命题）。
+        val lim = MomentsLogic.clampProbeN(limit)
+        val list = runCatching { GroupDb.current()?.listSnsArchive(lim) }
             .getOrNull().orEmpty()
         if (list.isEmpty()) return listOf("(empty) 还没有归档过任何动态")
-        return listOf("SNSLS archived=${list.size}") + list.map { r ->
+        return listOf("SNSLS archived=${list.size} limit=$lim") + list.map { r ->
             "SNSLS snsId=${r.snsId} user=${r.userName?.take(12)} t=${r.createTime} " +
                 "type=${r.type} src=${r.sourceType} " +
                 "content=${r.content?.size ?: 0}B attr=${r.attrBuf?.size ?: 0}B " +
@@ -458,6 +462,8 @@ object SnsGuard {
 
     /** 微信库里现在还有多少条 SnsInfo（验证「拦下来后行还在」） */
     fun dump(limit: Int = 5): List<String> {
+        // ⚠️ limit 来自广播 --ei n，拼进 SQL 字符串，入口钳位防全表拖库
+        val lim = MomentsLogic.clampProbeN(limit)
         val db = snsDb ?: return listOf("no sns db yet (先删一条动态，或让微信刷一次朋友圈)")
         val m = rawQueryMethod(db) ?: return listOf("no rawQuery on ${db.javaClass.name}")
         return runCatching {
@@ -467,7 +473,7 @@ object SnsGuard {
             val cur = m.invoke(
                 db,
                 "select snsId,userName,createTime,type,sourceType,localFlag from $TABLE " +
-                    "order by createTime desc limit $limit",
+                    "order by createTime desc limit $lim",
                 args,
             ) ?: return listOf("null cursor")
             try {
@@ -482,7 +488,7 @@ object SnsGuard {
                     out += "SNSDMP snsId=$id user=${u?.take(12)} t=$t type=$ty src=$src flag=$fl"
                     n++
                 }
-                out.add(0, "SNSDMP rows=$n (limit=$limit)")
+                out.add(0, "SNSDMP rows=$n (limit=$lim)")
             } finally {
                 runCatching { XposedHelpers.callMethod(cur, "close") }
             }

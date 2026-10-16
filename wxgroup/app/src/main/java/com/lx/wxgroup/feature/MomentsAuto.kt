@@ -267,8 +267,12 @@ object MomentsAuto {
      *
      * ⚠️ 全限定名是运行时捕获的（[timelineCls]），这里不拼字符串猜包名。
      * ⚠️ 整个包 runCatching：startActivity 抛出来会把微信搞崩。
+     *
+     * @param force 手动探针（`op=moments sub=refresh`）传 true：绕过 [launchDisabled]，
+     *   否则自动拉起失败过一次之后，手动诊断入口也被自己挡死，真机上没法再验证。
+     *   ⚠️ force 只绕过闸门，不重置 launchDisabled——自动轮依然被禁着，防止反复撩前台。
      */
-    private fun doRefresh(now: Long) {
+    private fun doRefresh(now: Long, force: Boolean = false) {
         val ctx = HostContext.app()
         val cls = timelineCls
         if (ctx == null || cls == null) {
@@ -278,7 +282,7 @@ object MomentsAuto {
             }
             return
         }
-        if (launchDisabled) return
+        if (launchDisabled && !force) return
         val ok = runCatching {
             val i = Intent().setClassName(ctx, cls.name)
             i.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_REORDER_TO_FRONT)
@@ -564,7 +568,7 @@ object MomentsAuto {
             "env" -> "MOMENT env charging=${charging()} wifi=${wifi()} ctx=${HostContext.app() != null}"
             "act" -> "MOMENT act timeline=${timelineCls?.name ?: "(未捕获，先手动进一次朋友圈)"} active=$timelineActive"
             "refresh" -> {
-                doRefresh(System.currentTimeMillis())
+                doRefresh(System.currentTimeMillis(), force = true)
                 "MOMENT refresh forced launches=${launches.get()} disabled=$launchDisabled"
             }
             "load" -> forceLoad()

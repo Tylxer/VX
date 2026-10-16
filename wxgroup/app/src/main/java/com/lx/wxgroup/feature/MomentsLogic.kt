@@ -348,6 +348,15 @@ object MomentsLogic {
 
     fun clampHours(h: Int): Int = h.coerceIn(MIN_INTERVAL_H, MAX_INTERVAL_H)
 
+    /** 探针 `n` 参数的钳位上限：广播 `--ei n` 外人可控，img / snsg 对账只需几条 */
+    const val MAX_PROBE_N = 50
+
+    /**
+     * 探针 `n` 的合法范围。直进 SQL LIMIT 会被 999999 这种值一次性把归档行
+     * （含 content/attr_buf/post_buf 三个 BLOB）全捞出来，真机 OOM。
+     */
+    fun clampProbeN(n: Int): Int = n.coerceIn(1, MAX_PROBE_N)
+
     /**
      * 环境是否满足「充电中 / WiFi 下」。
      *
