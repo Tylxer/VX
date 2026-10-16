@@ -395,22 +395,33 @@ class GroupDb private constructor(context: Context) :
             T_SNS, null, null, null, null, null, "create_time DESC", limit.toString()
         ).use { c ->
             while (c.moveToNext()) {
-                out += SnsRow(
-                    snsId = c.getLong(c.getColumnIndexOrThrow("sns_id")),
-                    userName = c.getString(c.getColumnIndexOrThrow("user_name")),
-                    createTime = c.getLong(c.getColumnIndexOrThrow("create_time")),
-                    type = c.getInt(c.getColumnIndexOrThrow("type")),
-                    sourceType = c.getInt(c.getColumnIndexOrThrow("source_type")),
-                    localFlag = c.getInt(c.getColumnIndexOrThrow("local_flag")),
-                    subType = c.getInt(c.getColumnIndexOrThrow("sub_type")),
-                    serverExtFlag = c.getInt(c.getColumnIndexOrThrow("server_ext_flag")),
-                    head = c.getString(c.getColumnIndexOrThrow("head")),
-                    stringSeq = c.getString(c.getColumnIndexOrThrow("string_seq")),
-                    content = c.getBlob(c.getColumnIndexOrThrow("content")),
-                    attrBuf = c.getBlob(c.getColumnIndexOrThrow("attr_buf")),
-                    postBuf = c.getBlob(c.getColumnIndexOrThrow("post_buf")),
-                    at = c.getLong(c.getColumnIndexOrThrow("at")),
-                )
+                out += c.toSnsRow()
+            }
+        }
+        return out
+    }
+
+    /**
+     * 朋友圈归档的**键集分页**（自动导出的遍历方式）。
+     *
+     * 为什么不能直接 `listSnsArchive(大 limit)` 一把梭：它把 `content` / `attrBuf` /
+     * `post_buf` 三个 BLOB 一起读进内存（朋友圈 content 动辄几十 KB），归档一多就是
+     * 几百 MB —— 后台线程 OOM 会把微信带走。这里一次只读一页。
+     *
+     * 游标是 `(create_time, sns_id)` 复合键：createTime 相同的相邻行不会漏
+     * （单纯 `create_time < ?` 会在页边界丢掉同一秒的行）。首次调用传
+     * `(Long.MAX_VALUE, Long.MAX_VALUE)` 即从最新一页开始。
+     */
+    fun listSnsArchiveBefore(createTime: Long, snsId: Long, limit: Int = 100): List<SnsRow> {
+        val out = mutableListOf<SnsRow>()
+        readableDatabase.query(
+            T_SNS, null,
+            "create_time < ? OR (create_time = ? AND sns_id < ?)",
+            arrayOf(createTime.toString(), createTime.toString(), snsId.toString()),
+            null, null, "create_time DESC, sns_id DESC", limit.toString()
+        ).use { c ->
+            while (c.moveToNext()) {
+                out += c.toSnsRow()
             }
         }
         return out
@@ -946,6 +957,23 @@ class GroupDb private constructor(context: Context) :
         remark = getString(getColumnIndexOrThrow("remark")) ?: "",
         alias = getString(getColumnIndexOrThrow("alias")) ?: "",
         type = getInt(getColumnIndexOrThrow("wxid_type")),
+    )
+
+    private fun Cursor.toSnsRow(): SnsRow = SnsRow(
+        snsId = getLong(getColumnIndexOrThrow("sns_id")),
+        userName = getString(getColumnIndexOrThrow("user_name")),
+        createTime = getLong(getColumnIndexOrThrow("create_time")),
+        type = getInt(getColumnIndexOrThrow("type")),
+        sourceType = getInt(getColumnIndexOrThrow("source_type")),
+        localFlag = getInt(getColumnIndexOrThrow("local_flag")),
+        subType = getInt(getColumnIndexOrThrow("sub_type")),
+        serverExtFlag = getInt(getColumnIndexOrThrow("server_ext_flag")),
+        head = getString(getColumnIndexOrThrow("head")),
+        stringSeq = getString(getColumnIndexOrThrow("string_seq")),
+        content = getBlob(getColumnIndexOrThrow("content")),
+        attrBuf = getBlob(getColumnIndexOrThrow("attr_buf")),
+        postBuf = getBlob(getColumnIndexOrThrow("post_buf")),
+        at = getLong(getColumnIndexOrThrow("at")),
     )
 
     object WxidType {
