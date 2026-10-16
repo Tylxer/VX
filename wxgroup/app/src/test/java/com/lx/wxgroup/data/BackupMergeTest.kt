@@ -128,6 +128,51 @@ class BackupMergeTest {
     }
 
     @Test
+    fun 文件同名组重复成员算已存在不算跳过() {
+        // 复核修复：同名组第二遍再见到第一遍刚加入的人，他就在这个组里（already），
+        // 不是"已在别的分组"（skipped）—— 否则 dry-run 预览会虚报冲突跳过数
+        val s = snap(
+            group("家人", member("wxid_a"), member("wxid_b")),
+            group("家人", member("wxid_a"), member("wxid_c")),
+        )
+
+        val plan = BackupMerge.plan(s, state(), replace = false)
+
+        val second = plan.groups[1]
+        assertEquals("a 第一遍已加入本组，算 already", 1, second.already)
+        assertEquals("不该报冲突跳过", 0, second.skipped.size)
+        assertEquals(listOf("wxid_c"), second.add.map { it.wxid })
+        assertEquals(3, plan.membersAdded)
+        assertEquals(0, plan.membersSkipped)
+        assertEquals(1, plan.membersAlready)
+
+        // 执行层照 plan 落库后：三人都只在家人组，没有重复、没有漏加
+        val db = FakeDb()
+        db.apply(plan)
+        assertEquals(setOf("wxid_a", "wxid_b", "wxid_c"), db.groups["家人"])
+    }
+
+    @Test
+    fun replace模式下文件同名组重复成员也算已存在() {
+        val s = snap(
+            group("家人", member("wxid_a"), member("wxid_b")),
+            group("家人", member("wxid_a"), member("wxid_c")),
+        )
+        val cur = state(owned = setOf("wxid_old"))
+
+        val plan = BackupMerge.plan(s, cur, replace = true)
+
+        assertEquals(3, plan.membersAdded)
+        assertEquals(0, plan.membersSkipped)
+        assertEquals(1, plan.membersAlready)
+
+        val db = FakeDb().apply { addGroup("旧组", "wxid_old") }
+        db.apply(plan)
+        assertEquals(setOf("wxid_a", "wxid_b", "wxid_c"), db.groups["家人"])
+        assertEquals("删光后旧组不该在", false, db.groups.containsKey("旧组"))
+    }
+
+    @Test
     fun replace模式全部按文件重建() {
         val s = snap(group("家人", member("wxid_x")), group("同事", member("wxid_y")))
         val cur = state(

@@ -124,10 +124,20 @@ class BackupPanelPage : PanelPage {
     }
 
     private fun doRestore(ctx: Context, db: GroupDb, e: BackupEntry, replace: Boolean) {
-        val out = BackupFlow.restore(ctx, db, e.snap, replace)
-        var msg = out.summary()
-        if (!out.reconcileOk) msg += "（对账异常，详见日志）"
-        UiKit.toast(ctx, msg)
+        // 对话框回调跑在主线程：restore 抛异常没有 runCatching 会直接打到微信宿主进程，
+        // 必须自己兜住（与 EntryReceiver 对 handle 的包裹同一套路）
+        val out = runCatching { BackupFlow.restore(ctx, db, e.snap, replace) }
+            .getOrElse {
+                LogX.w("BK restore failed: ${it.javaClass.simpleName}")
+                UiKit.toast(ctx, "恢复失败：${it.javaClass.simpleName ?: "未知原因"}")
+                return
+            }
+        UiKit.toast(ctx, out.summary())
+        if (out.aborted) {
+            // 安全快照没做成、恢复已中止：库没动过，不用刷新界面
+            return
+        }
+        if (!out.reconcileOk) LogX.w("BK restore reconcile mismatch, file=${e.file.name}")
         LogX.i(
             "BK restored file=${e.file.name} replace=$replace stats=${out.stats} " +
                 "reconcile=${out.reconcileOk} safety=${out.safetyNet?.absolutePath}"

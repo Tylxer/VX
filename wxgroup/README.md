@@ -167,7 +167,7 @@ app/src/main/java/com/v/wxgroup/
 ├── HookEntry.kt          模块入口
 ├── core/                 VersionGate / Anchors848 / ContactSync / ContactBinder / HostContext / ChatOpener
 ├── data/                 GroupDb + PrefKeys + Group / GroupMember / Friend / BackupIO（M5）
-├── feature/              GroupBar / ConvFilter / ConvMenu / GroupDetailPage / GroupPicker / GroupManager / MemberPage / BatchPicker / BackupPage（M5）
+├── feature/              GroupBar / ConvFilter / ConvMenu / GroupDetailPage / GroupPicker / GroupManager / MemberPage / BatchPicker
 ├── entry/                EntryReceiver（广播入口）
 ├── ui/                   UiKit（纯代码构造 View 的公共件）
 ├── probe/                UiProbe / MenuProbe / DexProbe / ChatListProbe / ChatOpenProbe

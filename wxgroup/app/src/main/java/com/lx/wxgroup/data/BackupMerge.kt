@@ -63,7 +63,7 @@ object BackupMerge {
         val add: List<MemberSnap>,
         /** 已在别的分组、按「以现有为准」跳过的人。只用于给用户看，不做任何写入 */
         val skipped: List<String>,
-        /** 已经就在这个组里的人。不写、不计入新增 */
+        /** 已经就在这个组里的人（含文件内同名组第一遍刚加入的）。不写、不计入新增 */
         val already: Int,
     )
 
@@ -106,6 +106,10 @@ object BackupMerge {
         // 已经"见过"的分组名：合并模式从库里现有名字起算，之后每处理一个组就记进去 ——
         // 文件里出现两个同名组时，第二个是合并而不是再新建（UNIQUE 约束下新建必然失败）
         val seen = HashSet<String>(if (replace) emptySet() else base.groupNames)
+        // 按组名累计"本组已加入"的 wxid：文件里出现两个同名组时，
+        // 第二遍再见到同一个人，他已经在这个组里（already），
+        // 不是"已在别的分组"（skipped）—— 否则 dry-run 预览会虚报冲突跳过数
+        val addedByName = HashMap<String, MutableSet<String>>()
         val actions = ArrayList<GroupAction>(snap.groups.size)
 
         for (gs in snap.groups) {
@@ -113,6 +117,7 @@ object BackupMerge {
             val existing = name in seen
             seen.add(name)
             val here = if (replace) emptySet<String>() else base.membersOfGroup[name].orEmpty()
+            val addedHere = addedByName.getOrPut(name) { HashSet() }
 
             val add = ArrayList<MemberSnap>()
             val skipped = ArrayList<String>()
@@ -120,9 +125,11 @@ object BackupMerge {
             for (m in gs.members) {
                 when {
                     m.wxid in here -> already++
+                    m.wxid in addedHere -> already++ // 同名组第一遍刚加入的，就在本组
                     m.wxid in owned -> skipped.add(m.wxid) // 已在别的组 → 以现有为准，不搬
                     else -> {
                         add.add(m)
+                        addedHere.add(m.wxid)
                         owned.add(m.wxid)
                     }
                 }

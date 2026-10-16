@@ -26,7 +26,8 @@ import java.io.File
  *
  * - **合并模式**不动任何现有数据，最坏是"什么都没加"；
  * - **覆盖模式**先删光再重建，中途失败会留下"半删"状态 —— 所以恢复前自动导出
- *   **安全快照**（[safetyNet]），失败时用户的退路是重新导入这份文件。
+ *   **安全快照**（[safetyNet]），快照没做成时**直接中止**（[Outcome.aborted]），
+ *   一个字节都不写库；成功时用户的退路是重新导入这份文件。
  */
 object BackupFlow {
 
@@ -36,11 +37,15 @@ object BackupFlow {
         val plan: BackupMerge.Plan,
         /** 落库实际次数与计划一致才为 true；false = 出了意外，日志里有明细 */
         val reconcileOk: Boolean,
-        /** 恢复前自动导出的安全快照；null = 没做成（只警告，不阻止恢复） */
+        /** 恢复前自动导出的安全快照；null = 没做成（覆盖模式下恢复已因此中止） */
         val safetyNet: File?,
+        /** true = 覆盖模式下没拿到安全快照、已中止，一个字节都没写库 */
+        val aborted: Boolean = false,
     ) {
         /** 给 toast 用的一行中文摘要 */
-        fun summary(): String = buildString {
+        fun summary(): String = if (aborted) {
+            "未生成安全快照，已中止恢复（现有数据未动）"
+        } else buildString {
             append("新增 ${stats.groupsAdded} 组 / ${stats.membersAdded} 人")
             if (stats.membersSkipped > 0) append("，${stats.membersSkipped} 人因已在其他分组跳过")
             if (stats.settingsApplied > 0) append("，${stats.settingsApplied} 项配置已覆盖")
@@ -94,8 +99,8 @@ object BackupFlow {
     /**
      * 恢复前的自动备份（覆盖模式的退路）。
      *
-     * 走 [BackupIO.export] 的目录兜底路径，失败只警告不阻止恢复 ——
-     * 备份功能本身失败时，不该连带把恢复也堵死。
+     * 走 [BackupIO.export] 的目录兜底路径，失败返回 null；**覆盖模式下 restore 见到 null
+     * 即中止**（一个字节都不写库）—— 先删光再重建中途失败没有还原手段，没有退路就不该动库。
      */
     fun safetyNet(ctx: Context, db: GroupDb): File? =
         runCatching { BackupIO.export(ctx, db)?.file }
@@ -111,6 +116,8 @@ object BackupFlow {
      *                必须由 UI 二次确认后才传）。
      * @param withSafetyNet 恢复前是否自动导出安全快照。链路自检（selftest）传 false：
      *                       它自己刚导出过一份，不需要再来一份。
+     * @return 覆盖模式下安全快照没做成时直接中止（[Outcome.aborted] = true），
+     *         一个字节都不写库 —— 合并模式没有这个限制（最坏是"什么都没加"）。
      */
     fun restore(
         ctx: Context?,
@@ -126,6 +133,19 @@ object BackupFlow {
             val c = ctx ?: runCatching { HostContext.app() }.getOrNull()
             if (c != null) safetyNet(c, db) else null
         } else null
+
+        // 覆盖模式的唯一退路是安全快照：没拿到就不能删库（否则半删状态无法还原）。
+        // 合并模式不动现有数据，不需要退路，照常继续。
+        if (replace && withSafetyNet && safetyFile == null) {
+            LogX.w("BACKUP restore aborted: replace without safety net, db untouched")
+            return Outcome(
+                stats = RestoreStats(0, 0, snap.groupCount),
+                plan = plan,
+                reconcileOk = true,
+                safetyNet = null,
+                aborted = true,
+            )
+        }
 
         // 覆盖模式：先删光（plan 已按空库生成，组名不会撞 UNIQUE）
         if (replace) {
