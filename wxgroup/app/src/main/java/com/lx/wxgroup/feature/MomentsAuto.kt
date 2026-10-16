@@ -11,6 +11,7 @@ import android.os.Handler
 import android.os.Looper
 import android.os.SystemClock
 import android.view.View
+import android.view.ViewGroup
 import com.lx.wxgroup.core.HostContext
 import com.lx.wxgroup.data.Keys
 import com.lx.wxgroup.data.Kv
@@ -120,6 +121,10 @@ object MomentsAuto {
     @Volatile
     private var unknownWarned = false
 
+    /** rv 捕获成功只打一行（每次进朋友圈都会重建，一行足够 */
+    @Volatile
+    private var rvLogged = false
+
     @Volatile
     private var lifecycleWarned = false
 
@@ -160,6 +165,8 @@ object MomentsAuto {
     private val loadLogged = java.util.concurrent.atomic.AtomicInteger(0)
     private val growLogged = java.util.concurrent.atomic.AtomicInteger(0)
     private val flingLogged = java.util.concurrent.atomic.AtomicInteger(0)
+    /** create 捕获兜底命中的日志限流（最多 3 行） */
+    private val fallbackLogged = java.util.concurrent.atomic.AtomicInteger(0)
 
     private val mainHandler by lazy { Handler(Looper.getMainLooper()) }
 
@@ -369,6 +376,31 @@ object MomentsAuto {
         }
     }
 
+    /**
+     * rv 只能从 [onCreateViewHolder] 抓：onBind 时 itemView **还没 attach**
+     * （真机实证 `p=null`，RecyclerView 先 bind 后 layout），从 item 往父链上找
+     * rv 永远失败 —— 曾导致 load 探针恒 "no rv"、grow/fling 整条链路断掉。
+     * 这里 args[0] 就是 RecyclerView 本体，且 onCreate 必先于 onBind 发生。
+     */
+    private val createHook = object : XC_MethodHook() {
+        override fun afterHookedMethod(param: MethodHookParam) {
+            runCatching {
+                // ⚠️ 钩子挂基类，全微信所有列表的 create 都会进来 —— 与 onBind:400
+                // 同样只认朋友圈的 adapter，否则聊天列表的 RV 会抢走 lastRv，
+                // load 探针甩在错误的列表上（真机「探针说成功但没反应」误判）。
+                val adapter = param.thisObject ?: return
+                if (!adapter.javaClass.name.startsWith(SNS_ADAPTER_PREFIX)) return
+                val parent = param.args?.getOrNull(0) as? View ?: return
+                if (!isRv(parent)) return
+                lastRv = WeakReference(parent)
+                if (!rvLogged) {
+                    rvLogged = true
+                    LogX.i("$TAG rv captured cls=${parent.javaClass.name}")
+                }
+            }
+        }
+    }
+
     private fun onBind(param: XC_MethodHook.MethodHookParam) {
         val adapter = param.thisObject ?: return
         // 钩子挂基类，微信里所有 WxRecyclerAdapter 子类都会进来 → 只认朋友圈的
@@ -379,7 +411,12 @@ object MomentsAuto {
         val holder = param.args?.getOrNull(0) ?: return
         val pos = param.args?.getOrNull(1) as? Int ?: return
         val view = holderView(holder) ?: return
-        val rv = rvOf(view) ?: return
+        val direct = rvOf(view)
+        // item 未 attach 时从 create 捕获的 rv 兜底（真机闭环：create 先于 bind）
+        val rv = direct ?: lastRv?.get() ?: return
+        if (direct == null && fallbackLogged.get() < 3 && fallbackLogged.incrementAndGet() <= 3) {
+            LogX.i("$TAG bind fallback rv=${rv.javaClass.simpleName} (create-captured)")
+        }
         val list = dataList(adapter) ?: return
         val size = list.size
 
@@ -484,7 +521,7 @@ object MomentsAuto {
         return runCatching { m.invoke(adapter) as? List<*> }.getOrNull()
     }
 
-    /** 给一个 adapter 类挂上它所有 onBindViewHolder(?, int) 的具体重载；返回新挂条数 */
+    /** 给一个 adapter 类挂上它所有 onBindViewHolder(?, int) / onCreateViewHolder(?, int) 的具体重载；返回新挂条数 */
     private fun hookAdapterClass(c: Class<*>): Int {
         var n = 0
         val ms = runCatching { c.methods }.getOrNull() ?: return 0
@@ -500,6 +537,18 @@ object MomentsAuto {
             val key = "${m.declaringClass.name}#${m.name}(${m.parameterTypes.joinToString { p -> p.name }})"
             if (!hookedMethods.add(key)) continue
             if (runCatching { XposedBridge.hookMethod(m, bindHook) }.isSuccess) n++
+        }
+        // onCreateViewHolder(ViewGroup, int)：parent 就是 rv，见 [createHook]
+        val ccands = ms.filter {
+            it.name == "onCreateViewHolder" && !Modifier.isAbstract(it.modifiers) &&
+                it.parameterTypes.size == 2 &&
+                ViewGroup::class.java.isAssignableFrom(it.parameterTypes[0]) &&
+                it.parameterTypes[1] == Int::class.javaPrimitiveType
+        }
+        for (m in (ccands.filter { !it.isBridge }.ifEmpty { ccands })) {
+            val key = "${m.declaringClass.name}#${m.name}(${m.parameterTypes.joinToString { p -> p.name }})"
+            if (!hookedMethods.add(key)) continue
+            if (runCatching { XposedBridge.hookMethod(m, createHook) }.isSuccess) n++
         }
         return n
     }
