@@ -24,6 +24,13 @@ import com.lx.wxgroup.feature.GroupBar
 import com.lx.wxgroup.feature.ScrollDock
 import com.lx.wxgroup.feature.SnsGuard
 import com.lx.wxgroup.feature.SnsTag
+import com.lx.wxgroup.feature.SnsCommentGuard
+import com.lx.wxgroup.feature.SnsCommentTag
+import com.lx.wxgroup.feature.PatBlock
+import com.lx.wxgroup.feature.MuteAt
+import com.lx.wxgroup.feature.DndWindow
+import com.lx.wxgroup.feature.AutoDndGroup
+import com.lx.wxgroup.feature.RedPacket
 import com.lx.wxgroup.hook.PlusMenu
 import com.lx.wxgroup.probe.ChatListProbe
 import com.lx.wxgroup.probe.ChatOpenProbe
@@ -179,7 +186,9 @@ class HookEntry : IXposedHookLoadPackage {
         }.onFailure { LogX.e("SnsGuard install failed", it) }
 
         // ---- 防撤回·朋友圈动态「[已删除]」标签（6.2 第三项）----
-        // 落点：View.setTag(g2) → g2.a(TimeLineObject) → Id（无符号十进制 String）。
+        // 落点：新版时间线 ImproveSnsTimelineUI → WxRecyclerAdapter.onBindViewHolder（**类名未混淆**）
+        // + adapter.getData() 的 ImproveInfo(name=…, snsID='无符号十进制')。
+        // ⚠️ 老版那条 View.setTag → TimeLineObject.Id 链在新版**不存在**（四轮真机取证结论）。
         // 只往「被我们救下来的动态」上打标，清单来自 sns_archive。
         runCatching {
             SnsTag.install(lpparam)
@@ -190,6 +199,44 @@ class HookEntry : IXposedHookLoadPackage {
         runCatching {
             NotifyMute.install(lpparam)
         }.onFailure { LogX.e("NotifyMute install failed", it) }
+
+        // ---- 6.1 聊天：关闭拍一拍 ----
+        runCatching {
+            PatBlock.install(lpparam)
+        }.onFailure { LogX.e("PatBlock install failed", it) }
+
+        // ---- 6.1 聊天：被 @ 静音（复用 NotifyMute 的静音通道，排除名单优先）----
+        runCatching {
+            MuteAt.install(lpparam)
+        }.onFailure { LogX.e("MuteAt install failed", it) }
+
+        // ---- 6.1 聊天：免打扰时段（除微信电话外掐断提示音与震动，支持跨天）----
+        runCatching {
+            DndWindow.install(lpparam)
+        }.onFailure { LogX.e("DndWindow install failed", it) }
+
+        // ---- 6.1 聊天：新加群自动免打扰（除自己创建的群）----
+        runCatching {
+            AutoDndGroup.install(lpparam)
+        }.onFailure { LogX.e("AutoDndGroup install failed", it) }
+
+        // ---- 6.3 红包：领取界面弹出时自动点「拆红包」（默认关）----
+        runCatching {
+            RedPacket.install(lpparam)
+        }.onFailure { LogX.e("RedPacket install failed", it) }
+
+        // ---- 6.2 防撤回：朋友圈**评论**防删除 + 评论 [已删除] 标签 ----
+        // ⚠️ 与动态不同：删评论前微信可能已重写 SnsInfo.attrBuf（评论可见列表的载体），
+        // 所以除了拦 delete SnsComment 还要做 attrBuf 差量检测与还原。细节见
+        // feature/SnsCommentGuard.kt 类注释；attrBuf 是否被重写**尚未实证**，靠 probe 取证。
+        runCatching {
+            SnsCommentGuard.install(lpparam)
+        }.onFailure { LogX.e("SnsCommentGuard install failed", it) }
+
+        // ---- 6.2 防撤回：朋友圈评论「[已删除]」标签 ----
+        runCatching {
+            SnsCommentTag.install(lpparam)
+        }.onFailure { LogX.e("SnsCommentTag install failed", it) }
 
         // ---- M2-C 入口：广播开分组管理页（模块没有可启动的 Activity）----
         runCatching {

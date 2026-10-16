@@ -72,18 +72,27 @@ def clear_log():
 
 def loaded():
     """
-    探测模块是否真的注入了当前微信进程。
+    探测模块是否真的注入了当前微信进程，**并且跑的是最新代码**。
 
     判据是**日志有没有反应**，不是 `dev.sh sync` 的 `[STALE] apk_path` ——
     实测 STALE 时模块照样正常加载，照着 sync 无脑跑 lspfix 每轮白花 30 秒。
     做法：删掉日志文件 → 发一条必然打日志的广播 → 看文件有没有被重新写出来。
+
+    ⚠️ **光看「文件被写回」会骗人**（2026-10-17 踩到）：旧版模块收到 `logclear`
+    也会打一行 `ENTRY PROBE unknown op=logclear` 把文件写回来 → 检测误判"已加载"，
+    结果整轮真机都在跑旧代码，日志一片 `unknown op=...`。
+    **正确判据**：文件里出现 `logclear` 且**不含** `unknown op=logclear`。
     """
     sh("shell", "rm", "-f", DBG)
     sh("shell", "am", "start", "-n", HOST + "/.ui.LauncherUI")
     time.sleep(2)
     bc("--es", "op", "logclear")
     time.sleep(2)
-    return "logclear" in pull_dbg()
+    txt = pull_dbg()
+    if "unknown op=logclear" in txt:
+        print("   ⚠️ 模块加载的是**旧代码**（logclear 返回 unknown op）")
+        return False
+    return "logclear" in txt
 
 
 def pull_dbg():
@@ -192,7 +201,17 @@ def main():
                 subprocess.run([PY, os.path.join(ROOT, "tools", "_lspfix.py")],
                                capture_output=True, text=True, encoding="utf-8", errors="ignore")
                 if not loaded():
-                    print("!! lspfix 后仍未加载，后续日志不可信")
+                    # ⚠️ 实测：`force-stop + am start` 第一次大概率还是旧代码，
+                    # **再来一次**才真正重载。所以这里双 force-stop 再试一次。
+                    print("   双 force-stop 重试（第一次重载常是旧代码）")
+                    sh("shell", "am", "force-stop", HOST)
+                    time.sleep(2)
+                    sh("shell", "am", "force-stop", HOST)
+                    time.sleep(2)
+                    sh("shell", "am", "start", "-n", HOST + "/.ui.LauncherUI")
+                    time.sleep(3)
+                    if not loaded():
+                        print("!! 重试后仍未加载，后续日志不可信")
         print(">> 场景 " + name)
         clear_log()
         r = subprocess.run([PY, os.path.join(ROOT, "tools", "_%s.py" % name)],

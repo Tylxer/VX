@@ -295,6 +295,38 @@ object EntryReceiver {
                             else -> LogX.i("SNSTAG unknown sub=$sub")
                         }
                     }
+                    // ---- 6.2 防撤回：朋友圈**评论**防删除 + 评论 [已删除] 标签 ----
+                    // ⚠️ 这两个都要读微信的 SnsMicroMsg.db → 走后台线程（onReceive 在主线程）
+                    "snsc" -> {
+                        val sub = intent.getStringExtra("sub") ?: "stat"
+                        val id = intent.getLongExtra("id", 0L)
+                        io {
+                            LogX.i("SNSCG " + com.lx.wxgroup.feature.SnsCommentGuard.probe(sub, id))
+                            LogX.i("SNSC " + com.lx.wxgroup.feature.SnsCommentTag.probe(sub, id))
+                        }
+                    }
+                    // ---- 6.1 聊天：拍一拍 / 被@静音 / 免打扰时段 / 新加群自动免打扰 ----
+                    // 这四个都是纯内存状态，主线程直接打没问题
+                    "quiet" -> {
+                        val sub = intent.getStringExtra("sub") ?: "stat"
+                        when (sub) {
+                            "pat" -> LogX.i("QUIET " + com.lx.wxgroup.feature.PatBlock.probe(sub))
+                            "at" -> LogX.i("QUIET " + com.lx.wxgroup.feature.MuteAt.probe(sub))
+                            "dnd" -> LogX.i("QUIET " + com.lx.wxgroup.feature.DndWindow.probe(sub))
+                            "grp" -> LogX.i("QUIET " + com.lx.wxgroup.feature.AutoDndGroup.probe(sub))
+                            else -> {
+                                LogX.i("QUIET " + com.lx.wxgroup.feature.PatBlock.probe(sub))
+                                LogX.i("QUIET " + com.lx.wxgroup.feature.MuteAt.probe(sub))
+                                LogX.i("QUIET " + com.lx.wxgroup.feature.DndWindow.probe(sub))
+                                LogX.i("QUIET " + com.lx.wxgroup.feature.AutoDndGroup.probe(sub))
+                            }
+                        }
+                    }
+                    // ---- 6.3 红包：领取界面自动点「拆红包」----
+                    "redpacket" -> {
+                        val sub = intent.getStringExtra("sub") ?: "stat"
+                        LogX.i("REDPK " + com.lx.wxgroup.feature.RedPacket.probe(sub))
+                    }
                     // 防撤回调试：不打搅用户也能看清 message 表的 type / isSend 语义
                     // --es sub all = 不看撤回、直接列最近的普通消息；--ei n 12 = 条数
                     //
