@@ -101,6 +101,14 @@ object MomentsExport {
     private val errs = AtomicLong(0)
     private val imgProbeLogged = AtomicInteger(0)
 
+    /**
+     * 图片对账日志的自增序号。
+     *
+     * ⚠️ 必须带序号：LogX 有 1 秒去重，同一条动态连着探两次会吐出**完全相同**的一行，
+     * 第二行被吞 → 对账时凭空少一条候选，还查不出原因。
+     */
+    private val imgSeq = AtomicLong(0)
+
     @Volatile
     private var pathWarned = false
 
@@ -388,7 +396,8 @@ object MomentsExport {
         val keys = MomentsLogic.mediaKeys(row.snsId, urls)
         imgProbeLogged.incrementAndGet()
         LogX.i(
-            "$TAG img snsId=${row.snsId} user=${row.userName?.take(12)} nick=${nick?.take(8)} " +
+            "$TAG img #${imgSeq.incrementAndGet()} snsId=${row.snsId} " +
+                "user=${row.userName?.take(12)} nick=${nick?.take(8)} " +
                 "keys=[${keys.take(8).joinToString(",")}] " +
                 "urls=[${urls.take(3).joinToString(",") { it.take(64) }}]"
         )
