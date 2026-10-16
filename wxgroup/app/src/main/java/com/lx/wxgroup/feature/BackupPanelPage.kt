@@ -5,6 +5,7 @@ import android.content.Context
 import android.view.View
 import android.widget.LinearLayout
 import com.lx.wxgroup.data.BackupEntry
+import com.lx.wxgroup.data.BackupFlow
 import com.lx.wxgroup.data.BackupIO
 import com.lx.wxgroup.data.GroupDb
 import com.lx.wxgroup.data.Kv
@@ -92,19 +93,30 @@ class BackupPanelPage : PanelPage {
 
     private fun confirmRestore(ctx: Context, db: GroupDb, e: BackupEntry) {
         val s = e.snap
+        // dry-run 预览：点按钮之前让用户看到会发生什么（只读，不写库）
+        val mergePreview = runCatching { BackupFlow.previewText(BackupFlow.preview(db, s, false)) }
+            .getOrElse { "（预览失败：${it.javaClass.simpleName}）" }
         AlertDialog.Builder(ctx)
             .setTitle("恢复这份备份？")
             .setMessage(
                 "${e.file.name}\n" +
                     "导出于 ${BackupIO.stampHuman(s.exportedAt)}\n" +
                     "含 ${s.groupCount} 个分组 / ${s.memberCount} 条成员关系" +
-                    if (s.settings.isNotEmpty()) " / ${s.settings.size} 项配置" else ""
+                    if (s.settings.isNotEmpty()) " / ${s.settings.size} 项配置" else "" +
+                    "\n\n$mergePreview"
             )
             .setNegativeButton("取消", null)
             .setNeutralButton("合并") { _, _ -> doRestore(ctx, db, e, false) }
             .setPositiveButton("覆盖") { _, _ ->
-                // 覆盖会先删光现有分组，必须二次确认
-                UiKit.confirm(ctx, "覆盖恢复", "会先删除现有全部分组，再按备份重建。确认？") {
+                // 覆盖会先删光现有分组，必须二次确认；确认框里给的是覆盖后的预览
+                val replacePreview =
+                    runCatching { BackupFlow.previewText(BackupFlow.preview(db, s, true)) }
+                        .getOrElse { "（预览失败）" }
+                UiKit.confirm(
+                    ctx,
+                    "覆盖恢复",
+                    "会先删除现有全部分组，再按备份重建。确认？\n\n$replacePreview",
+                ) {
                     doRestore(ctx, db, e, true)
                 }
             }
@@ -112,14 +124,24 @@ class BackupPanelPage : PanelPage {
     }
 
     private fun doRestore(ctx: Context, db: GroupDb, e: BackupEntry, replace: Boolean) {
-        val st = BackupIO.restore(db, e.snap, replace)
-        val msg = buildString {
-            append("已恢复：新增 ${st.groupsAdded} 组 / ${st.membersAdded} 人")
-            if (st.membersSkipped > 0) append("，${st.membersSkipped} 人因已在其他分组跳过")
-            if (st.settingsApplied > 0) append("，${st.settingsApplied} 项配置已覆盖")
+        // 对话框回调跑在主线程：restore 抛异常没有 runCatching 会直接打到微信宿主进程，
+        // 必须自己兜住（与 EntryReceiver 对 handle 的包裹同一套路）
+        val out = runCatching { BackupFlow.restore(ctx, db, e.snap, replace) }
+            .getOrElse {
+                LogX.w("BK restore failed: ${it.javaClass.simpleName}")
+                UiKit.toast(ctx, "恢复失败：${it.javaClass.simpleName ?: "未知原因"}")
+                return
+            }
+        UiKit.toast(ctx, out.summary())
+        if (out.aborted) {
+            // 安全快照没做成、恢复已中止：库没动过，不用刷新界面
+            return
         }
-        UiKit.toast(ctx, msg)
-        LogX.i("BK restored file=${e.file.name} replace=$replace stats=$st")
+        if (!out.reconcileOk) LogX.w("BK restore reconcile mismatch, file=${e.file.name}")
+        LogX.i(
+            "BK restored file=${e.file.name} replace=$replace stats=${out.stats} " +
+                "reconcile=${out.reconcileOk} safety=${out.safetyNet?.absolutePath}"
+        )
         // 分组变了，聊天页顶部的分组行要跟着重画
         GroupBar.refreshAll()
         Panel.refresh()

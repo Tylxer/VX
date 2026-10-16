@@ -222,75 +222,18 @@ object BackupIO {
     /**
      * 恢复。
      *
+     * ⚠️ 实现已迁移到 [BackupFlow]：那里"先生成计划（[BackupMerge.plan]）再照计划落库"，
+     * 计划的语义由单测锁住，执行层只做机械动作。本方法保留是为了兼容旧调用方，
+     * 新代码请直接调 `BackupFlow.restore`（能拿到计划、对账结论和安全快照路径）。
+     *
      * @param replace false=**合并**（默认）：同名分组补进缺的成员，
      *                现有成员、现有归属、以及文件里没有的配置项都不动；
      *                true=**覆盖**：先删光所有分组再按备份重建。会丢数据，
      *                必须由 UI 二次确认后才传。
-     *
-     * **成员归属冲突以现有为准**（v6.4 定）：文件里某个人属于 A 组、但库里他已经
-     * 在 B 组 —— **保持他在 B 组，不搬动**。备份是"把缺的补回来"，不是"按文件重排"。
-     * 只有**当前不属于任何分组**的人才会被加进文件里指定的组。
-     *
-     * ⚠️ 这与手动加人不同：UI 上把人勾进某组时，用户就是要他从原组移出
-     * （`addMembers` 会先把他从任何组摘掉）。合并恢复不抢这个决定权。
-     *
-     * 覆盖模式不受此约束 —— 它先删光所有分组，此时"现有归属"已不存在，
-     * 全部按文件重建。
-     *
-     * 配置只在文件带配置段时才写（决策 #10），且只覆盖文件里出现的 key
-     * （`Kv.importSome` 会忽略未登记的 key）。
      */
     fun restore(db: GroupDb, snap: Snapshot, replace: Boolean): RestoreStats {
-        if (replace) {
-            for (g in db.listGroups()) db.deleteGroup(g.id)
-        }
-        var groupsAdded = 0
-        var membersAdded = 0
-        var membersSkipped = 0
-        val byName = db.listGroups().associateBy { it.name }.toMutableMap()
-        // 恢复开始时的成员归属快照。循环里新加的人也要并进来 ——
-        // 旧备份（v0）允许一人多组，同一个人可能在文件里出现两次，只认第一次
-        val owned = db.allMemberWxids().toMutableSet()
-
-        for (gs in snap.groups) {
-            var gid = byName[gs.name]?.id ?: -1L
-            if (gid <= 0) {
-                gid = db.createGroup(gs.name, gs.color)
-                if (gid <= 0) {
-                    LogX.w("BACKUP create group failed: ${gs.name}")
-                    continue
-                }
-                groupsAdded++
-                // 置顶只在新建组时应用：合并语义下不该推翻用户现有的置顶状态
-                if (gs.pinned) db.setGroupPinned(gid, true)
-                byName[gs.name] = Group(gid, gs.name, gs.color, gs.sortOrder, System.currentTimeMillis())
-            }
-            val here = db.memberWxids(gid)
-            val need = ArrayList<MemberSnap>()
-            for (m in gs.members) {
-                when {
-                    m.wxid in here -> Unit          // 已经在这个组，无需处理
-                    m.wxid in owned -> membersSkipped++ // 已在别的组 → 以现有为准，跳过
-                    else -> need.add(m)
-                }
-            }
-            if (need.isNotEmpty()) {
-                // nickname 承载显示名：Friend.displayName 的取值顺序是 备注>昵称>别名>wxid
-                membersAdded += db.addMembers(
-                    gid,
-                    need.map { Friend(wxid = it.wxid, nickname = it.displayName, type = it.wxidType) },
-                )
-                owned.addAll(need.map { it.wxid })
-            }
-        }
-
-        val settingsApplied = if (snap.hasSettings) Kv.importSome(snap.settings) else 0
-        LogX.i(
-            "BACKUP restore replace=$replace groupsAdded=$groupsAdded" +
-                " membersAdded=$membersAdded membersSkipped=$membersSkipped" +
-                " settingsApplied=$settingsApplied"
-        )
-        return RestoreStats(groupsAdded, membersAdded, snap.groupCount, settingsApplied, membersSkipped)
+        val ctx = runCatching { HostContext.app() }.getOrNull()
+        return BackupFlow.restore(ctx, db, snap, replace).stats
     }
 
     // ---------------------------------------------------------------- 目录

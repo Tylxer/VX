@@ -9,6 +9,7 @@ import android.os.Handler
 import android.os.Looper
 import com.lx.wxgroup.core.HostContext
 import java.io.File
+import com.lx.wxgroup.data.BackupFlow
 import com.lx.wxgroup.data.BackupIO
 import com.lx.wxgroup.data.GroupDb
 import com.lx.wxgroup.feature.ConvFilter
@@ -60,7 +61,7 @@ object EntryReceiver {
     /** 定位探针。--es op convtime  → 打印会话对象的全部字段，用于找会话时间字段（S10） */
     const val ACTION_PROBE = "com.lx.wxgroup.action.PROBE"
 
-    /** M5：备份与恢复。--es op export|list|restore [--es file 绝对路径] [--ez replace true] */
+    /** M5：备份与恢复。--es op export|list|restore|plan|selftest [--es file 绝对路径] [--ez replace true] */
     const val ACTION_BACKUP = "com.lx.wxgroup.action.BACKUP"
     const val EXTRA_OP = "op"
     const val EXTRA_FILE = "file"
@@ -378,14 +379,25 @@ object EntryReceiver {
                             }
                         }
                     }
+                    // 查配置当前值。默认打印常用几个 key；
+                    // --es key <k> 查单个（备份导入后断言"只覆盖了文件里有的项"用）
                     "kvget" -> {
-                        for (k in listOf(
-                            com.lx.wxgroup.data.Keys.CHAT_DND_ENABLED,
-                            com.lx.wxgroup.data.Keys.CHAT_DND_START,
-                            com.lx.wxgroup.data.Keys.CHAT_DND_END,
-                            com.lx.wxgroup.data.Keys.CHAT_MUTE_AT_ENABLED,
-                            com.lx.wxgroup.data.Keys.CHAT_AT_ALIASES,
-                        )) LogX.i("PROBE kv $k = ${com.lx.wxgroup.data.Kv.getString(k)}")
+                        val one = intent.getStringExtra("key")
+                        val keys = if (!one.isNullOrBlank()) {
+                            listOf(one)
+                        } else {
+                            listOf(
+                                com.lx.wxgroup.data.Keys.CHAT_DND_ENABLED,
+                                com.lx.wxgroup.data.Keys.CHAT_DND_START,
+                                com.lx.wxgroup.data.Keys.CHAT_DND_END,
+                                com.lx.wxgroup.data.Keys.CHAT_MUTE_AT_ENABLED,
+                                com.lx.wxgroup.data.Keys.CHAT_AT_ALIASES,
+                            )
+                        }
+                        for (k in keys) {
+                            val known = com.lx.wxgroup.data.Prefs.spec(k) != null
+                            LogX.i("PROBE kv $k = ${com.lx.wxgroup.data.Kv.getString(k)}${if (known) "" else " (未登记)"}")
+                        }
                     }
                     // A13 探针 convtop / A7 探针 marktest 已用完，随 ConvTopProbe 一起删除：
                     // 结论已固化在 ConvLayout 与 MarkRead 的注释里。
@@ -475,14 +487,46 @@ object EntryReceiver {
                     return
                 }
                 val replace = intent.getBooleanExtra(EXTRA_REPLACE, false)
-                val st = BackupIO.restore(db, snap, replace)
+                val out = BackupFlow.restore(context, db, snap, replace)
                 LogX.i(
                     "ENTRY BACKUP restore ok path=$path replace=$replace schema=${snap.schema}" +
-                        " groupsAdded=${st.groupsAdded} membersAdded=${st.membersAdded}" +
-                        " membersSkipped=${st.membersSkipped}" +
-                        " settingsApplied=${st.settingsApplied}"
+                        " plan=${out.plan.summary()}" +
+                        " groupsAdded=${out.stats.groupsAdded} membersAdded=${out.stats.membersAdded}" +
+                        " membersSkipped=${out.stats.membersSkipped}" +
+                        " settingsApplied=${out.stats.settingsApplied}" +
+                        " reconcile=${out.reconcileOk}" +
+                        " safety=${out.safetyNet?.absolutePath}"
                 )
                 GroupBar.refreshAll()
+            }
+            /**
+             * dry-run 预览：读文件、算计划、打日志，**一个字节都不写库**。
+             * 真机回路用它断言"将发生什么"，不用真恢复一遍看结果。
+             *   --es op plan --es file <绝对路径> [--ez replace true]
+             */
+            "plan" -> {
+                val path = intent.getStringExtra(EXTRA_FILE)
+                if (path.isNullOrBlank()) {
+                    LogX.w("ENTRY BACKUP plan needs --es file")
+                    return
+                }
+                val res = BackupIO.readDetailed(File(path))
+                val snap = res.snapshot
+                if (snap == null) {
+                    LogX.w("ENTRY BACKUP plan unreadable: $path reason=${res.error}")
+                    return
+                }
+                val replace = intent.getBooleanExtra(EXTRA_REPLACE, false)
+                val plan = BackupFlow.preview(db, snap, replace)
+                LogX.i("ENTRY BACKUP plan path=$path ${BackupFlow.previewText(plan)}")
+                LogX.i("ENTRY BACKUP plan detail ${plan.summary()}")
+                for (a in plan.groups) {
+                    LogX.i(
+                        "ENTRY BACKUP plan group ${a.name} create=${a.create}" +
+                            " pinned=${a.applyPinned} add=${a.add.size}" +
+                            " skipped=${a.skipped.size} already=${a.already}"
+                    )
+                }
             }
             /**
              * 自检：导出 → 读回 → 比对 → 再合并导入一次。
@@ -506,18 +550,20 @@ object EntryReceiver {
                 val consistent = snap.groupCount == r.groups &&
                     snap.memberCount == r.members &&
                     snap.settings.size == r.settings
-                // 自己导出的文件再合并导回来，一条都不该新增 —— 幂等
-                val st = BackupIO.restore(db, snap, false)
-                val idempotent = st.groupsAdded == 0 && st.membersAdded == 0
+                // 自己导出的文件再合并导回来，一条都不该新增 —— 幂等。
+                // withSafetyNet=false：刚导出的那份就是现成的退路
+                val out = BackupFlow.restore(ctx, db, snap, false, withSafetyNet = false)
+                val idempotent = out.stats.groupsAdded == 0 && out.stats.membersAdded == 0
                 LogX.i(
-                    "ENTRY BACKUP selftest ${if (consistent && idempotent) "PASS" else "FAIL"}" +
+                    "ENTRY BACKUP selftest ${if (consistent && idempotent && out.reconcileOk) "PASS" else "FAIL"}" +
                         " file=${r.file.absolutePath} schema=${snap.schema}" +
                         " groups=${r.groups}/${snap.groupCount}" +
                         " members=${r.members}/${snap.memberCount}" +
                         " kv=${r.settings}/${snap.settings.size}" +
-                        " reimport_added=${st.groupsAdded}/${st.membersAdded}" +
-                        " membersSkipped=${st.membersSkipped}" +
-                        " settingsApplied=${st.settingsApplied}"
+                        " reimport_added=${out.stats.groupsAdded}/${out.stats.membersAdded}" +
+                        " membersSkipped=${out.stats.membersSkipped}" +
+                        " settingsApplied=${out.stats.settingsApplied}" +
+                        " reconcile=${out.reconcileOk}"
                 )
             }
             else -> LogX.w("ENTRY BACKUP unknown op=$op")

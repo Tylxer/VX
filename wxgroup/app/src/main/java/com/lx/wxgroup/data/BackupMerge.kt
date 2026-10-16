@@ -10,10 +10,10 @@ package com.lx.wxgroup.data
  * 本文件**不碰任何 Android API**（没有 Context / Uri / SQLite / Kv），
  * 只用 [Snapshot] 和几个普通的 Set/Map，配 `app/src/test/.../BackupMergeTest.kt` 直接跑。
  *
- * 真正落库的是 [BackupIO.restore]；本文件产出的是**计划**（[Plan]），
- * 用于① 导入前的 dry-run 预览（adb/UI 都能看）② 单测锁住规则语义。
- * ⚠️ 两边语义必须一致：本文件是规则的**唯一书面定义**，
- *    改规则先改这里和它的单测，再对齐 [BackupIO.restore]。
+     * 真正落库的是 [BackupFlow]（由 [BackupIO.restore] 委托）；本文件产出的是**计划**（[Plan]），
+     * 用于① 导入前的 dry-run 预览（adb/UI 都能看）② 单测锁住规则语义。
+     * ⚠️ 两边语义必须一致：本文件是规则的**唯一书面定义**，
+     *    改规则先改这里和它的单测，再对齐 [BackupFlow]。
  *
  * ## 规则（v6.3 / v6.4 定，不要放宽）
  *
@@ -27,11 +27,13 @@ package com.lx.wxgroup.data
  *    这里只需保证已知字段照常读出）。
  * 6. 分组按**名字**匹配，不按 id —— id 是自增主键，换机后不可能对上；
  *    分组名有 UNIQUE 约束，是天然的业务主键。
+ * 7. **文件里出现两个同名组**（手工编辑过的文件可能有）：第二个并进第一个，
+ *    只算一次新建。分组名 UNIQUE，再"新建"一个必然失败。
  */
 object BackupMerge {
 
     /**
-     * 导入前库的现状快照。调用方（[com.lx.wxgroup.feature.BackupFlow]）从 [GroupDb] 读出来传进来。
+     * 导入前库的现状快照。调用方（[com.lx.wxgroup.data.BackupFlow]）从 [GroupDb] 读出来传进来。
      *
      * @param groupNames 现有全部分组名
      * @param membersOfGroup 分组名 -> 该组现有成员 wxid
@@ -55,11 +57,13 @@ object BackupMerge {
         val create: Boolean,
         /** 仅在 [create] 为 true 时有意义：新建时是否按文件置顶 */
         val applyPinned: Boolean,
+        /** 新建时的颜色（执行层建组用；合并模式忽略） */
+        val color: Int = 0,
         /** 要新增进这个组的成员（已去重、已排除归属冲突） */
         val add: List<MemberSnap>,
         /** 已在别的分组、按「以现有为准」跳过的人。只用于给用户看，不做任何写入 */
         val skipped: List<String>,
-        /** 已经就在这个组里的人。不写、不计入新增 */
+        /** 已经就在这个组里的人（含文件内同名组第一遍刚加入的）。不写、不计入新增 */
         val already: Int,
     )
 
@@ -99,12 +103,21 @@ object BackupMerge {
         // ⚠️ 循环里新加的人也要并进 owned：旧备份（v0）允许一人多组，
         //    同一个人可能在文件里出现两次，**只认第一次**（否则第二次会把他搬到另一组）。
         val owned = base.owned.toMutableSet()
+        // 已经"见过"的分组名：合并模式从库里现有名字起算，之后每处理一个组就记进去 ——
+        // 文件里出现两个同名组时，第二个是合并而不是再新建（UNIQUE 约束下新建必然失败）
+        val seen = HashSet<String>(if (replace) emptySet() else base.groupNames)
+        // 按组名累计"本组已加入"的 wxid：文件里出现两个同名组时，
+        // 第二遍再见到同一个人，他已经在这个组里（already），
+        // 不是"已在别的分组"（skipped）—— 否则 dry-run 预览会虚报冲突跳过数
+        val addedByName = HashMap<String, MutableSet<String>>()
         val actions = ArrayList<GroupAction>(snap.groups.size)
 
         for (gs in snap.groups) {
             val name = gs.name
-            val existing = !replace && name in base.groupNames
+            val existing = name in seen
+            seen.add(name)
             val here = if (replace) emptySet<String>() else base.membersOfGroup[name].orEmpty()
+            val addedHere = addedByName.getOrPut(name) { HashSet() }
 
             val add = ArrayList<MemberSnap>()
             val skipped = ArrayList<String>()
@@ -112,9 +125,11 @@ object BackupMerge {
             for (m in gs.members) {
                 when {
                     m.wxid in here -> already++
+                    m.wxid in addedHere -> already++ // 同名组第一遍刚加入的，就在本组
                     m.wxid in owned -> skipped.add(m.wxid) // 已在别的组 → 以现有为准，不搬
                     else -> {
                         add.add(m)
+                        addedHere.add(m.wxid)
                         owned.add(m.wxid)
                     }
                 }
@@ -124,6 +139,7 @@ object BackupMerge {
                 create = !existing,
                 // 置顶只在新建时应用：合并语义下不该推翻用户现有的置顶状态
                 applyPinned = !existing && gs.pinned,
+                color = gs.color,
                 add = add,
                 skipped = skipped,
                 already = already,
@@ -161,6 +177,16 @@ object BackupMerge {
         }
         return out to dropped
     }
+
+    /**
+     * 执行后**对账**：落库实际发生的次数必须和 plan 的预期一致。
+     *
+     * 对不上说明执行层出了意外（并发建同名组、磁盘满、SQLite 约束冲突）——
+     * 这种偏差用户看不见但不代表没发生，必须在日志里能数出来。
+     * 由执行层（[com.lx.wxgroup.data.BackupFlow]）在 restore 结束后调用。
+     */
+    fun reconcile(plan: Plan, createdGroups: Int, addedMembers: Int): Boolean =
+        createdGroups == plan.groupsCreated && addedMembers == plan.membersAdded
 
     /**
      * 版本兼容说明（写进日志，出问题时一眼能看出是哪个文件）。
