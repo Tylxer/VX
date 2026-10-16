@@ -86,6 +86,20 @@ object EntryReceiver {
         }.start()
     }
 
+    /**
+     * 取一个 long 型附加参数。
+     *
+     * ⚠️ 不能用 `getLongExtra` 配 adb 的 `--ei`：存进去的是 Integer，
+     * 而 getLongExtra 遇到非 Long 会**静默返回默认值 0**（ardel 踩过：「删单条」变「删全部」）。
+     */
+    private fun firstLong(intent: Intent, key: String): Long =
+        when (val raw = intent.extras?.get(key)) {
+            is Long -> raw
+            is Int -> raw.toLong()
+            is String -> raw.toLongOrNull() ?: 0L
+            else -> 0L
+        }
+
     fun register(context: Context) {
         val receiver = object : BroadcastReceiver() {
             override fun onReceive(c: Context, intent: Intent) {
@@ -152,6 +166,9 @@ object EntryReceiver {
                         LogX.i("PROBE kvset $key=$v -> now=${com.lx.wxgroup.data.Kv.getString(key)}")
                         // 改完立刻重读，不用重启微信（防撤回的开关走这条）
                         runCatching { com.lx.wxgroup.feature.AntiRevoke.refresh() }
+                        runCatching { com.lx.wxgroup.feature.SnsGuard.refresh() }
+                        // 「显示动态[已删除]标签」也是开关，改完要让缓存立刻失效
+                        runCatching { com.lx.wxgroup.feature.SnsTag.refresh() }
                         // 「显示撤回提示」也是反着生效的开关（关=隐藏），同样要立刻重读。
                         // ⚠️ 用 invalidate 而不是 refresh：清单可能刚增删过提示行，缓存要失效
                         runCatching { com.lx.wxgroup.feature.AntiRevokeHint.invalidate() }
@@ -177,6 +194,96 @@ object EntryReceiver {
                         val sub = intent.getStringExtra("sub") ?: "on"
                         val sec = intent.getIntExtra("sec", 90)
                         com.lx.wxgroup.probe.RevokeHuntProbe.command(sub, sec)
+                    }
+                    // 6.2 朋友圈防撤回取证：哪个库 / 哪张表 / 删除时写了什么
+                    // --es sub on|off|flush|stat|tables|sample|clear [--ei sec 150]
+                    "sns" -> {
+                        val sub = intent.getStringExtra("sub") ?: "on"
+                        val sec = intent.getIntExtra("sec", 150)
+                        // ⚠️ tables / sample 要遍历所有库查 sqlite_master + pragma，
+                        // 必须丢后台线程，否则广播主线程 ANR（防撤回那次踩过）
+                        val t = intent.getStringExtra("table")
+                        io { com.lx.wxgroup.probe.SnsHuntProbe.command(sub, sec, t) }
+                    }
+                    // 朋友圈动态防删除（SnsGuard）
+                    // --es sub ls = 归档清单；stat = 状态；dump = 微信库里还有几条
+                    // --es sub del --es id <snsId> = 绕过拦截真删（清理用）
+                    // 朋友圈界面 View 结构取证（为「[已删除]标签」做准备）
+                    // --es sub tree = 完整树；tagged = 只打带 snsId 的节点
+                    "snsv" -> {
+                        val sub = intent.getStringExtra("sub") ?: "tree"
+                        val n = intent.getIntExtra("n", 240)
+                        io {
+                            when (sub) {
+                                "tagged" -> com.lx.wxgroup.probe.SnsViewProbe.tagged(n)
+                                "ids" -> com.lx.wxgroup.probe.SnsViewProbe.ids(n)
+                                "recycler" -> com.lx.wxgroup.probe.SnsViewProbe.recycler(n)
+                                "tagdump" -> com.lx.wxgroup.probe.SnsViewProbe.tagDump(
+                                    intent.getStringExtra("cls") ?: "", n
+                                )
+                                else -> com.lx.wxgroup.probe.SnsViewProbe.tree(n)
+                            }
+                        }
+                    }
+                    "snsg" -> {
+                        val sub = intent.getStringExtra("sub") ?: "stat"
+                        val n = intent.getIntExtra("n", 20)
+                        io {
+                            when (sub) {
+                                "stat" -> LogX.i("SNSG " + com.lx.wxgroup.feature.SnsGuard.stat())
+                                "ls" -> for (l in com.lx.wxgroup.feature.SnsGuard.listArchived(n)) {
+                                    LogX.i(l)
+                                }
+                                "dump" -> for (l in com.lx.wxgroup.feature.SnsGuard.dump(n)) {
+                                    LogX.i(l)
+                                }
+                                "one" -> {
+                                    val id = firstLong(intent, "id")
+                                    for (l in com.lx.wxgroup.feature.SnsGuard.one(id)) LogX.i(l)
+                                }
+                                "show" -> {
+                                    val id = firstLong(intent, "id")
+                                    LogX.i("SNSG show " + com.lx.wxgroup.feature.SnsGuard.show(id))
+                                }
+                                "del" -> {
+                                    val id = firstLong(intent, "id")
+                                    LogX.i("SNSG del " + com.lx.wxgroup.feature.SnsGuard.forceDelete(id))
+                                }
+                                // 归档里每条的**当前** localFlag（dump 里的 flag 是快照，别当依据）
+                                "flags" -> for (l in com.lx.wxgroup.feature.SnsGuard.flags()) {
+                                    LogX.i("SNSG $l")
+                                }
+                                // 把归档里已不可见的动态批量恢复可见（修早期版本的历史遗留）
+                                "fixall" -> LogX.i(
+                                    "SNSG " + com.lx.wxgroup.feature.SnsGuard.restoreAll()
+                                )
+                                // 模拟微信真实两步删除（update 清可见位 → delete 行），
+                                // 走真实的拦截路径，用来验证「拦下 + 恢复可见 + 归档 + 贴标」
+                                "simdel" -> {
+                                    val id = firstLong(intent, "id")
+                                    LogX.i("SNSG " + com.lx.wxgroup.feature.SnsGuard.simulateDelete(id))
+                                }
+                                else -> LogX.i("SNSG unknown sub=$sub")
+                            }
+                        }
+                    }
+                    // 朋友圈动态「[已删除]」标签（SnsTag）
+                    // --es sub stat = 状态；hit = 当前界面上打过标的 snsId 清单
+                    "snstag" -> {
+                        val sub = intent.getStringExtra("sub") ?: "stat"
+                        when (sub) {
+                            "stat" -> LogX.i("SNSTAG " + com.lx.wxgroup.feature.SnsTag.stat())
+                            "dump" -> LogX.i("SNSTAG\n" + com.lx.wxgroup.feature.SnsTag.dump())
+                            // 强制给当前屏幕上解析出来的动态打标（验证整条链路通不通）
+                            "mark" -> LogX.i("SNSTAG " + com.lx.wxgroup.feature.SnsTag.markVisible())
+                            "unmark" -> LogX.i("SNSTAG " + com.lx.wxgroup.feature.SnsTag.unmark())
+                            // --es id <dump 里的无符号 id> → 精确模拟「这条被删了」
+                            "fake" -> LogX.i(
+                                "SNSTAG " + com.lx.wxgroup.feature.SnsTag
+                                    .fakeMark(intent.getStringExtra("id").orEmpty())
+                            )
+                            else -> LogX.i("SNSTAG unknown sub=$sub")
+                        }
                     }
                     // 防撤回调试：不打搅用户也能看清 message 表的 type / isSend 语义
                     // --es sub all = 不看撤回、直接列最近的普通消息；--ei n 12 = 条数

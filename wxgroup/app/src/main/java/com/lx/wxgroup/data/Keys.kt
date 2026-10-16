@@ -175,7 +175,10 @@ object Prefs {
         // 防撤回域：默认全关，由用户自己开（决策 #2）
         PrefSpec(Keys.ANTIREVOKE_MSG, PrefKind.SWITCH, "false", "防撤回", "防止消息撤回"),
         PrefSpec(Keys.ANTIREVOKE_SNS, PrefKind.SWITCH, "false", "防撤回", "防止朋友圈动态撤回"),
-        PrefSpec(Keys.ANTIREVOKE_SNS_DELETED_TAG, PrefKind.SWITCH, "false", "防撤回", "显示动态[已删除]标签"),
+        PrefSpec(
+            Keys.ANTIREVOKE_SNS_DELETED_TAG, PrefKind.SWITCH, "false", "防撤回",
+            "显示动态[已删除]标签（需同时开启「防止朋友圈动态撤回」）"
+        ),
         PrefSpec(Keys.ANTIREVOKE_COMMENT, PrefKind.SWITCH, "false", "防撤回", "防止评论撤回"),
         PrefSpec(Keys.ANTIREVOKE_COMMENT_DELETED_TAG, PrefKind.SWITCH, "false", "防撤回", "显示评论[已删除]标签"),
         PrefSpec(Keys.ANTIREVOKE_SHOW_HINT, PrefKind.SWITCH, "false", "防撤回", "显示撤回提示"),

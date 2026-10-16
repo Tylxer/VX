@@ -22,6 +22,8 @@ import com.lx.wxgroup.feature.AntiRevokeHint
 import com.lx.wxgroup.feature.ConvMenuInject
 import com.lx.wxgroup.feature.GroupBar
 import com.lx.wxgroup.feature.ScrollDock
+import com.lx.wxgroup.feature.SnsGuard
+import com.lx.wxgroup.feature.SnsTag
 import com.lx.wxgroup.hook.PlusMenu
 import com.lx.wxgroup.probe.ChatListProbe
 import com.lx.wxgroup.probe.ChatOpenProbe
@@ -29,6 +31,7 @@ import com.lx.wxgroup.probe.DexProbe
 import com.lx.wxgroup.probe.MenuHuntProbe
 import com.lx.wxgroup.probe.MenuProbe
 import com.lx.wxgroup.probe.RevokeHuntProbe
+import com.lx.wxgroup.probe.SnsHuntProbe
 import com.lx.wxgroup.probe.UiProbe
 import com.lx.wxgroup.util.LogX
 
@@ -98,6 +101,7 @@ class HookEntry : IXposedHookLoadPackage {
         // 需要取证时发广播 op=menuhunt / op=revoke sub=on 才临时装钩，off 会全部 unhook。
         MenuHuntProbe.prepare(lpparam)
         RevokeHuntProbe.prepare(lpparam)
+        SnsHuntProbe.prepare(lpparam)
 
         ContactSync.init(context)
         HostContext.setApp(context)
@@ -166,6 +170,20 @@ class HookEntry : IXposedHookLoadPackage {
         runCatching {
             AntiRevokeHint.install(lpparam)
         }.onFailure { LogX.e("AntiRevokeHint install failed", it) }
+
+        // ---- 防撤回·朋友圈动态防删除（6.2 第二项）：拦住 DELETE FROM SnsInfo 并归档整行 ----
+        // ⚠️ 朋友圈是**独立的库** SnsMicroMsg.db，不是 EnMicroMsg.db。
+        // 删动态是物理 DELETE 整行（不是改标记），所以策略是「拦 + 归档」而不是「拦 + 改写」。
+        runCatching {
+            SnsGuard.install(lpparam)
+        }.onFailure { LogX.e("SnsGuard install failed", it) }
+
+        // ---- 防撤回·朋友圈动态「[已删除]」标签（6.2 第三项）----
+        // 落点：View.setTag(g2) → g2.a(TimeLineObject) → Id（无符号十进制 String）。
+        // 只往「被我们救下来的动态」上打标，清单来自 sns_archive。
+        runCatching {
+            SnsTag.install(lpparam)
+        }.onFailure { LogX.e("SnsTag install failed", it) }
 
         // ---- K9：通知静音过滤器（防止被@ + 免打扰时段 + 微信来电放行）----
         // 只在主进程装：实测通知就是主进程发的，:push 进程连一条 notify 都没有。

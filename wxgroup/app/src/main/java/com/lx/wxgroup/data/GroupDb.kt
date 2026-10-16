@@ -37,7 +37,7 @@ class GroupDb private constructor(context: Context) :
 
     companion object {
         const val DB_NAME = "wxgroup.db"
-        private const val DB_VERSION = 6
+        private const val DB_VERSION = 7
 
         private const val T_GROUP = "groups"
         private const val T_MEMBER = "group_member"
@@ -45,6 +45,7 @@ class GroupDb private constructor(context: Context) :
         private const val T_KV = "kv"
         private const val T_DND = "auto_dnd_done"
         private const val T_RESCUED = "rescued"
+        private const val T_SNS = "sns_archive"
 
         @Volatile
         private var instance: GroupDb? = null
@@ -94,6 +95,7 @@ class GroupDb private constructor(context: Context) :
         createKvTable(db)
         createDndTable(db)
         createRescuedTable(db)
+        createSnsTable(db)
     }
 
     override fun onUpgrade(db: SQLiteDatabase, oldVersion: Int, newVersion: Int) {
@@ -150,6 +152,9 @@ class GroupDb private constructor(context: Context) :
                 db.execSQL("ALTER TABLE $T_RESCUED ADD COLUMN orig_extra TEXT")
             }
         }
+        if (oldVersion < 7) {
+            createSnsTable(db)
+        }
     }
 
     /**
@@ -180,6 +185,38 @@ class GroupDb private constructor(context: Context) :
             """.trimIndent()
         )
         db.execSQL("CREATE INDEX IF NOT EXISTS idx_rescued_at ON $T_RESCUED(at)")
+    }
+
+    /**
+     * 朋友圈动态归档（[com.lx.wxgroup.feature.SnsGuard]）。
+     *
+     * 微信删动态是**物理 DELETE 整行**，拦住只能保住「微信库里这行还在」；
+     * 一旦微信换条路清理掉、或者模块被卸掉，内容就没了。
+     * 所以拦的同时把整行（含 content / attrBuf / postBuf 三个 BLOB）复制一份到这里。
+     * 这也是 6.4「自动导出朋友圈动态」的数据源。
+     */
+    private fun createSnsTable(db: SQLiteDatabase) {
+        db.execSQL(
+            """
+            CREATE TABLE IF NOT EXISTS $T_SNS (
+                sns_id          INTEGER NOT NULL PRIMARY KEY,
+                user_name       TEXT,
+                create_time     INTEGER NOT NULL DEFAULT 0,
+                type            INTEGER NOT NULL DEFAULT 0,
+                source_type     INTEGER NOT NULL DEFAULT 0,
+                local_flag      INTEGER NOT NULL DEFAULT 0,
+                sub_type        INTEGER NOT NULL DEFAULT 0,
+                server_ext_flag INTEGER NOT NULL DEFAULT 0,
+                head            TEXT,
+                string_seq      TEXT,
+                content         BLOB,
+                attr_buf        BLOB,
+                post_buf        BLOB,
+                at              INTEGER NOT NULL
+            )
+            """.trimIndent()
+        )
+        db.execSQL("CREATE INDEX IF NOT EXISTS idx_sns_time ON $T_SNS(create_time)")
     }
 
     // ---------------------------------------------------------------- 防撤回：被救下的消息
@@ -293,6 +330,116 @@ class GroupDb private constructor(context: Context) :
 
     fun deleteRescued(msgId: Long) {
         writableDatabase.delete(T_RESCUED, "msg_id=?", arrayOf(msgId.toString()))
+    }
+
+    // ---------------------------------------------------------------- 朋友圈动态归档
+
+    /** 一条朋友圈动态的完整快照（含三个 BLOB） */
+    data class SnsRow(
+        val snsId: Long,
+        val userName: String?,
+        val createTime: Long,
+        val type: Int,
+        val sourceType: Int,
+        val localFlag: Int,
+        val subType: Int,
+        val serverExtFlag: Int,
+        val head: String?,
+        val stringSeq: String?,
+        val content: ByteArray?,
+        val attrBuf: ByteArray?,
+        val postBuf: ByteArray?,
+        val at: Long = System.currentTimeMillis(),
+    )
+
+    /**
+     * 归档一条动态。
+     *
+     * ⚠️ **首条为准**：已经有就不覆盖。理由跟 `recordRescued` 一样 ——
+     * 覆盖会把「删之前那一版」冲掉，而删之前的才是我们要留的原文。
+     */
+    fun archiveSns(row: SnsRow): Boolean {
+        if (row.snsId == 0L) return false
+        if (hasSns(row.snsId)) return true
+        val values = ContentValues().apply {
+            put("sns_id", row.snsId)
+            put("user_name", row.userName)
+            put("create_time", row.createTime)
+            put("type", row.type)
+            put("source_type", row.sourceType)
+            put("local_flag", row.localFlag)
+            put("sub_type", row.subType)
+            put("server_ext_flag", row.serverExtFlag)
+            put("head", row.head)
+            put("string_seq", row.stringSeq)
+            put("content", row.content)
+            put("attr_buf", row.attrBuf)
+            put("post_buf", row.postBuf)
+            put("at", row.at)
+        }
+        // CONFLICT_IGNORE：并发下撞主键就放弃，绝不覆盖已有归档
+        return writableDatabase.insertWithOnConflict(
+            T_SNS, null, values, SQLiteDatabase.CONFLICT_IGNORE
+        ) != -1L
+    }
+
+    private fun hasSns(snsId: Long): Boolean {
+        readableDatabase.query(
+            T_SNS, arrayOf("sns_id"), "sns_id=?", arrayOf(snsId.toString()), null, null, null
+        ).use { c -> return c.moveToFirst() }
+    }
+
+    fun listSnsArchive(limit: Int = 20): List<SnsRow> {
+        val out = mutableListOf<SnsRow>()
+        readableDatabase.query(
+            T_SNS, null, null, null, null, null, "create_time DESC", limit.toString()
+        ).use { c ->
+            while (c.moveToNext()) {
+                out += SnsRow(
+                    snsId = c.getLong(c.getColumnIndexOrThrow("sns_id")),
+                    userName = c.getString(c.getColumnIndexOrThrow("user_name")),
+                    createTime = c.getLong(c.getColumnIndexOrThrow("create_time")),
+                    type = c.getInt(c.getColumnIndexOrThrow("type")),
+                    sourceType = c.getInt(c.getColumnIndexOrThrow("source_type")),
+                    localFlag = c.getInt(c.getColumnIndexOrThrow("local_flag")),
+                    subType = c.getInt(c.getColumnIndexOrThrow("sub_type")),
+                    serverExtFlag = c.getInt(c.getColumnIndexOrThrow("server_ext_flag")),
+                    head = c.getString(c.getColumnIndexOrThrow("head")),
+                    stringSeq = c.getString(c.getColumnIndexOrThrow("string_seq")),
+                    content = c.getBlob(c.getColumnIndexOrThrow("content")),
+                    attrBuf = c.getBlob(c.getColumnIndexOrThrow("attr_buf")),
+                    postBuf = c.getBlob(c.getColumnIndexOrThrow("post_buf")),
+                    at = c.getLong(c.getColumnIndexOrThrow("at")),
+                )
+            }
+        }
+        return out
+    }
+
+    /**
+     * 已归档动态的 snsId 全集（给「[已删除]标签」判定用）。
+     *
+     * ⚠️ **绝不能**用 [listSnsArchive] 代替：它把 `content` / `attr_buf` / `post_buf`
+     * 三个 BLOB 一起读出来（朋友圈 content 动辄几十 KB），而这里只需要一个 id 集合，
+     * 而且调用方跑在**主线程**（View.setTag 钩子里 / 滚动过程中）。
+     * 不 ORDER BY：只需覆盖索引扫一遍，不必排序。
+     */
+    fun snsArchivedIds(): Set<Long> {
+        val out = HashSet<Long>(256)
+        // ⚠️ 不加 LIMIT：无 ORDER BY 时 LIMIT 取的是「任意 N 行」，归档一多就会
+        // 静默漏掉早期被删的动态（标签凭空消失且没有任何日志）。这里只读一个
+        // INTEGER 列，全量扫的代价远小于漏标。
+        readableDatabase.query(
+            T_SNS, arrayOf("sns_id"), null, null, null, null, null
+        ).use { c ->
+            val i = c.getColumnIndexOrThrow("sns_id")
+            while (c.moveToNext()) out.add(c.getLong(i))
+        }
+        return out
+    }
+
+    fun deleteSnsArchive(snsId: Long) {
+        writableDatabase.delete(T_SNS, "sns_id=?", arrayOf(snsId.toString()))
     }
 
     /**
