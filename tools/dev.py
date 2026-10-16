@@ -64,6 +64,28 @@ def restart():
     time.sleep(8)
 
 
+def clear_log():
+    """清掉落盘日志（模块内 LogX.reset），顺便把计数归零。"""
+    bc("--es", "op", "logclear")
+    time.sleep(1)
+
+
+def loaded():
+    """
+    探测模块是否真的注入了当前微信进程。
+
+    判据是**日志有没有反应**，不是 `dev.sh sync` 的 `[STALE] apk_path` ——
+    实测 STALE 时模块照样正常加载，照着 sync 无脑跑 lspfix 每轮白花 30 秒。
+    做法：删掉日志文件 → 发一条必然打日志的广播 → 看文件有没有被重新写出来。
+    """
+    sh("shell", "rm", "-f", DBG)
+    sh("shell", "am", "start", "-n", HOST + "/.ui.LauncherUI")
+    time.sleep(2)
+    bc("--es", "op", "logclear")
+    time.sleep(2)
+    return "logclear" in pull_dbg()
+
+
 def pull_dbg():
     sh("pull", DBG, LOCAL_DBG)
     try:
@@ -162,10 +184,17 @@ def main():
             r = subprocess.run(["sh", "dev.sh", "install"], cwd=os.path.join(ROOT, "wxgroup"),
                                capture_output=True, text=True, encoding="utf-8", errors="ignore")
             print(((r.stdout or "") + (r.stderr or "")).strip()[-300:])
-            print(">> lspfix")
-            subprocess.run([PY, os.path.join(ROOT, "tools", "_lspfix.py")],
-                           capture_output=True, text=True, encoding="utf-8", errors="ignore")
+            print(">> 模块加载检测（5 秒，比无脑 lspfix 的 30 秒便宜）")
+            if loaded():
+                print("   已加载，跳过 lspfix")
+            else:
+                print("   未加载 → lspfix")
+                subprocess.run([PY, os.path.join(ROOT, "tools", "_lspfix.py")],
+                               capture_output=True, text=True, encoding="utf-8", errors="ignore")
+                if not loaded():
+                    print("!! lspfix 后仍未加载，后续日志不可信")
         print(">> 场景 " + name)
+        clear_log()
         r = subprocess.run([PY, os.path.join(ROOT, "tools", "_%s.py" % name)],
                            capture_output=True, text=True, encoding="utf-8", errors="ignore")
         print(((r.stdout or "") + (r.stderr or "")).strip()[-1500:])

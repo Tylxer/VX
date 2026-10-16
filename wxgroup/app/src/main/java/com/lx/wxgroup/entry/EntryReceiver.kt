@@ -152,6 +152,12 @@ object EntryReceiver {
             ACTION_PROBE -> {
                 val op = intent.getStringExtra(EXTRA_OP) ?: return
                 when (op) {
+                    // 清空落盘日志并归零计数。测试前发一条即可，
+                    // 不用再 force-stop 两次重启微信（省 30 秒，也避开模块重载的不确定性）。
+                    "logclear" -> {
+                        val n = com.lx.wxgroup.util.LogX.reset()
+                        com.lx.wxgroup.util.LogX.i("PROBE logclear 已清 $n 行")
+                    }
                     "convtime" -> {
                         for (line in com.lx.wxgroup.probe.ConvTimeProbe.dump()) {
                             LogX.i("PROBE $line")
