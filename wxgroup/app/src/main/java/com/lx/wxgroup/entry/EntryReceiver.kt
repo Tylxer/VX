@@ -339,14 +339,14 @@ object EntryReceiver {
                         LogX.i("REDPK " + com.lx.wxgroup.feature.RedPacket.probe(sub))
                     }
                     // ---- 6.4 朋友圈：定时刷新 / 自动加载 / 自动导出 ----
-                    // --es sub stat|env|act|refresh|load|export|img|scan|path [--ei n 5]
+                    // --es sub stat|env|act|refresh|load|rvmethods|export|img|scan|path [--ei n 5]
                     // ⚠️ refresh/load 会撩微信前台或甩列表，img/scan 要读库 → 都走后台线程
                     "moments" -> {
                         val sub = intent.getStringExtra("sub") ?: "stat"
                         val n = intent.getIntExtra("n", 5)
                         io {
                             when (sub.lowercase()) {
-                                "stat", "env", "act", "refresh", "load" ->
+                                "stat", "env", "act", "refresh", "load", "rvmethods" ->
                                     LogX.i(com.lx.wxgroup.feature.MomentsAuto.probe(sub))
                                 else ->
                                     LogX.i(com.lx.wxgroup.feature.MomentsExport.probe(sub, n))

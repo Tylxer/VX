@@ -33,9 +33,10 @@ import java.util.Collections
  * - **定时刷新**：周期性把朋友圈时间线拉到前台，让微信真的去服务端拉一次动态。
  *   目的是「在对方删除前留存」——删动态在本地是物理 DELETE（见 [SnsGuard]），
  *   本地库里有这一行，删除才会被拦下并归档；拉得越勤，漏删窗口越小。
- * - **自动加载**：用户滚到时间线底部时，替他把列表再甩到底（[android.widget.fling]
- *   用的是 RecyclerView 自己的公有 API），让微信自己的「滑到底加载更多」继续工作，
- *   把更多历史动态拉进本地库。
+ * - **自动加载**：用户滚到时间线底部时，替他把列表再往下滚一段（真机实证：
+ *   时间线是 ImproveRecyclerView，微信剥了公有的 fling(int,int)，改用
+ *   smoothScrollBy/scrollBy，见 [triggerLoadMore]），让微信自己的
+ *   「滑到底加载更多」继续工作，把更多历史动态拉进本地库。
  *
  * ## 锚点（全部来自 docs/取证结论.md「朋友圈」节，没有一个是猜的）
  * - adapter：`com.tencent.mm.view.recyclerview.WxRecyclerAdapter`（**类名未混淆**），
@@ -50,8 +51,9 @@ import java.util.Collections
  * 1. 显式 Intent 重新拉起时间线 Activity，是否**真的触发一次服务端拉取**（还是只
  *   走本地缓存 onResume）。探针：`op=moments sub=refresh` 后看 `MOMENT autoload grow`
  *    与 SnsMicroMsg.db 的写入。
- * 2. 底部 fling 是否稳定触发微信自己的「加载更多」。自观测信号：onBind 里每次看到
+ * 2. 滚到底是否稳定触发微信自己的「加载更多」。自观测信号：onBind 里每次看到
  *    `getData().size` 变大会打 `MOMENT autoload grow`——它就是硬判据。
+ *    （2026-10-18 真机：grow 0->10 / 10->20 已实证；smoothScrollBy 触发链复验中）
  */
 object MomentsAuto {
 
@@ -78,8 +80,11 @@ object MomentsAuto {
     /** 多久没有新绑定算「新一轮浏览」（自动加载计数随之归零） */
     private const val SESSION_IDLE_MS = 10_000L
 
-    /** 向下甩的力度（px/s）。RecyclerView.fling 的公有参数 */
-    private const val FLING_VY = 8000
+    /**
+     * 「拉更多」的滚动距离（px，不是速度）。smoothScrollBy(dx,dy) / scrollBy 吃的是像素距离。
+     * 2400px ≈ 一屏，足够滚到列表底部触发微信自己的加载更多。
+     */
+    private const val SCROLL_DY = 2400
 
     /** 日志限流：LogX 是主线程同步文件 IO，热路径只能留前几条 */
     private const val LOG_MAX = 5
@@ -130,6 +135,9 @@ object MomentsAuto {
 
     private val hookedMethods: MutableSet<String> = Collections.synchronizedSet(HashSet())
 
+    /** 已自愈补挂过钩子的具体 adapter 类（onBind 首次见到就补挂，防 setAdapter 没赶上） */
+    private val hookedAdapters: MutableSet<String> = Collections.synchronizedSet(HashSet())
+
     /** adapter 类 → getData() 方法（负缓存用 containsKey 表达，CHM 不允许 null value） */
     private val dataMethodCache: MutableMap<String, Method?> =
         Collections.synchronizedMap(HashMap())
@@ -164,9 +172,11 @@ object MomentsAuto {
     private val grows = java.util.concurrent.atomic.AtomicLong(0)
     private val loadLogged = java.util.concurrent.atomic.AtomicInteger(0)
     private val growLogged = java.util.concurrent.atomic.AtomicInteger(0)
-    private val flingLogged = java.util.concurrent.atomic.AtomicInteger(0)
+    private val warnLogged = java.util.concurrent.atomic.AtomicInteger(0)
     /** create 捕获兜底命中的日志限流（最多 3 行） */
     private val fallbackLogged = java.util.concurrent.atomic.AtomicInteger(0)
+    /** create 钩子见过 sns adapter 但 parent 不是 RV 的诊断计数（最多 5 行） */
+    private val createSeen = java.util.concurrent.atomic.AtomicInteger(0)
 
     private val mainHandler by lazy { Handler(Looper.getMainLooper()) }
 
@@ -369,7 +379,7 @@ object MomentsAuto {
             binds.incrementAndGet()
             runCatching { onBind(param) }
                 .onFailure { t ->
-                    if (flingLogged.get() < 3 && flingLogged.incrementAndGet() <= 3) {
+                    if (warnLogged.get() < 3 && warnLogged.incrementAndGet() <= 3) {
                         LogX.w("$TAG bind err: ${t.javaClass.simpleName}")
                     }
                 }
@@ -391,7 +401,15 @@ object MomentsAuto {
                 val adapter = param.thisObject ?: return
                 if (!adapter.javaClass.name.startsWith(SNS_ADAPTER_PREFIX)) return
                 val parent = param.args?.getOrNull(0) as? View ?: return
-                if (!isRv(parent)) return
+                if (!isRv(parent)) {
+                    // 诊断：sns adapter 的 parent 不是 RV（自愈没生效时靠它定位）
+                    if (createSeen.get() < 5) {
+                        createSeen.incrementAndGet()
+                        LogX.w("$TAG create seen adapter=${adapter.javaClass.name} " +
+                            "parent=${parent.javaClass.name} isRv=false")
+                    }
+                    return
+                }
                 lastRv = WeakReference(parent)
                 if (!rvLogged) {
                     rvLogged = true
@@ -406,6 +424,16 @@ object MomentsAuto {
         // 钩子挂基类，微信里所有 WxRecyclerAdapter 子类都会进来 → 只认朋友圈的
         if (!adapter.javaClass.name.startsWith(SNS_ADAPTER_PREFIX)) return
         snsBinds.incrementAndGet()
+
+        // 自愈：setAdapter 钩子可能没赶上（时间线 Activity 被系统恢复时，
+        // setAdapter 早于本钩子安装就调用完了 → 具体类的 onCreateViewHolder
+        // 从来没挂上，rv 捕获断掉——真机 2026-10-18 实证 snsBinds=36 但零 create）。
+        // 这里首次见到某具体类就当场补挂（hookedMethods 去重，不会重复挂钩）。
+        if (hookedAdapters.add(adapter.javaClass.name)) {
+            runCatching { hookAdapterClass(adapter.javaClass) }
+                .onFailure { LogX.w("$TAG self-heal hook failed: ${it.javaClass.simpleName}") }
+        }
+
         if (!cfg().autoLoad) return
 
         val holder = param.args?.getOrNull(0) ?: return
@@ -437,19 +465,40 @@ object MomentsAuto {
         if (!MomentsLogic.loadMoreDue(pos, size, lastTriggerAt, now, sessionCount)) return
         lastTriggerAt = now
         sessionCount++
+        // ⚠️ loads 计的是「尝试」不是「成功」：触发失败时也 ++（失败后退避 1.5s 不重试）。
+        // 复判：loads>0 但无 "autoload <how>" 日志 = 触发失败了。
         loads.incrementAndGet()
-        val flung = runCatching {
-            XposedHelpers.callMethod(rv, "fling", 0, FLING_VY)
-            true
-        }.getOrElse {
-            if (flingLogged.get() < 3 && flingLogged.incrementAndGet() <= 3) {
-                LogX.w("$TAG fling failed on ${rv.javaClass.name}: ${it.javaClass.simpleName}")
-            }
-            false
-        }
-        if (!flung) return
+        val how = triggerLoadMore(rv) ?: return
         if (loadLogged.get() < LOG_MAX && loadLogged.incrementAndGet() <= LOG_MAX) {
-            LogX.i("$TAG autoload fling pos=$pos/$size session=$sessionCount")
+            LogX.i("$TAG autoload $how pos=$pos/$size session=$sessionCount")
+        }
+    }
+
+    /**
+     * 触发「拉更多」：把列表往下甩一段。返回成功用的方法名，全失败返回 null。
+     *
+     * ⚠️ 真机实证（2026-10-18）：时间线是 ImproveRecyclerView（extends
+     * WxRecyclerView extends androidx RecyclerView），微信把公有的
+     * fling(int,int) 剥了 —— callMethod(rv,"fling",0,vy) 恒 NoSuchMethodError。
+     * 反射枚举（`op=moments sub=rvmethods`）确认可用的是：
+     * - `smoothScrollBy(int,int)`（动画滚，onScrolled 连续回调，最接近 fling 手感）
+     * - `scrollBy(int,int)`（WxRecyclerView 自己的同步滚）
+     */
+    private fun triggerLoadMore(rv: View): String? {
+        return runCatching {
+            XposedHelpers.callMethod(rv, "smoothScrollBy", 0, SCROLL_DY)
+            "smoothScrollBy"
+        }.getOrElse {
+            runCatching {
+                XposedHelpers.callMethod(rv, "scrollBy", 0, SCROLL_DY)
+                "scrollBy"
+            }.getOrElse { t2 ->
+                if (warnLogged.get() < 3 && warnLogged.incrementAndGet() <= 3) {
+                    LogX.w("$TAG load-more trigger failed on ${rv.javaClass.name}: " +
+                        "${t2.javaClass.simpleName}")
+                }
+                null
+            }
         }
     }
 
@@ -601,7 +650,8 @@ object MomentsAuto {
             "launches=${launches.get()} launchDisabled=$launchDisabled " +
             "timeline=${timelineCls?.simpleName ?: "-"} active=$timelineActive " +
             "binds=${binds.get()} snsBinds=${snsBinds.get()} loads=${loads.get()} " +
-            "grows=${grows.get()} lastSize=$lastSize"
+            "grows=${grows.get()} lastSize=$lastSize " +
+            "rv=${lastRv?.get()?.javaClass?.simpleName ?: "-"}"
     }.getOrElse { "MOMENT stat error=${it.javaClass.simpleName}" }
 
     /**
@@ -610,6 +660,9 @@ object MomentsAuto {
      * - `stat` 状态；`env` 当前充电/WiFi；`act` 时间线类捕获情况
      * - `refresh` 立刻触发一次刷新（绕过调度，真机验证用）
      * - `load` 对最近一个时间线列表立刻甩一次底（真机验证用）
+     * - `rvmethods` 反射枚举 rv 类层级上的滚动/fling API（ImproveRecyclerView
+     *   没有 androidx 的 fling(int,int)，真机 2026-10-18 实证 NoSuchMethodError；
+     *   用枚举结果决定「拉更多」的正确调法，不猜）
      */
     fun probe(sub: String): String = runCatching {
         when (sub.lowercase()) {
@@ -621,18 +674,51 @@ object MomentsAuto {
                 "MOMENT refresh forced launches=${launches.get()} disabled=$launchDisabled"
             }
             "load" -> forceLoad()
-            else -> "MOMENT subs=stat|env|act|refresh|load"
+            "rvmethods" -> rvMethods()
+            else -> "MOMENT subs=stat|env|act|refresh|load|rvmethods"
         }
     }.getOrElse { "MOMENT probe error=${it.javaClass.simpleName}" }
 
-    /** fling 必须在主线程（探针可能跑在广播的后台线程上） */
+    /**
+     * 枚举 lastRv 类层级（含父类，最多 6 层）上名字含 scroll/fling/smooth/velocity
+     * 的方法，逐个打日志（去重、限量 60 行）。真机上跑一次看结果，再定触发 API。
+     */
+    private fun rvMethods(): String {
+        val rv = lastRv?.get() ?: return "MOMENT rvm no rv (先进朋友圈滚一下)"
+        val seen = HashSet<String>()
+        var c: Class<*>? = rv.javaClass
+        var up = 0
+        var matched = 0
+        var n = 0
+        while (c != null && up < 6) {
+            for (m in runCatching { c.declaredMethods }.getOrNull().orEmpty()) {
+                val name = m.name.lowercase()
+                if (!name.contains("scroll") && !name.contains("fling") &&
+                    !name.contains("smooth") && !name.contains("velocity")
+                ) continue
+                val sig = "${m.name}(${m.parameterTypes.joinToString { p -> p.simpleName }})"
+                val key = "${c.name}#$sig"
+                if (!seen.add(key)) continue
+                matched++
+                if (n < 60) {
+                    n++
+                    LogX.i("MOMENT rvm $key")
+                }
+            }
+            c = c.superclass
+            up++
+        }
+        return "MOMENT rvm done cls=${rv.javaClass.name} matched=$matched logged=$n"
+    }
+
+    /** 滚动触发必须在主线程（探针可能跑在广播的后台线程上） */
     private fun forceLoad(): String {
         val rv = lastRv?.get()
             ?: return "MOMENT load no rv (先进朋友圈滚一下，让钩子看见列表)"
         mainHandler.post {
-            runCatching { XposedHelpers.callMethod(rv, "fling", 0, FLING_VY) }
-                .onFailure { LogX.w("$TAG load fling failed: ${it.javaClass.simpleName}") }
+            val how = triggerLoadMore(rv)
+            if (how == null) LogX.w("$TAG load trigger failed (见 rvmethods 枚举)")
         }
-        return "MOMENT load fling posted rv=${rv.javaClass.simpleName}"
+        return "MOMENT load trigger posted rv=${rv.javaClass.simpleName}"
     }
 }
