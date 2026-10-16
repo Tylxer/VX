@@ -693,7 +693,8 @@ object SnsGuard {
     }
 
     /** 手动把某条恢复成可见（补拦：修复之前拦下来的那些 localFlag 已经被清掉了） */
-    fun show(snsId: Long): String {        val db = snsDb ?: return "no sns db yet"
+    fun show(snsId: Long): String {
+        val db = snsDb ?: return "no sns db yet"
         val m = runCatching {
             db.javaClass.methods.firstOrNull {
                 it.name == "rawQuery" &&
