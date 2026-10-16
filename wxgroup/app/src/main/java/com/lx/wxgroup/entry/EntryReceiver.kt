@@ -249,6 +249,10 @@ object EntryReceiver {
                                     val id = firstLong(intent, "id")
                                     LogX.i("SNSG del " + com.lx.wxgroup.feature.SnsGuard.forceDelete(id))
                                 }
+                                // 评论表取证（列名 + 最近几行）
+                                "cmts" -> for (l in com.lx.wxgroup.feature.SnsGuard.comments(n)) {
+                                    LogX.i(l)
+                                }
                                 // 归档里每条的**当前** localFlag（dump 里的 flag 是快照，别当依据）
                                 "flags" -> for (l in com.lx.wxgroup.feature.SnsGuard.flags()) {
                                     LogX.i("SNSG $l")

@@ -490,6 +490,54 @@ object SnsGuard {
         }.getOrElse { listOf("err ${it.javaClass.simpleName}: ${(it.cause ?: it).message?.take(80)}") }
     }
 
+    /**
+     * 评论表取证：列名 + 最近几行的全部列值。
+     *
+     * 为什么先看这个：评论的**可见列表**存在 `SnsInfo.attrBuf`（protobuf），
+     * 而 `SnsComment` 是另一份明细。做「评论[已删除]标签」前必须先确认：
+     * 界面渲染到底认哪一份 —— 只认 attrBuf 的话，保住 `SnsComment` 行是不够的。
+     */
+    fun comments(limit: Int = 3): List<String> {
+        val db = snsDb ?: return listOf("no sns db yet")
+        val m = rawQueryMethod(db) ?: return listOf("no rawQuery")
+        val out = ArrayList<String>()
+        runCatching {
+            val args: Any = if (m.parameterTypes[1] == Array<String>::class.java) {
+                emptyArray<String>()
+            } else {
+                emptyArray<Any>()
+            }
+            val c = m.invoke(
+                db, "select * from SnsComment order by rowid desc limit $limit", args
+            ) ?: run { out += "CMT null cursor"; return@runCatching }
+            try {
+                val names = (XposedHelpers.callMethod(c, "getColumnNames") as? Array<*>)
+                    ?.map { it?.toString().orEmpty() } ?: emptyList()
+                out += "CMT cols=${names.joinToString("|")}"
+                var n = 0
+                while (XposedHelpers.callMethod(c, "moveToNext") as? Boolean == true) {
+                    val sb = StringBuilder("CMT#$n ")
+                    for (i in names.indices) {
+                        // BLOB 列 getString 会抛，逐列吞异常；长值截断，别把日志撑爆
+                        val v = runCatching { XposedHelpers.callMethod(c, "getString", i) as? String }
+                            .getOrNull()
+                        sb.append(names[i]).append('=')
+                            .append(v?.take(60)?.replace('\n', ' ') ?: "<blob/null>")
+                            .append("  ")
+                    }
+                    out += sb.toString()
+                    n++
+                }
+                out.add(0, "CMT rows=$n (limit=$limit)")
+            } finally {
+                runCatching { XposedHelpers.callMethod(c, "close") }
+            }
+        }.onFailure {
+            out += "CMT err ${it.javaClass.simpleName}: ${(it.cause ?: it).message?.take(80)}"
+        }
+        return out
+    }
+
     /** 只读：查某条当前的 localFlag（不修改） */
     private fun queryFlag(db: Any, snsId: Long): Int? {
         val m = runCatching {
