@@ -10,10 +10,10 @@ package com.lx.wxgroup.data
  * 本文件**不碰任何 Android API**（没有 Context / Uri / SQLite / Kv），
  * 只用 [Snapshot] 和几个普通的 Set/Map，配 `app/src/test/.../BackupMergeTest.kt` 直接跑。
  *
- * 真正落库的是 [BackupIO.restore]；本文件产出的是**计划**（[Plan]），
- * 用于① 导入前的 dry-run 预览（adb/UI 都能看）② 单测锁住规则语义。
- * ⚠️ 两边语义必须一致：本文件是规则的**唯一书面定义**，
- *    改规则先改这里和它的单测，再对齐 [BackupIO.restore]。
+     * 真正落库的是 [BackupFlow]（由 [BackupIO.restore] 委托）；本文件产出的是**计划**（[Plan]），
+     * 用于① 导入前的 dry-run 预览（adb/UI 都能看）② 单测锁住规则语义。
+     * ⚠️ 两边语义必须一致：本文件是规则的**唯一书面定义**，
+     *    改规则先改这里和它的单测，再对齐 [BackupFlow]。
  *
  * ## 规则（v6.3 / v6.4 定，不要放宽）
  *
@@ -33,7 +33,7 @@ package com.lx.wxgroup.data
 object BackupMerge {
 
     /**
-     * 导入前库的现状快照。调用方（[com.lx.wxgroup.feature.BackupFlow]）从 [GroupDb] 读出来传进来。
+     * 导入前库的现状快照。调用方（[com.lx.wxgroup.data.BackupFlow]）从 [GroupDb] 读出来传进来。
      *
      * @param groupNames 现有全部分组名
      * @param membersOfGroup 分组名 -> 该组现有成员 wxid
