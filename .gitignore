@@ -23,3 +23,5 @@ local.properties
 
 # 工作区内部数据
 .workbuddy/
+__pycache__/
+*.pyc
