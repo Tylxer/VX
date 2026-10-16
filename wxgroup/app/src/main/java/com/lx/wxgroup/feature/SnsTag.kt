@@ -26,6 +26,9 @@ import java.util.WeakHashMap
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicInteger
 
+// 纯逻辑都在 SnsTagLogic 里（零 Android 依赖，可跑 JVM 单测），这里只是别名
+private typealias ItemInfo = SnsTagLogic.Info
+
 /**
  * 朋友圈动态「[已删除]」标签（需求 6.2 第三项）。
  *
@@ -446,16 +449,8 @@ object SnsTag {
      * 作者名字对账。**严格**：拿不到名字 / 读不到文字 / 名字太短 → 一律不采信。
      * 打错标签（把没删的动态标成已删除）比不打标签糟糕得多，宁可让 missed 涨。
      */
-    private fun nameOk(info: ItemInfo, texts: List<String>): Boolean {
-        val n = info.name
-        if (n == null || n.length < 2) return false   // 拿不到/太短 → 无从校验
-        if (texts.isEmpty()) return false             // item 上读不到文字
-        return texts.any { t ->
-            t.length >= 2 && (t.contains(n) || (t.length >= 3 && n.contains(t)))
-            //                                  ↑ 反向包含只在文本够长时才算，
-            //                                    否则一两字的名字碎片会恒真
-        }
-    }
+    private fun nameOk(info: ItemInfo, texts: List<String>): Boolean =
+        SnsTagLogic.nameOk(info.name, texts)
 
     /**
      * item 子树里的可见文字（跳过我们自己加的标签），用来跟 ImproveInfo.name 对账。
@@ -483,16 +478,12 @@ object SnsTag {
 
     // ------------------------------------------------------------------ 解析 ImproveInfo
 
-    class ItemInfo(val snsId: Long, val name: String?)
 
     /**
      * `ImproveInfo(name=贸易商陈健峰, snsID='15033729556253184615', …)`。
      * 这个 `toString()` 是**功能性格式**（名字/时间/rowid 都在里面，是界面上要用的），
      * 比猜混淆字段名稳。⚠️ `snsID` 允许负号 —— 有符号写法也要能吃下。
      */
-    private val ID_RE = Regex("""snsID\s*=\s*'?(-?\d{15,20})""")
-    private val NAME_RE = Regex("""[^A-Za-z]name\s*=\s*'?([^,'\n]{1,32})""")
-
     /** item 类名 → 承载 ImproveInfo 的字段（null 字段 = item 自身就是） */
     private class Path(val field: Field?)
 
@@ -533,13 +524,7 @@ object SnsTag {
         return null
     }
 
-    private fun parseInfo(s: String?): ItemInfo? {
-        if (s == null) return null
-        val m = ID_RE.find(s) ?: return null
-        val id = parseSnsId(m.groupValues[1]) ?: return null
-        val name = NAME_RE.find(s)?.groupValues?.get(1)?.trim()?.takeIf { it.isNotEmpty() }
-        return ItemInfo(id, name)
-    }
+    private fun parseInfo(s: String?): ItemInfo? = SnsTagLogic.parseInfo(s)
 
     private fun isPlain(v: Any): Boolean {
         if (v is String || v is Number || v is Boolean || v is Char || v is ByteArray) return true
@@ -554,22 +539,7 @@ object SnsTag {
      * 这是最后一道防线 —— 取错字段时几乎不可能同时满足这个形状，
      * 「打错标签」（比不打标签糟糕得多）就基本不会发生。
      */
-    private fun parseSnsId(raw: String): Long? {
-        if (raw.isEmpty() || raw.length > 20) return null
-        var i = 0
-        if (raw[0] == '-') {
-            i = 1
-            if (raw.length == 1) return null
-        }
-        while (i < raw.length) {
-            val ch = raw[i]
-            if (ch < '0' || ch > '9') return null
-            i++
-        }
-        return runCatching {
-            if (raw[0] == '-') raw.toLong() else java.lang.Long.parseUnsignedLong(raw)
-        }.getOrNull()
-    }
+    private fun parseSnsId(raw: String): Long? = SnsTagLogic.parseSnsId(raw)
 
     // ------------------------------------------------------------------ 全量重判
 

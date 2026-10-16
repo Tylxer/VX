@@ -1,10 +1,16 @@
 #!/bin/sh
 # 开发回路脚本（Git Bash 下运行）
-#   sh dev.sh build     编译 debug APK
+#   sh dev.sh build     编译 debug APK（实测增量 14s，不是瓶颈，别费劲优化它）
 #   sh dev.sh install   安装 + 同步 LSPosed 模块路径 + 确保启用
 #   sh dev.sh restart   杀微信进程让它重新加载模块
 #   sh dev.sh log       只看本模块日志
-#   sh dev.sh all       build + install + restart（最常用）
+#   sh dev.sh all       build + install + restart
+#
+# 真机回路的耗时大头是 install + LSPosed apk_path 修复 + 场景脚本里的 sleep，
+# 所以最有效的提速是**减少回路轮次**：把改动攒齐一次上机，别改一处上一轮。
+# 一条命令跑完整回路（含日志过滤）：python tools/dev.py loop <场景名> --grep '关键字'
+#
+# ⚠️ 真机脚本放 tools/（进版本库），不要放 _cache/（整个被 .gitignore 忽略，会丢）。
 #
 # 用法前先修 PATH（WorkBuddy 的 Bash 工具 PATH 是坏的）：
 #   export PATH="/usr/bin:/bin:/mingw64/bin:/usr/local/bin:$PATH"
@@ -44,7 +50,7 @@ sync)
     echo "当前 APK 路径: $P"
     "$ADB" shell "su -c 'cp /data/adb/lspd/config/modules_config.db /sdcard/_m.db && chmod 666 /sdcard/_m.db'" >/dev/null 2>&1
     "$ADB" pull /sdcard/_m.db "$ROOT/_cache/_m.db" >/dev/null 2>&1
-    PKGNAME=$PKG APKPATH="$P" HOSTPKG=$HOST "$PY" "$ROOT/_cache/_check.py"
+    PKGNAME=$PKG APKPATH="$P" HOSTPKG=$HOST "$PY" "$ROOT/tools/_check.py"
     ;;
 test)
     # JVM 单测：只跑纯 Kotlin 逻辑（不依赖 Android/Xposed 的部分，如 SQL 改写）。
