@@ -28,7 +28,9 @@ import sys
 import time
 
 ADB = r"C:\Users\lx\AppData\Local\Android\Sdk\platform-tools\adb.exe"
-ROOT = r"C:\Users\lx\WorkBuddy\2026-09-29-20-23-21"
+# 仓库根从 __file__ 推导：并行开发时每路是一个 git worktree（独立目录），
+# 各树里的 dev.py 必须操作自己那棵树的路径，不能写死主工作区。
+ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 PY = r"C:\Users\lx\.workbuddy\binaries\python\versions\3.13.12\python.exe"
 DBG = "/sdcard/Android/data/com.tencent.mm/cache/wxgroup_dbg.txt"
 LOCAL_DBG = os.path.join(ROOT, "_dbg_pull.txt")

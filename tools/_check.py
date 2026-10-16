@@ -1,7 +1,9 @@
 """只读检查 LSPosed 里本模块的注册状态，不做任何写操作。"""
 import sqlite3, os, sys
 
-p = r"C:\Users\lx\WorkBuddy\2026-09-29-20-23-21\_cache\_m.db"
+# db 路径由 dev.sh 以 argv[1] 传入（各 worktree 拉到自己树里的 _cache）；
+# 缺省时退回主工作区路径（兼容脱离 dev.sh 手工直跑）。
+p = sys.argv[1] if len(sys.argv) > 1 else r"C:\Users\lx\WorkBuddy\2026-09-29-20-23-21\_cache\_m.db"
 pkg = os.environ["PKGNAME"]
 apkp = os.environ["APKPATH"]
 host = os.environ["HOSTPKG"]

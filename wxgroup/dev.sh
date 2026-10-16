@@ -25,7 +25,10 @@ export JAVA_HOME="C:/Users/lx/WorkBuddy/2026-09-29-20-23-21/_cache/jdk21"
 export GRADLE_USER_HOME="C:/Users/lx/WorkBuddy/2026-09-29-20-23-21/_cache/gradlehome"
 
 ADB="C:/Users/lx/AppData/Local/Android/Sdk/platform-tools/adb.exe"
-ROOT="C:/Users/lx/WorkBuddy/2026-09-29-20-23-21"
+# 仓库根从脚本自身位置推导（dev.sh 位于 <root>/wxgroup/）：兼容 git worktree，
+# 并行开发时每路工作树跑自己树里的 dev.sh，构建/安装自己树产出的 APK。
+# JAVA_HOME / GRADLE_USER_HOME 仍指向主工作区 _cache：JDK 与依赖缓存跨树共享是有意的。
+ROOT="$(cd "$(dirname "$0")/.." && pwd -W)"
 PY="C:/Users/lx/.workbuddy/binaries/python/versions/3.13.12/python.exe"
 PKG=com.lx.wxgroup
 HOST=com.tencent.mm
@@ -50,7 +53,7 @@ sync)
     echo "当前 APK 路径: $P"
     "$ADB" shell "su -c 'cp /data/adb/lspd/config/modules_config.db /sdcard/_m.db && chmod 666 /sdcard/_m.db'" >/dev/null 2>&1
     "$ADB" pull /sdcard/_m.db "$ROOT/_cache/_m.db" >/dev/null 2>&1
-    PKGNAME=$PKG APKPATH="$P" HOSTPKG=$HOST "$PY" "$ROOT/tools/_check.py"
+    PKGNAME=$PKG APKPATH="$P" HOSTPKG=$HOST "$PY" "$ROOT/tools/_check.py" "$ROOT/_cache/_m.db"
     ;;
 test)
     # JVM 单测：只跑纯 Kotlin 逻辑（不依赖 Android/Xposed 的部分，如 SQL 改写）。
