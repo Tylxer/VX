@@ -389,6 +389,13 @@ class GroupDb private constructor(context: Context) :
         ).use { c -> return c.moveToFirst() }
     }
 
+    /** 按 snsId 读一条归档（反插恢复用；读整行含三个 BLOB，后台线程调） */
+    fun snsArchived(snsId: Long): SnsRow? {
+        readableDatabase.query(
+            T_SNS, null, "sns_id=?", arrayOf(snsId.toString()), null, null, null, "1"
+        ).use { c -> return if (c.moveToFirst()) c.toSnsRow() else null }
+    }
+
     fun listSnsArchive(limit: Int = 20): List<SnsRow> {
         val out = mutableListOf<SnsRow>()
         readableDatabase.query(

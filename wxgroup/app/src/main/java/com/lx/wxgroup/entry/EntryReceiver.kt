@@ -271,6 +271,13 @@ object EntryReceiver {
                                 "fixall" -> LogX.i(
                                     "SNSG " + com.lx.wxgroup.feature.SnsGuard.restoreAll()
                                 )
+                                // 从归档反插回 SnsInfo（需求 6.4「从归档恢复」）：
+                                // 行还在就补可见位，行没了就整行 INSERT 回去。
+                                // ⚠️ 这是写对方数据库，一次只恢复一条，先跑 --check 看清归档
+                                "restore" -> {
+                                    val id = firstLong(intent, "id")
+                                    LogX.i("SNSG restore " + com.lx.wxgroup.feature.SnsGuard.restore(id))
+                                }
                                 // 模拟微信真实两步删除（update 清可见位 → delete 行），
                                 // 走真实的拦截路径，用来验证「拦下 + 恢复可见 + 归档 + 贴标」
                                 "simdel" -> {

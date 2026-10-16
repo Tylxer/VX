@@ -616,9 +616,84 @@ object SnsGuard {
         return "restoreAll total=${ids.size} visible=$visible fixed=$fixed missing=$missing"
     }
 
+    /**
+     * 从归档**反插回**微信的 `SnsInfo`（需求 6.4「从归档恢复」，诊断入口，不自动执行）。
+     *
+     * 两种入口状态分开处理：
+     * - 行**还在**（只是被清了可见位）→ 走 [restoreVisibility] 老路，不 INSERT；
+     * - 行**没了**（拦之前就删了 / 早期版本没拦到）→ 用归档快照整行 INSERT 回去，
+     *   并把 `localFlag` 置上可见位（时间线查询白名单每个值都含 bit4）。
+     *
+     * ⚠️ INSERT 只提供**已知的 13 列**（见 [readRow]），`SnsInfo` 共 18 列，剩下 5 列
+     * 靠微信建表时的默认值。若有 NOT NULL 且无默认值的列，这里会失败并把异常
+     * 消息带回来 —— 那就是下一步要补的列，靠真机报错定位，不猜。
+     * ⚠️ wcdb 的 `insert` 与 AOSP 签名一致（`insert(table, nullColumnHack, values)`）；
+     *    找不到 3 参版就退 `insertWithOnConflict` 4 参版。
+     */
+    fun restore(snsId: Long): String {
+        val db = snsDb ?: return "no sns db yet (先进一次朋友圈，或删一条动态)"
+        val row = runCatching { GroupDb.current()?.snsArchived(snsId) }.getOrNull()
+            ?: return "no archive for snsId=$snsId"
+        val cur = queryFlag(db, snsId)
+        if (cur != null) {
+            val fixed = restoreVisibility(db, snsId, cur)
+            return "snsId=$snsId already in SnsInfo localFlag=$cur " +
+                if (fixed != 0) "-> restored $fixed" else "(visible already)"
+        }
+        val m = insertMethod(db) ?: return "no insert method on ${db.javaClass.name}"
+        val values = ContentValues().apply {
+            put("snsId", row.snsId)
+            put("userName", row.userName)
+            put("createTime", row.createTime)
+            put("type", row.type)
+            put("sourceType", row.sourceType)
+            // 归档快照是微信清位后的值（恒 2），插回去必须把可见位补上
+            put("localFlag", row.localFlag or VISIBLE_BIT)
+            put("subType", row.subType)
+            put("serverExtFlag", row.serverExtFlag)
+            put("head", row.head)
+            put("stringSeq", row.stringSeq)
+            put("content", row.content)
+            put("attrBuf", row.attrBuf)
+            put("postBuf", row.postBuf)
+        }
+        val args: Array<Any?> = if (m.parameterTypes.size == 3) {
+            arrayOf(TABLE, null, values)
+        } else {
+            arrayOf(TABLE, null, values, CONFLICT_REPLACE)
+        }
+        val r = runCatching { m.invoke(db, *args) as? Long }.getOrElse {
+            return "restore err ${it.javaClass.simpleName}: " +
+                "${(it.cause ?: it).message?.take(120)}"
+        }
+        if (r == null || r < 0) return "restore failed ret=$r (可能撞主键/约束)"
+        val after = queryFlag(db, snsId)
+        return "restored snsId=$snsId rowid=$r localFlag=${row.localFlag}" +
+            "->${row.localFlag or VISIBLE_BIT} now=$after"
+    }
+
+    /** wcdb/AOSP 一致的冲突算法值：CONFLICT_REPLACE = 5 */
+    private const val CONFLICT_REPLACE = 5
+
+    /** 找 insert：优先 3 参 `insert(table, hack, values)`，退 4 参 insertWithOnConflict */
+    private fun insertMethod(db: Any): java.lang.reflect.Method? {
+        val three = db.javaClass.methods.firstOrNull {
+            it.name == "insert" && it.parameterTypes.size == 3 &&
+                it.parameterTypes[0] == String::class.java &&
+                it.parameterTypes[1] == String::class.java &&
+                it.parameterTypes[2] == ContentValues::class.java
+        }
+        if (three != null) return three
+        return db.javaClass.methods.firstOrNull {
+            it.name == "insertWithOnConflict" && it.parameterTypes.size == 4 &&
+                it.parameterTypes[0] == String::class.java &&
+                it.parameterTypes[1] == String::class.java &&
+                it.parameterTypes[2] == ContentValues::class.java
+        }
+    }
+
     /** 手动把某条恢复成可见（补拦：修复之前拦下来的那些 localFlag 已经被清掉了） */
-    fun show(snsId: Long): String {
-        val db = snsDb ?: return "no sns db yet"
+    fun show(snsId: Long): String {        val db = snsDb ?: return "no sns db yet"
         val m = runCatching {
             db.javaClass.methods.firstOrNull {
                 it.name == "rawQuery" &&
