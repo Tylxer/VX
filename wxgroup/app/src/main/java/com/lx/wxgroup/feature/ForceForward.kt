@@ -593,7 +593,10 @@ object ForceForward {
             val msg = ForwardLogic.summary(sent, degraded, skipped, failed)
             LogX.i("FORWARD done $msg plan=${plan.strategy}")
             if (ctx != null) {
-                val full = if (sent == 0) "$msg（发送链路未接通，未实际发送，详见日志 FORWARD）" else msg
+                // 只有「本来要发但发不出去」才提示链路未接通；SKIP 是原料/类型问题，文案自解释
+                val full = if (sent == 0 && plan.strategy != ForwardLogic.Strategy.SKIP) {
+                    "$msg（发送链路未接通，未实际发送，详见日志 FORWARD）"
+                } else msg
                 UiKit.toast(ctx, full)
             }
         }.onFailure { LogX.e("FF execute failed", it) }
