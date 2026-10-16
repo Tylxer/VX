@@ -9,9 +9,9 @@ import org.junit.Test
  * 需求 6.6「强制转发」纯逻辑层（[ForwardLogic]）的单测。
  *
  * 数据来源纪律（对应 docs/开发流程与原则.md 阶段1「测试数据用真机真实样本」）：
- * 1. **菜单词表全部取自真机取证**（docs/取证结论.md「会话长按菜单」）：
- *    会话列表菜单就是 `标为未读 / 取消置顶 / 不显示该聊天 / 删除该聊天` 四项；
- *    聊天消息菜单用微信 8.0.48 上常见的长按项组合。
+ * 1. **菜单词表**：CONV 词表真机取证（docs/取证结论.md「会话长按菜单」：
+ *    `标为未读 / 取消置顶 / 不显示该聊天 / 删除该聊天` 四项）；
+ *    **CHAT 词表待 op=forward dump 验证**（当前是常见长按项组合推断，未取证）。
  * 2. **appmsg XML 样本覆盖 8.0.48 实测见过的两种写法**
  *    （见 [ForwardLogic.appMsgTypeOf] 注释）：`<type>` 带空格、`<appmsg>` 前有 XML 头。
  *
@@ -401,6 +401,21 @@ class ForwardLogicTest {
                 ForwardLogic.NativeState.AVAILABLE
             ).strategy
         )
+    }
+
+    @Test
+    fun skipUncoveredKindWithNativeUnknownEvenIfTextPresent() {
+        // ★ 真机长按路径的形状：snapshotNow 的 kind 恒 UNKNOWN（G2）、nativeState()
+        // 恒 UNKNOWN → planFor 首行 isCovered(UNKNOWN)=false 恒 SKIP，failed 恒 0。
+        // execute() 的 toast 后缀条件因此必须看 sent==0，不能看 failed>0。
+        // 有文本原料也救不回来（首行就拦掉）—— 防止将来有人把 isCovered 挪到
+        // 原料判断之后，「未知类型也硬发」。
+        val plan = ForwardLogic.planFor(
+            ForwardLogic.Snapshot(kind = ForwardLogic.Kind.UNKNOWN, text = "x"),
+            ForwardLogic.NativeState.UNKNOWN
+        )
+        assertEquals(ForwardLogic.Strategy.SKIP, plan.strategy)
+        assertTrue(plan.reason.contains("不支持"))
     }
 
     @Test

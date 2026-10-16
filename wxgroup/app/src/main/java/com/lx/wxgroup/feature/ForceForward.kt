@@ -2,6 +2,7 @@ package com.lx.wxgroup.feature
 
 import android.os.Handler
 import android.os.Looper
+import android.text.TextUtils
 import android.view.View
 import android.view.ViewGroup
 import android.widget.AbsListView
@@ -382,6 +383,10 @@ object ForceForward {
         val tv = TextView(ctx)
         tv.text = label
         tv.tag = tag
+        // ⚠️ 单行 + 末尾省略：[LABEL_FORWARD] 9 字 vs 原生 2-4 字项，容器高度按
+        // 原生项量好（addItems 的 sample.height），不限行数会换行后被垂直裁切
+        tv.maxLines = 1
+        tv.ellipsize = TextUtils.TruncateAt.END
         runCatching { tv.gravity = sample.gravity }
         tv.setTextColor(COLOR_MODULE)
         runCatching {
@@ -548,8 +553,9 @@ object ForceForward {
      * 展开目标 → 选策略 → 逐目标执行 → 汇总 toast。
      *
      * v1 的诚实边界：两条发送链路都未接通（见 [nativeForward] / [resendText]），
-     * 所以除 SKIP 外全部记 failed，toast 明说「未实际发送」。链路接通后这里只需
-     * 把对应分支换成真调用，计数与文案不用动。
+     * 非 SKIP 分支全部记 failed；**sent==0 一律加「未实际发送」后缀**（含 SKIP：
+     * 真机长按路径 kind 恒 UNKNOWN，恒走 SKIP 且 failed 恒 0，文案必须诚实）。
+     * 链路接通后这里只需把对应分支换成真调用，计数与文案不用动。
      */
     private fun execute(snap: ForwardLogic.Snapshot, picked: List<String>) {
         runCatching {
@@ -593,8 +599,11 @@ object ForceForward {
             val msg = ForwardLogic.summary(sent, degraded, skipped, failed)
             LogX.i("FORWARD done $msg plan=${plan.strategy}")
             if (ctx != null) {
-                // 只有「本来要发但发不出去」才提示链路未接通；SKIP 是原料/类型问题，文案自解释
-                val full = if (sent == 0 && plan.strategy != ForwardLogic.Strategy.SKIP) {
+                // sent==0 一律加后缀（含 SKIP）：真机长按路径 snapshotNow 的 kind 恒
+                // UNKNOWN（G2）→ planFor 首行 isCovered(UNKNOWN)=false 恒 SKIP，
+                // failed 也恒 0。若把 SKIP 排除在后缀条件外，toast 只剩「已发送 0 个
+                // 目标 · 跳过 N」，看着像成功了 —— 没发出去就必须说「未实际发送」。
+                val full = if (sent == 0) {
                     "$msg（发送链路未接通，未实际发送，详见日志 FORWARD）"
                 } else msg
                 UiKit.toast(ctx, full)
