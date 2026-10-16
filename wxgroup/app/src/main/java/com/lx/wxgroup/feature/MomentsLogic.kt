@@ -49,6 +49,24 @@ object MomentsLogic {
     /** 到期但环境不满足（没充电 / 没 WiFi）时，隔多久再判一次 */
     const val RETRY_MS = 10 * 60_000L
 
+    // ------------------------------------------------------------------ 自动加载判据
+
+    /**
+     * 「距列表末尾还有几条」之内算贴底（onBind 的 [pos] 与 [size] 都来自
+     * `WxRecyclerAdapter.onBindViewHolder` + `getData()`，错位也不影响这个判定：
+     * 错位一两位仍在窗口内）。
+     */
+    const val LOAD_NEAR_END = 3
+
+    /** 同一轮浏览里最多自动触发多少次「拉更多」（防失控滚到底） */
+    const val LOAD_MAX_PER_SESSION = 30
+
+    /** 两次自动触发之间的最小间隔（毫秒） */
+    const val LOAD_MIN_INTERVAL_MS = 1_500L
+
+    /** 导出两轮之间的最小间隔（毫秒） */
+    const val EXPORT_MIN_INTERVAL_MS = 10 * 60_000L
+
     private val DAY_FMT = DateTimeFormatter.ofPattern(DAY_PATTERN, Locale.US)
     private val FULL_FMT = DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm", Locale.US)
 
@@ -330,6 +348,15 @@ object MomentsLogic {
 
     fun clampHours(h: Int): Int = h.coerceIn(MIN_INTERVAL_H, MAX_INTERVAL_H)
 
+    /** 探针 `n` 参数的钳位上限：广播 `--ei n` 外人可控，img / snsg 对账只需几条 */
+    const val MAX_PROBE_N = 50
+
+    /**
+     * 探针 `n` 的合法范围。直进 SQL LIMIT 会被 999999 这种值一次性把归档行
+     * （含 content/attr_buf/post_buf 三个 BLOB）全捞出来，真机 OOM。
+     */
+    fun clampProbeN(n: Int): Int = n.coerceIn(1, MAX_PROBE_N)
+
     /**
      * 环境是否满足「充电中 / WiFi 下」。
      *
@@ -378,4 +405,44 @@ object MomentsLogic {
         if (now < due) return due
         return if (envOk(charging, wifi, requireCharging, requireWifi)) now else now + retryMs
     }
+
+    // ------------------------------------------------------------------ 自动加载 / 导出节奏
+
+    /**
+     * 这一次绑定要不要顺手「拉更多」。
+     *
+     * 判据拆出来单测的理由：贴底窗口、节流、每轮上限三个条件**任一写错**，
+     * 表现分别是「永远不自动加载」「每帧都 fling 把列表甩到底」「一夜之间把全部历史拉完」——
+     * 三种都只能上真机才发现，而这里 16 秒就能锁住。
+     *
+     * @param pos onBindViewHolder 的 position
+     * @param size `adapter.getData().size`
+     * @param lastTriggerAt 上次自动触发的时刻（elapsedRealtime；0 = 没触发过）
+     * @param sessionCount 本轮浏览已触发次数
+     */
+    fun loadMoreDue(
+        pos: Int,
+        size: Int,
+        lastTriggerAt: Long,
+        now: Long,
+        sessionCount: Int,
+        maxPerSession: Int = LOAD_MAX_PER_SESSION,
+        minIntervalMs: Long = LOAD_MIN_INTERVAL_MS,
+    ): Boolean {
+        if (size <= 0 || pos < 0) return false
+        // 贴底：最后 LOAD_NEAR_END 条之内
+        if (pos < size - LOAD_NEAR_END) return false
+        if (sessionCount >= maxPerSession) return false
+        if (lastTriggerAt > 0L && now - lastTriggerAt < minIntervalMs) return false
+        return true
+    }
+
+    /**
+     * 导出是否到点。
+     *
+     * `lastRunAt<=0`（含从没导出过）→ 立刻跑：用户打开自动导出开关后，
+     * 第一轮 tick 就该把已归档的存量导出去，而不是干等一个间隔。
+     */
+    fun exportDue(lastRunAt: Long, now: Long, minIntervalMs: Long = EXPORT_MIN_INTERVAL_MS): Boolean =
+        lastRunAt <= 0L || now - lastRunAt >= minIntervalMs
 }

@@ -272,6 +272,16 @@ class MomentsLogicTest {
     }
 
     @Test
+    fun clampProbeNBounds() {
+        // 广播 --ei n 是外人可控的：0/负数兜底成 1，999999 这种必须钳到 50 防 SQL LIMIT OOM
+        assertEquals(1, MomentsLogic.clampProbeN(0))
+        assertEquals(1, MomentsLogic.clampProbeN(-7))
+        assertEquals(MomentsLogic.MAX_PROBE_N, MomentsLogic.clampProbeN(999_999))
+        assertEquals(5, MomentsLogic.clampProbeN(5))
+        assertEquals(MomentsLogic.MAX_PROBE_N, MomentsLogic.clampProbeN(MomentsLogic.MAX_PROBE_N))
+    }
+
+    @Test
     fun envOkIsOrOfChargingAndWifi() {
         assertTrue(MomentsLogic.envOk(charging = true, wifi = false))
         assertTrue(MomentsLogic.envOk(charging = false, wifi = true))
@@ -313,5 +323,48 @@ class MomentsLogicTest {
         val last = NOW - 1_000L
         assertEquals(last + 24 * 3_600_000L, MomentsLogic.nextRefreshAt(last, 999, false, false, NOW))
         assertEquals(last + 3_600_000L, MomentsLogic.nextRefreshAt(last, 0, false, false, NOW))
+    }
+
+    // ------------------------------------------------------------------ 自动加载 / 导出节奏
+
+    @Test
+    fun loadMoreDueOnlyNearEnd() {
+        val now = 10_000L
+        // 贴底（最后 3 条之内）才触发
+        assertTrue(MomentsLogic.loadMoreDue(pos = 27, size = 30, 0L, now, 0))
+        assertTrue(MomentsLogic.loadMoreDue(pos = 29, size = 30, 0L, now, 0))
+        // 差一条都不行：pos=26 距末尾还有 3 条
+        assertFalse(MomentsLogic.loadMoreDue(pos = 26, size = 30, 0L, now, 0))
+        assertFalse(MomentsLogic.loadMoreDue(pos = 0, size = 30, 0L, now, 0))
+    }
+
+    @Test
+    fun loadMoreDueRejectsJunkPositions() {
+        assertFalse(MomentsLogic.loadMoreDue(pos = 0, size = 0, 0L, 100L, 0))
+        assertFalse(MomentsLogic.loadMoreDue(pos = -1, size = 30, 0L, 100L, 0))
+    }
+
+    @Test
+    fun loadMoreDueThrottlesAndCapsSession() {
+        val now = 10_000L
+        // 节流：1.5s 内的第二次不触发
+        assertFalse(MomentsLogic.loadMoreDue(29, 30, now - 500, now, 0))
+        assertTrue(MomentsLogic.loadMoreDue(29, 30, now - 1_600, now, 0))
+        // 每轮上限：达到 30 次后哪怕贴底+过了节流也不再触发
+        assertFalse(MomentsLogic.loadMoreDue(29, 30, now - 9_000, now, 30))
+        assertTrue(MomentsLogic.loadMoreDue(29, 30, now - 9_000, now, 29))
+    }
+
+    @Test
+    fun exportDueFirstRunImmediateThenSpaced() {
+        val now = 1_000_000L
+        // 从没导出过 → 立刻
+        assertTrue(MomentsLogic.exportDue(0L, now))
+        assertTrue(MomentsLogic.exportDue(-1L, now))
+        // 10 分钟内不重复跑
+        assertFalse(MomentsLogic.exportDue(now - 60_000L, now))
+        // 到点就跑
+        assertTrue(MomentsLogic.exportDue(now - MomentsLogic.EXPORT_MIN_INTERVAL_MS, now))
+        assertTrue(MomentsLogic.exportDue(now - MomentsLogic.EXPORT_MIN_INTERVAL_MS - 1, now))
     }
 }

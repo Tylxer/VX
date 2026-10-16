@@ -176,6 +176,10 @@ object EntryReceiver {
                         runCatching { com.lx.wxgroup.feature.SnsGuard.refresh() }
                         // 「显示动态[已删除]标签」也是开关，改完要让缓存立刻失效
                         runCatching { com.lx.wxgroup.feature.SnsTag.refresh() }
+                        // 6.4 朋友圈三项：定时刷新/自动加载是 TTL 缓存，热刷立刻生效；
+                        // 自动导出的根目录/名单同理
+                        runCatching { com.lx.wxgroup.feature.MomentsAuto.refresh() }
+                        runCatching { com.lx.wxgroup.feature.MomentsExport.refresh() }
                         // 「显示撤回提示」也是反着生效的开关（关=隐藏），同样要立刻重读。
                         // ⚠️ 用 invalidate 而不是 refresh：清单可能刚增删过提示行，缓存要失效
                         runCatching { com.lx.wxgroup.feature.AntiRevokeHint.invalidate() }
@@ -268,6 +272,13 @@ object EntryReceiver {
                                 "fixall" -> LogX.i(
                                     "SNSG " + com.lx.wxgroup.feature.SnsGuard.restoreAll()
                                 )
+                                // 从归档反插回 SnsInfo（需求 6.4「从归档恢复」）：
+                                // 行还在就补可见位，行没了就整行 INSERT 回去。
+                                // ⚠️ 这是写对方数据库，一次只恢复一条，先跑 --check 看清归档
+                                "restore" -> {
+                                    val id = firstLong(intent, "id")
+                                    LogX.i("SNSG restore " + com.lx.wxgroup.feature.SnsGuard.restore(id))
+                                }
                                 // 模拟微信真实两步删除（update 清可见位 → delete 行），
                                 // 走真实的拦截路径，用来验证「拦下 + 恢复可见 + 归档 + 贴标」
                                 "simdel" -> {
@@ -327,6 +338,21 @@ object EntryReceiver {
                     "redpacket" -> {
                         val sub = intent.getStringExtra("sub") ?: "stat"
                         LogX.i("REDPK " + com.lx.wxgroup.feature.RedPacket.probe(sub))
+                    }
+                    // ---- 6.4 朋友圈：定时刷新 / 自动加载 / 自动导出 ----
+                    // --es sub stat|env|act|refresh|load|rvmethods|export|img|scan|path [--ei n 5]
+                    // ⚠️ refresh/load 会撩微信前台或甩列表，img/scan 要读库 → 都走后台线程
+                    "moments" -> {
+                        val sub = intent.getStringExtra("sub") ?: "stat"
+                        val n = intent.getIntExtra("n", 5)
+                        io {
+                            when (sub.lowercase()) {
+                                "stat", "env", "act", "refresh", "load", "rvmethods" ->
+                                    LogX.i(com.lx.wxgroup.feature.MomentsAuto.probe(sub))
+                                else ->
+                                    LogX.i(com.lx.wxgroup.feature.MomentsExport.probe(sub, n))
+                            }
+                        }
                     }
                     // 防撤回调试：不打搅用户也能看清 message 表的 type / isSend 语义
                     // --es sub all = 不看撤回、直接列最近的普通消息；--ei n 12 = 条数

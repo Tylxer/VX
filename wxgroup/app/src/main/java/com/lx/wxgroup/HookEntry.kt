@@ -26,6 +26,8 @@ import com.lx.wxgroup.feature.SnsGuard
 import com.lx.wxgroup.feature.SnsTag
 import com.lx.wxgroup.feature.SnsCommentGuard
 import com.lx.wxgroup.feature.SnsCommentTag
+import com.lx.wxgroup.feature.MomentsAuto
+import com.lx.wxgroup.feature.MomentsExport
 import com.lx.wxgroup.feature.PatBlock
 import com.lx.wxgroup.feature.MuteAt
 import com.lx.wxgroup.feature.DndWindow
@@ -237,6 +239,19 @@ class HookEntry : IXposedHookLoadPackage {
         runCatching {
             SnsCommentTag.install(lpparam)
         }.onFailure { LogX.e("SnsCommentTag install failed", it) }
+
+        // ---- 6.4 朋友圈：定时刷新 + 自动加载（默认关；刷新要充电/WiFi 任一满足）----
+        // 刷新 = 到点时把时间线 Activity 显式拉起来（类名运行时捕获，不猜包名）；
+        // 自动加载 = 用户滚到底时替他把列表再甩一下（RecyclerView.fling 公有 API）。
+        runCatching {
+            MomentsAuto.install(lpparam)
+        }.onFailure { LogX.e("MomentsAuto install failed", it) }
+
+        // ---- 6.4 朋友圈：自动导出（sns_archive → 文本文件；图片规则未取证，只留探针）----
+        // 没有任何 hook：后台 5 分钟一拍，导出间隔 10 分钟，单航班后台线程。
+        runCatching {
+            MomentsExport.install(lpparam)
+        }.onFailure { LogX.e("MomentsExport install failed", it) }
 
         // ---- M2-C 入口：广播开分组管理页（模块没有可启动的 Activity）----
         runCatching {

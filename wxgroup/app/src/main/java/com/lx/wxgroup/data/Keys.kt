@@ -129,6 +129,16 @@ object Keys {
     const val MOMENTS_EXPORT_PATH = "moments.export_path"
     const val MOMENTS_EXPORT_LIST = "moments.export_list"
 
+    /**
+     * 定时刷新 / 自动导出的**内部状态**（epoch millis 字符串，读不到按 0 = 从没做过）。
+     *
+     * ⚠️ **刻意不进 `Prefs.ALL`**：进了就会显示在设置页、还会被备份引擎带走，
+     * 而它只是「上次什么时候刷过」的运行状态，换机重置没有意义。
+     * Kv 对未登记的 key 也能正常读写（`defaultOf` 返回空串），只是不出现在 UI/备份里。
+     */
+    const val MOMENTS_LAST_REFRESH_AT = "moments.last_refresh_at"
+    const val MOMENTS_LAST_EXPORT_AT = "moments.last_export_at"
+
     // —— 群发域 ——
     const val BROADCAST_INTERVAL_S = "broadcast.interval_s"
     const val BROADCAST_LAST_TEXT = "broadcast.last_text"
