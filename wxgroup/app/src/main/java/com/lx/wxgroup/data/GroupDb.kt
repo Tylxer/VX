@@ -608,6 +608,17 @@ class GroupDb private constructor(context: Context) :
         ).use { return it.moveToFirst() }
     }
 
+    /** 全部已记账的群（模块重启后恢复内存态用；顺带按记账时间排序便于排查） */
+    fun listDndHandled(): List<String> {
+        readableDatabase.query(
+            T_DND, arrayOf("chatroom_id"), null, null, null, null, "handled_at ASC"
+        ).use { cursor ->
+            return buildList {
+                while (cursor.moveToNext()) add(cursor.getString(0))
+            }
+        }
+    }
+
     /** 记下「已经给这个群设过免打扰」。之后用户手动关掉，模块不再自动打开 */
     fun markDndHandled(chatroomId: String) {
         if (chatroomId.isBlank()) return
