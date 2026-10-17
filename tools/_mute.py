@@ -7,10 +7,13 @@
 
 ⏳ 功能已实现（lane/muteat）：chat.mute_at_* 由 feature/MuteAt.kt 读取，
    纯判据在 feature/MuteAtLogic.kt（JVM 单测覆盖）。探针：
-   op=quiet sub=at        总状态（registered/enabled/matched/bridge）
-   op=quiet sub=scope     允许/排除名单当前值
-   op=quiet sub=aliases   解析后的别名列表
-   op=quiet sub=extras    最近一条通知的 extras（定「群名」锚点用）
+   op=quiet sub=at sub2=status    总状态（registered/enabled/matched/bridge）
+   op=quiet sub=at sub2=scope     允许/排除名单当前值
+   op=quiet sub=at sub2=aliases   解析后的别名列表
+   op=quiet sub=at sub2=extras    最近一条通知的 extras（定「群名」锚点用）
+   op=quiet sub=dnd sub2=window   当前是否在免打扰时段
+
+   ⚠️ sub 选功能（at|pat|dnd|grp），sub2 才是该功能的子命令，别合成一个。
 
 判据：响铃/震动消失，但**角标、消息、通知栏全部照常** —— 断言只认这三条副作用，
      声音本身没法自动断言，靠日志里有没有 mute 命中。

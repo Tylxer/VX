@@ -231,6 +231,37 @@ object SnsRestoreLogic {
     // ------------------------------------------------------------------ 回滚
 
     /**
+     * 一行在**写库之前**的存在性三态。
+     *
+     * ⚠️ 必须三态、不能压成 Boolean：把 [UNKNOWN] 当成「不存在」是**致命**的 ——
+     * 「不存在」意味着后面的 INSERT 造出来的就是新行，回滚可以按主键删掉它；
+     * 而 [UNKNOWN] 意味着**预检查询本身失败了**（rawQuery 抛异常 / 返回空游标），
+     * 库里到底有没有这一行**不知道**，这时候插进去的行没法证明是新的。
+     */
+    enum class Presence { PRESENT, ABSENT, UNKNOWN }
+
+    /**
+     * 本次批量里**允许按 snsId 从 `SnsInfo` 回滚删除**的 id 集合。
+     *
+     * 准入条件：步骤是 [Action.INSERT]，且该 snsId 在批量开始前被查成 [Presence.ABSENT]
+     * （**确认不在库里**）—— 只有这种行才肯定是咱们这次插进去的。
+     *
+     * ⚠️ 为什么卡这么死：`SnsInfo` 的 `snsId` **有没有唯一约束没有实证**
+     * （docs/取证结论.md 朋友圈章节里没有这一条，别猜）。若它不是唯一键，
+     * 同一个 snsId 可以并存多行，而 `delete from SnsInfo where snsId=?` 会
+     * **把用户本来就有的那一行一起删掉** —— 那不是回滚，是直接删掉用户看得见的动态。
+     * 所以清单外的 id 一律不许删：宁可在微信库里留一行脏数据等人清理，也不能删错。
+     *
+     * @param steps 本次批量的步骤（传计划 [plan] 或已执行的步骤集都一样：
+     *              只有 INSERT 且预检为 [Presence.ABSENT] 的才会被选中）
+     * @param pre 批量开始前逐条查出来的存在性；查都没查过的 id 按 [Presence.UNKNOWN] 处理
+     */
+    fun undoableInserts(steps: List<Step>, pre: Map<Long, Presence>): Set<Long> =
+        steps.filter { it.action == Action.INSERT && pre[it.snsId] == Presence.ABSENT }
+            .map { it.snsId }
+            .toSet()
+
+    /**
      * 一个**已成功执行**的步骤对应的回滚步骤。
      *
      * - INSERT 成功 → 把插进去的行删掉（否则微信库里多一行我们自己造的数据）；

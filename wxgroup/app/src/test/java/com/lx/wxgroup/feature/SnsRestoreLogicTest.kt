@@ -261,6 +261,82 @@ class SnsRestoreLogicTest {
         assertEquals(emptyList<SnsRestoreLogic.Step>(), SnsRestoreLogic.rollbackOrder(emptyList()))
     }
 
+    // ------------------------------------------------------------------ 回滚准入（B2）
+
+    /**
+     * 回滚只能删「写库之前**确认不在** SnsInfo 里」的那些行。
+     *
+     * `SnsInfo.snsId` 有没有唯一约束**没有实证**；若它不是唯一键，`where snsId=?` 的 delete
+     * 会把用户本来就有的那一行一起删掉。所以除了 ABSENT，其它三态一律不许删。
+     */
+    @Test
+    fun undoableInsertsOnlyTheConfirmedAbsentOnes() {
+        val pre = mapOf(
+            1L to SnsRestoreLogic.Presence.ABSENT, // ✅ 确认不在 → 本次插的，可删
+            2L to SnsRestoreLogic.Presence.PRESENT, // ❌ 用户本来就有，删了就是删用户数据
+            3L to SnsRestoreLogic.Presence.UNKNOWN, // ❌ 预检查询失败，证明不了是新的
+        )
+        val steps = listOf(
+            SnsRestoreLogic.Step(1L, SnsRestoreLogic.Action.INSERT, null, null),
+            SnsRestoreLogic.Step(2L, SnsRestoreLogic.Action.INSERT, null, null),
+            SnsRestoreLogic.Step(3L, SnsRestoreLogic.Action.INSERT, null, null),
+            SnsRestoreLogic.Step(4L, SnsRestoreLogic.Action.INSERT, null, null), // 预检都没查过
+        )
+        assertEquals(setOf(1L), SnsRestoreLogic.undoableInserts(steps, pre))
+    }
+
+    /** 只改可见位的步骤不进删除清单 —— 它的逆操作是写回原值，碰不到行本身 */
+    @Test
+    fun undoableInsertsExcludesSetFlagSteps() {
+        val pre = mapOf(1L to SnsRestoreLogic.Presence.ABSENT, 2L to SnsRestoreLogic.Presence.PRESENT)
+        val steps = listOf(
+            SnsRestoreLogic.Step(1L, SnsRestoreLogic.Action.INSERT, null, null),
+            SnsRestoreLogic.Step(2L, SnsRestoreLogic.Action.SET_FLAG, 2, 18),
+            SnsRestoreLogic.Step(3L, SnsRestoreLogic.Action.SKIP, 18, null),
+        )
+        assertEquals(setOf(1L), SnsRestoreLogic.undoableInserts(steps, pre))
+        assertEquals(emptySet<Long>(), SnsRestoreLogic.undoableInserts(emptyList(), emptyMap()))
+    }
+
+    /**
+     * 端到端：跑到一半失败时，**只有确认新插入的那些行**会被倒序回滚删除。
+     *
+     * 这里锁的是「plan → undoable → rollbackOrder」三者的组合语义：
+     * 计划里第 3 条是预检失败(UNKNOWN)的 INSERT，它即便执行成功也不许被删。
+     */
+    @Test
+    fun halfFailedBatchRollsBackOnlyNewRowsInReverseOrder() {
+        val rows = listOf(realRow(snsId = 1L), realRow(snsId = 2L), realRow(snsId = 3L))
+        // 1 确认没了；2 在但被清位；3 预检查询失败（UNKNOWN）
+        val pre = mapOf(
+            1L to SnsRestoreLogic.Presence.ABSENT,
+            2L to SnsRestoreLogic.Presence.PRESENT,
+            3L to SnsRestoreLogic.Presence.UNKNOWN,
+        )
+        // plan 只认「行在不在」，所以它看不出 1 和 3 的区别 —— 两者都是 INSERT
+        val plan = SnsRestoreLogic.plan(rows, mapOf(2L to 2))
+        assertEquals(3, plan.size)
+        assertEquals(listOf(1L, 3L), plan.filter { it.action == SnsRestoreLogic.Action.INSERT }
+            .map { it.snsId })
+        assertEquals(SnsRestoreLogic.Action.SET_FLAG, plan[1].action)
+
+        // 真正决定“回滚敢不敢删”的是三态：只有 1 能删
+        val undoable = SnsRestoreLogic.undoableInserts(plan, pre)
+        assertEquals(setOf(1L), undoable)
+
+        val done = listOf(
+            SnsRestoreLogic.Step(1L, SnsRestoreLogic.Action.INSERT, null, null),
+            SnsRestoreLogic.Step(2L, SnsRestoreLogic.Action.SET_FLAG, 2, 18),
+            SnsRestoreLogic.Step(3L, SnsRestoreLogic.Action.INSERT, null, null),
+        )
+        val back = SnsRestoreLogic.rollbackOrder(done)
+        assertEquals(listOf(3L, 2L, 1L), back.map { it.snsId }) // 倒序：后写的先撤
+        val deletable = back.filter { it.action == SnsRestoreLogic.Action.ROLLBACK_DELETE }
+            .map { it.snsId }
+            .filter { undoable.contains(it) }
+        assertEquals(listOf(1L), deletable) // 3 查不出来时不许删
+    }
+
     // ------------------------------------------------------------------ 汇总
 
     @Test
