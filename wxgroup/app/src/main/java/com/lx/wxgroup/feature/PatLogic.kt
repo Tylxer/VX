@@ -16,9 +16,9 @@ package com.lx.wxgroup.feature
  * - hook 主体（拦截双击触发）保持「待取证」，见 PatBlock 顶部常量；
  * - 本文件只交付**不依赖微信私有 API** 的判据：开关语义、系统消息文本形态、
  *   以及真机反射枚举取证时的候选筛选；
- * - 真机取证入口：广播 `op=quiet sub=pat sub2=dbltap`（hook Android SDK 公开的
- *   `GestureDetector$OnDoubleTapListener#onDoubleTap`  dump 调用栈，零猜测锚点），
- *   拿到真实类名/方法名后回填 PatBlock 常量即可生效。
+ * - 真机取证入口：广播 `op=quiet sub=pat sub2=dbltap`（hook Android framework 的具体方法
+ *   `GestureDetector#onTouchEvent`，反射读出 `mDoubleTapListener` 的真实实现类并 dump
+ *   调用栈，零猜测锚点），拿到真实类名/方法名后回填 PatBlock 常量即可生效。
  */
 object PatLogic {
 
@@ -157,4 +157,18 @@ object PatLogic {
 
     /** 还能不能再打一条栈（纯判据，探针侧调用；[count] 是已打条数）。 */
     fun stackDumpDue(count: Int, max: Int = MAX_STACK_DUMPS): Boolean = count < max
+
+    /**
+     * 探针「这一帧要不要 dump」的判据（纯函数）。
+     *
+     * 探针挂在 `GestureDetector#onTouchEvent` 上，**每一个触摸事件都会进来**
+     * （滑动列表时一秒几十次），所以只认两类：
+     * - [alreadySeen]=false：这是个**新的** doubleTap listener 实现类，它的类名和栈值得记一笔；
+     *   同一个类的重复事件静默跳过（同一页面里反复双击不会刷屏）；
+     * - 且预算 [count] 还没到 [max]。
+     *
+     * @param alreadySeen 该 listener 类名是否已在去重表里
+     */
+    fun shouldDumpListener(alreadySeen: Boolean, count: Int, max: Int = MAX_STACK_DUMPS): Boolean =
+        !alreadySeen && stackDumpDue(count, max)
 }

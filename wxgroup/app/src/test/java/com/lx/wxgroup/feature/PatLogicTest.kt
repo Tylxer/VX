@@ -158,6 +158,29 @@ class PatLogicTest {
     }
 
     @Test
+    fun newListenerClassDumpsOnceRepeatsAreSilenced() {
+        // 探针挂在 GestureDetector#onTouchEvent 上：每个触摸事件都会进回调，
+        // 所以同一个 doubleTap listener 实现类只能打一次，否则滑列表就刷屏
+        assertTrue(PatLogic.shouldDumpListener(alreadySeen = false, count = 0))
+        assertFalse(PatLogic.shouldDumpListener(alreadySeen = true, count = 0))
+        assertFalse(PatLogic.shouldDumpListener(alreadySeen = true, count = 7))
+    }
+
+    @Test
+    fun listenerDumpStillRespectsGlobalBudget() {
+        assertFalse(PatLogic.shouldDumpListener(alreadySeen = false, count = PatLogic.MAX_STACK_DUMPS))
+        assertTrue(
+            PatLogic.shouldDumpListener(
+                alreadySeen = false,
+                count = PatLogic.MAX_STACK_DUMPS - 1,
+            )
+        )
+        // 自定义预算同样生效
+        assertTrue(PatLogic.shouldDumpListener(alreadySeen = false, count = 2, max = 3))
+        assertFalse(PatLogic.shouldDumpListener(alreadySeen = false, count = 3, max = 3))
+    }
+
+    @Test
     fun constantsAreStable() {
         assertEquals("拍了拍", PatLogic.PAT_KEYWORD)
         assertEquals(50, PatLogic.MAX_STACK_DUMPS)
