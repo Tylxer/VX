@@ -293,7 +293,8 @@ object SnsCommentTag {
         }
         // ② 降级路径：评论行 → commentSvrID 未取证，改用「归档正文 ↔ 界面文案」对账定位。
         //    只用 Android 标准 API（遍历 TextView），不碰任何未取证的微信类名/字段名。
-        if (markByText(itemView, snsId)) return
+        val cands = textsFor(snsId) ?: return // 缓存还没填好就先不打，下一轮 bind 自会再来
+        if (markByText(itemView, cands)) return
         degradeHits.incrementAndGet()
         logOnce("SNSC_TAG degrade: snsId=$snsId 有 ${svrIds.size} 条已删评论，" +
             "评论行→commentSvrID 未取证且正文对账没命中 -> skip")
@@ -306,8 +307,7 @@ object SnsCommentTag {
      * ⚠️ 只认 [SnsCommentLogic.textHit] 判定的命中（严格：短碎片、完全对不上都不算），
      * 宁可 missed 涨也不能误标。
      */
-    private fun markByText(itemView: View, snsId: Long): Boolean {
-        val cands = textsFor(snsId) ?: return false
+    private fun markByText(itemView: View, cands: List<List<String>>): Boolean {
         var hit = 0
         for (tv in textViewsOf(itemView)) {
             val t = tv.text?.toString() ?: continue
