@@ -641,6 +641,23 @@ object AntiRevoke {
         if (msgDb !== db) msgDb = db
     }
 
+    /**
+     * 给**只读诊断探针**用的查询句柄：`消息库实例 + rawQuery 反射方法`。
+     *
+     * 存在的理由：模块里唯一能拿到微信消息库的地方就是这里的写库 hook
+     * （`msgDb` 在 updateWithOnConflict 里捕获），别的探针没别的入口。
+     * 与其让每个探针各自去试 `SQLiteDatabase` 的各种入口，不如共用这一条实证过的路。
+     *
+     * @return 任一缺失就返回 null（消息库还没抓到 / rawQuery 没找到），
+     *         调用方据此打一行说明，**不要**退到别的东西上重试（早期版本退 [lastDb]
+     *         的教训见 [wxDb] 的注释）。
+     */
+    internal fun msgQueryHandle(): Pair<Any, Method>? {
+        val db = msgDb ?: return null
+        val m = rawQueryMethod(db) ?: return null
+        return db to m
+    }
+
     @Volatile
     private var rawQueryMethod: Method? = null
 

@@ -160,7 +160,8 @@ object MainPage : PanelPage {
     fun redpacketPage(): PanelPage = SettingPage(
         title = "红包",
         domain = "红包",
-        footnote = "在红包领取界面自动点击「拆红包」，不改变消息接收链路。",
+        footnote = "「自动点击拆红包」只在领取界面已弹出后替你点那一下按钮，不改变消息接收链路。" +
+            "「决策引擎」目前只做识别与记录：取证前 type/文案两项留空，识别不到就什么都不会发生。",
     )
 
     fun momentsPage(): PanelPage = SettingPage(
