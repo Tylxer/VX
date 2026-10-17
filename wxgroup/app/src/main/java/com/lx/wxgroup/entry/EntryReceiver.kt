@@ -216,6 +216,18 @@ object EntryReceiver {
                         val t = intent.getStringExtra("table")
                         io { com.lx.wxgroup.probe.SnsHuntProbe.command(sub, sec, t) }
                     }
+                    // K3「按微信标签选人」的数据源取证（**待取证**，探针本身不含任何硬编表名）
+                    // --es sub on|off|stat|dbs|tables [--ei sec 60]
+                    // --es sub info|rows --es table <表名> [--ei n 5]
+                    // --es sub sql  --es sql "select ... from rcontact limit 5"
+                    "label" -> {
+                        val sub = intent.getStringExtra("sub") ?: "stat"
+                        val sec = intent.getIntExtra("sec", 60)
+                        val t = intent.getStringExtra("table")
+                        val s = intent.getStringExtra("sql")
+                        val n = intent.getIntExtra("n", 5)
+                        io { com.lx.wxgroup.probe.LabelHuntProbe.command(sub, sec, t, s, n) }
+                    }
                     // 朋友圈动态防删除（SnsGuard）
                     // --es sub ls = 归档清单；stat = 状态；dump = 微信库里还有几条
                     // --es sub del --es id <snsId> = 绕过拦截真删（清理用）
