@@ -13,10 +13,9 @@ import java.util.LinkedHashSet
  * 所以本类只做「拿到原始串之后」的判定，取数部分见 `probe/LabelHuntProbe.kt`
  * 与 `docs/标签数据源取证方案.md`。
  *
- * ## ⚠️ 分隔符是候选集，不是结论
- * [SEPARATORS] 里每个字符都会当分隔符。真机抓到真实值后要在这里收敛成单一常量，
- * 并给 [splitIds] 补一条对应单测（[SEPARATORS] 放宽的代价是把「含空格的 id」
- * 误切成两个，取证后可收窄）。
+ * ## ⚠️ 分隔符待真机确认，当前为兼容解析
+ * [SEPARATORS] 里每个字符都会当分隔符。主代理下一轮会从 `rcontact.contactLabelIds`
+ * 取真实原始串；确认后再收敛候选集，避免长期把合法 id 中的字符误当分隔符。
  *
  * ## 三态必须分开（这是最容易写错的地方）
  * 「id 不在表里」和「id 在表里但名字是空串」是两件事：
@@ -27,10 +26,10 @@ import java.util.LinkedHashSet
 object LabelLogic {
 
     /**
-     * 候选分隔符。**待取证**：真实值出来后收敛。
-     * 空格/制表/换行也列进来，是为了兜住「微信把整串前后包了空白」的情况。
+     * 候选分隔符。**待真机确认，当前为兼容解析**。
+     * 除常见半角符号外兼容中文顿号、全角逗号与空白。
      */
-    private const val SEPARATORS = ",;| \t\r\n"
+    private const val SEPARATORS = ",，;|、 \t\r\n"
 
     /**
      * 把原始 id 串切成 id 列表。
@@ -94,6 +93,17 @@ object LabelLogic {
             if (src.isEmpty()) return
             synchronized(map) { map.putAll(src) }
         }
+
+        /** 用一次临界区原子替换整份索引，加载失败时旧快照不受影响。 */
+        fun replaceAll(src: Map<String, String?>) {
+            synchronized(map) {
+                map.clear()
+                map.putAll(src)
+            }
+        }
+
+        /** 诊断 / UI 使用的稳定快照；调用方拿不到内部可变 map。 */
+        fun snapshot(): Map<String, String?> = synchronized(map) { HashMap(map) }
 
         /** 这个 id 是否在索引里（**不关心**名字是否为空） */
         fun has(id: String): Boolean = synchronized(map) { map.containsKey(id) }

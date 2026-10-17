@@ -216,17 +216,21 @@ object EntryReceiver {
                         val t = intent.getStringExtra("table")
                         io { com.lx.wxgroup.probe.SnsHuntProbe.command(sub, sec, t) }
                     }
-                    // K3「按微信标签选人」的数据源取证（**待取证**，探针本身不含任何硬编表名）
-                    // --es sub on|off|stat|dbs|tables [--ei sec 60]
-                    // --es sub info|rows --es table <表名> [--ei n 5]
-                    // --es sub sql  --es sql "select ... from rcontact limit 5"
+                    // K3 微信标签数据源：names=全部映射；of=联系人标签+原始 id 串；stat=缓存状态
+                    // --es sub of --es user <wxid>
+                    // 版本漂移诊断仍保留 info|rows|sql 等只读命令
                     "label" -> {
                         val sub = intent.getStringExtra("sub") ?: "stat"
                         val sec = intent.getIntExtra("sec", 60)
                         val t = intent.getStringExtra("table")
                         val s = intent.getStringExtra("sql")
                         val n = intent.getIntExtra("n", 5)
-                        io { com.lx.wxgroup.probe.LabelHuntProbe.command(sub, sec, t, s, n) }
+                        val user = intent.getStringExtra("user")
+                        io {
+                            com.lx.wxgroup.probe.LabelHuntProbe.command(
+                                sub, sec, t, s, n, user
+                            )
+                        }
                     }
                     // 朋友圈动态防删除（SnsGuard）
                     // --es sub ls = 归档清单；stat = 状态；dump = 微信库里还有几条

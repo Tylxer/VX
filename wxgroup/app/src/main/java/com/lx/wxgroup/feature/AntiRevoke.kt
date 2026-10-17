@@ -339,7 +339,11 @@ object AntiRevoke {
         if (table != TABLE_MESSAGE && table != TABLE_CONV) return
         val values = a.getOrNull(1) as? ContentValues ?: return
         // 记下「消息库」：后面的插入 / 伪装都要写到这个库上，用错库会 no such table
-        if (table == TABLE_MESSAGE && msgDb !== param.thisObject) msgDb = param.thisObject
+        if (table == TABLE_MESSAGE && msgDb !== param.thisObject) {
+            msgDb = param.thisObject
+            // ContactLabel / rcontact 与 message 同库；首次拿到常驻句柄即后台预热标签索引。
+            LabelSource.warmUp()
+        }
 
         // 采样：证明钩子真的被调用了（节流到 5 秒一条）。
         // 撤回没拦住时，这条是区分「钩子没跑」和「跑了但自己 return 了」的关键。
@@ -638,7 +642,10 @@ object AntiRevoke {
     internal fun needsMsgDb(): Boolean = msgDb == null
 
     internal fun noteMsgDb(db: Any) {
-        if (msgDb !== db) msgDb = db
+        if (msgDb !== db) {
+            msgDb = db
+            LabelSource.warmUp()
+        }
     }
 
     @Volatile

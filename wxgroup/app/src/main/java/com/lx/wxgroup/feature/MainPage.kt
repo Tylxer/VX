@@ -80,8 +80,9 @@ object MainPage : PanelPage {
     /**
      * 所有 `ENTER` 类配置项（名单、群发目标）的点击入口 —— 都推同一个 [PickerPage]。
      *
-     * 群发目标是「混合选」：模块分组 + 好友各一段；其余名单只有好友一段。
-     * 微信标签段等锚点定位后再补（旧项目确认 `field_contactLabelIds` 只读，得另找数据源）。
+     * 群发目标与转发目标是「混合选」：模块分组 + 微信标签 + 好友；其余名单只有好友一段。
+     * 微信标签段来自 [LabelSource]（`ContactLabel` + `rcontact` 两份只读缓存），
+     * [LabelSource.ready] 为 false 时不显示该段（宁可少一段，不显示空段）。
      */
     private fun onEnterSpec(spec: PrefSpec): Boolean {
         val db = GroupDb.current()
@@ -102,6 +103,7 @@ object MainPage : PanelPage {
                 )
             }
             if (groups.isNotEmpty()) sections.add(PickerPage.Section("我的分组", groups))
+            labelSection()?.let { sections.add(it) }
         }
         if (friends.isNotEmpty()) {
             sections.add(
@@ -121,13 +123,32 @@ object MainPage : PanelPage {
                 title = spec.title,
                 sections = sections,
                 initial = Kv.getList(spec.key),
-                hint = if (mixed) "分组与好友可混选，发送时会展开成具体的人并去重" else null,
+                hint = if (mixed) "分组、微信标签与好友可混选，发送时会展开成具体的人并去重" else null,
             ) { ids ->
                 Kv.putList(spec.key, ids)
                 LogX.i("PREF ${spec.key} = ${ids.size} 项")
             }
         )
         return true
+    }
+
+    /**
+     * 微信标签段：id 带 `t:` 前缀（与 wxid / 分组 id 区分），展示标签名 + 人数。
+     *
+     * 为空（无标签或缓存还没灌进来）时返回 null，调用方据此不显示段。
+     */
+    private fun labelSection(): PickerPage.Section? {
+        if (!LabelSource.ready()) return null
+        val items = LabelSource.allLabels()
+            .filter { !it.name.isNullOrBlank() }
+            .map {
+                PickerPage.Item(
+                    id = "${ForwardLogic.PREFIX_LABEL}${it.id}",
+                    title = it.name!!,
+                    subtitle = "微信标签 · ${it.memberCount} 人",
+                )
+            }
+        return if (items.isEmpty()) null else PickerPage.Section("微信标签", items)
     }
 
     // ------------------------------------------------------------ 各二级页

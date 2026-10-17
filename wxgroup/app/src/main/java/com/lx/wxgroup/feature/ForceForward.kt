@@ -493,9 +493,10 @@ object ForceForward {
     /**
      * K3 选择器（[PickerPage]）选转发目标。
      *
-     * 需求 6.6 要三个 Tab（好友·群聊 / 模块分组 / 微信标签）。**微信标签 Tab 未实现**：
-     * 标签 id→名、标签→成员两个锚点都没有（G5），`t:` 前缀展开暂不可用 —— 宁可少一段，
-     * 不猜数据源。分组段 id 带 `g:` 前缀，发送前由 [ForwardLogic.resolveTargets] 展开。
+     * 需求 6.6 要三个 Tab（好友·群聊 / 模块分组 / 微信标签）。微信标签段取自
+     * [LabelSource]（`ContactLabel` + `rcontact` 两份只读缓存）：段内 id 带 `t:` 前缀，
+     * 发送前由 [ForwardLogic.resolveTargets] 展开成人。
+     * [LabelSource.ready] 为 false（缓存还没灌进来）时不显示该段。
      */
     private fun openTargetPicker(snap: ForwardLogic.Snapshot) {
         val ctx = HostContext.activity() ?: HostContext.app()
@@ -533,6 +534,18 @@ object ForceForward {
                 )
             )
         }
+        if (LabelSource.ready()) {
+            val labels = LabelSource.allLabels()
+                .filter { !it.name.isNullOrBlank() }
+                .map {
+                    PickerPage.Item(
+                        id = "${ForwardLogic.PREFIX_LABEL}${it.id}",
+                        title = it.name!!,
+                        subtitle = "微信标签 · ${it.memberCount} 人",
+                    )
+                }
+            if (labels.isNotEmpty()) sections.add(PickerPage.Section("微信标签", labels))
+        }
         if (sections.isEmpty()) {
             UiKit.toast(ctx, "好友缓存为空，先去通讯录滚一遍再回来")
             LogX.w("FF picker: no sections (friends=${friends.size} groups=${groups.size})")
@@ -544,7 +557,7 @@ object ForceForward {
                 title = "转发到多个",
                 sections = sections,
                 multi = true,
-                hint = "分组与好友可混选，发送前会展开成具体的人并去重；当前会话自动排除",
+                hint = "分组、微信标签与好友可混选，发送前会展开成具体的人并去重；当前会话自动排除",
             ) { ids -> execute(snap, ids) }
         )
     }
@@ -649,15 +662,19 @@ object ForceForward {
 
     // ------------------------------------------------------------ 数据
 
-    /** 分组 id → 成员 wxid。标签表（`t:`）留空：数据源未取证（G5） */
+    /** 分组 id → 成员 wxid；标签 id → 成员 wxid（来自 [LabelSource] 的只读缓存） */
     private fun buildBuckets(db: GroupDb?): ForwardLogic.Buckets {
-        if (db == null) return ForwardLogic.Buckets()
         val groups = HashMap<String, List<String>>()
-        for (g in runCatching { db.listGroups() }.getOrDefault(emptyList())) {
-            val members = runCatching { db.memberWxids(g.id) }.getOrDefault(emptySet())
-            if (members.isNotEmpty()) groups[g.id.toString()] = members.toList()
+        if (db != null) {
+            for (g in runCatching { db.listGroups() }.getOrDefault(emptyList())) {
+                val members = runCatching { db.memberWxids(g.id) }.getOrDefault(emptySet())
+                if (members.isNotEmpty()) groups[g.id.toString()] = members.toList()
+            }
         }
-        return ForwardLogic.Buckets(groups = groups, labels = emptyMap())
+        return ForwardLogic.Buckets(
+            groups = groups,
+            labels = runCatching { LabelSource.membersByLabelId() }.getOrDefault(emptyMap()),
+        )
     }
 
     // ------------------------------------------------------------ 探针 / 自检
