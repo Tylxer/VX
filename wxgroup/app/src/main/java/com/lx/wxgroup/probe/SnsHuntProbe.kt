@@ -179,6 +179,10 @@ object SnsHuntProbe {
             // 打含 sns 的表的列结构与样本行 —— 回答「字段叫什么」
             // --es table SnsInfo 只打指定表（表太多时按字母序会漏掉最关键的 SnsInfo）
             "sample" -> dumpSample(table)
+            // 「snsId 有没有唯一约束」—— restore 上真机的硬门禁（pk=0 不等于没有唯一约束）
+            "index" -> dumpIndexes(table)
+            // 建表/建索引原始 DDL，人眼最不容易误读
+            "ddl" -> dumpDdl(table)
             else -> own("SNS unknown sub=$sub")
         }
     }
@@ -354,6 +358,79 @@ object SnsHuntProbe {
                 for (r in one) own("SNS   row ${r.take(600)}")
             }
         }
+    }
+
+    /**
+     * 「snsId 到底有没有唯一约束」—— restore 能不能上真机的**硬门禁**。
+     *
+     * ⚠️ 为什么 `sample` 不够：`pragma table_info` 的 `pk` 列**只反映 PRIMARY KEY 声明**，
+     * 看不见 `CREATE UNIQUE INDEX`。真机实测 SnsInfo 18 列**全 pk=0**，但那不代表没有唯一约束
+     * —— SQLite 的唯一约束常靠独立索引实现。所以必须查 index_list + index_info 才能定案。
+     *
+     * 判定：存在覆盖 snsId 的 unique 索引 → `CONFLICT_IGNORE` 有效（撞唯一约束就退）；
+     * 都没有 → IGNORE 形同虚设，restore 可能在已有行旁再插一条一样的，**整条路别上真机**。
+     */
+    private fun dumpIndexes(only: String?) {
+        val t = safeIdent(only) ?: "SnsInfo"
+        val snapshot = synchronized(dbs) { dbs.toList() }
+        for (db in snapshot) {
+            if (!isOpen(db)) continue
+            val list = runCatching { rows(db, "pragma index_list($t)") }.getOrDefault(emptyList())
+            if (list.isEmpty()) continue // 这个库里没有这张表
+            val p = pathOf(db)
+            own("SNS index_list $t db=$p n=" + list.size + " (unique=1 才是唯一索引)")
+            for (r in list) own("SNS   idx ${r.take(200)}")
+            // 每个索引覆盖哪些列 —— 唯一索引若不覆盖 snsId，对 INSERT 去重没有帮助
+            for (name in columnNamed(db, "pragma index_list($t)", "name")) {
+                val safe = safeIdent(name) ?: continue
+                val info = runCatching { rows(db, "pragma index_info($safe)") }.getOrDefault(emptyList())
+                if (info.isEmpty()) continue
+                val cols = columnNamed(db, "pragma index_info($safe)", "name").joinToString(",")
+                own("SNS   info $safe cols=$cols")
+                for (r in info) own("SNS     ${r.take(160)}")
+            }
+        }
+    }
+
+    /**
+     * 建表 / 建索引的原始 DDL —— 人眼最不容易误读的证据（有没有 PRIMARY KEY、UNIQUE 一眼可见）。
+     * `select type, name, sql from sqlite_master where tbl_name=?`
+     */
+    private fun dumpDdl(only: String?) {
+        val t = safeIdent(only) ?: "SnsInfo"
+        val snapshot = synchronized(dbs) { dbs.toList() }
+        for (db in snapshot) {
+            if (!isOpen(db)) continue
+            val r = runCatching {
+                rows(db, "select type, name, sql from sqlite_master where tbl_name='$t'")
+            }.getOrDefault(emptyList())
+            if (r.isEmpty()) continue
+            own("SNS ddl $t db=${pathOf(db)} n=" + r.size)
+            for (line in r) own("SNS   ddl ${line.take(700)}")
+        }
+    }
+
+    /** 取结果集里指定列的一列值（index_list 的 name / unique，index_info 的 name 等） */
+    private fun columnNamed(db: Any, sql: String, col: String): List<String> {
+        val cur = raw(db, sql) ?: return emptyList()
+        return runCatching {
+            val i = XposedHelpers.callMethod(cur, "getColumnIndex", col) as? Int ?: -1
+            val out = mutableListOf<String>()
+            if (i >= 0) {
+                while (XposedHelpers.callMethod(cur, "moveToNext") as? Boolean == true) {
+                    out.add(XposedHelpers.callMethod(cur, "getString", i) as? String ?: "")
+                }
+            }
+            out
+        }.also { close(cur) }.getOrDefault(emptyList())
+    }
+
+    /** 表名/索引名来自广播参数，拼进 SQL 前先卡白名单，别把 SQL 拼坏 */
+    private fun safeIdent(s: String?): String? {
+        val t = s?.trim() ?: return null
+        if (t.isEmpty() || t.length > 64) return null
+        if (!t.all { it.isLetterOrDigit() || it == '_' }) return null
+        return t
     }
 
     /** 单行单列查询 */
