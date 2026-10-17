@@ -55,6 +55,43 @@ class LabelLogicTest {
         assertEquals(listOf("7", "3", "9"), LabelLogic.splitIds("7,3,7,9,3"))
     }
 
+    /**
+     * 制表与换行也是分隔符（SEPARATORS 里列了，但一直没人测）。
+     * 微信把整串按行写、或用 `\t` 分隔都是可能的，漏了这两个就会把整串当成一个 id。
+     */
+    @Test
+    fun tabAndNewlineAlsoSplit() {
+        assertEquals(listOf("1", "2", "3"), LabelLogic.splitIds("1\t2\t3"))
+        assertEquals(listOf("1", "2"), LabelLogic.splitIds("1\r\n2"))
+        assertEquals(listOf("1", "2"), LabelLogic.splitIds("1\n2\r"))
+        // 混排：逗号 + 换行 + 制表一起出现
+        assertEquals(listOf("1", "2", "3"), LabelLogic.splitIds("1,\t2\n3"))
+        // 前后包换行（微信把整串包了空白的情况）
+        assertEquals(listOf("12"), LabelLogic.splitIds("\n 12 \t"))
+    }
+
+    /**
+     * 超长串（200+ id）不炸且结果正确：一次通讯录同步可能灌进几百个 id，
+     * 顺带确认去重后条数对得上、顺序还是首次出现的顺序。
+     */
+    @Test
+    fun longStringHoldsUp() {
+        val raw = (1..250).joinToString(",") { it.toString() }
+        val ids = LabelLogic.splitIds(raw)
+        assertEquals(250, ids.size)
+        assertEquals("1", ids.first())
+        assertEquals("250", ids.last())
+
+        // 250 个后面再重复一遍 → 去重后仍是 250，且顺序不变
+        val dup = LabelLogic.splitIds("$raw,$raw")
+        assertEquals(250, dup.size)
+        assertEquals("1", dup.first())
+        assertEquals("250", dup.last())
+
+        // 前后各塞一串空段也不该影响
+        assertEquals(250, LabelLogic.splitIds(",,,$raw,,,").size)
+    }
+
     // ---------------------------------------------------------------- 形状检查
 
     @Test

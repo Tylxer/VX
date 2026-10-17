@@ -32,6 +32,7 @@ import java.util.WeakHashMap
  * adb shell ... --es op label --es sub info  --es table <表名>   # 列名（pragma table_info）
  * adb shell ... --es op label --es sub rows  --es table <表名> [--ei n 5]  # 样本行
  * adb shell ... --es op label --es sub sql   --es sql "select contactLabelIds from rcontact limit 5"
+ *     # 只放行 select / explain / 只读 pragma，见 isReadOnly
  * adb shell ... --es op label --es sub off                       # 取完务必关掉（钩子在热路径上）
  * ```
  * 日志前缀 `LABEL`。
@@ -124,7 +125,7 @@ object LabelHuntProbe {
 
             /**
              * 任意只读 SQL。取证后期不想为了一条查询再打一次包时用。
-             * ⚠️ 只放行 select / pragma —— 探针绝不写微信的库。
+             * ⚠️ 只放行 select / explain / 只读 pragma（判据见 [isReadOnly]）—— 探针绝不写微信的库。
              */
             "sql" -> runSql(sql)
 
@@ -248,16 +249,61 @@ object LabelHuntProbe {
         for (r in out) own("$TAG   row $r")
     }
 
+    /**
+     * **只读 pragma 动词白名单**。
+     *
+     * ⚠️ `pragma` 不等于只读 —— 这些动词会改微信的库文件或文件头，
+     * 一律**不进**白名单（连读的形式也不放行，少一层判断就少一个出错的地方）：
+     * `user_version`（改文件头，可能触发微信自己的迁移/降级，最危险）、
+     * `journal_mode`（持久化进文件头）、`optimize`（写 `sqlite_stat1`，没有还会建表）、
+     * `incremental_vacuum`、`wal_checkpoint`、`writable_schema`、`application_id`、
+     * `schema_version`、`auto_vacuum`、`foreign_keys`。
+     *
+     * 白名单里剩下的这些**即使被人写成赋值形式也改不动库**，配合
+     * [isReadOnly] 里的 `=` 检查构成两层防线。
+     */
+    private val READ_ONLY_PRAGMAS = setOf(
+        "table_info", "table_list",
+        "index_list", "index_info", "index_xinfo",
+        "foreign_key_list", "foreign_key_check",
+        "integrity_check", "quick_check",
+        "database_list", "collation_list", "function_list", "compile_options",
+        "page_count", "page_size", "freelist_count", "encoding",
+    )
+
+    /**
+     * 这条 SQL 是不是只读的（`sub=sql` 的唯一关卡）。
+     *
+     * 三个放行口，各自都有理由：
+     * - `select` / `explain`：`explain` 只编译出字节码并列出，**不执行**；
+     *   两个都挡掉 `load_extension`（SQLite 的加载原生代码，命中就是在微信进程里执行任意 so）。
+     * - `pragma`：**只看动词**，动词不在 [READ_ONLY_PRAGMAS] 里就拒；
+     *   动词对了还要再查一次后面有没有 `=` —— `page_size=4096` 这种赋值形式照样是写。
+     *
+     * 多语句**不用担心**：`rawQuery` 内部是 `sqlite3_prepare_v2`，只编译第一条语句，
+     * 分号后面的字节根本不会被 prepare，所以 `select 1; delete from x` 只会跑 `select 1`。
+     */
+    private fun isReadOnly(sql: String): Boolean {
+        val l = sql.lowercase()
+        if (l.startsWith("select") || l.startsWith("explain")) {
+            return !l.contains("load_extension")
+        }
+        if (!l.startsWith("pragma")) return false
+        val rest = l.removePrefix("pragma").trimStart()
+        val verb = rest.takeWhile { it.isLetter() || it == '_' }
+        if (verb !in READ_ONLY_PRAGMAS) return false
+        return !rest.contains("=")
+    }
+
     private fun runSql(sql: String?) {
         val s = sql?.trim()
         if (s.isNullOrEmpty()) {
             own("$TAG sql: --es sql 不能为空")
             return
         }
-        val l = s.lowercase()
         // ⚠️ 探针只做只读：写微信的库是不可逆的
-        if (!l.startsWith("select") && !l.startsWith("pragma") && !l.startsWith("explain")) {
-            own("$TAG sql refused: 只放行 select / pragma / explain")
+        if (!isReadOnly(s)) {
+            own("$TAG sql refused: 只放行 select / explain / 只读 pragma（如 pragma table_info(表名)）")
             return
         }
         val snapshot = allDbs()

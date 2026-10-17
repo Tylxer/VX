@@ -37,7 +37,13 @@ object LabelLogic {
      *
      * - null / 全空白 → 空列表（不是 listOf("")：空串不是有效 id）
      * - 重复 id 去重，**保持首次出现顺序**（UI 上的标签顺序要稳定）
-     * - 每段 trim：微信很可能写 `1, 2,3`
+     * - 每一段遇到 [SEPARATORS] 里的字符就截断
+     *
+     * ⚠️ 关于 `1, 2,3` 那种「逗号后面带空格」：那**不是**靠下面 [add] 里的 `trim()`
+     * 处理的 —— 空格本身就是 [SEPARATORS] 之一，遇到它就 flush 了，
+     * 所以 [cur] 里永远进不来任何空白字符，`trim()` 实际上一次都不会生效。
+     * 留着它只是当 [SEPARATORS] 将来收窄（比如收敛成只有 `,`）时的兜底，
+     * 别把功劳记在它头上。
      */
     fun splitIds(raw: String?): List<String> {
         if (raw.isNullOrBlank()) return emptyList()
@@ -54,6 +60,13 @@ object LabelLogic {
         return out.toList()
     }
 
+    /**
+     * 把累积的 [cur] 收进结果集并清空。
+     *
+     * ⚠️ 这里的 `trim()` 目前是**兜底而非主力**：[SEPARATORS] 已含全部空白字符，
+     * 空白根本进不了 [cur]。它只在 [SEPARATORS] 将来收窄（收敛成单个真实分隔符）
+     * 之后才有意义 —— 到那时 `1, 2,3` 里的空格才需要靠它去掉。
+     */
     private fun add(cur: StringBuilder, out: LinkedHashSet<String>) {
         if (cur.isEmpty()) return
         val s = cur.toString().trim()
