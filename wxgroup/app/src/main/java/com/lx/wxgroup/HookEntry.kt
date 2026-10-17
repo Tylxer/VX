@@ -207,10 +207,18 @@ class HookEntry : IXposedHookLoadPackage {
         }.onFailure { LogX.e("SnsTag install failed", it) }
 
         // ---- K9：通知静音过滤器（防止被@ + 免打扰时段 + 微信来电放行）----
-        // 只在主进程装：实测通知就是主进程发的，:push 进程连一条 notify 都没有。
-        runCatching {
-            NotifyMute.install(lpparam)
-        }.onFailure { LogX.e("NotifyMute install failed", it) }
+        // ⚠️ 2026-10-17 停用：静音域已统一到 QuietNotificationBridge（MuteAt /
+        // DndWindow / AutoDndGroup 共用一条通知改写通道），判据在 MuteAtLogic /
+        // QuietLogic（有 JVM 单测覆盖）。K9 与新链路挂**同三个锚点**且判据分叉
+        // （K9 的 isNameChar 把 CJK 当名字字符 → `@老王在吗` 判不出；`@all` 无边界
+        // 检查 → `@allow 请查看` 被误判为 @all 静音），双轨并存会让真机结果不可归因。
+        // 来电放行新链路也有（DndWindow.isIncomingCall + callsPassed），不会丢功能。
+        //
+        // 类与其取证注释全部保留（VOIP 通知特征等结论在 core/NotifyMute.kt），
+        // 要回退就把下面两行注回来。
+        // runCatching {
+        //     NotifyMute.install(lpparam)
+        // }.onFailure { LogX.e("NotifyMute install failed", it) }
 
         // ---- 6.1 聊天：关闭拍一拍 ----
         runCatching {

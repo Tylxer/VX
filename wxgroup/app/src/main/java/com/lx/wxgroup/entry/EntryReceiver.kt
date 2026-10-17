@@ -322,12 +322,14 @@ object EntryReceiver {
                     "quiet" -> {
                         val sub = intent.getStringExtra("sub") ?: "stat"
                         when (sub) {
-                            "pat" -> LogX.i("QUIET " + com.lx.wxgroup.feature.PatBlock.probe(sub))
+                            // ⚠️ probe() 收的是**功能自己的 sub**（status/dbltap/...），
+                            // 不是本分支名 —— 传分支名会落到各自的 else 只打印用法串
+                            "pat" -> LogX.i("QUIET " + com.lx.wxgroup.feature.PatBlock.probe("status"))
                             // sub=at 直接看「防止被@」总状态；scope/aliases/map/extras
                             // 细项走下面的 else 分支（会同时打四项探针）
                             "at" -> LogX.i("QUIET " + com.lx.wxgroup.feature.MuteAt.probe("status"))
-                            "dnd" -> LogX.i("QUIET " + com.lx.wxgroup.feature.DndWindow.probe(sub))
-                            "grp" -> LogX.i("QUIET " + com.lx.wxgroup.feature.AutoDndGroup.probe(sub))
+                            "dnd" -> LogX.i("QUIET " + com.lx.wxgroup.feature.DndWindow.probe("status"))
+                            "grp" -> LogX.i("QUIET " + com.lx.wxgroup.feature.AutoDndGroup.probe("status"))
                             else -> {
                                 LogX.i("QUIET " + com.lx.wxgroup.feature.PatBlock.probe(sub))
                                 LogX.i("QUIET " + com.lx.wxgroup.feature.MuteAt.probe(sub))

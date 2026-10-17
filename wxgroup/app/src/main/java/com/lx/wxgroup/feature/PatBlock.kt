@@ -23,11 +23,15 @@ import java.lang.reflect.Method
  *
  * 取证入口（零猜测锚点，随时可跑）：
  * ```
- * adb shell am broadcast -a com.lx.wxgroup.action.QUIET -p com.tencent.mm \
- *   --es op pat --es sub dbltap      # 开启：hook SDK 公开的 onDoubleTap 打栈
+ * adb shell am broadcast -a com.lx.wxgroup.action.PROBE -p com.tencent.mm \
+ *   --es op quiet --es sub dbltap    # 开启：hook SDK 公开的 onDoubleTap 打栈
  * # 去聊天页双击一次对方头像，然后：
  * python tools/dev.py q 'PATDBG'     # 看栈里的微信真实类名/方法名
- * adb shell am broadcast ... --es sub dbltapoff   # 关闭
+ * adb shell am broadcast -a com.lx.wxgroup.action.PROBE -p com.tencent.mm \
+ *   --es op quiet --es sub dbltapoff # 关闭
+ *
+ * ⚠️ action 是 PROBE（不是 QUIET，模块没有这个 action，照旧注释敲会静默无输出）；
+ * 入口统一走 `op=quiet`，dbltap/dbltapoff/anchor/status 都是它的 sub。
  * ```
  * 拿到真实类名/方法名后回填下面三个常量即可生效。
  */

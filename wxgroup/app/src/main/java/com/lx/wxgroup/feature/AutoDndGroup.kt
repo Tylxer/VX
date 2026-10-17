@@ -128,6 +128,14 @@ object AutoDndGroup {
             val username = ConvReader.username(item)
             if (QuietLogic.isGroupTalker(username)) found.add(username)
         }
+        // ⚠️ 快照不完整比没有快照更危险：一旦 baselineReady=true，所有不在快照里的
+        // 老群都会被 classifyGroup 判成 NEW → 第一条通知就把老群静音并写进台账
+        // （重启后仍静音，用户侧不可逆）。所以「一个群都没枚举到」时**不置就绪**，
+        // 让 classifyGroup 继续按「存量群」处理（宁漏设也不错设老群）。
+        if (count == 0 || found.isEmpty()) {
+            LogX.i("QUIET ADND baseline NOT ready (count=$count groups=${found.size}) — 保持存量假设")
+            return
+        }
         synchronized(baseline) {
             if (baselineReady) return
             baseline.addAll(found)
