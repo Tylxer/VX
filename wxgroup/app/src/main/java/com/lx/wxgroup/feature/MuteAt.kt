@@ -15,6 +15,7 @@ import de.robv.android.xposed.XposedHelpers
 import de.robv.android.xposed.callbacks.XC_LoadPackage
 import java.util.Collections
 import java.util.HashMap
+import java.util.concurrent.CopyOnWriteArrayList
 import java.util.concurrent.atomic.AtomicLong
 
 /**
@@ -137,6 +138,17 @@ internal object QuietNotificationBridge {
     @Volatile
     private var lastDump = ""
 
+    /**
+     * 新加群自动免打扰（AutoDndGroup）置过静音的群。
+     *
+     * 与 DND 时段共用同一条通知改写通道（锚点见类注释），只是判定条件不同：
+     * 这里是「这个群被登记过」而不是「当前在时段内」。
+     */
+    private val autoDndTalkers: MutableSet<String> = Collections.synchronizedSet(LinkedHashSet())
+
+    /** talker 观察者：每条通知构造时回调（AutoDndGroup 靠它发现新群聊会话）。 */
+    private val talkerObservers: MutableList<(String) -> Unit> = CopyOnWriteArrayList()
+
     fun install(lpparam: XC_LoadPackage.LoadPackageParam): Boolean {
         if (installed) return true
         synchronized(installLock) {
@@ -164,6 +176,26 @@ internal object QuietNotificationBridge {
 
     fun enableDnd() {
         dndEnabled = true
+    }
+
+    /** 登记「这个群要走自动免打扰静音」（AutoDndGroup 判定为新群后调用）。 */
+    fun markAutoDndTalker(talker: String) {
+        if (talker.isNotBlank()) autoDndTalkers.add(talker)
+    }
+
+    fun isAutoDndTalker(talker: String?): Boolean =
+        !talker.isNullOrBlank() && autoDndTalkers.contains(talker)
+
+    /** 注册 talker 观察者（只回调非空 talker；用于被动发现群聊会话）。 */
+    fun addTalkerObserver(observer: (String) -> Unit) {
+        talkerObservers.add(observer)
+    }
+
+    private fun fireTalkerObservers(talker: String) {
+        if (talker.isBlank()) return
+        for (observer in talkerObservers) {
+            runCatching { observer(talker) }
+        }
     }
 
     private fun installItemHook(lpparam: XC_LoadPackage.LoadPackageParam): Boolean {
@@ -244,6 +276,10 @@ internal object QuietNotificationBridge {
         }
 
         val talker = talkerOf(id)
+        if (Kv.getBool(Keys.CHAT_AUTO_DND_NEW_GROUP) && isAutoDndTalker(talker)) {
+            mute(notification, id, "GRP", talker)
+            return
+        }
         if (muteAtEnabled && MuteAt.shouldMute(notification, talker)) {
             mute(notification, id, "AT", talker)
         }
@@ -369,6 +405,9 @@ internal object QuietNotificationBridge {
             }
             talkerById[item.id] = item.talker
         }
+        // 被动观察：每个新通知都过一遍（talker 解析失败就跳过，AutoDndGroup 侧幂等去重）
+        val talker = item.talker
+        if (!talker.isNullOrBlank()) fireTalkerObservers(talker)
     }
 
     private fun talkerOf(id: Int): String? = synchronized(talkerById) {
@@ -387,7 +426,7 @@ internal object QuietNotificationBridge {
     }
 
     fun status(): String =
-        "installed=$installed item=$itemHooked at=$muteAtEnabled dnd=$dndEnabled muted=${muted.get()}"
+        "installed=$installed item=$itemHooked at=$muteAtEnabled dnd=$dndEnabled muted=${muted.get()} autoDnd=${autoDndTalkers.size}"
 
     fun mapStatus(): String = synchronized(talkerById) {
         "tracked=${talkerById.size} known=${talkerById.values.count { it != null }}"
