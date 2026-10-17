@@ -38,7 +38,9 @@ class GroupManagerPage : PanelPage {
         val root = LinearLayout(ctx).apply { orientation = LinearLayout.VERTICAL }
         root.addView(Rows.note(ctx, "点击管理成员 · ▲▼ 调整顺序 · 长按重命名或删除"))
 
-        val list = UiKit.listView(ctx, 0.40f).apply { this.adapter = adapter }
+        // ⚠️ 同 PickerPage：apply 块内 this.adapter 赋值不可靠，显式落到局部变量再设
+        val list = UiKit.listView(ctx, 0.40f)
+        list.adapter = adapter
         // ListView 嵌在 Panel 的 ScrollView 里，不拦一下父容器会抢走竖向滑动
         list.setOnTouchListener { v, _ ->
             v.parent?.requestDisallowInterceptTouchEvent(true)

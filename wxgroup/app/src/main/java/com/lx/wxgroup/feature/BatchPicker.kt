@@ -93,7 +93,9 @@ object BatchPicker {
             addView(btnNone, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
         }
 
-        val list = UiKit.listView(ctx, 0.5f).apply { this.adapter = adapter }
+        // ⚠️ 同 PickerPage：apply 块内 this.adapter 赋值不可靠，显式落到局部变量再设
+        val list = UiKit.listView(ctx, 0.5f)
+        list.adapter = adapter
 
         val root = LinearLayout(ctx).apply {
             orientation = LinearLayout.VERTICAL

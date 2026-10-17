@@ -113,15 +113,15 @@ object GroupDetailPage {
 
         // ---- 成员列表 ----
         val adapter = MemberAdapter(ctx, all)
-        val list = ListView(ctx).apply {
-            this.adapter = adapter
-            dividerHeight = UiKit.dp(ctx, 1)
-            layoutParams = LinearLayout.LayoutParams(
-                ViewGroup.LayoutParams.MATCH_PARENT, 0, 1f
-            )
-            // 行内控件会抢焦点，必须让 ListView 自己接管
-            isFocusable = true
-        }
+        // ⚠️ 同 PickerPage：apply 块内 this.adapter 赋值不可靠，显式落到局部变量再设
+        val list = ListView(ctx)
+        list.adapter = adapter
+        list.dividerHeight = UiKit.dp(ctx, 1)
+        list.layoutParams = LinearLayout.LayoutParams(
+            ViewGroup.LayoutParams.MATCH_PARENT, 0, 1f
+        )
+        // 行内控件会抢焦点，必须让 ListView 自己接管
+        list.isFocusable = true
         root.addView(list)
 
         // ---- 底部 ----

@@ -48,7 +48,9 @@ object MemberPage {
         LogX.i("MEM open group=$groupId(${db.countMembers(groupId)}) name=$groupName")
 
         val adapter = MemberAdapter(ctx, members, db, groupId)
-        val list = UiKit.listView(ctx, 0.45f).apply { this.adapter = adapter }
+        // ⚠️ 同 PickerPage：apply 块内 this.adapter 赋值不可靠，显式落到局部变量再设
+        val list = UiKit.listView(ctx, 0.45f)
+        list.adapter = adapter
 
         val root = LinearLayout(ctx).apply { orientation = LinearLayout.VERTICAL }
         root.addView(UiKit.label(ctx, "点击某一行 = 把该好友移出本组", 12f, gray = true))

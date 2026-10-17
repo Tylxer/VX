@@ -74,7 +74,11 @@ class PickerPage(
         root.addView(search)
 
         adapter = Adapter(ctx, sections, selected)
-        val list = UiKit.listView(ctx, 0.42f).apply { this.adapter = adapter }
+        // ⚠️ 不能用 `.apply { this.adapter = adapter }`：apply 块里 this.adapter 会被解析到
+        // PickerPage 的同名字段上（自赋值），ListView 的 setAdapter 从未被调用——
+        // 真机 2026-10-18 实锤 list.adapter==null、零行渲染。必须先落到局部变量再赋值。
+        val list = UiKit.listView(ctx, 0.42f)
+        list.adapter = adapter
 
         if (multi) {
             root.addView(quickRow(ctx, list))
