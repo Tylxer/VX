@@ -24,14 +24,16 @@ import java.lang.reflect.Method
  * 取证入口（零猜测锚点，随时可跑）：
  * ```
  * adb shell am broadcast -a com.lx.wxgroup.action.PROBE -p com.tencent.mm \
- *   --es op quiet --es sub dbltap    # 开启：hook SDK 公开的 onDoubleTap 打栈
+ *   --es op quiet --es sub pat --es sub2 dbltap    # 开启：hook SDK 公开的 onDoubleTap 打栈
  * # 去聊天页双击一次对方头像，然后：
  * python tools/dev.py q 'PATDBG'     # 看栈里的微信真实类名/方法名
  * adb shell am broadcast -a com.lx.wxgroup.action.PROBE -p com.tencent.mm \
- *   --es op quiet --es sub dbltapoff # 关闭
+ *   --es op quiet --es sub pat --es sub2 dbltapoff # 关闭
  *
  * ⚠️ action 是 PROBE（不是 QUIET，模块没有这个 action，照旧注释敲会静默无输出）；
- * 入口统一走 `op=quiet`，dbltap/dbltapoff/anchor/status 都是它的 sub。
+ * 入口统一走 `op=quiet`：`--es sub pat` 是**路由**（选中本功能），
+ * `--es sub2` 才是本功能的子命令（dbltap/dbltapoff/anchor/status）。
+ * 两个参数不能混 —— 早先只用一个 sub 时，sub2 这些子命令根本传不进来。
  * ```
  * 拿到真实类名/方法名后回填下面三个常量即可生效。
  */
@@ -64,7 +66,7 @@ object PatBlock {
         runCatching {
             hostLoader = lpparam.classLoader
             if (PAT_TRIGGER_CLASS_8048.isBlank() || PAT_TRIGGER_METHOD_8048.isBlank()) {
-                LogX.i("QUIET PAT skipped: 8.0.48 trigger anchor pending evidence (probe: op=pat sub=dbltap)")
+                LogX.i("QUIET PAT skipped: 8.0.48 trigger anchor pending evidence (probe: op=quiet sub=pat sub2=dbltap)")
                 return
             }
             val triggerClass = runCatching {
@@ -128,7 +130,7 @@ object PatBlock {
      * 栈帧里就是微信真实的触发类名/方法名。
      *
      * ⚠️ 这是**取证工具**，不是功能：默认不挂，手动广播开启，限流
-     * [PatLogic.MAX_STACK_DUMPS] 条，用完记得关（`sub=dbltapoff`）。
+     * [PatLogic.MAX_STACK_DUMPS] 条，用完记得关（`sub2=dbltapoff`）。
      */
     private fun setDbltap(on: Boolean): String = runCatching {
         if (on && !dbltapHooked) {
@@ -169,7 +171,7 @@ object PatBlock {
     fun probe(sub: String): String = runCatching {
         when (sub.lowercase()) {
             "status" -> "installed=$installed hooks=$hookedMethods blocked=${blocked.get()} enabled=${Kv.getBool(Keys.CHAT_DISABLE_PAT)} dbltap=$dbltapHooked dumps=${stackDumps.get()}"
-            "anchor" -> "class=${PAT_TRIGGER_CLASS_8048.ifBlank { "待取证" }} method=${PAT_TRIGGER_METHOD_8048.ifBlank { "待取证" }} argc=$PAT_TRIGGER_ARG_COUNT_8048 (evidence: op=pat sub=dbltap)"
+            "anchor" -> "class=${PAT_TRIGGER_CLASS_8048.ifBlank { "待取证" }} method=${PAT_TRIGGER_METHOD_8048.ifBlank { "待取证" }} argc=$PAT_TRIGGER_ARG_COUNT_8048 (evidence: op=quiet sub=pat sub2=dbltap)"
             "dbltap" -> setDbltap(true)
             "dbltapoff" -> setDbltap(false)
             else -> "subs=status,anchor,dbltap,dbltapoff"

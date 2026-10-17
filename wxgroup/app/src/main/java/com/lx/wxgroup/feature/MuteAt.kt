@@ -31,8 +31,11 @@ import java.util.concurrent.atomic.AtomicLong
  * - 名单 / 别名：Kv.getList（JSON 数组）/ Kv.getString（裸文本）。
  *
  * ⚠️ 待取证：允许/排除名单支持「群名」元素，但通知链路目前拿不到群显示名
- * （extras 无 chatroom id），群名元素暂不命中；`op=quiet sub=extras` 可 dump
- * 最近一条通知的全部 extras，供下轮真机定「EXTRA_TITLE 是否即群名」的锚点。
+ * （extras 无 chatroom id），群名元素暂不命中；`op=quiet sub=at sub2=extras` 可
+ * dump 最近一条通知的全部 extras，供下轮真机定「EXTRA_TITLE 是否即群名」的锚点。
+ *
+ * 探针用法（op=quiet：`sub` 选中本功能，`sub2` 是本功能的子命令）：
+ *   sub=at sub2=status | scope | aliases | map | extras
  */
 object MuteAt {
 
@@ -131,7 +134,7 @@ internal object QuietNotificationBridge {
     @Volatile
     private var muteUntilMs = 0L
 
-    /** 最近一条通知的快照（`op=quiet sub=extras` 取证用，不持有 Notification 对象） */
+    /** 最近一条通知的快照（`op=quiet sub=at sub2=extras` 取证用，不持有 Notification 对象） */
     @Volatile
     private var lastDumpId = -1
 
@@ -288,7 +291,7 @@ internal object QuietNotificationBridge {
     /**
      * 记下最近一条通知的可读快照（只取字符串，不持有 Notification 对象）。
      *
-     * 给 `op=quiet sub=extras` 用：下轮真机据此确认「EXTRA_TITLE 是不是群名」——
+     * 给 `op=quiet sub=at sub2=extras` 用：下轮真机据此确认「EXTRA_TITLE 是不是群名」——
      * 这是允许/排除名单「群名」元素接线的唯一待定锚点。
      */
     private fun rememberDump(id: Int, dump: String) {

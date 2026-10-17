@@ -24,7 +24,7 @@ package com.lx.wxgroup.feature
  * （取证结论「通知静音」节：extras 里没有 chatroom id，contentIntent 反射取不到），
  * 拿不到群显示名，所以 [MuteAt] 现在传 groupName=null，群名元素暂时永远不命中。
  * 纯判据先按双格式写好测好；等拿到「talker → 群名」锚点（候选：通知 EXTRA_TITLE
- * 是否即群名，需真机确认，可用 `op=quiet sub=extras` dump 最近一条通知的 extras）
+ * 是否即群名，需真机确认，可用 `op=quiet sub=at sub2=extras` dump 最近一条通知的 extras）
  * 后只需在 hook 侧一行接线。
  *
  * ## 二、优先级（写死，调换顺序 = 改语义）

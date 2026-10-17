@@ -30,7 +30,8 @@ time.sleep(2)
 print("  act:", top())
 
 step("探针：6.1 静音四项")
-bc("--es", "op", "quiet")
+# sub=all（未知 sub 同路）→ 四项探针各打一遍；只查一项时用 sub=at|pat|dnd|grp
+bc("--es", "op", "quiet", "--es", "sub", "all")
 time.sleep(3)
 
 step("探针：评论防撤回 / 评论标签")

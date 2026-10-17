@@ -64,6 +64,10 @@ object DndWindow {
         }.getOrDefault(false)
     }
 
+    /**
+     * 探针用法（入口 `op=quiet`：`sub` 选中本功能，`sub2` 是本功能的子命令）：
+     *   `--es op quiet --es sub dnd --es sub2 status|window|call`
+     */
     fun probe(sub: String): String = runCatching {
         when (sub.lowercase()) {
             "status" -> "registered=$registered enabled=${Kv.getBool(Keys.CHAT_DND_ENABLED)} muted=${muted.get()} callsPassed=${callsPassed.get()}"

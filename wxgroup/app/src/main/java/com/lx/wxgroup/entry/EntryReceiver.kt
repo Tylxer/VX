@@ -318,23 +318,37 @@ object EntryReceiver {
                         }
                     }
                     // ---- 6.1 聊天：拍一拍 / 被@静音 / 免打扰时段 / 新加群自动免打扰 ----
+                    // --es sub at|pat|dnd|grp     路由到哪个功能（默认 at）
+                    //                            给个其它值（如 all）→ 四项各打一遍
+                    // --es sub2 <该功能的子命令>   默认 status
+                    //
+                    // ⚠️ sub 与「功能自己的子命令」是两个参数，不能混：
+                    // 早先只用 sub 时，sub=pat 会走进回退分支、并把 "pat" 当成
+                    // 子命令传给 probe()，结果四项都只打印各自用法串；后来把实参
+                    // 硬编码成 "status"，又让 dbltap / extras / window 这些子命令
+                    // 永远传不进去（拍一拍取证卡死在这里）。现在 sub 只管路由，
+                    // 子命令走独立的 sub2。
+                    //
+                    //   --es op quiet --es sub pat --es sub2 dbltap   # 打开拍一拍取证
+                    //   --es op quiet --es sub pat --es sub2 dbltapoff
+                    //   --es op quiet --es sub dnd --es sub2 window   # 查免打扰时段
+                    //   --es op quiet --es sub at  --es sub2 extras   # 取证通知 extras
+                    //
                     // 这四个都是纯内存状态，主线程直接打没问题
                     "quiet" -> {
-                        val sub = intent.getStringExtra("sub") ?: "stat"
-                        when (sub) {
-                            // ⚠️ probe() 收的是**功能自己的 sub**（status/dbltap/...），
-                            // 不是本分支名 —— 传分支名会落到各自的 else 只打印用法串
-                            "pat" -> LogX.i("QUIET " + com.lx.wxgroup.feature.PatBlock.probe("status"))
-                            // sub=at 直接看「防止被@」总状态；scope/aliases/map/extras
-                            // 细项走下面的 else 分支（会同时打四项探针）
-                            "at" -> LogX.i("QUIET " + com.lx.wxgroup.feature.MuteAt.probe("status"))
-                            "dnd" -> LogX.i("QUIET " + com.lx.wxgroup.feature.DndWindow.probe("status"))
-                            "grp" -> LogX.i("QUIET " + com.lx.wxgroup.feature.AutoDndGroup.probe("status"))
+                        val sub = intent.getStringExtra("sub") ?: "at"
+                        val arg = intent.getStringExtra("sub2") ?: "status"
+                        when (sub.lowercase()) {
+                            "pat" -> LogX.i("QUIET " + com.lx.wxgroup.feature.PatBlock.probe(arg))
+                            "at" -> LogX.i("QUIET " + com.lx.wxgroup.feature.MuteAt.probe(arg))
+                            "dnd" -> LogX.i("QUIET " + com.lx.wxgroup.feature.DndWindow.probe(arg))
+                            "grp" -> LogX.i("QUIET " + com.lx.wxgroup.feature.AutoDndGroup.probe(arg))
+                            // 未知 sub：四项都过一遍（同样用 arg 当子命令）
                             else -> {
-                                LogX.i("QUIET " + com.lx.wxgroup.feature.PatBlock.probe(sub))
-                                LogX.i("QUIET " + com.lx.wxgroup.feature.MuteAt.probe(sub))
-                                LogX.i("QUIET " + com.lx.wxgroup.feature.DndWindow.probe(sub))
-                                LogX.i("QUIET " + com.lx.wxgroup.feature.AutoDndGroup.probe(sub))
+                                LogX.i("QUIET " + com.lx.wxgroup.feature.PatBlock.probe(arg))
+                                LogX.i("QUIET " + com.lx.wxgroup.feature.MuteAt.probe(arg))
+                                LogX.i("QUIET " + com.lx.wxgroup.feature.DndWindow.probe(arg))
+                                LogX.i("QUIET " + com.lx.wxgroup.feature.AutoDndGroup.probe(arg))
                             }
                         }
                     }

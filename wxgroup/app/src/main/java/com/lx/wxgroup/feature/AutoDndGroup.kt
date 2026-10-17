@@ -186,6 +186,10 @@ object AutoDndGroup {
         }.onFailure { LogX.i("QUIET ADND apply failed: ${it.javaClass.simpleName}") }
     }
 
+    /**
+     * 探针用法（入口 `op=quiet`：`sub` 选中本功能，`sub2` 是本功能的子命令）：
+     *   `--es op quiet --es sub grp --es sub2 status|anchor|applied`
+     */
     fun probe(sub: String): String = runCatching {
         when (sub.lowercase()) {
             "status" ->

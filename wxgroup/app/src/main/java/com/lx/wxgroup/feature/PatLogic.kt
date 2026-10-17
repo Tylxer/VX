@@ -16,7 +16,7 @@ package com.lx.wxgroup.feature
  * - hook 主体（拦截双击触发）保持「待取证」，见 PatBlock 顶部常量；
  * - 本文件只交付**不依赖微信私有 API** 的判据：开关语义、系统消息文本形态、
  *   以及真机反射枚举取证时的候选筛选；
- * - 真机取证入口：广播 `op=pat sub=dbltap`（hook Android SDK 公开的
+ * - 真机取证入口：广播 `op=quiet sub=pat sub2=dbltap`（hook Android SDK 公开的
  *   `GestureDetector$OnDoubleTapListener#onDoubleTap`  dump 调用栈，零猜测锚点），
  *   拿到真实类名/方法名后回填 PatBlock 常量即可生效。
  */
@@ -148,7 +148,7 @@ object PatLogic {
     // ------------------------------------------------------------------ 取证探针限流
 
     /**
-     * `op=pat sub=dbltap` 栈 dump 的**条数上限**。
+     * `op=quiet sub=pat sub2=dbltap` 栈 dump 的**条数上限**。
      *
      * 双击一次会触发多次 onDoubleTap 回调（不同 View 的 listener 层层上报），
      * 不限流会把 LogX 环形缓冲冲爆、把真机日志搅乱。50 条足够覆盖一轮双击。
