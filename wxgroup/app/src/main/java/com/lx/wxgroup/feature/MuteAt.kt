@@ -17,7 +17,22 @@ import java.util.Collections
 import java.util.HashMap
 import java.util.concurrent.atomic.AtomicLong
 
-/** 被 @ 时仅切到静音通知通道，消息、@ 标记、通知栏和角标均不改。 */
+/**
+ * 「防止被@」（需求 6.1：chat.mute_at_enabled / _allow / _exclude / chat.at_aliases）。
+ *
+ * 语义：某群消息里 @了我（或 @所有人）→ 把该条通知的 channel 换成预建静音通道，
+ * 消息、@ 标记、通知栏、角标全部原样，只是不响不振。手段（静音通道 + 震动窗口）
+ * 与 hook 点锚点见 core/NotifyMute 类注释和 docs/取证结论.md「通知静音」节。
+ *
+ * 纯判据在 [MuteAtLogic]（零 Android 依赖 + JVM 单测）；本类只负责 hook 侧取值：
+ * - 通知正文：tickerText + EXTRA_TEXT + EXTRA_BIG_TEXT（微信把 @ 渲染进正文）；
+ * - talker：NotificationItem.h，经 [QuietNotificationBridge] 的 id→talker 映射拿；
+ * - 名单 / 别名：Kv.getList（JSON 数组）/ Kv.getString（裸文本）。
+ *
+ * ⚠️ 待取证：允许/排除名单支持「群名」元素，但通知链路目前拿不到群显示名
+ * （extras 无 chatroom id），群名元素暂不命中；`op=quiet sub=extras` 可 dump
+ * 最近一条通知的全部 extras，供下轮真机定「EXTRA_TITLE 是否即群名」的锚点。
+ */
 object MuteAt {
 
     @Volatile
@@ -39,14 +54,16 @@ object MuteAt {
     internal fun shouldMute(notification: Notification, talker: String?): Boolean {
         return runCatching {
             if (!registered || !Kv.getBool(Keys.CHAT_MUTE_AT_ENABLED)) return false
-            if (!QuietLogic.groupInScope(
+            // 群名元素暂不接线（待取证，见类注释）；锚点落地后把 null 换成真实群显示名
+            if (!MuteAtLogic.groupInScope(
                     talker,
+                    null,
                     Kv.getList(Keys.CHAT_MUTE_AT_ALLOW),
                     Kv.getList(Keys.CHAT_MUTE_AT_EXCLUDE),
                 )
             ) return false
             val text = notificationText(notification)
-            if (!QuietLogic.isAtMe(text, QuietLogic.aliases(Kv.getString(Keys.CHAT_AT_ALIASES)))) {
+            if (!MuteAtLogic.isAtMe(text, MuteAtLogic.aliases(Kv.getString(Keys.CHAT_AT_ALIASES)))) {
                 return false
             }
             matched.incrementAndGet()
@@ -65,9 +82,11 @@ object MuteAt {
         when (sub.lowercase()) {
             "status" -> "registered=$registered enabled=${Kv.getBool(Keys.CHAT_MUTE_AT_ENABLED)} matched=${matched.get()} bridge=${QuietNotificationBridge.status()}"
             "scope" -> "allow=${Kv.getList(Keys.CHAT_MUTE_AT_ALLOW)} exclude=${Kv.getList(Keys.CHAT_MUTE_AT_EXCLUDE)}"
-            "aliases" -> "aliases=${QuietLogic.aliases(Kv.getString(Keys.CHAT_AT_ALIASES))}"
+            "aliases" -> "aliases=${MuteAtLogic.aliases(Kv.getString(Keys.CHAT_AT_ALIASES))}"
             "map" -> QuietNotificationBridge.mapStatus()
-            else -> "subs=status,scope,aliases,map"
+            // 取证用：最近一条通知的全部 extras（定「EXTRA_TITLE 是否即群名」锚点）
+            "extras" -> QuietNotificationBridge.lastNotificationDump()
+            else -> "subs=status,scope,aliases,map,extras"
         }
     }.getOrElse { "error=${it.javaClass.simpleName}" }
 }
@@ -75,6 +94,8 @@ object MuteAt {
 /**
  * MuteAt 与 DndWindow 共用的唯一通知拦截器。两项分别 install 也只会 hook 一次，避免一条
  * Notification 被重复改写。会话来源使用 8.0.48 已实证的 NotificationItem(d=id,h=talker)。
+ *
+ * 「@我」与作用域的纯判据在 [MuteAtLogic]；这里只做取值和静音落地。
  */
 internal object QuietNotificationBridge {
 
@@ -108,6 +129,13 @@ internal object QuietNotificationBridge {
 
     @Volatile
     private var muteUntilMs = 0L
+
+    /** 最近一条通知的快照（`op=quiet sub=extras` 取证用，不持有 Notification 对象） */
+    @Volatile
+    private var lastDumpId = -1
+
+    @Volatile
+    private var lastDump = ""
 
     fun install(lpparam: XC_LoadPackage.LoadPackageParam): Boolean {
         if (installed) return true
@@ -208,6 +236,7 @@ internal object QuietNotificationBridge {
             args.isNotEmpty() && args[0] is Int -> args[0] as Int
             else -> return
         }
+        rememberDump(id, describe(id, notification))
 
         if (dndEnabled && DndWindow.shouldMute(notification)) {
             mute(notification, id, "DND", talkerOf(id))
@@ -219,6 +248,38 @@ internal object QuietNotificationBridge {
             mute(notification, id, "AT", talker)
         }
     }
+
+    /**
+     * 记下最近一条通知的可读快照（只取字符串，不持有 Notification 对象）。
+     *
+     * 给 `op=quiet sub=extras` 用：下轮真机据此确认「EXTRA_TITLE 是不是群名」——
+     * 这是允许/排除名单「群名」元素接线的唯一待定锚点。
+     */
+    private fun rememberDump(id: Int, dump: String) {
+        lastDumpId = id
+        lastDump = dump
+    }
+
+    private fun describe(id: Int, notification: Notification): String = buildString {
+        append("id=").append(id)
+        append(" channel=").append(channelIdOf(notification))
+        append(" category=").append(notification.category)
+        append(" ticker=").append(notification.tickerText)
+        val extras = notification.extras
+        if (extras != null) {
+            append(" title=").append(extras.getCharSequence(Notification.EXTRA_TITLE))
+            append(" text=").append(extras.getCharSequence(Notification.EXTRA_TEXT))
+            append(" bigText=").append(extras.getCharSequence(Notification.EXTRA_BIG_TEXT))
+            append(" keys=").append(extras.keySet().joinToString(","))
+        }
+    }
+
+    private fun channelIdOf(notification: Notification): String? =
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+            runCatching { notification.channelId }.getOrNull()
+        } else null
+
+    fun lastNotificationDump(): String = "id=$lastDumpId $lastDump"
 
     private fun mute(notification: Notification, id: Int, reason: String, talker: String?) {
         val context = HostContext.app() ?: return

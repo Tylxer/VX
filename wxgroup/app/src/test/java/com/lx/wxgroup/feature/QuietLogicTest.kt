@@ -6,6 +6,7 @@ import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Test
 
+/** 只覆盖免打扰时段判据；「防止被@」判据在 MuteAtLogicTest。 */
 class QuietLogicTest {
 
     @Test
@@ -41,40 +42,5 @@ class QuietLogicTest {
         assertFalse(QuietLogic.inDndWindow(0, "bad", "07:00"))
         assertFalse(QuietLogic.inDndWindow(-1, "23:00", "07:00"))
         assertFalse(QuietLogic.inDndWindow(24 * 60, "23:00", "07:00"))
-    }
-
-    @Test
-    fun atAliasRequiresNameBoundary() {
-        assertTrue(QuietLogic.containsAtAlias("张三: @V 收到", "V"))
-        assertTrue(QuietLogic.containsAtAlias("@V", "V"))
-        assertFalse(QuietLogic.containsAtAlias("张三: @Verity 收到", "V"))
-        assertFalse(QuietLogic.containsAtAlias("张三: @VIP 收到", "V"))
-        assertFalse(QuietLogic.containsAtAlias("张三: @V_2 收到", "V"))
-        assertFalse(QuietLogic.containsAtAlias("张三: @V-test 收到", "V"))
-        assertTrue(QuietLogic.containsAtAlias("先 @VIP 后 @V。", "V"))
-    }
-
-    @Test
-    fun aliasesAndBroadcastMentionsAreRecognized() {
-        assertEquals(listOf("V", "老王", "Alice"), QuietLogic.aliases("V，老王、 Alice\nV"))
-        assertTrue(QuietLogic.isAtMe("@所有人 请查看", emptyList()))
-        assertTrue(QuietLogic.isAtMe("@all 请查看", emptyList()))
-        assertFalse(QuietLogic.isAtMe("@allow 请查看", emptyList()))
-        assertTrue(QuietLogic.isAtMe("@老王 请查看", listOf("老王")))
-    }
-
-    @Test
-    fun exclusionWinsBeforeAllowList() {
-        val room = "123@chatroom"
-        assertFalse(QuietLogic.groupInScope(room, listOf(room), listOf(room)))
-        assertTrue(QuietLogic.groupInScope(room, listOf(room), emptyList()))
-        assertFalse(QuietLogic.groupInScope(room, listOf("other@chatroom"), emptyList()))
-    }
-
-    @Test
-    fun emptyAllowMeansAllGroupsButNeverDirectChats() {
-        assertTrue(QuietLogic.groupInScope("123@chatroom", emptyList(), emptyList()))
-        assertFalse(QuietLogic.groupInScope("wxid_someone", emptyList(), emptyList()))
-        assertFalse(QuietLogic.groupInScope(null, emptyList(), emptyList()))
     }
 }
