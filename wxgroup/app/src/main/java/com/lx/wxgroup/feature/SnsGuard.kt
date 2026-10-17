@@ -1043,6 +1043,18 @@ object SnsGuard {
      * 而那个判定有可能因为**查询失败**而落空（见 [readFlag] 的 [SnsRestoreLogic.Presence]），
      * 那种情况下行其实还在，REPLACE 会把 13 列覆盖成归档值、另外 5 列打成默认值
      * —— **把活行写坏**。IGNORE 撞主键就返回 -1，什么都不动，宁可报失败也不冒险。
+     *
+     * ── 合并须知（跨 lane 改同一个坑，别把两份都留下）────────────────────────
+     * 本文件**只有这一个**冲突算法常量，它只服务 [insertRow]（写**微信的 SnsInfo**）。
+     * main 与其它 lane 的旧版本里，同一个位置叫 **`CONFLICT_REPLACE = 5`**，
+     * 它也是同一个 `insertRow` 的实参（旧版 `restore()` 里内联写的），**用途相同、值是错的**。
+     * 合并时应当**用这里的 `4` 顶掉那个 `5`**，而不是两个常量并存：
+     *   - 留 `5` → 写微信 SnsInfo 变成 REPLACE，覆盖用户的活行（最坏结局）；
+     *   - 留 `1` → ROLLBACK，撞主键回滚整批；
+     *   - 两个都留 → 那个 `5` 会变成没人调用的死常量，谁下次顺手接上就是线上事故。
+     * 写**自己归档表**（`sns_archive`）的那条路径跟这里无关，它在
+     * `GroupDb.insertSnsArchive` 里用框架常量 `SQLiteDatabase.CONFLICT_IGNORE`
+     * （首条为准，**故意**不去覆盖），不要把它和这里的值串味。
      */
     private const val CONFLICT_IGNORE = 4
 
