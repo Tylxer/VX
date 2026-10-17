@@ -343,6 +343,20 @@ object EntryReceiver {
                         val sub = intent.getStringExtra("sub") ?: "stat"
                         LogX.i("REDPK " + com.lx.wxgroup.feature.RedPacket.probe(sub))
                     }
+                    // ---- 6.3 红包：消息层决策引擎的**取证探针** ----
+                    // ⚠️ 现在只有一个探针，没有 hook：取证结论里没有任何红包锚点，
+                    //    在拿到「红包消息的 type / 正文字段」实证之前不敢 hook 任何微信类。
+                    //    判据与决策引擎已就位（feature/LuckyLogic + JVM 单测），但两条识别判据
+                    //    的配置默认留空 → 引擎恒 Skip，不会有任何动作。
+                    //    --es sub cfg = 当前配置；rows = 最近 n 条 message 全字段；types = type 低位分布
+                    "lucky" -> {
+                        val sub = intent.getStringExtra("sub") ?: "cfg"
+                        val n = intent.getIntExtra("n", 12)
+                        // 读微信的消息库 → 必须走后台线程，否则 onReceive 卡成 ANR
+                        io {
+                            for (l in com.lx.wxgroup.probe.LuckyProbe.command(sub, n)) LogX.i(l)
+                        }
+                    }
                     // ---- 6.4 朋友圈：定时刷新 / 自动加载 / 自动导出 ----
                     // --es sub stat|env|act|refresh|load|rvmethods|export|img|scan|path [--ei n 5]
                     // ⚠️ refresh/load 会撩微信前台或甩列表，img/scan 要读库 → 都走后台线程
