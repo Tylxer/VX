@@ -595,6 +595,37 @@ object SnsGuard {
     }
 
     /**
+     * 插后复查：同一个 snsId 现在有几行。
+     *
+     * ⚠️ 为什么要这个：真机 DDL 实证 `SnsInfo` 上 **snsId 既不是 PRIMARY KEY 也没有 UNIQUE**
+     * （`CREATE TABLE SnsInfo ( snsId LONG, ...)`，6 个索引 `unique` 全为 0），
+     * 所以 `CONFLICT_IGNORE` **拦不住重复插入** —— 它只在撞到唯一约束时才退。
+     * 主防线是「写之前 [readFlag] 查成 ABSENT 才插」，这里数一遍是为了兜住 TOCTOU
+     * （查与插之间微信自己插了一条同 snsId）。
+     */
+    private fun countRows(db: Any, snsId: Long): Int? {
+        val m = rawQueryMethod(db) ?: return null
+        return runCatching {
+            val args: Any = if (m.parameterTypes[1] == Array<String>::class.java) {
+                arrayOf(snsId.toString())
+            } else {
+                arrayOf<Any>(snsId.toString())
+            }
+            val c = m.invoke(db, "select count(*) from $TABLE where snsId=?", args)
+                ?: return@runCatching null
+            try {
+                if (XposedHelpers.callMethod(c, "moveToFirst") as? Boolean != true) {
+                    null
+                } else {
+                    (XposedHelpers.callMethod(c, "getLong", 0) as? Long ?: 0L).toInt()
+                }
+            } finally {
+                runCatching { XposedHelpers.callMethod(c, "close") }
+            }
+        }.getOrNull()
+    }
+
+    /**
      * 诊断：列出归档里每条的**当前** localFlag。
      * ⚠️ 不要拿 [dump] 里的 flag 当依据 —— 那是**归档快照**，恒为微信清位后的值（2），
      * 不代表现在库里是多少。
@@ -678,6 +709,13 @@ object SnsGuard {
                         "${(it.cause ?: it).message?.take(120)}"
                 }
                 if (r == null || r < 0) return "restore failed ret=$r (可能撞主键/约束)"
+                // ⚠️ 真机实证：SnsInfo 上 snsId **没有唯一约束**（6 个索引 unique 全 0），
+                // 所以 CONFLICT_IGNORE 这道保险是失效的 —— 重复插入不会报错也不会被拦。
+                // 主防线是「写之前查到 ABSENT 才插」，这里再数一遍兜住 TOCTOU。
+                val n = countRows(db, snsId)
+                if (n != null && n > 1) {
+                    LogX.w("SNS ⚠️ 插重了 snsId=$snsId count=$n（表上无唯一约束，IGNORE 拦不住）")
+                }
                 val after = queryFlag(db, snsId)
                 "restored snsId=$snsId rowid=$r localFlag=${row.localFlag}" +
                     "->${row.localFlag or VISIBLE_BIT} now=$after"
