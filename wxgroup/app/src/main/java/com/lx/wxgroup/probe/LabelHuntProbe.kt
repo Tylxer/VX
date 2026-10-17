@@ -1,6 +1,8 @@
 package com.lx.wxgroup.probe
 
 import com.lx.wxgroup.feature.AntiRevoke
+import com.lx.wxgroup.feature.LabelLogic
+import com.lx.wxgroup.feature.LabelSource
 import com.lx.wxgroup.util.LogX
 import de.robv.android.xposed.XC_MethodHook
 import de.robv.android.xposed.XposedBridge
@@ -10,17 +12,14 @@ import java.util.Collections
 import java.util.WeakHashMap
 
 /**
- * K3「按微信标签选人」的**取证探针**（`op=label`）。
+ * K3「按微信标签选人」的诊断探针（`op=label`）。
  *
- * # 为什么必须有它
- * 已知锚点只有一半：`com.tencent.mm.storage.h4.field_contactLabelIds` 能读出
- * 「这个联系人身上挂了哪些标签 id」，但 **id → 标签名** 的映射在哪，全项目没有任何实机证据。
- * 微信有多个库（已证：朋友圈在独立的 `SnsMicroMsg.db`）、表名可能是混淆外的拼写，
- * **猜一个表名上真机 = 一次冷启动十几分钟**，所以第一步只做枚举：哪个库、哪些表、列名、样本行。
+ * 真机已确认主库包含 `ContactLabel(labelID,labelName)` 与
+ * `rcontact(username,contactLabelIds)`；日常验证优先使用 `names` / `of` / `stat`，
+ * 原有枚举与只读 SQL 子命令保留作版本漂移诊断。
  *
- * # ⚠️ 本文件全程「待取证」，不含任何硬编的表名/类名
- * 表名靠 `sqlite_master` 枚举 + 关键字过滤得到，拿到真实结果后再固化到
- * `core/Anchors848.kt` 和 `docs/取证结论.md`。
+ * `contactLabelIds` 的真实分隔符仍待真机确认，`sub=of` 会同时输出原始串、解析 id
+ * 与标签名，不能只看解析结果后反推分隔符。
  *
  * # 用法（一条命令一个答案）
  * ```
@@ -33,6 +32,9 @@ import java.util.WeakHashMap
  * adb shell ... --es op label --es sub rows  --es table <表名> [--ei n 5]  # 样本行
  * adb shell ... --es op label --es sub sql   --es sql "select contactLabelIds from rcontact limit 5"
  *     # 只放行 select / explain / 只读 pragma，见 isReadOnly
+ * adb shell ... --es op label --es sub names          # 全部 id→name 映射
+ * adb shell ... --es op label --es sub of --es user <wxid> # 某联系人标签名 + 原始 id 串
+ * adb shell ... --es op label --es sub stat           # ready / 索引 / cache hit
  * adb shell ... --es op label --es sub off                       # 取完务必关掉（钩子在热路径上）
  * ```
  * 日志前缀 `LABEL`。
@@ -89,7 +91,14 @@ object LabelHuntProbe {
 
     // ------------------------------------------------------------------ 命令
 
-    fun command(sub: String, sec: Int, table: String?, sql: String?, n: Int) {
+    fun command(
+        sub: String,
+        sec: Int,
+        table: String?,
+        sql: String?,
+        n: Int,
+        user: String?,
+    ) {
         when (sub) {
             "on" -> {
                 val ms = sec.coerceIn(10, MAX_WINDOW_SEC) * 1000L
@@ -107,11 +116,19 @@ object LabelHuntProbe {
                 own("$TAG off: unhooked")
             }
 
-            "stat" -> own(
-                "$TAG stat hooks=${unhooks.size} dbs=${dbs.size} " +
-                    "mainDb=${pathOf(AntiRevoke.wxDb())} " +
-                    "windowLeft=${(until - System.currentTimeMillis()).coerceAtLeast(0)}ms"
-            )
+            "stat" -> {
+                LabelSource.refreshBlocking()
+                own(
+                    "$TAG probe hooks=${unhooks.size} dbs=${dbs.size} " +
+                        "mainDb=${pathOf(AntiRevoke.wxDb())} " +
+                        "windowLeft=${(until - System.currentTimeMillis()).coerceAtLeast(0)}ms"
+                )
+                own(LabelSource.stat())
+            }
+
+            "names" -> dumpNames()
+
+            "of" -> dumpOf(user)
 
             /** 见过哪些库（path 是判断「该往哪个库读」的唯一依据） */
             "dbs" -> dumpDbs()
@@ -129,7 +146,10 @@ object LabelHuntProbe {
              */
             "sql" -> runSql(sql)
 
-            else -> own("$TAG unknown sub=$sub (on|off|stat|dbs|tables|info|rows|sql)")
+            else -> own(
+                "$TAG unknown sub=$sub " +
+                    "(names|of|stat|on|off|dbs|tables|info|rows|sql)"
+            )
         }
     }
 
@@ -173,6 +193,45 @@ object LabelHuntProbe {
     }
 
     // ------------------------------------------------------------------ 输出
+
+    private fun dumpNames() {
+        if (!LabelSource.refreshBlocking()) {
+            own("$TAG names unavailable: ${LabelSource.stat()}")
+            return
+        }
+        val labels = LabelSource.allLabels()
+        own("$TAG names n=${labels.size}")
+        for (label in labels) {
+            val name = label.name ?: "<empty>"
+            own("$TAG   id=${label.id} name=$name members=${label.memberCount}")
+        }
+    }
+
+    private fun dumpOf(user: String?) {
+        val wxid = user?.trim().orEmpty()
+        if (wxid.isEmpty()) {
+            own("$TAG of: --es user <wxid> 不能为空")
+            return
+        }
+        if (!LabelSource.refreshBlocking()) {
+            own("$TAG of user=$wxid unavailable: ${LabelSource.stat()}")
+            return
+        }
+        val raw = LabelSource.rawIdsOf(wxid)
+        val ids = LabelLogic.splitIds(raw)
+        val names = LabelSource.labelsOf(wxid)
+        val resolved = ids.joinToString(",") { id ->
+            when {
+                !LabelSource.hasLabel(id) -> "$id=<unknown>"
+                LabelSource.labelName(id).isNullOrBlank() -> "$id=<empty>"
+                else -> "$id=${LabelSource.labelName(id)}"
+            }
+        }
+        own(
+            "$TAG of user=$wxid raw=${raw?.let { "[$it]" } ?: "<missing>"} " +
+                "ids=${ids.joinToString(",")} names=${names.joinToString(",")} resolved=$resolved"
+        )
+    }
 
     private fun dumpDbs() {
         val snapshot = allDbs()
