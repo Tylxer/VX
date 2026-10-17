@@ -1,0 +1,227 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>防撤回开关 · UI 行为确认（v2）</title>
+<style>
+  :root{
+    --wx-bg:#EDEDED; --wx-nav:#EDEDED; --bubble-them:#FFFFFF; --bubble-me:#95EC69;
+    --text:#191919; --hint:#B2B2B2; --line:#D9D9D9;
+    --card:#FFFFFF; --page:#F2F3F5; --ink:#1F2328; --muted:#6B7280; --warn:#C2410C;
+    --on:#07C160; --off:#C9CDD4; --mine:#0A7C3F;
+  }
+  *{box-sizing:border-box}
+  body{margin:0;padding:24px;background:var(--page);color:var(--ink);
+       font:14px/1.6 -apple-system,"PingFang SC","Microsoft YaHei",sans-serif;display:flex;justify-content:center}
+  .wrap{width:100%;max-width:940px}
+  h1{font-size:18px;margin:0 0 4px}
+  .sub{color:var(--muted);font-size:13px;margin-bottom:18px}
+  .ver{display:inline-block;background:#E8F5E9;color:#0A7C3F;border:1px solid #B7E0C2;
+       border-radius:4px;padding:1px 6px;font-size:11px;margin-left:6px}
+  .row{display:flex;gap:24px;flex-wrap:wrap;align-items:flex-start}
+  .card{background:var(--card);border:1px solid var(--line);border-radius:12px;padding:18px}
+  .sw{flex:1 1 320px;min-width:300px}
+  .phone{flex:0 0 320px}
+
+  .sw-item{display:flex;justify-content:space-between;align-items:flex-start;gap:12px;
+           padding:12px 0;border-bottom:1px dashed var(--line)}
+  .sw-item:last-of-type{border-bottom:0}
+  .sw-name{font-weight:600}
+  .sw-desc{color:var(--muted);font-size:12px;margin-top:2px}
+  .tg{flex:0 0 auto;width:46px;height:26px;border-radius:13px;background:var(--off);
+      position:relative;cursor:pointer;transition:.18s;border:0;padding:0}
+  .tg::after{content:"";position:absolute;top:3px;left:3px;width:20px;height:20px;border-radius:50%;
+             background:#fff;transition:.18s;box-shadow:0 1px 3px rgba(0,0,0,.25)}
+  .tg[aria-checked="true"]{background:var(--on)}
+  .tg[aria-checked="true"]::after{left:23px}
+  .sw-val{font-size:11px;color:var(--muted);margin-top:6px;text-align:right}
+  .sw-val b{color:var(--ink)}
+
+  .dev{width:320px;border:8px solid #1F2328;border-radius:34px;overflow:hidden;background:var(--wx-bg);
+       box-shadow:0 8px 24px rgba(0,0,0,.18)}
+  .nav{background:var(--wx-nav);padding:10px 12px;display:flex;align-items:center;gap:10px;
+       border-bottom:1px solid #DCDCDC}
+  .back{font-size:18px}
+  .nav b{font-size:15px;font-weight:600}
+  .chat{padding:14px 10px;min-height:430px;display:flex;flex-direction:column;gap:11px}
+  .hint{align-self:center;color:var(--hint);font-size:12px;text-align:center;max-width:84%;padding:2px 8px}
+  .hint.ours{color:#8A8A8A}
+  .hint.native{color:var(--hint)}
+  .msg{display:flex;gap:8px;align-items:flex-start;max-width:88%}
+  .msg.me{align-self:flex-end;flex-direction:row-reverse}
+  .ava{width:34px;height:34px;border-radius:4px;background:#C8C9CC;flex:0 0 34px;
+       display:flex;align-items:center;justify-content:center;color:#fff;font-size:13px}
+  .bub{background:var(--bubble-them);padding:9px 12px;border-radius:6px;
+       font-size:14px;color:var(--text);word-break:break-word;box-shadow:0 1px 1px rgba(0,0,0,.05)}
+  .msg.me .bub{background:var(--bubble-me)}
+  .tag{font-size:10px;border-radius:3px;padding:0 4px;margin-top:5px;display:inline-block}
+  .tag.ours{color:#8A5A00;background:#FFF3D6;border:1px solid #F0DFA8}
+  .tag.native{color:#3A6EA5;background:#E8F1FB;border:1px solid #BBD5F0}
+  .tag.saved{color:#5A4A8A;background:#EFEAFB;border:1px solid #D5C9F0}
+  .dev-note{padding:8px 12px;background:#F7F7F7;border-top:1px solid #E5E5E5;
+            font-size:11px;color:var(--muted)}
+
+  .explain{margin-top:20px}
+  .explain h2{font-size:14px;margin:0 0 10px}
+  .explain ul{margin:0;padding-left:18px}
+  .explain li{margin-bottom:6px}
+  .flag{margin-top:12px;background:#FFF4ED;border:1px solid #F6C9A8;border-radius:8px;
+        padding:10px 12px;color:var(--warn);font-size:12.5px}
+  .flag b{display:block;margin-bottom:4px}
+  .flag ul{margin:6px 0 0;padding-left:16px}
+  .flag li{margin-bottom:4px}
+  .legend{margin-top:16px;font-size:12px;color:var(--muted);border-top:1px solid var(--line);padding-top:12px}
+  .legend code{background:#F0F1F3;padding:1px 5px;border-radius:3px;font-size:11.5px}
+  .chk{display:flex;align-items:center;gap:6px;margin-top:12px;font-size:12px;color:var(--muted)}
+</style>
+</head>
+<body>
+<div class="wrap">
+  <h1>防撤回 · 开关行为确认<span class="ver">v2 · 按你刚澄清的语义</span></h1>
+  <div class="sub">左边点开关，右边聊天页实时变。重点看：<b>微信自带的那条灰色条从头到尾不动</b>。</div>
+
+  <div class="row">
+    <div class="card sw">
+      <div class="sw-item">
+        <div>
+          <div class="sw-name">防止消息撤回</div>
+          <div class="sw-desc">拦截<strong>他人</strong>撤回，消息留在原地</div>
+        </div>
+        <button class="tg" id="tg-msg" role="switch" aria-checked="true" aria-label="防止消息撤回"></button>
+      </div>
+      <div class="sw-val"><code>antirevoke.msg</code> 当前 <b id="v-msg">开</b></div>
+
+      <div class="sw-item">
+        <div>
+          <div class="sw-name">显示撤回提示</div>
+          <div class="sw-desc">只管<b>我们生成的「已阻止」提示条</b>；微信自带的灰色条不受它影响</div>
+        </div>
+        <button class="tg" id="tg-hint" role="switch" aria-checked="false" aria-label="显示撤回提示"></button>
+      </div>
+      <div class="sw-val"><code>antirevoke.show_hint</code> 当前 <b id="v-hint">关（默认）</b></div>
+
+      <div class="sw-item">
+        <div>
+          <div class="sw-name">恢复默认 <span style="color:#C2410C">（新增）</span></div>
+          <div class="sw-desc">开启期间，被救下的消息（含这期间新拦的）<b>显示成正常撤回</b>；关掉后恢复显示原文</div>
+        </div>
+        <button class="tg" id="tg-restore" role="switch" aria-checked="false" aria-label="恢复默认"></button>
+      </div>
+      <div class="sw-val"><code>antirevoke.restore_default</code> 当前 <b id="v-restore">关（默认）</b></div>
+
+      <label class="chk"><input type="checkbox" id="tags" checked> 显示内部标注（谁的提示条 / 谁救的）</label>
+    </div>
+
+    <div class="phone">
+      <div class="dev">
+        <div class="nav"><span class="back">‹</span><b>verity</b></div>
+        <div class="chat" id="chat"></div>
+        <div class="dev-note" id="note"></div>
+      </div>
+    </div>
+  </div>
+
+  <div class="card explain">
+    <h2>当前这组开关的实际效果</h2>
+    <ul id="explain"></ul>
+    <div class="flag">
+      <b>⚠️ 还需要你拍板的三点</b>
+      <ul>
+        <li><b>提示条文案</b>：原型里用的是「"verity" 尝试撤回一条消息（已阻止）」。
+            微信自己也有类似的（库里见过「xx尝试撤回上一条消息（已阻止）」），要不要跟它保持一致？</li>
+        <li><b>「恢复默认」开时，还要不要显示「已阻止」提示条</b>：原型里按<b>不显示</b>
+            （既然要装成没装模块的样子，就不该留痕迹）。</li>
+        <li><b>需求文档要改</b>：6.2 现在写的是「关闭时连历史已存在的撤回提示一并隐藏」，
+            按新语义应改成「控制我们自己生成的『已阻止』提示条，关闭时连历史的也一并隐藏」。要我改吗？</li>
+      </ul>
+    </div>
+    <div class="legend">
+      数据原型：第 2 条「123456」= <b>历史被防撤回救下的</b>；第 5 条「刚才那条别看」= <b>对方刚刚撤回的</b>；
+      最后那条「你撤回了一条消息」= <b>微信自带的</b>（自己撤回），用于验证它始终不受影响。
+    </div>
+  </div>
+</div>
+
+<script>
+const MSGS = [
+  {who:'them', text:'在吗',          kind:'plain'},
+  {who:'them', text:'123456',        kind:'saved', tip:'历史被救下的'},
+  {who:'me',   text:'收到',          kind:'plain'},
+  {who:'them', text:'明天见',        kind:'plain'},
+  {who:'them', text:'刚才那条别看',  kind:'new',   tip:'对方刚刚撤回的'},
+  {who:'none', text:'你撤回了一条消息', kind:'native', tip:'微信自带'},
+];
+const S = {msg:true, hint:false, restore:false, tags:true};
+const REVOKED = '"verity" 撤回了一条消息';
+const BLOCKED = '"verity" 尝试撤回一条消息（已阻止）';
+
+function bind(id, key){
+  const el = document.getElementById('tg-'+id);
+  el.addEventListener('click', () => {
+    S[key] = !S[key];
+    el.setAttribute('aria-checked', String(S[key]));
+    document.getElementById('v-'+id).textContent =
+      (key==='hint'||key==='restore') ? (S[key] ? '开' : '关（默认）') : (S[key] ? '开' : '关');
+    render();
+  });
+}
+bind('msg','msg'); bind('hint','hint'); bind('restore','restore');
+document.getElementById('tags').addEventListener('change', e => { S.tags = e.target.checked; render(); });
+
+function tag(cls, txt){ return S.tags ? `<span class="tag ${cls}">${txt}</span>` : ''; }
+function bubble(m){
+  return `<div class="msg ${m.who==='me'?'me':''}">
+      <div class="ava">${m.who==='me'?'我':'V'}</div>
+      <div><div class="bub">${m.text}</div>${m.tip?tag('saved',m.tip):''}</div></div>`;
+}
+function hint(text, cls, tip){
+  return `<div class="hint ${cls}">${text}<br>${tag(cls,tip)}</div>`;
+}
+
+function render(){
+  const out = [];
+  for (const m of MSGS){
+    if (m.kind === 'plain'){ out.push(bubble(m)); continue; }
+    // 微信自带的撤回提示条：任何开关都不动它
+    if (m.kind === 'native'){ out.push(hint(m.text, 'native', '微信自带 · 不受影响')); continue; }
+
+    if (!S.msg){
+      // 防撤回关 → 微信原生行为：撤回成功，显示微信自己的灰色条
+      out.push(hint(REVOKED, 'native', '微信自带 · 撤回成功'));
+      continue;
+    }
+    // 防撤回开 → 消息被救下
+    if (S.restore){
+      // 恢复默认：伪装成正常撤回的样子（含开启期间新拦下的）
+      out.push(hint(REVOKED, 'ours', '伪装成正常撤回'));
+    } else {
+      out.push(bubble(m));                                  // 原文照常显示
+      if (S.hint) out.push(hint(BLOCKED, 'ours', '我们生成的'));  // 可选：附加「已阻止」提示条
+    }
+  }
+  document.getElementById('chat').innerHTML = out.join('');
+
+  const li = [];
+  li.push('<b>微信自带的灰色条</b>（最后那条「你撤回了一条消息」）：<b>任何开关都不影响它</b>，始终显示。');
+
+  if (!S.msg){
+    li.push('<b>被撤回的两条</b>：防撤回关 → 微信原生，显示成「"verity" 撤回了一条消息」灰色条。');
+  } else if (S.restore){
+    li.push('<b>被救下的两条</b>：显示成「正常撤回」的灰色条（装成没装模块的样子），'
+          + '期间新拦下的也一样；<b>关掉「恢复默认」后全部恢复显示原文</b>——数据本身没动。');
+  } else {
+    li.push('<b>被救下的两条</b>：原文气泡照常显示。');
+    li.push(S.hint
+      ? '后面跟一条<b>我们生成的</b>「已阻止」提示条。'
+      : '<b>不显示</b>任何提示条（静默救回，对方看不出异常）。');
+  }
+
+  document.getElementById('explain').innerHTML = li.map(x=>`<li>${x}</li>`).join('');
+  document.getElementById('note').textContent =
+    `防撤回=${S.msg?'开':'关'} / 显示提示=${S.hint?'开':'关'} / 恢复默认=${S.restore?'开':'关'}`;
+}
+render();
+</script>
+</body>
+</html>
