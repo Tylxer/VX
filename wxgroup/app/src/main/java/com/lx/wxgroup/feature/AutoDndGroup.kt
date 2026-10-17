@@ -1,129 +1,194 @@
 package com.lx.wxgroup.feature
 
+import com.lx.wxgroup.core.ConvReader
 import com.lx.wxgroup.data.GroupDb
 import com.lx.wxgroup.data.Keys
 import com.lx.wxgroup.data.Kv
 import com.lx.wxgroup.util.LogX
+import de.robv.android.xposed.XC_MethodHook
+import de.robv.android.xposed.XposedHelpers
 import de.robv.android.xposed.callbacks.XC_LoadPackage
 import java.util.Collections
-import java.util.HashMap
+import java.util.concurrent.atomic.AtomicInteger
 
 /**
- * 新加群自动打开微信自带「消息免打扰」，自己创建的群除外。
+ * 新加群自动免打扰（6.1 第四条：被拉进新群时自动把该群设为免打扰）。
  *
- * 四个判定点对应需求 6.1 的第四条：
- *   1. 新群      —— 只在进群那一刻设一次，设置后写入 auto_dnd_done；
- *   2. 自建群    —— 群主是自己则不设，且**不记台账**（用户后面自己改不影响）；
- *   3. 存量群    —— 开启开关之前就在的群，只在它出现新进群事件时才管；
- *   4. 手动关掉后 —— 已记台账的群不再重复开启（[GroupDb.isDndHandled]）。
+ * ## 取证依据（全部来自 docs/取证结论.md 已实证章节，不猜 API）
  *
- * ⚠️ 待取证：8.0.48/2588 GP 的「进群事件」回调和「设置免打扰」的方法尚未定位，
- * 下面两个常量不能用猜测的混淆名填（会误伤普通点击 / 写错库）。锚点确定后填入即可。
+ * 1. **「新群聊会话」从哪来** —— 会话列表结构是 8.0.48/2588 实证结论
+ *    （ConvFilter 类注释 + ConvReader 实测记录）：
+ *    `ConversationListView → HeaderViewListAdapter.mAdapter`，item 是
+ *    `com.tencent.mm.storage.r4`，`field_username` 就是 wxid，群聊以 `@chatroom` 结尾。
+ *    → 模块启动时 hook `ListView.setAdapter`（Android 公开 API，锚点与 ConvFilter 不同
+ *    功能共用同一处），首次拿到会话列表 adapter 后后台枚举一次，得到**存量群快照**。
+ * 2. **「出现了一个没见过的群聊」从哪来** —— 通知链路实证结论（docs/取证结论.md
+ *    「通知静音」章节）：每条微信通知都构造 `NotificationItem`，字段 `h`=talker。
+ *    QuietNotificationBridge 已 hook 该方法并暴露 talker 观察者 → 本类 registered
+ *    observer 被动接收。
+ * 3. **「置免打扰」怎么落** —— 同样取自「通知静音」章节实证：响铃/震动由系统按
+ *    channel 播放，正解是把通知的 `mChannelId` 反射改写成自建静音通道
+ *    （IMPORTANCE_HIGH + setSound(null) + enableVibration(false)），通知栏/角标原样。
+ *    → 本类只做「登记」，静音改写完全复用 QuietNotificationBridge（与 DND 时段
+ *    / 被@静音同一条通道），**不写微信任何数据、不调任何未实证的微信 API**。
  *
- * 退路：进群事件不一定存在稳定 hook 点，定位不到会漏设。为此保留开关分支
- * [SWEEP_FALLBACK_ENABLED]，改为定期扫描已识别群列表补设（对每个群走同一套
- * 判定 + 台账）。与实时分支共用 [applyOne]，语义一致。
+ * ## 降级与已知边界（宁可不做，不猜）
+ *
+ * - **「入群事件」无锚点**：取证结论里没有进群回调/事件的定位。按批准的退路实现为
+ *   「检测到未见过的新群聊会话时置免打扰」：存量靠启动快照区分，快照未就绪前
+ *   观察到的群一律按存量（宁漏设，也不把老群静音了）。
+ * - **微信自身的「消息免打扰」开关状态未动**：写微信库/调微信设置接口没有锚点，
+ *   本类的「免打扰」= 该群通知走静音通道（用户侧效果：不响铃不震动）。
+ * - **「自建群不设」暂不生效**：判定群主需要 chatroom owner 锚点（NotificationItem /
+ *   r4 均无此字段），取证结论未覆盖 → 待取证后补（[applyOne] 的 owner 参数预留）。
+ * - **手动关掉后不再自动打开**：靠 GroupDb.auto_dnd_done 台账（重启仍有效）。
  */
 object AutoDndGroup {
 
-    private const val JOIN_EVENT_CLASS_8048 = "" // 待取证：进群事件所在类
-    private const val JOIN_EVENT_METHOD_8048 = "" // 待取证：进群回调方法名
+    /** 锚点同 ConvFilter（docs/取证结论.md 会话列表结论）：微信会话列表 ListView。 */
+    private const val CONV_LIST_CLASS = "com.tencent.mm.ui.conversation.ConversationListView"
 
-    /** 进群事件定位不到时，改为扫描补设。锚点确定后建议关掉，避免无谓开销。 */
-    private const val SWEEP_FALLBACK_ENABLED = true
-
-    private const val SWEEP_INTERVAL_MS = 5 * 60 * 1000L
+    /** setAdapter 后等微信把 2900+ 会话填完再枚举，快照才准（毫秒）。 */
+    private const val SNAPSHOT_DELAY_MS = 2500L
 
     @Volatile
     private var installed = false
 
-    @Volatile
-    private var joinHooked = false
+    /** 存量群快照（模块启动时枚举会话列表得到）；快照就绪前一律按存量处理 */
+    private val baseline: MutableSet<String> = Collections.synchronizedSet(LinkedHashSet())
 
     @Volatile
-    private var lastSweepAt = 0L
+    private var baselineReady = false
 
-    private val applied = Collections.synchronizedMap(HashMap<String, Boolean>())
+    /** 已登记/已记账的群（含从 GroupDb 台账恢复的），内存态去重用 */
+    private val handled: MutableSet<String> = Collections.synchronizedSet(LinkedHashSet())
+
+    /** 本次进程内新登记过的群数（observer 可能在多线程回调，必须原子） */
+    private val joined = AtomicInteger(0)
 
     fun install(lpparam: XC_LoadPackage.LoadPackageParam) {
         runCatching {
-            joinHooked = installJoinHook(lpparam)
-            if (joinHooked) {
-                installed = true
-            } else if (SWEEP_FALLBACK_ENABLED) {
-                installed = true
-                LogX.i("QUIET ADND fallback=sweep only (join hook pending evidence)")
-            } else {
-                LogX.i("QUIET ADND skipped: join anchor pending evidence")
-                return
+            // 重启恢复：台账里的群直接灌回 bridge 的静音集合，不用等它们再发通知
+            GroupDb.current()?.listDndHandled()?.forEach {
+                handled.add(it)
+                QuietNotificationBridge.markAutoDndTalker(it)
             }
-            LogX.i("QUIET ADND installed joinHooked=$joinHooked sweep=$SWEEP_FALLBACK_ENABLED")
+            QuietNotificationBridge.addTalkerObserver(::onTalkerObserved)
+            hookConversationList(lpparam)
+            installed = true
+            LogX.i(
+                "QUIET ADND installed restored=${handled.size} " +
+                    "enabled=${Kv.getBool(Keys.CHAT_AUTO_DND_NEW_GROUP)}"
+            )
         }.onFailure {
             installed = false
             LogX.i("QUIET ADND install failed: ${it.javaClass.simpleName}")
         }
     }
 
-    private fun installJoinHook(lpparam: XC_LoadPackage.LoadPackageParam): Boolean {
-        if (JOIN_EVENT_CLASS_8048.isBlank() || JOIN_EVENT_METHOD_8048.isBlank()) return false
-        val eventClass = runCatching {
-            Class.forName(JOIN_EVENT_CLASS_8048, false, lpparam.classLoader)
-        }.getOrNull() ?: return false
-        val methods = eventClass.declaredMethods.filter { it.name == JOIN_EVENT_METHOD_8048 }
-        if (methods.isEmpty()) return false
-        LogX.i("QUIET ADND join anchor present but handler pending evidence")
-        return false
-    }
-
-    /** 主入口：判定 + 设置 + 记账；失败静默放弃（绝不崩微信）。 */
-    fun applyOne(chatroomId: String, ownerWxid: String?, selfWxid: String?): Boolean {
-        return runCatching {
-            if (!installed || !Kv.getBool(Keys.CHAT_AUTO_DND_NEW_GROUP)) return false
-            if (chatroomId.isBlank() || !chatroomId.endsWith("@chatroom")) return false
-            if (alreadyHandled(chatroomId)) return false
-            val self = selfWxid?.trim().orEmpty()
-            val owner = ownerWxid?.trim().orEmpty()
-            if (self.isNotBlank() && self == owner) {
-                LogX.i("QUIET ADND skip own group $chatroomId")
-                return false
-            }
-            if (!setMute(chatroomId)) return false
-            GroupDb.current()?.markDndHandled(chatroomId)
-            applied[chatroomId] = true
-            LogX.i("QUIET ADND muted $chatroomId")
-            true
-        }.getOrDefault(false)
-    }
-
-    /** 扫描退路：定时对当前已知群跑一遍 [applyOne]，命中新群就补设。 */
-    fun sweepIfDue(nowMs: Long = System.currentTimeMillis(), chatrooms: List<String>) {
+    /**
+     * 会话列表首次拿到 adapter 时，后台枚举一次存量群。
+     *
+     * 枚举按 Android 公开 API（ListAdapter.getCount/getItem）+ ConvReader（实证字段）。
+     * header/footer 行的 getItem 返回 null → ConvReader.username("") 安全跳过。
+     */
+    private fun hookConversationList(lpparam: XC_LoadPackage.LoadPackageParam) {
         runCatching {
-            if (!installed || !SWEEP_FALLBACK_ENABLED) return
-            if (nowMs - lastSweepAt < SWEEP_INTERVAL_MS) return
-            lastSweepAt = nowMs
-            for (room in chatrooms) applyOne(room, null, null)
-        }.onFailure { LogX.i("QUIET ADND sweep failed: ${it.javaClass.simpleName}") }
+            XposedHelpers.findAndHookMethod(
+                "android.widget.ListView",
+                lpparam.classLoader,
+                "setAdapter",
+                android.widget.ListAdapter::class.java,
+                object : XC_MethodHook() {
+                    override fun afterHookedMethod(param: MethodHookParam) {
+                        val list = param.thisObject as? android.widget.ListView ?: return
+                        if (list.javaClass.name != CONV_LIST_CLASS) return
+                        if (baselineReady) return
+                        val adapter = runCatching { list.adapter }.getOrNull() ?: return
+                        // HeaderViewListAdapter 的 count 含 header/footer，getItem 越界返回 null，均可安全跳过
+                        Thread({
+                            runCatching { snapshotBaseline(adapter) }
+                                .onFailure {
+                                    LogX.i("QUIET ADND snapshot failed: ${it.javaClass.simpleName}")
+                                }
+                        }, "wxgroup-adnd-snap").start()
+                    }
+                }
+            )
+            LogX.i("QUIET ADND hooked ListView.setAdapter (baseline 快照)")
+        }.onFailure { LogX.i("QUIET ADND hook setAdapter failed: ${it.javaClass.simpleName}") }
     }
 
-    private fun alreadyHandled(chatroomId: String): Boolean =
-        applied[chatroomId] == true || GroupDb.current()?.isDndHandled(chatroomId) == true
+    private fun snapshotBaseline(adapter: android.widget.ListAdapter) {
+        Thread.sleep(SNAPSHOT_DELAY_MS) // 等微信把数据填完再快照
+        val count = runCatching { adapter.count }.getOrDefault(0)
+        val found = LinkedHashSet<String>()
+        for (i in 0 until count) {
+            val item = runCatching { adapter.getItem(i) }.getOrNull() ?: continue
+            val username = ConvReader.username(item)
+            if (QuietLogic.isGroupTalker(username)) found.add(username)
+        }
+        synchronized(baseline) {
+            if (baselineReady) return
+            baseline.addAll(found)
+            baselineReady = true
+        }
+        LogX.i("QUIET ADND baseline ready groups=${found.size} (of $count convs)")
+    }
 
     /**
-     * 打开微信自带的消息免打扰。
-     *
-     * 待取证：真实写库口径（会话表免打扰位 / 群设置接口）未确认，这里保留单一写入点，
-     * 拿到锚点后只改本方法，不扩散到别处。未取证前返回 false（宁可不设，也不写错库）。
+     * 被动观察：每条带 talker 的通知过一遍（bridge 回调，可能高频 → 只做内存判定）。
+     * 命中新群才落库/登记；写库丢后台线程，绝不卡通知路径。
      */
-    private fun setMute(chatroomId: String): Boolean {
-        if (chatroomId.isBlank()) return false
-        return false
+    private fun onTalkerObserved(talker: String) {
+        if (!installed) return
+        val verdict = runCatching {
+            QuietLogic.classifyGroup(talker, baseline, handled, baselineReady)
+        }.getOrDefault(QuietLogic.GroupDndVerdict.EXISTING)
+        if (verdict != QuietLogic.GroupDndVerdict.NEW) return
+        applyOne(talker, ownerWxid = null)
+    }
+
+    /**
+     * 判定 + 登记 + 记账；失败静默放弃（绝不崩微信）。
+     *
+     * @param ownerWxid 群主 wxid。**当前无锚点可取，调用方恒传 null**；
+     *   取证到 chatroom owner 锚点后按「群主是自己不设」补上（需求 6.1 第四条）。
+     *   自身 wxid 同样未定位（取证结论 S8），两侧都无数据时该判定整体跳过。
+     */
+    private fun applyOne(chatroomId: String, ownerWxid: String?) {
+        runCatching {
+            if (!Kv.getBool(Keys.CHAT_AUTO_DND_NEW_GROUP)) return
+            if (!QuietLogic.isGroupTalker(chatroomId)) return
+            // 自建群不设 —— 暂不可用：ownerWxid / 自身 wxid 均无锚点（见 KDoc）
+            val selfWxid: String? = null
+            if (!ownerWxid.isNullOrBlank() && !selfWxid.isNullOrBlank() && ownerWxid == selfWxid) {
+                LogX.i("QUIET ADND skip own group $chatroomId")
+                return
+            }
+            handled.add(chatroomId)
+            QuietNotificationBridge.markAutoDndTalker(chatroomId)
+            joined.incrementAndGet()
+            // 记账落后台线程：通知路径上不能做磁盘 IO
+            Thread({
+                runCatching { GroupDb.current()?.markDndHandled(chatroomId) }
+                    .onFailure { LogX.i("QUIET ADND ledger failed: ${it.javaClass.simpleName}") }
+            }, "wxgroup-adnd-ledger").start()
+            LogX.i("QUIET ADND muted ${chatroomId.take(24)} (new group → silent channel)")
+        }.onFailure { LogX.i("QUIET ADND apply failed: ${it.javaClass.simpleName}") }
     }
 
     fun probe(sub: String): String = runCatching {
         when (sub.lowercase()) {
-            "status" -> "installed=$installed joinHooked=$joinHooked sweep=$SWEEP_FALLBACK_ENABLED enabled=${Kv.getBool(Keys.CHAT_AUTO_DND_NEW_GROUP)} applied=${applied.size}"
-            "anchor" -> "join=${JOIN_EVENT_CLASS_8048.ifBlank { "待取证" }}#${JOIN_EVENT_METHOD_8048.ifBlank { "待取证" }} setter=待取证"
-            "applied" -> "applied=${applied.keys.toList()}"
+            "status" ->
+                "installed=$installed enabled=${Kv.getBool(Keys.CHAT_AUTO_DND_NEW_GROUP)} " +
+                    "baselineReady=$baselineReady baseline=${baseline.size} handled=${handled.size} joined=$joined"
+            "anchor" ->
+                "convList=$CONV_LIST_CLASS(list.setAdapter+ConvReader.username) " +
+                    "observe=NotificationItem.h(bridge observer) " +
+                    "setter=QuietNotificationBridge(mChannelId rewrite) " +
+                    "joinEvent=无锚点-降级为新群会话检测 owner=无锚点-自建群判定暂缺"
+            "applied" -> "handled=${handled.toList()}"
             else -> "subs=status,anchor,applied"
         }
     }.getOrElse { "error=${it.javaClass.simpleName}" }

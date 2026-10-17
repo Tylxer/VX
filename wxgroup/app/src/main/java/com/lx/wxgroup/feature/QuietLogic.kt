@@ -61,6 +61,39 @@ object QuietLogic {
         return allow.isEmpty() || talker in allow
     }
 
+    /** 群聊 talker 一律 `@chatroom` 结尾（8.0.48 实证，见 ConvReader / docs/取证结论.md）。 */
+    fun isGroupTalker(talker: String?): Boolean =
+        !talker.isNullOrBlank() && talker.endsWith(CHATROOM_SUFFIX)
+
+    /**
+     * 新加群自动免打扰的群聊分类结果。
+     *
+     * - NOT_GROUP 不是群聊（不管）
+     * - HANDLED   台账里已有这个群（设过免打扰，不重复设）
+     * - EXISTING  存量群：启动快照里就有，或快照还没就绪（宁漏设也不错设老群）
+     * - NEW       快照之后才出现的群聊 = 新群 → 设免打扰
+     */
+    enum class GroupDndVerdict { NOT_GROUP, NEW, EXISTING, HANDLED }
+
+    /**
+     * 新群判定（纯函数，见 [GroupDndVerdict]）。
+     *
+     * @param baseline      启动时枚举会话列表得到的存量群快照
+     * @param handled       已记账（设过免打扰 / 手动登记过）的群
+     * @param baselineReady 快照是否就绪；false 时一律按存量处理
+     */
+    fun classifyGroup(
+        talker: String?,
+        baseline: Set<String>,
+        handled: Set<String>,
+        baselineReady: Boolean,
+    ): GroupDndVerdict {
+        if (!isGroupTalker(talker)) return GroupDndVerdict.NOT_GROUP
+        if (talker in handled) return GroupDndVerdict.HANDLED
+        if (!baselineReady || talker in baseline) return GroupDndVerdict.EXISTING
+        return GroupDndVerdict.NEW
+    }
+
     private fun isNameChar(char: Char): Boolean =
         char.isLetterOrDigit() || char == '_' || char == '-'
 
