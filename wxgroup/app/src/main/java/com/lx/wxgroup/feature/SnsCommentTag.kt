@@ -39,6 +39,11 @@ import java.util.concurrent.atomic.AtomicInteger
  * 所以两个 `PENDING_*` 常量留空：install 时反射查不到就**静默跳过**，运行时只计数、
  * **不打标**。取证到之后把常量填上即可，逻辑一行不用改。
  *
+ * 降级期也不是完全不干活：走**正文对账** —— 归档里存着删之前的 `curActionBuf`，
+ * 抽出正文候选跟界面上的 TextView 文案对账（[SnsCommentLogic.textHit]），
+ * 命中就在这条评论行上打标。这条路径只用 Android 标准 API（遍历 TextView），
+ * **不碰任何未取证的微信类名/字段名**。
+ *
  * 降级期要验证「容器 / 落点」本身没问题，用 `probe("mark")`：给指定 snsId 的动态
  * 强制打一个标签，肉眼确认位置对不对。
  */
@@ -66,11 +71,16 @@ object SnsCommentTag {
     private const val SNS_ADAPTER_PREFIX = "com.tencent.mm.plugin.sns."
 
     private const val MARK = "wxgroup.sns.comment.deleted.tag"
-    private const val LABEL = "[已删除]"
+
+    /** ⚠️ 标签文本的唯一来源，别再就地写字面量（拼装规则锁在 [SnsCommentLogic.labelText] 单测里） */
+    private const val LABEL = SnsCommentLogic.LABEL_DELETED
 
     private const val SET_TTL_MS = 5000L
     private const val CFG_TTL_MS = 30000L
     private const val LOG_MAX = 5
+
+    private const val TEXT_LIMIT = 500
+    private const val TEXT_CACHE_MAX = 300
 
     @Volatile private var enabled = false
     @Volatile private var cfgAt = 0L
@@ -80,8 +90,24 @@ object SnsCommentTag {
     private val loading = AtomicBoolean(false)
     private val added = AtomicInteger(0)
     private val degradeHits = AtomicInteger(0)
+    private val textHits = AtomicInteger(0)
     private val binds = AtomicInteger(0)
     private val miscLogged = AtomicInteger(0)
+
+    /**
+     * `snsId -> 该动态已删评论的正文候选`（每条评论一个 `List<String>`）。
+     *
+     * ⚠️ **value 允许为 null**（= 查过了，归档里没有这条动态的已删评论），
+     * 所以必须用 `containsKey` 区分「没查过」和「查过是空的」——
+     * **不能用 ConcurrentHashMap**（CHM 不允许 null value，真机崩过一次）。
+     */
+    private val textCache: MutableMap<Long, List<List<String>>?> =
+        Collections.synchronizedMap(HashMap())
+
+    /** 待补的 snsId（主线程只往里丢，后台线程排空） */
+    private val wantTexts: MutableSet<Long> = Collections.synchronizedSet(HashSet())
+
+    private val loadingTexts = AtomicBoolean(false)
 
     /** 探针用的强制集合：只对它打开，正常运行里恒为空 */
     @Volatile private var forceSet: Set<Long> = emptySet()
@@ -216,6 +242,8 @@ object SnsCommentTag {
         cfgAt = SystemClock.elapsedRealtime()
         setAt = 0L
         forceSet = emptySet() // 验证用的强制集合只在探针里设，开关一变就清掉
+        synchronized(textCache) { textCache.clear() }
+        synchronized(wantTexts) { wantTexts.clear() }
     }
 
     // ------------------------------------------------------------------ 绑定回调
@@ -249,22 +277,77 @@ object SnsCommentTag {
         }
         if (svrIds.isNullOrEmpty()) return
         val getter = pendingIdMethod
-        if (getter == null || pendingRowCls == null) {
-            // ⚠️ 未取证 → 降级：只计数不打标。打错标签比不打标签糟糕得多。
-            degradeHits.incrementAndGet()
-            logOnce("SNSC_TAG degrade: snsId=$snsId 有 ${svrIds.size} 条已删评论，" +
-                "但评论行→commentSvrID 映射未取证 -> skip")
+        if (getter != null && pendingRowCls != null) {
+            // ① 精确路径（取证完成后自动生效）：评论行 View → commentSvrID
+            for (row in rowsOf(itemView, pendingRowCls!!)) {
+                val svr = runCatching {
+                    when (val v = getter.invoke(row)) {
+                        is Long -> v
+                        is Int -> v.toLong()
+                        else -> null
+                    }
+                }.getOrNull() ?: continue
+                if (svrIds.contains(svr)) applyLabel(row, LABEL)
+            }
             return
         }
-        for (row in rowsOf(itemView, pendingRowCls!!)) {
-            val svr = runCatching {
-                when (val v = getter.invoke(row)) {
-                    is Long -> v
-                    is Int -> v.toLong()
-                    else -> null
+        // ② 降级路径：评论行 → commentSvrID 未取证，改用「归档正文 ↔ 界面文案」对账定位。
+        //    只用 Android 标准 API（遍历 TextView），不碰任何未取证的微信类名/字段名。
+        val cands = textsFor(snsId) ?: return // 缓存还没填好就先不打，下一轮 bind 自会再来
+        if (markByText(itemView, cands)) return
+        degradeHits.incrementAndGet()
+        logOnce("SNSC_TAG degrade: snsId=$snsId 有 ${svrIds.size} 条已删评论，" +
+            "评论行→commentSvrID 未取证且正文对账没命中 -> skip")
+    }
+
+    /**
+     * 降级定位：拿归档里「删之前」的评论正文候选，跟 itemView 子树里的 TextView 文案对账，
+     * 命中就在这条评论行的容器最前面插 `[已删除]`。
+     *
+     * ⚠️ 只认 [SnsCommentLogic.textHit] 判定的命中（严格：短碎片、完全对不上都不算），
+     * 宁可 missed 涨也不能误标。
+     */
+    private fun markByText(itemView: View, cands: List<List<String>>): Boolean {
+        var hit = 0
+        for (tv in textViewsOf(itemView)) {
+            val t = tv.text?.toString() ?: continue
+            if (t.contains(LABEL)) continue // 已经打过了
+            if (cands.none { SnsCommentLogic.textHit(it, listOf(t)) }) continue
+            val host = tv.parent as? ViewGroup ?: continue
+            applyLabel(host, LABEL)
+            hit++
+        }
+        if (hit > 0) textHits.addAndGet(hit)
+        return hit > 0
+    }
+
+    /** 后台线程填充 [textCache]；主线程绝不查库 */
+    private fun textsFor(snsId: Long): List<List<String>>? {
+        synchronized(textCache) {
+            if (textCache.containsKey(snsId)) return textCache[snsId]
+        }
+        if (wantTexts.add(snsId)) loadTextsAsync()
+        return null
+    }
+
+    private fun loadTextsAsync() {
+        if (!loadingTexts.compareAndSet(false, true)) return
+        bg.execute {
+            runCatching {
+                val all = SnsCommentGuard.archivedTexts(TEXT_LIMIT)
+                val ids = synchronized(wantTexts) {
+                    wantTexts.toList().also { wantTexts.clear() }
                 }
-            }.getOrNull() ?: continue
-            if (svrIds.contains(svr)) applyLabel(row, LABEL)
+                synchronized(textCache) {
+                    if (textCache.size > TEXT_CACHE_MAX) textCache.clear()
+                    // ⚠️ all[id] 为 null = 「查过了，这条动态没有可定位的已删评论」，
+                    //    照样存进去，靠 containsKey 记住「查过了」，避免反复回库
+                    for (id in ids) textCache[id] = all[id]
+                }
+            }.onFailure {
+                logOnce("SNSC_TAG load texts failed: ${it.javaClass.simpleName}")
+            }
+            loadingTexts.set(false)
         }
     }
 
@@ -307,6 +390,22 @@ object SnsCommentTag {
         while (stack.isNotEmpty() && budget-- > 0) {
             val v = stack.removeLast()
             if (v is TextView) v.text?.toString()?.let { if (it.isNotEmpty()) out += it }
+            if (v is ViewGroup) {
+                for (i in 0 until v.childCount) v.getChildAt(i)?.let { stack += it }
+            }
+        }
+        return out
+    }
+
+    /** itemView 子树里所有的 TextView（降级对账用；带预算，别在异常深的树上跑太久） */
+    private fun textViewsOf(root: View): List<TextView> {
+        val out = mutableListOf<TextView>()
+        val stack = ArrayDeque<View>()
+        stack += root
+        var budget = 60
+        while (stack.isNotEmpty() && budget-- > 0) {
+            val v = stack.removeLast()
+            if (v is TextView) out += v
             if (v is ViewGroup) {
                 for (i in 0 until v.childCount) v.getChildAt(i)?.let { stack += it }
             }
@@ -417,8 +516,9 @@ object SnsCommentTag {
         return when (sub.lowercase()) {
             "stat" -> "SNSC_TAG stat enabled=${Kv.getBool(Keys.ANTIREVOKE_COMMENT)}&&" +
                 "${Kv.getBool(Keys.ANTIREVOKE_COMMENT_DELETED_TAG)} binds=${binds.get()} " +
-                "added=${added.get()} degrade=${degradeHits.get()} " +
-                "posts=${delMap.size} setAge=${(SystemClock.elapsedRealtime() - setAt) / 1000}s"
+                "added=${added.get()} textHits=${textHits.get()} " +
+                "degrade=${degradeHits.get()} posts=${delMap.size} " +
+                "tcache=${textCache.size} setAge=${(SystemClock.elapsedRealtime() - setAt) / 1000}s"
 
             "list" -> {
                 if (delMap.isEmpty()) "SNSC_TAGLS (empty) 归档里没有已删评论"
@@ -444,6 +544,21 @@ object SnsCommentTag {
                 "SNSC_TAG unmark ok"
             }
 
+            // 降级对账用的正文候选：确认归档里到底抽没抽出可读正文
+            "texts" -> buildString {
+                val snap = synchronized(textCache) { textCache.entries.take(5) }
+                if (snap.isEmpty()) {
+                    append("SNSC_TAGTEXT (empty) 缓存还没填 —— 先让朋友圈刷到有已删评论的动态")
+                } else {
+                    appendLine("SNSC_TAGTEXT tcache=${textCache.size} 显示前 5 条：")
+                    for ((k, v) in snap) {
+                        appendLine("SNSC_TAGTEXT snsId=$k comments=${v?.size ?: 0} " +
+                            "first=${v?.firstOrNull()?.take(3)}")
+                    }
+                    append(("(null = 查过了但归档里没有可定位的正文)"))
+                }
+            }
+
             "pending" -> buildString {
                 appendLine("SNSC_TAG 待取证清单：")
                 appendLine("T3 评论行 View 类名：'$PENDING_COMMENT_ROW_CLASS'（空 = 未取证）")
@@ -457,7 +572,7 @@ object SnsCommentTag {
                 "SNSC_TAG refreshed"
             }
 
-            else -> "SNSC_TAG probe: stat | list | mark <snsId> | unmark | pending | refresh"
+            else -> "SNSC_TAG probe: stat | list | texts | mark <snsId> | unmark | pending | refresh"
         }
     }
 }

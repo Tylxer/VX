@@ -554,6 +554,20 @@ object SnsCommentGuard {
         return r
     }
 
+    /**
+     * [SnsCommentLogic.classify] 要的「正文」。
+     *
+     * ⚠️ `curActionBuf` 抽不出可读片段时交回 **null（= 未知）**，只有**确认为空**时才交回 `""` ——
+     * 这两者对 [SnsCommentLogic.classify] 的含义完全不同（ALIVE vs EMPTY）。
+     * 抽出来的候选里取最长的那个当正文近似值（探针只用来分辨空/非空，够用）。
+     */
+    private fun contentOf(row: Row?): String? {
+        if (row == null) return null
+        val buf = row.curActionBuf
+        if (buf == null || buf.isEmpty()) return ""
+        return SnsCommentLogic.textCandidates(buf).maxByOrNull { it.length }
+    }
+
     /** 只取 attrBuf 一列 —— 评论拦截点上唯一需要的东西，别 select * 拖三个 BLOB */
     private fun readAttrBuf(db: Any, snsId: Long): ByteArray? {
         var out: ByteArray? = null
@@ -644,6 +658,17 @@ object SnsCommentGuard {
     internal fun archivedIds(limit: Int = 500): Map<Long, Set<Long>> =
         runCatching { archive()?.ids(limit) }.getOrNull() ?: emptyMap()
 
+    /**
+     * 标签侧的数据源：`snsId -> 每条已删评论的正文候选`（每条评论一个 `List<String>`）。
+     *
+     * 用在「评论行 View ↔ commentSvrID 映射」还没取证时的**降级定位**：
+     * 归档里存的是删之前的 `curActionBuf`，抽出来的正文候选可以跟界面上的 TextView
+     * 文案对账（[SnsCommentLogic.textHit]），从而找到那条评论画在哪个 View 上。
+     * 全程只用 Android 标准 API，不碰任何未取证的微信类名/字段名。
+     */
+    internal fun archivedTexts(limit: Int = 500): Map<Long, List<List<String>>> =
+        runCatching { archive()?.texts(limit) }.getOrNull() ?: emptyMap()
+
     // ------------------------------------------------------------------ 诊断
 
     private fun logOnce(msg: String) {
@@ -651,8 +676,8 @@ object SnsCommentGuard {
     }
 
     /**
-     * 探针。`sub`：`stat` / `list` / `snap`(带 id) / `traceon` / `traceoff` /
-     * `pending` / `refresh`
+     * 探针。`sub`：`stat` / `list` / `form`（形态取证）/ `snap`(带 id) / `traceon` /
+     * `traceoff` / `pending` / `refresh`
      */
     fun probe(sub: String, id: Long = 0L): String {
         return when (sub.lowercase()) {
@@ -683,6 +708,58 @@ object SnsCommentGuard {
                     "${(SystemClock.elapsedRealtime() - s.at) / 1000}s head=${SnsCommentLogic.hex(s.buf)}"
             }
 
+            /**
+             * ⚠️ **取证探针**（取证结论「朋友圈」#9 的待办）：删评论之后本地库里那条记录
+             * 到底是「整行消失」「内容清空」还是「置了某个 flag」。
+             *
+             * 做法：归档里每条 `(snsID, commentSvrID)` 是**删之前**的快照，拿它去**当前**
+             * SnsComment 里点查就是**删之后**的状态 —— 两者对比就是答案。
+             * 一次跑完定形态，判据（[SnsCommentLogic.classify]）一行不用改。
+             */
+            "form" -> {
+                val db = snsDb
+                if (db == null) {
+                    "SNSCFORM 还没抓到 SnsMicroMsg.db 句柄 —— 先去朋友圈刷一刷 / 让它" +
+                        "删一条评论，拦截点会顺手记下库实例"
+                } else {
+                    val ids = runCatching { archive()?.ids(50) }.getOrNull().orEmpty()
+                    if (ids.isEmpty()) {
+                        "SNSCFORM (empty) 归档里没有已删评论 —— 先开「防撤回-评论」开关，" +
+                            "让微信真删一条评论，再跑这条"
+                    } else buildString {
+                        val tally = HashMap<SnsCommentLogic.DelForm, Int>()
+                        var shown = 0
+                        for ((snsId, svrs) in ids) {
+                            for (svr in svrs) {
+                                val row = runCatching {
+                                    readRow(db, SnsCommentLogic.Id(snsId, svr))
+                                }.getOrNull()
+                                val form = SnsCommentLogic.classify(
+                                    SnsCommentLogic.CommentState(
+                                        present = row != null,
+                                        content = contentOf(row),
+                                        flag = row?.commentflag,
+                                    )
+                                )
+                                tally[form] = (tally[form] ?: 0) + 1
+                                if (shown++ < 5) {
+                                    appendLine(
+                                        "SNSCFORM ${SnsCommentLogic.key(snsId, svr)} form=$form " +
+                                            "present=${row != null} " +
+                                            "buf=${row?.curActionBuf?.size ?: -1}B " +
+                                            "flag=${row?.commentflag} " +
+                                            "label=${SnsCommentLogic.labelText(form) ?: "(不打标)"}"
+                                    )
+                                }
+                            }
+                        }
+                        append("SNSCFORM total=${tally.values.sum()} " + tally.entries
+                            .sortedBy { it.key.name }
+                            .joinToString(" ") { "${it.key}=${it.value}" })
+                    }
+                }
+            }
+
             "traceon" -> {
                 startTrace()
                 "SNSC trace ON ${TRACE_WINDOW_MS / 1000}s —— 现在去删一条评论，" +
@@ -700,6 +777,8 @@ object SnsCommentGuard {
                     "method='$PENDING_DELETE_DAO_METHOD'（空 = 未取证）")
                 appendLine("T2 删评论时是否重写 SnsInfo.attrBuf：用 probe(\"traceon\") 实证，" +
                     "看 old/new 字节数是否不同")
+                appendLine("T2b 删评论后本地库里那条记录变成哪种形态（整行消失/内容清空/置 flag）：" +
+                    "用 probe(\"form\") 实证，看 form= 的分布")
                 append("T3 评论行 View 与 commentSvrID 的映射：见 SnsCommentTag.probe(\"pending\")")
             }
 
@@ -798,6 +877,27 @@ private class CommentArchive(ctx: Context) :
             val i2 = c.getColumnIndexOrThrow("commentSvrID")
             while (c.moveToNext()) {
                 out.getOrPut(c.getLong(i1)) { HashSet() } += c.getLong(i2)
+            }
+        }
+        return out
+    }
+
+    /**
+     * 降级定位用的数据源：`snsId -> 每条已删评论的正文候选`。
+     * 抽不出正文的行直接丢（没东西可对账，留着只会让命中判据变松）。
+     */
+    fun texts(limit: Int): Map<Long, List<List<String>>> {
+        val out = HashMap<Long, MutableList<List<String>>>()
+        readableDatabase.query(
+            T, arrayOf("snsID", "curActionBuf"), null, null, null, null,
+            "$AT DESC", limit.toString()
+        ).use { c ->
+            val i1 = c.getColumnIndexOrThrow("snsID")
+            val i2 = c.getColumnIndexOrThrow("curActionBuf")
+            while (c.moveToNext()) {
+                val cands = SnsCommentLogic.textCandidates(c.getBlob(i2))
+                if (cands.isEmpty()) continue
+                out.getOrPut(c.getLong(i1)) { ArrayList() } += cands
             }
         }
         return out

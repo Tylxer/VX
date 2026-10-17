@@ -206,6 +206,111 @@ object SnsCommentLogic {
         return Verdict(Act.RESTORE, "snapshot has more entries", o, n)
     }
 
+    // ------------------------------------------------------------------ 「已删除」形态判定
+
+    /** 需求 6.2 第 5 项：被删评论的位置显示的文本 */
+    const val LABEL_DELETED = "[已删除]"
+
+    /**
+     * 一条评论的三种「已删除」形态。
+     *
+     * ⚠️ 到底是哪一种，8.0.48 上**没有实证**（取证结论「朋友圈」#9 的待办）：
+     * 删评论时本地库里那条记录是「整行消失」「内容清空」还是「置了某个 flag」，
+     * 三种可能都先做出来，取证探针（`snsc sub=form`）一跑就知道是哪种，
+     * 判据本身不用改。
+     */
+    enum class DelForm {
+        /** 正常评论 —— 不打标 */
+        ALIVE,
+
+        /** 形态 A：整行消失 —— 按 (snsID, commentSvrID) 查不到这一行了 */
+        MISSING,
+
+        /** 形态 B：内容清空 —— 行还在，但正文是空 / 全空白 / 只剩标点 */
+        EMPTY,
+
+        /** 形态 C：置了删除标记位 —— 行还在、正文也在，但被打上了「已删」标记 */
+        FLAGGED,
+    }
+
+    /**
+     * ⚠️ **待取证**：`commentflag`（以及 `isSilence` / `msgRelevanceType`）里到底哪一位
+     * 表示「这条评论已被删除」，8.0.48 上**没有实证**，所以这里是 null。
+     *
+     * null = 未取证 → [classify] **永远不会产出 [DelForm.FLAGGED]**。
+     * 「漏标」只是功能没生效，「误标」是把别人的正常评论打成已删除 —— 后者糟得多。
+     * 取证到之后把这里填成具体的位掩码即可，判据一行不用改（单测锁住了两种行为）。
+     */
+    val DELETED_FLAG_MASK: Int? = null
+
+    /**
+     * 一条评论在某个时刻的可观测状态。
+     *
+     * @param present 本地库里这一行还在吗（`SnsComment` 按 (snsID, commentSvrID) 点查）
+     * @param content 抽出来的正文；⚠️ `null` = **抽不出来（未知）**，不等于「空」
+     * @param flag 候选标记位；读不到就 null
+     */
+    data class CommentState(
+        val present: Boolean,
+        val content: String?,
+        val flag: Int? = null,
+    )
+
+    /**
+     * 正文是不是「被清空了」：null / 空串 / 全空白 / 只剩标点。
+     *
+     * ⚠️ `null` 一律返回 **false**（未知 ≠ 空）—— 抽不出正文时不能当作「已删除」的证据。
+     * ⚠️ 纯 emoji 评论是**正常内容**，不能判成空（所以 OTHER_SYMBOL / SURROGATE 算有内容）。
+     */
+    private val MEANINGFUL_CATEGORIES = setOf(
+        CharCategory.OTHER_SYMBOL, // emoji / 图形符号
+        CharCategory.SURROGATE,    // emoji 的高低代理项（BMP 外的符号）
+    )
+
+    fun isBlankish(s: String?): Boolean {
+        if (s == null) return false
+        if (s.isBlank()) return true
+        return s.none { it.isLetterOrDigit() || it.category in MEANINGFUL_CATEGORIES }
+    }
+
+    /**
+     * 判定一条评论处于哪种形态。规则刻意保守（打错标签比不打标签糟糕得多）：
+     *
+     * | 输入 | 判定 | 理由 |
+     * |---|---|---|
+     * | 行没了 | MISSING | 这是最硬的证据 |
+     * | 行在、抽不出正文 | ALIVE | 没有证据，不打标 |
+     * | 行在、正文空/空白/纯标点 | EMPTY | 正文被抹掉了 |
+     * | 行在、正文正常、flag 命中掩码 | FLAGGED | 掩码未取证时这一支**走不到** |
+     * | 其余 | ALIVE | |
+     */
+    fun classify(st: CommentState, mask: Int? = DELETED_FLAG_MASK): DelForm {
+        if (!st.present) return DelForm.MISSING
+        val c = st.content ?: return DelForm.ALIVE
+        if (isBlankish(c)) return DelForm.EMPTY
+        val m = mask
+        val f = st.flag
+        if (m != null && f != null && (f and m) != 0) return DelForm.FLAGGED
+        return DelForm.ALIVE
+    }
+
+    /** 是不是「已被删除的评论」（三种形态任一） */
+    fun isDeleted(st: CommentState, mask: Int? = DELETED_FLAG_MASK): Boolean =
+        classify(st, mask) != DelForm.ALIVE
+
+    /**
+     * `[已删除]` 文本拼装。
+     *
+     * - [DelForm.ALIVE] → **null**，表示「不打标」（调用方必须按 null 处理，不能当空串塞进 UI）
+     * - 有昵称 → `<昵称>：[已删除]`；昵称为空/全空白 → 只出 `[已删除]`
+     * - ⚠️ **一律不保留残留正文**：需求要的就是「显示 [已删除] 而不是残留内容」
+     */
+    fun labelText(form: DelForm, nick: String? = null): String? {
+        if (form == DelForm.ALIVE) return null
+        val n = nick?.trim()?.takeIf { it.isNotEmpty() } ?: return LABEL_DELETED
+        return "$n：$LABEL_DELETED"
+    }
+
     // ------------------------------------------------------------------ 正文候选 / 对账
 
     private const val MAX_CANDIDATES = 8

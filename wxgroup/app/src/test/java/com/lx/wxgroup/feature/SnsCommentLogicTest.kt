@@ -222,6 +222,117 @@ class SnsCommentLogicTest {
         assertFalse(SnsCommentLogic.textHit(emptyList(), listOf("这是一条测试评论")))
     }
 
+    // ------------------------------------------------------------------ 「已删除」形态判定
+    //
+    // ⚠️ 三种形态（整行消失 / 内容清空 / 置 flag）到底哪一种是 8.0.48 的真实行为，
+    // 目前**没有实证**（取证结论「朋友圈」#9）。所以这里把三种都锁住，
+    // 真机探针 `snsc sub=form` 跑完就知道是哪一种，判据不用改。
+
+    private fun state(present: Boolean, content: String?, flag: Int? = null) =
+        SnsCommentLogic.CommentState(present, content, flag)
+
+    /** 形态 A：整行消失 */
+    @Test
+    fun formMissingWhenRowGone() {
+        assertEquals(SnsCommentLogic.DelForm.MISSING, SnsCommentLogic.classify(state(false, null)))
+        assertEquals(SnsCommentLogic.DelForm.MISSING, SnsCommentLogic.classify(state(false, "还在的正文")))
+        assertTrue(SnsCommentLogic.isDeleted(state(false, null)))
+    }
+
+    /** 形态 B：内容清空 —— 空串 / 全空格 / 只剩标点 */
+    @Test
+    fun formEmptyWhenContentBlank() {
+        assertEquals(SnsCommentLogic.DelForm.EMPTY, SnsCommentLogic.classify(state(true, "")))
+        assertEquals(SnsCommentLogic.DelForm.EMPTY, SnsCommentLogic.classify(state(true, "   ")))
+        assertEquals(SnsCommentLogic.DelForm.EMPTY, SnsCommentLogic.classify(state(true, "\t\n ")))
+        assertEquals(SnsCommentLogic.DelForm.EMPTY, SnsCommentLogic.classify(state(true, "。。。")))
+        assertEquals(SnsCommentLogic.DelForm.EMPTY, SnsCommentLogic.classify(state(true, "?!...")))
+    }
+
+    /** ⚠️ 边界：`content == null` 是「抽不出正文」，不是「空」→ 必须判 ALIVE（不误标） */
+    @Test
+    fun contentNullMeansUnknownNotDeleted() {
+        assertEquals(SnsCommentLogic.DelForm.ALIVE, SnsCommentLogic.classify(state(true, null)))
+        assertFalse(SnsCommentLogic.isDeleted(state(true, null)))
+        assertFalse(SnsCommentLogic.isBlankish(null))
+    }
+
+    /** ⚠️ 纯 emoji 评论是正常内容，不能被当成「内容被清空」 */
+    @Test
+    fun emojiOnlyIsRealContent() {
+        assertFalse(SnsCommentLogic.isBlankish("😀😀"))
+        assertEquals(SnsCommentLogic.DelForm.ALIVE, SnsCommentLogic.classify(state(true, "😀")))
+    }
+
+    /** 正常评论不误标：有正文、没 flag */
+    @Test
+    fun normalCommentStaysAlive() {
+        val st = state(true, "这是一条正常评论", 0)
+        assertEquals(SnsCommentLogic.DelForm.ALIVE, SnsCommentLogic.classify(st))
+        assertFalse(SnsCommentLogic.isDeleted(st))
+        // 一个字也得算内容
+        assertEquals(SnsCommentLogic.DelForm.ALIVE, SnsCommentLogic.classify(state(true, "好")))
+    }
+
+    /**
+     * 形态 C：置 flag。
+     * ⚠️ 掩码**未取证**（[SnsCommentLogic.DELETED_FLAG_MASK] == null）时这一支必须走不到 ——
+     * 宁可漏标，不能把正常评论误标成已删除。
+     */
+    @Test
+    fun flagFormIsInertUntilForensics() {
+        val st = state(true, "正文还在", 1)
+        assertEquals(SnsCommentLogic.DelForm.ALIVE, SnsCommentLogic.classify(st)) // 默认掩码 null
+        assertFalse(SnsCommentLogic.isDeleted(st))
+        // 给了掩码才认
+        assertEquals(SnsCommentLogic.DelForm.FLAGGED, SnsCommentLogic.classify(st, 1))
+        assertEquals(SnsCommentLogic.DelForm.ALIVE, SnsCommentLogic.classify(st, 2))
+        assertEquals(SnsCommentLogic.DelForm.ALIVE, SnsCommentLogic.classify(state(true, "正文", 0), 1))
+        // 掩码给了但 flag 读不到 → 仍然不认
+        assertEquals(SnsCommentLogic.DelForm.ALIVE, SnsCommentLogic.classify(state(true, "正文", null), 1))
+    }
+
+    /** 行没了 > 一切：即便 flag/正文都正常 */
+    @Test
+    fun missingOutranksEverything() {
+        assertEquals(SnsCommentLogic.DelForm.MISSING, SnsCommentLogic.classify(state(false, "正文", 1), 1))
+    }
+
+    // ------------------------------------------------------------------ [已删除] 文本拼装
+
+    @Test
+    fun labelNullForAliveComment() {
+        assertNull(SnsCommentLogic.labelText(SnsCommentLogic.DelForm.ALIVE))
+        assertNull(SnsCommentLogic.labelText(SnsCommentLogic.DelForm.ALIVE, "张三"))
+    }
+
+    @Test
+    fun labelPlainWithoutNick() {
+        for (f in listOf(
+            SnsCommentLogic.DelForm.MISSING,
+            SnsCommentLogic.DelForm.EMPTY,
+            SnsCommentLogic.DelForm.FLAGGED,
+        )) {
+            assertEquals("[已删除]", SnsCommentLogic.labelText(f))
+            assertEquals("[已删除]", SnsCommentLogic.labelText(f, null))
+            assertEquals("[已删除]", SnsCommentLogic.labelText(f, "   ")) // 空白昵称 = 没有昵称
+        }
+    }
+
+    @Test
+    fun labelWithNick() {
+        assertEquals("张三：[已删除]", SnsCommentLogic.labelText(SnsCommentLogic.DelForm.EMPTY, "张三"))
+        assertEquals("张三：[已删除]", SnsCommentLogic.labelText(SnsCommentLogic.DelForm.MISSING, " 张三 "))
+    }
+
+    /** ⚠️ 拼装结果**不能**带残留正文 —— 需求要的是「显示 [已删除] 而不是残留内容」 */
+    @Test
+    fun labelNeverLeaksResidualContent() {
+        val s = SnsCommentLogic.labelText(SnsCommentLogic.DelForm.EMPTY, "张三")!!
+        assertFalse(s.contains("这是被抹掉的正文"))
+        assertTrue(s.endsWith("[已删除]"))
+    }
+
     // ------------------------------------------------------------------ 诊断输出
 
     @Test
