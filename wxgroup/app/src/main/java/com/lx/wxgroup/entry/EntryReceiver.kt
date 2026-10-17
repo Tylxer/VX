@@ -273,12 +273,25 @@ object EntryReceiver {
                                     "SNSG " + com.lx.wxgroup.feature.SnsGuard.restoreAll()
                                 )
                                 // 从归档反插回 SnsInfo（需求 6.4「从归档恢复」）：
-                                // 行还在就补可见位，行没了就整行 INSERT 回去。
+                                // 幂等判定 —— 行在且可见=SKIP / 行在但被清位=补位 / 行没了=整行 INSERT。
                                 // ⚠️ 这是写对方数据库，一次只恢复一条，先跑 --check 看清归档
                                 "restore" -> {
                                     val id = firstLong(intent, "id")
-                                    LogX.i("SNSG restore " + com.lx.wxgroup.feature.SnsGuard.restore(id))
+                                    LogX.i(
+                                        "SNSG restore " +
+                                            com.lx.wxgroup.feature.SnsGuard.restore(id)
+                                    )
                                 }
+                                // 批量恢复：--ei n <条数> --ez dry true(默认，只看计划)|false(真写)
+                                // 失败即停 + 倒序回滚；幂等，可以重跑
+                                "restoreall" -> for (l in com.lx.wxgroup.feature.SnsGuard
+                                    .restoreBatch(n, intent.getBooleanExtra("dry", true))
+                                ) LogX.i("SNSG $l")
+                                // 取证：SnsInfo 列清单 + 「没写的列里有没有 NOT NULL 无默认值」
+                                // （INSERT 只给部分列，这是唯一的硬风险，只读不写）
+                                "cols" -> for (l in com.lx.wxgroup.feature.SnsGuard
+                                    .snsInfoColumns()
+                                ) LogX.i("SNSG $l")
                                 // 模拟微信真实两步删除（update 清可见位 → delete 行），
                                 // 走真实的拦截路径，用来验证「拦下 + 恢复可见 + 归档 + 贴标」
                                 "simdel" -> {
