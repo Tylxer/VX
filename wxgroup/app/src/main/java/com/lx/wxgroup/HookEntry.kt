@@ -38,6 +38,7 @@ import com.lx.wxgroup.hook.PlusMenu
 import com.lx.wxgroup.probe.ChatListProbe
 import com.lx.wxgroup.probe.ChatOpenProbe
 import com.lx.wxgroup.probe.DexProbe
+import com.lx.wxgroup.probe.LabelHuntProbe
 import com.lx.wxgroup.probe.MenuHuntProbe
 import com.lx.wxgroup.probe.MenuProbe
 import com.lx.wxgroup.probe.RevokeHuntProbe
@@ -112,6 +113,7 @@ class HookEntry : IXposedHookLoadPackage {
         MenuHuntProbe.prepare(lpparam)
         RevokeHuntProbe.prepare(lpparam)
         SnsHuntProbe.prepare(lpparam)
+        LabelHuntProbe.prepare(lpparam)
 
         ContactSync.init(context)
         HostContext.setApp(context)
