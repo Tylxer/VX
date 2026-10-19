@@ -11,6 +11,7 @@ import com.lx.wxgroup.core.ActivityResultRelay
 import com.lx.wxgroup.core.ContactSync
 import com.lx.wxgroup.core.DexKitLocator
 import com.lx.wxgroup.core.HostContext
+import com.lx.wxgroup.core.FileSender
 import com.lx.wxgroup.core.TextSender
 import com.lx.wxgroup.core.NotifyMute
 import com.lx.wxgroup.core.VersionGate
@@ -122,6 +123,7 @@ class HookEntry : IXposedHookLoadPackage {
         MuteSetterProbe.prepare(lpparam)
         SendProbe.prepare(lpparam)
         TextSender.prepare(lpparam)
+        FileSender.prepare(lpparam)
 
         ContactSync.init(context)
         HostContext.setApp(context)

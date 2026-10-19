@@ -376,6 +376,82 @@ class ForwardLogicTest {
         assertEquals(ForwardLogic.Strategy.RESEND_FILE, plan.strategy)
     }
 
+    // ---------------------------------------------------------- 文件重发能力（A 档）
+
+    @Test
+    fun canResendFileOnlyForImage() {
+        // 2026-10-20 静态取证：只有 IMAGE(qf4/o4.O8) 有已证实的完整链路。
+        // VIDEO 曾判 true，复核时发现 r1.a(o1.VIDEO) 造的是普通 q1，而 t81/g.i 第一句
+        // 就 instance-of modelimage/o3、不是就直接 return ⇒ l1.a 恒 null ⇒ 恒静默失败。
+        // 放宽这里 = 对着未证实的反射调用赌微信不崩，所以逐个种类锁死。
+        assertEquals(true, ForwardLogic.canResendFile(ForwardLogic.Kind.IMAGE))
+        for (k in listOf(
+            ForwardLogic.Kind.TEXT,
+            ForwardLogic.Kind.VIDEO,   // ← 视频没链路，必须在这里面
+            ForwardLogic.Kind.VOICE,
+            ForwardLogic.Kind.FILE,
+            ForwardLogic.Kind.CARD,
+            ForwardLogic.Kind.LOCATION,
+            ForwardLogic.Kind.LINK,
+            ForwardLogic.Kind.UNKNOWN,
+        )) {
+            assertEquals("kind=$k 不该被判为可重发文件", false, ForwardLogic.canResendFile(k))
+        }
+    }
+
+    @Test
+    fun plainFileWithLocalPathSkipsInsteadOfFailingPerTarget() {
+        // 普通文件有本地路径、但没有可用的文件发送链路 ⇒ 应提前 SKIP 并说清原因。
+        // 若这里退化成 RESEND_FILE，真机上会「逐目标失败」，toast 只剩「失败 N」不说为什么。
+        val plan = ForwardLogic.planFor(
+            snap(
+                ForwardLogic.Kind.FILE,
+                text = "",
+                localPath = "/storage/.../pdf",
+                fileExists = true
+            ),
+            ForwardLogic.NativeState.UNKNOWN
+        )
+        assertEquals(ForwardLogic.Strategy.SKIP, plan.strategy)
+        assertTrue("reason 要说明是链路缺失：${plan.reason}", plan.reason.contains("暂无发送链路"))
+    }
+
+    @Test
+    fun voiceWithLocalPathAlsoSkips() {
+        // 语音（type=34）同样没有已证实的非 UI 发送链路
+        val plan = ForwardLogic.planFor(
+            snap(
+                ForwardLogic.Kind.VOICE,
+                localPath = "/storage/.../amr",
+                fileExists = true
+            ),
+            ForwardLogic.NativeState.UNKNOWN
+        )
+        assertEquals(ForwardLogic.Strategy.SKIP, plan.strategy)
+    }
+
+    @Test
+    fun videoWithLocalPathSkipsInsteadOfFailingPerTarget() {
+        // 视频有本地文件但**没有**可用的发送链路（r1.a(VIDEO) 造不出 o3，见 canResendFile 注释）
+        // ⇒ 应提前 SKIP 并说清原因，而不是逐目标失败（toast 只剩「失败 N」不说为什么）。
+        val plan = ForwardLogic.planFor(
+            snap(ForwardLogic.Kind.VIDEO, localPath = "/storage/.../mp4", fileExists = true),
+            ForwardLogic.NativeState.UNKNOWN
+        )
+        assertEquals(ForwardLogic.Strategy.SKIP, plan.strategy)
+        assertTrue("reason 要说明是链路缺失：${plan.reason}", plan.reason.contains("暂无发送链路"))
+    }
+
+    @Test
+    fun imageWithoutExistingFileStillFallsThroughToSkip() {
+        // fileExists=false 时不应走 RESEND_FILE（sender 里也挡，但计划层就该挡住）
+        val plan = ForwardLogic.planFor(
+            snap(ForwardLogic.Kind.IMAGE, localPath = "/storage/.../jpg", fileExists = false),
+            ForwardLogic.NativeState.UNKNOWN
+        )
+        assertEquals(ForwardLogic.Strategy.SKIP, plan.strategy)
+    }
+
     @Test
     fun textWinsOverFileWhenBothAvailable() {
         // 有文本优先重发文本（文件路径此时用不上）

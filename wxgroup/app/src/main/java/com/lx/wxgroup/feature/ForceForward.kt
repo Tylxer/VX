@@ -10,6 +10,7 @@ import android.widget.AdapterView
 import android.widget.ListView
 import android.widget.PopupWindow
 import android.widget.TextView
+import com.lx.wxgroup.core.FileSender
 import com.lx.wxgroup.core.HostContext
 import com.lx.wxgroup.core.TextSender
 import com.lx.wxgroup.ui.Panel
@@ -644,10 +645,45 @@ object ForceForward {
         return TextSender.send(target, snap.text)
     }
 
-    /** 降级重发文件。同 [resendText]：v1 恒 false（G3）。 */
+    /**
+     * 降级重发文件（无转发标记）。
+     *
+     * ✅ **A 档已接通（2026-10-20，静态取证；待真机）**：走 [FileSender.send]，
+     * 链路 = `hl0/r1.a(o1.IMAGE|VIDEO)` → `q1.g(path)` → `q1.h(talker)` →
+     * `q1.f(m)` → `q1.a()` → `MsgRetransmitUI.g6(l1)` → `l1.a()`，
+     * 与微信自己的 `qf4/o4.O8`（发图）逐条同构。证据见 `docs/取证结论.md`「K8-file」段。
+     *
+     * ⛔ **只支持图片/视频**：`qf4/o4` 里没有「发普通文件（appmsg type=6）」的公开方法，
+     * `hl0/o1` 的 APPMSG 常量在 classes7 全文零引用 ⇒ 普通文件（[ForwardLogic.Kind.FILE]）
+     * 明确返回 false，**不静默假装成功**。要补需走 `pluginsdk/model/app/u0` + `WXFileObject`
+     * + CDN 上传（参数 14 个），属独立的取证任务。
+     */
     private fun resendFile(snap: ForwardLogic.Snapshot, target: String): Boolean {
-        LogX.w("FORWARD resend-file unavailable (K8 send link missing, G3), target=${target.take(24)}")
-        return false
+        // 与 ForwardLogic.canResendFile 一一对应：判 true 的种类这里必须能映射出
+        // 一个真能发的 FileSender.Kind，否则就是「计划层放行、发送层静默拒绝」的缺口。
+        val kind = when (snap.kind) {
+            ForwardLogic.Kind.IMAGE -> FileSender.Kind.IMAGE
+            // 视频走 modelimage/o3 那条链，尚未取证完整（见 ForwardLogic.canResendFile 注释）
+            ForwardLogic.Kind.VIDEO -> FileSender.Kind.VIDEO
+            else -> FileSender.Kind.UNSUPPORTED
+        }
+        if (kind != FileSender.Kind.IMAGE) {
+            LogX.w(
+                "FORWARD resend-file unsupported kind=${snap.kind} " +
+                    "(仅 IMAGE 已取证；视频待 o3.j() 取证，普通文件待 B 档), target=${target.take(24)}"
+            )
+            return false
+        }
+        if (snap.localPath.isBlank() || !snap.fileExists) {
+            LogX.w(
+                "FORWARD resend-file no local file kind=${snap.kind} " +
+                    "path='${snap.localPath.take(80)}' exists=${snap.fileExists}"
+            )
+            return false
+        }
+        val ok = FileSender.send(kind, target, snap.localPath)
+        LogX.i("FORWARD resend-file kind=${snap.kind} ok=$ok target=${target.take(24)}")
+        return ok
     }
 
     // ------------------------------------------------------------ 探针 / 自检
@@ -658,6 +694,8 @@ object ForceForward {
      * - `on` / `off`  运行时开关（**真机反向对照用**，不写库、不进设置）
      * - `dump`  最近一次聊天消息菜单的文案清单（认人判据取证）
      * - `pick`  不走长按，直接打开选择器跑一遍「选目标→展开→策略→汇总」（半自动验收）
+     * - `filerdy`  文件重发（A 档）链路就绪性：`resendFile.ready=` + 可发种类清单。**不发消息**，
+     *              真机首验先跑这个再跑正式菜单，避免把「链路没 prepare」误判成「发送失败」
      */
     fun probe(sub: String): String = runCatching {
         when (sub.lowercase()) {
@@ -687,7 +725,11 @@ object ForceForward {
                 )
                 "picker opened (synthetic snapshot)"
             }
-            else -> "subs=stat,on,off,dump,pick"
+            "filerdy" ->
+                // A 档文件重发链路就绪性（不发消息，只报状态）：真机首验先跑这个
+                "resendFile.ready=${FileSender.ready()} " +
+                    "kinds=${ForwardLogic.Kind.entries.filter { ForwardLogic.canResendFile(it) }}"
+            else -> "subs=stat,on,off,dump,pick,filerdy"
         }
     }.getOrElse { "error=${it.javaClass.simpleName}" }
 

@@ -248,8 +248,56 @@ object ForwardLogic {
         val hasText = snap.text.isNotBlank()
         val hasFile = snap.localPath.isNotBlank() && snap.fileExists
         if (hasText) return Plan(Strategy.RESEND_TEXT, "原生转发不可用，降级重发文本")
-        if (hasFile) return Plan(Strategy.RESEND_FILE, "原生转发不可用，降级重发文件")
+        if (hasFile) {
+            // 有文件但种类发不出去（如普通文件/语音）→ 提前 SKIP 并说清原因，
+            // 否则会走到 resendFile 里逐目标失败，toast 只剩「失败 N」不说为什么。
+            if (!canResendFile(snap.kind)) {
+                return Plan(
+                    Strategy.SKIP,
+                    "原生转发不可用；${labelOf(snap.kind)}的本地文件暂无发送链路"
+                )
+            }
+            return Plan(Strategy.RESEND_FILE, "原生转发不可用，降级重发文件")
+        }
         return Plan(Strategy.SKIP, "原生转发不可用且取不到可重发的内容")
+    }
+
+    /**
+     * 哪些消息种类**本地文件**能发出去（降级重发的原料判据）。
+     *
+     * ## 为什么要单独一个纯函数
+     *
+     * 这是**只能在真机上才发现错**的那类判据（发不出去 = 静默失败），所以必须能在
+     * JVM 单测里锁住。`ForceForward.resendFile` 只是按这里的结论去调 sender。
+     *
+     * ## 为什么只有 IMAGE（视频曾经判 true，已收回）
+     *
+     * 2026-10-20 静态取证（`docs/取证结论.md`「K8-file」段）最初以为
+     * IMAGE（`qf4/o4.O8`）与 VIDEO（`o4.c9`）都能走这条 builder 链。
+     * 复核时逐条读 `t81/g` 发现**视频走的是另一条路**：
+     *
+     * - `r1.a(o1.VIDEO)` 造出的是普通 `q1`，`q1.a()` 对 VIDEO 分支调 `t81/g.i(q1)`；
+     * - `t81/g.i` **第一句**就是 `instance-of q1, com/tencent/mm/modelimage/o3`
+     *   （`8bbca6`），不是 `o3` 子类就直接 `return-object v0`（`8bbd72`），
+     *   拿到的 `k1.a` 恒为 null；
+     * - 于是 `l1.a()` 里 `Objects.requireNonNull` 抛 NPE（`71039c`），
+     *   被 `FileSender.send` 最外层 `runCatching` 吞掉 ⇒ **恒 false，只留一行 NPE**。
+     *
+     * 正解是 `modelimage/o3.j()` 工厂 + `o3.E/F/K/H` 字段 + `q1.h=20`，
+     * 这套**尚未取证完整**。放它进来就是「判 true 但发不出去」的静默失败，
+     * 比直接判 false 差得多（用户会以为发出去了）。⇒ 先判 false，等独立取证再放宽。
+     *
+     * 普通文件（appmsg type=6）与语音（type=34）同样没有已证实的非 UI 链路，
+     * `hl0/o1` 的 APPMSG 常量在 classes7 全文零引用。
+     *
+     * ⚠️ **不许为了「都支持」把这里放宽** —— 放宽 = 对着未证实的反射调用赌微信不崩。
+     * 要支持视频，先补 `o3.j()` 那条链的取证；要支持普通文件，先补
+     * `pluginsdk/model/app/u0` + `WXFileObject` 的取证。
+     */
+    fun canResendFile(kind: Kind): Boolean = when (kind) {
+        Kind.IMAGE -> true
+        Kind.TEXT, Kind.VIDEO, Kind.VOICE, Kind.FILE, Kind.CARD, Kind.LOCATION, Kind.LINK,
+        Kind.UNKNOWN -> false
     }
 
     /** 汇总 toast（逻辑层定文案），防止 UI 侧各自造句子 */
