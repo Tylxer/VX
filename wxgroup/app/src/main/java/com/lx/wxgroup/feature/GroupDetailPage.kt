@@ -20,6 +20,9 @@ import com.lx.wxgroup.core.ChatOpener
 import com.lx.wxgroup.core.HostContext
 import com.lx.wxgroup.data.GroupDb
 import com.lx.wxgroup.data.GroupMember
+import com.lx.wxgroup.data.Keys
+import com.lx.wxgroup.data.Kv
+import com.lx.wxgroup.ui.Panel
 import com.lx.wxgroup.ui.UiKit
 import com.lx.wxgroup.util.LogX
 
@@ -125,6 +128,8 @@ object GroupDetailPage {
         root.addView(list)
 
         // ---- 底部 ----
+        // dialog 先建出来（还没 setContentView / show）：下面「群发消息」的回调要用它 dismiss。
+        val dialog = Dialog(ctx)
         val bottom = LinearLayout(ctx).apply {
             orientation = LinearLayout.HORIZONTAL
             setPadding(pad, UiKit.dp(ctx, 8), pad, UiKit.dp(ctx, 10))
@@ -133,16 +138,14 @@ object GroupDetailPage {
             BatchPicker.show(groupId, groupName)
         }
         val sendBtn = button(ctx, "群发消息", UiKit.softBg(), darkText = true) {
-            UiKit.toast(ctx, "群发还没做（M3 之后）")
+            sendToGroup(ctx, dialog, db, groupId, groupName)
         }
         bottom.addView(addBtn)
         bottom.addView(sendBtn)
         root.addView(bottom)
 
-        val dialog = Dialog(ctx).apply {
-            setContentView(root)
-            setOnDismissListener { GroupBar.refreshAll() }
-        }
+        dialog.setContentView(root)
+        dialog.setOnDismissListener { GroupBar.refreshAll() }
         close.setOnClickListener { dialog.dismiss() }
         manage.setOnClickListener { MemberPage.show(groupId, groupName) }
         search.addTextChangedListener(object : TextWatcher {
@@ -169,8 +172,75 @@ object GroupDetailPage {
         }
     }
 
-    private fun memberMenu(
+    /**
+     * 「群发消息」按钮：把**当前分组**作为发送目标送进群发页。
+     *
+     * ## 为什么是「预填目标」而不是在这里直接发
+     * 群发是**全程后台**的任务（关掉弹窗也继续跑、再打开能看到进度），它的
+     * 运行态、风控闸门、暂停/继续、结果对账全在 [MassSendPage] 的单例里。
+     * 在这里另起一套发送循环 = 同一件事两份实现，两边迟早不一致。
+     * ⇒ 只做**填目标 + 跳转**，把「发什么、发不发」交给那一页决定。
+     *
+     * ## 文案要说清「不是立刻发」
+     * 用户点「群发消息」的心理预期是「点了就发出去」。这里只填目标，
+     * 于是必须同时**关掉当前页、打开群发页**，让用户看到那个还需要
+     * 填内容 + 点「开始群发」的页面 —— 否则就是「点了没反应」。
+     * 填完给的那句 toast 是补充说明，不是唯一反馈。
+     *
+     * ## ⚠️ 绝不静默覆盖已有目标
+     * `broadcast.targets` 是群发页的长期配置，用户可能在里面精心选了 30 个分组 / 标签 / 好友。
+     * 一个从「成员列表」进来的按钮如果直接把它改成一个分组，就是**静默的数据损失**
+     * （用户下次群发才发现目标全没了）。所以：空着就直接填，
+     * 已经是它就直接跳，**有别的内容必须先问一句**。
+     */
+    private fun sendToGroup(ctx: Context, dialog: Dialog, db: GroupDb, groupId: Long, groupName: String) {
+        val picked = "${MassSendLogic.PREFIX_GROUP}$groupId"
+        val members = runCatching { db.memberWxids(groupId).size }.getOrDefault(0)
+        if (members == 0) {
+            UiKit.toast(ctx, "「$groupName」还没有成员")
+            return
+        }
+        val cur = runCatching { Kv.getList(Keys.BROADCAST_TARGETS) }.getOrDefault(emptyList())
+
+        // 空着 / 已经是它 —— 不用问，直接进
+        if (cur.isEmpty() || cur == listOf(picked)) {
+            applyTargetAndOpen(ctx, dialog, picked, groupId, members, groupName, replaced = 0)
+            return
+        }
+
+        AlertDialog.Builder(ctx)
+            .setTitle("替换发送目标？")
+            .setMessage(
+                "群发页当前已选 ${cur.size} 个目标。\n" +
+                    "点「设为当前分组」会把它们全部换成「$groupName」($members 人)。"
+            )
+            .setPositiveButton("设为当前分组") { _, _ ->
+                applyTargetAndOpen(ctx, dialog, picked, groupId, members, groupName, replaced = cur.size)
+            }
+            .setNegativeButton("取消", null)
+            .show()
+    }
+
+    private fun applyTargetAndOpen(
         ctx: Context,
+        dialog: Dialog,
+        picked: String,
+        groupId: Long,
+        members: Int,
+        groupName: String,
+        replaced: Int,
+    ) {
+        Kv.putList(Keys.BROADCAST_TARGETS, listOf(picked))
+        LogX.i(
+            "DETAIL send-to-group group=$groupId members=$members replaced=$replaced " +
+                "-> 目标已预填，跳转群发页"
+        )
+        dialog.dismiss()
+        Panel.open(MassSendPage)
+        UiKit.toast(ctx, "目标已设为「$groupName」($members 人)，填好消息内容后点开始")
+    }
+
+    private fun memberMenu(ctx: Context,
         db: GroupDb,
         groupId: Long,
         member: GroupMember,

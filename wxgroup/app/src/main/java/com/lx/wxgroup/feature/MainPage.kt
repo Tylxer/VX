@@ -183,8 +183,8 @@ object MainPage : PanelPage {
     fun redpacketPage(): PanelPage = SettingPage(
         title = "红包",
         domain = "红包",
-        footnote = "「自动点击拆红包」只在领取界面已弹出后替你点那一下按钮，不改变消息接收链路。" +
-            "「决策引擎」目前只做识别与记录：取证前 type/文案两项留空，识别不到就什么都不会发生。",
+        footnote = "「自动点击拆红包」只在领取界面已弹出后替你点那一下按钮，" +
+            "不改变消息接收链路、不在后台触发。决定权仍在你：你点开哪个红包，就只拆哪个。",
     )
 
     fun momentsPage(): PanelPage = SettingPage(
@@ -200,9 +200,10 @@ object MainPage : PanelPage {
      * 交给 [MassSendPage]（单例，任务状态活过面板重建 —— 群发是全程后台的），
      * 不再用 `SettingPage` 占位：目标 / 内容 / 间隔三项配置在那一页里照样走 K2 渲染器。
      *
-     * ⚠️ 执行链路依赖底层发送接口（锚点 S9，**未定位**）：`MassSendRunner.send`
-     * 恒返回 NO_CHANNEL，任务会照常走完全部目标，最后由弹窗如实告知
-     * 「完成 0/N · 未发送 N」并导出目标清单。**不假装发送成功。**
+     * ✅ **S9 已接通并真机验证**（2026-10-18）：`MassSendRunner.send` 走
+     * `core/TextSender.send` 真发。只有模块未 prepare（链路缺失）时才返回 NO_CHANNEL，
+     * 那时任务照常走完全部目标，最后由弹窗如实告知「完成 0/N · 未发送 N」
+     * 并导出目标清单。**不假装发送成功。**
      */
     fun broadcastPage(): PanelPage = MassSendPage
 
