@@ -126,10 +126,10 @@ object Keys {
      * 这是 **UI 层**的东西（判据在 `feature/RedPacketLogic`），默认关。
      *
      * ⚠️ **红包域只有这一个开关 + 三个数值/名单项**（2026-10-19 收尾定）。
-     * 曾有一整套「消息层决策引擎」（`redpacket.decide` / `type_codes` / `text_markers` 等 6 个键
-     * + `LuckyLogic` + `LuckyProbe` + 496 行单测），但 `decide()` 在生产代码里**零调用点**，
-     * 打开开关不会有任何效果 —— 那是"看起来能自动抢红包、实际什么都不做"的空壳，已整块删除。
-     * 要恢复必须先取证出红包消息的 `type` 低位（见 `docs/取证结论.md` §6.3）。
+     * ⛔ 2026-10-20 用户决定：消息层「自动抢红包」永久不做，勿恢复（LuckyLogic/LuckyProbe 已删除）。
+     * 曾有一整套「消息层决策引擎」（6 个键 + `LuckyLogic` + `LuckyProbe` + 496 行单测），已整块删除：
+     * `decide()` 在生产代码里**零调用点**，是"看起来能自动抢红包、实际什么都不做"的空壳。
+     * 需求 6.3 只剩 UI 层：用户手动点开红包后自动点「开」，由 `feature/RedPacketLogic.kt` 实现。
      */
     const val REDPACKET_AUTO_OPEN = "redpacket.auto_open"
 

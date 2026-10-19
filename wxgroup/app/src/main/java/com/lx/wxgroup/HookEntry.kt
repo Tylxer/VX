@@ -265,14 +265,18 @@ class HookEntry : IXposedHookLoadPackage {
         // ⚠️ 与动态不同：删评论前微信可能已重写 SnsInfo.attrBuf（评论可见列表的载体），
         // 所以除了拦 delete SnsComment 还要做 attrBuf 差量检测与还原。细节见
         // feature/SnsCommentGuard.kt 类注释；attrBuf 是否被重写**尚未实证**，靠 probe 取证。
-        runCatching {
-            SnsCommentGuard.install(lpparam)
-        }.onFailure { LogX.e("SnsCommentGuard install failed", it) }
+        // ⛔ 2026-10-20 用户决定：评论域（评论防删除 + [已删除]标签）功能已停止，不再安装 hook。
+        // 实现完整保留在 feature/SnsCommentGuard.kt / feature/SnsCommentTag.kt / feature/SnsCommentLogic.kt（冻结，不删）。
+        // 恢复时：取消下面这段注释即可（连同 SnsCommentTag.install 一起）。
+        // runCatching {
+        //     SnsCommentGuard.install(lpparam)
+        // }.onFailure { LogX.e("SnsCommentGuard install failed", it) }
 
         // ---- 6.2 防撤回：朋友圈评论「[已删除]」标签 ----
-        runCatching {
-            SnsCommentTag.install(lpparam)
-        }.onFailure { LogX.e("SnsCommentTag install failed", it) }
+        // ⛔ 2026-10-20 同上：评论域功能已停止，不再安装 hook。
+        // runCatching {
+        //     SnsCommentTag.install(lpparam)
+        // }.onFailure { LogX.e("SnsCommentTag install failed", it) }
 
         // ---- 6.4 朋友圈：定时刷新 + 自动加载（默认关；刷新要充电/WiFi 任一满足）----
         // 刷新 = 到点时把时间线 Activity 显式拉起来（类名运行时捕获，不猜包名）；

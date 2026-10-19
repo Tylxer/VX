@@ -358,6 +358,15 @@ object EntryReceiver {
                             }
                         }
                     }
+                    // R9-P2 朋友圈图片 CDN 落盘验证（tools/_r9_cdn.py 用的临时探针）
+                    // --es sub stat|hook|dk|force|cbon|reqmp|paths|ls|export|imgpath [--es val ..] [--ei n 20]
+                    "cdn" -> {
+                        val sub = intent.getStringExtra("sub") ?: "stat"
+                        val v = intent.getStringExtra("val")
+                        val n = intent.getIntExtra("n", 20)
+                        // ⚠️ 凡是「读目录 / 拷文件」的一律走已有的 io { } 后台线程
+                        io { com.lx.wxgroup.probe.SnsCdnProbe.command(sub, v, n) }
+                    }
                     // 朋友圈动态「[已删除]」标签（SnsTag）
                     // --es sub stat = 状态；hit = 当前界面上打过标的 snsId 清单
                     "snstag" -> {
@@ -436,13 +445,13 @@ object EntryReceiver {
                         val sub = intent.getStringExtra("sub") ?: "stat"
                         LogX.i("REDPK " + com.lx.wxgroup.feature.RedPacket.probe(sub))
                     }
-                    // ---- 6.3 红包：只有 UI 层（见上面 "redpacket"），没有消息层入口 ----
-                    // ⚠️ 曾有 op=lucky 的「消息层决策引擎」探针（LuckyProbe + LuckyLogic），
-                    //    2026-10-19 **整块删除**：`decide()` 在生产代码里零调用点，
-                    //    6 个配置项（decide/type_codes/text_markers/allow/exclude/max_attempts）
+                    // ---- 6.3 红包：只有 UI 层（见上面 "redpacket"），消息层永久不做 ----
+                    // ⛔ 2026-10-20 用户决定：消息层「自动抢红包」永久不做，勿恢复（LuckyLogic/LuckyProbe 已删除）。
+                    //    曾有 op=lucky 的「消息层决策引擎」探针（LuckyProbe + LuckyLogic），2026-10-19 整块删除：
+                    //    `decide()` 在生产代码里零调用点，6 个配置项（decide/type_codes/text_markers/allow/exclude/max_attempts）
                     //    只是"打开也不会有任何效果"的空壳，容易让人以为功能能做而实际不做。
-                    //    要恢复：`git show 86e7808:wxgroup/app/src/main/java/com/lx/wxgroup/feature/LuckyLogic.kt`
-                    //    但恢复前必须先取证出红包消息的 type 低位（见 docs/取证结论.md §6.3）。
+                    //    ⛔ 勿按 git 历史恢复（如 86e7808 的 LuckyLogic.kt）：该恢复指令已作废。
+                    //    需求 6.3 只剩 UI 层：用户手动点开红包后自动点「开」，由 feature/RedPacketLogic.kt 实现。
                     // ---- 6.4 朋友圈：定时刷新 / 自动加载 / 自动导出 ----
                     // --es sub stat|env|act|refresh|load|rvmethods|export|img|scan|path [--ei n 5]
                     // ⚠️ refresh/load 会撩微信前台或甩列表，img/scan 要读库 → 都走后台线程
