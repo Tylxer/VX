@@ -31,7 +31,23 @@ data class PrefSpec(
     val title: String,
     val min: Int? = null,
     val max: Int? = null,
-    val unit: String? = null
+    val unit: String? = null,
+    /**
+     * **登记在表里，但不进设置页**（默认 false = 正常渲染）。
+     *
+     * 这个标记只影响 UI 一处：`Prefs.visible(domain)` 会把它滤掉，
+     * 而 `Prefs.ALL` / `spec()` / `defaultOf()` / `Kv.exportAll()` / `BackupFlow.knownKeys`
+     * **全部照旧包含它** —— 所以「已备份的配置不丢」和 `kvget/kvset` 探针都不受影响。
+     *
+     * 什么时候该用：某项**还没有消费点**（现在改它不会有任何效果），
+     * 但**已经可能存在于用户的备份文件里**，删定义会让旧备份导入时被
+     * `BackupMerge.knownKeys` 当未知 key 丢掉。这种「保留定义 + 不渲染」是
+     * 唯一正确的空壳形态 —— 既不骗用户，也不丢数据。
+     *
+     * ⚠️ 反例：功能**将来要做**、现在只是没做完 ⇒ 那不该用 hidden，
+     * 该把 `Prefs.ALL` 那一行直接删掉，等做完了再加回来。
+     */
+    val hidden: Boolean = false
 )
 
 /** key 常量。业务代码只引用这里，不写字面量 */
@@ -154,14 +170,18 @@ object Keys {
      * 元素可以是 talker（`wxid_xxx` / `xxx@chatroom`）也可以是群显示名。
      * **留空 = 全部会话**。
      *
-     * ⚠️ **当前未接线**：UI 层（`RedPacket`）只在"用户已经手动点开红包"之后才动手，
+     * ⚠️ **当前无消费点**：UI 层（`RedPacket`）只在"用户已经手动点开红包"之后才动手，
      * 那时没有会话筛选的余地 —— 用户点开的红包就是要拆的红包。
-     * 这两个键留给「消息层」用，但消息层已删除（见 [REDPACKET_AUTO_OPEN] 的注释）。
-     * 保留定义是为了**已备份的配置不丢**（`BackupFlow` 会按 `Prefs.ALL` 过滤）。
+     * 这两个键曾留给「消息层」用，但消息层已删除（见 [REDPACKET_AUTO_OPEN] 的注释）。
+     *
+     * 既然没有消费点，就不能在设置页画输入框（那是「说能做、实际不做」的空壳）。
+     * 但它**又必须留在 `Prefs.ALL` 里**：用户旧备份文件里可能带着这两个 key，
+     * 删掉定义会让 `BackupFlow.knownKeys` 把它们当未知 key 丢弃。
+     * ⇒ 唯一正确的处置是 `hidden = true`：**保留定义、不渲染**。
      */
     const val REDPACKET_ALLOW = "redpacket.allow"
 
-    /** 排除范围（格式同 [REDPACKET_ALLOW]）。⚠️ 当前同样**未接线**，原因见上 */
+    /** 排除范围（格式同 [REDPACKET_ALLOW]）。⚠️ 同样**无消费点**、`hidden = true`，原因见上 */
     const val REDPACKET_EXCLUDE = "redpacket.exclude"
 
     // —— 朋友圈域 ——
@@ -261,11 +281,13 @@ object Prefs {
         ),
         PrefSpec(
             Keys.REDPACKET_ALLOW, PrefKind.TEXT, "", "红包",
-            "参与范围（逗号分隔 wxid / 群名，留空=全部；当前仅消息层使用，暂未接线）"
+            "参与范围（逗号分隔 wxid / 群名，留空=全部；当前无消费点）",
+            hidden = true
         ),
         PrefSpec(
             Keys.REDPACKET_EXCLUDE, PrefKind.TEXT, "", "红包",
-            "排除范围（逗号分隔，优先于参与范围；当前暂未接线）"
+            "排除范围（逗号分隔，优先于参与范围；当前无消费点）",
+            hidden = true
         ),
 
         // 朋友圈域
@@ -300,8 +322,21 @@ object Prefs {
     /** 取默认值；未登记过的 key 返回空串，不抛异常 */
     fun defaultOf(key: String): String = byKey[key]?.def ?: ""
 
-    /** 按域取配置，用于渲染某个二级页 */
+    /**
+     * 按域取配置，用于渲染某个二级页。
+     *
+     * ⚠️ **这个函数不过滤 `hidden`**（它答的是「这个域登记了哪些 key」，
+     * 备份/统计口径要的是全集）。**渲染一律用 [visible]**。
+     */
     fun byDomain(domain: String): List<PrefSpec> = ALL.filter { it.domain == domain }
+
+    /**
+     * 按域取**要画出来**的配置 —— 渲染器唯一该用的入口。
+     *
+     * 比 [byDomain] 多滤掉 `hidden = true` 的项（定义还在、备份还在、探针还在，
+     * 只是不给用户看一个改了也没用的输入框）。理由见 [PrefSpec.hidden]。
+     */
+    fun visible(domain: String): List<PrefSpec> = byDomain(domain).filter { !it.hidden }
 
     /** 数值钳制到 [min, max]；不是数值型或没有范围则原样返回 */
     fun clamp(key: String, value: Int): Int {

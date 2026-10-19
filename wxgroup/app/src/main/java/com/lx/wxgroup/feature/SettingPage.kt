@@ -48,7 +48,9 @@ class SettingPage(
             root.addView(Rows.section(ctx, "设置"))
         }
 
-        val specs = domain?.let { Prefs.byDomain(it) }.orEmpty()
+        // 用 visible() 而不是 byDomain()：hidden 的项（保留定义但不该渲染）不画出来，
+        // 否则会出现「改了没有任何效果」的空壳输入框。理由见 PrefSpec.hidden。
+        val specs = domain?.let { Prefs.visible(it) }.orEmpty()
         if (specs.isNotEmpty()) {
             root.addView(Rows.prefGroup(ctx, specs, onEnter))
         } else if (head.isEmpty()) {

@@ -69,7 +69,9 @@ object MainPage : PanelPage {
 
     /** 「已开 n / m 项」，让用户不用点进去就知道这个域现在是开是关 */
     private fun switchSummary(domain: String): String {
-        val switches = Prefs.byDomain(domain).filter { it.kind == PrefKind.SWITCH }
+        // visible()：只统计用户真正能看到的项，否则「1 / 3 项已开启」里的分母
+        // 会把 hidden 项算进来，跟二级页实际显示的行数对不上。
+        val switches = Prefs.visible(domain).filter { it.kind == PrefKind.SWITCH }
         if (switches.isEmpty()) return ""
         val on = switches.count { Kv.getBool(it.key) }
         return if (on == 0) "未开启" else "$on / ${switches.size} 项已开启"

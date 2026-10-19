@@ -257,3 +257,73 @@
 - 文档：`取证结论.md`（订正 `q1.g` 语义、补 `O8` 逐字段表、补视频死路证据）。
 - `assembleDebug` **EXIT=0**；单测 **557 条 / 0 失败**（基线 552 ⇒ +5）。
 - 全程**未碰 adb**。
+
+---
+
+## R11c（2026-10-20）：红包名单空壳 —— 保留定义、不渲染
+
+### 起因
+
+R11b 提交后按「扫剩余离线债」的流程 `grep TODO|未接线|空壳`，命中 `Keys.kt:157/164`。
+核实后确认它是**真空壳**，且形态比一般的"功能没做完"更麻烦：
+
+| 事实 | 证据 |
+|---|---|
+| 零消费点 | `REDPACKET_ALLOW` / `REDPACKET_EXCLUDE` 在 `main/` 与 `test/` 下**除定义与登记外零引用** |
+| 但会被渲染 | `Keys.kt:263/267` 在 `Prefs.ALL` 里登记为 `PrefKind.TEXT` ⇒ `SettingPage` 画出两个输入框 |
+| 但删不得 | 用户旧备份文件里可能带这两个 key，删定义会让 `BackupFlow.knownKeys` 当未知 key 丢弃 |
+
+⇒ **两个错误答案之间夹着唯一正确的那个**：留着定义、不渲染。
+
+### 处置（三层约束，三个文件分别保证）
+
+| 约束 | 保证方式 |
+|---|---|
+| 定义还在 | `Prefs.ALL` 保留那两行，`hidden = true` |
+| 备份还在 | `Kv.exportAll()`（`:72`）与 `BackupFlow.knownKeys`（`:69`）都遍历 `Prefs.ALL`，**未改** |
+| 不渲染 | 新增 `Prefs.visible(domain)` = `byDomain(domain).filter { !it.hidden }`，三个渲染点全改用它 |
+
+改动点：
+- `Keys.kt`：`PrefSpec` 加 `hidden: Boolean = false` + 一段「什么时候该用 / 反例是什么」的注释；
+  新增 `Prefs.visible(domain)`；`byDomain` 注释里点明「**不过滤 hidden**，渲染一律用 `visible`」。
+- `SettingPage.kt:51`、`MassSendPage.kt:106`、`MainPage.kt:72`（`switchSummary` 的分母）改 `visible`。
+
+### 为什么 `MainPage.switchSummary` 也要改
+
+它算「已开 n / m 项」的分母。若用 `byDomain`，红包域分母会把两个 hidden 的 TEXT 也算进去 ——
+不过滤的话分母偏大，且与二级页实际行数对不上。**空壳的一个隐蔽副作用是污染统计口径**，
+所以它与渲染点同等对待。
+
+### 新单测 `PrefsVisibilityTest`（8 条）
+
+不测业务，只锁**形态**：hidden 的项必须「定义在 / 备份在 / 不渲染」同时成立。
+
+1. `hiddenKeysAreStillRegistered` —— `Prefs.ALL` 里有、`spec()` 能查到；
+2. `hiddenKeysAreNotRenderedInAnyDomain` —— 遍历所有域，`visible()` 结果里都没有；
+3. `byDomainKeepsHiddenButVisibleDropsIt` —— 两者对 hidden 项恰好差这一项（防「把 visible 改成 byDomain 别名」）；
+4. `hiddenDefaultsToFalse` —— 新配置项不能悄悄不显示；
+5. `hiddenDoesNotAffectDefaultsOrClamp` —— hidden 只影响渲染，不改默认值/钳制；
+6. **`noUnexpectedHiddenPrefs`** —— 反向守卫：hidden 白名单变动必须显式改测试；
+7. `keysAreUnique` —— 重复 key 会让 `spec()` 静默取到后一条；
+8. `keyPrefixMatchesDomainGrouping` —— `<域>.` 前缀与 `domain` 分组必须一致。
+
+第 6 条是本轮**最有价值**的一条：`hidden` 是个"眼不见"的旋钮，一旦被滥用就变成
+"功能没做完但先把开关藏起来"的合法借口 —— 那比空壳更糟，因为连设置页有这个条目这个线索都没了。
+把它钉成白名单，新增 hidden 必须过一次显式决策。
+
+### 「空壳的唯一正确形态」——写进方法论的判据
+
+遇到"定义了但没消费点"的配置项，先分清是哪一种：
+
+| 情形 | 正确处置 |
+|---|---|
+| 功能**将来要做**，只是没做完 | **把 `Prefs.ALL` 那一行删掉**，做完再加回来。`hidden` 不是"待办暂存区" |
+| 功能**永久不做**（如本轮的「消息层自动抢红包」已被用户否决） | 删 key 定义 + 删登记；但**如果旧版本曾把 key 写进备份**，则留定义 + `hidden` |
+
+区分标准只有一条：**旧备份文件里会不会有这个 key**。会 ⇒ 留；不会 ⇒ 删。
+
+### 验证
+
+- `testDebugUnitTest` **EXIT=0**，XML 核验 **565 条 / 0 失败 / 0 错误 / 0 跳过**（基线 557 ⇒ +8）。
+- `assembleDebug` **EXIT=0**（11s）。
+- 全程**未碰 adb**。

@@ -103,7 +103,8 @@ object MassSendPage : PanelPage {
 
     /** 配置态：三项配置 + 开始按钮 + 上次结果 */
     private fun buildConfig(ctx: Context, root: LinearLayout, j: MassSendLogic.Job) {
-        val specs = Prefs.byDomain("群发")
+        // visible()：hidden 的项保留定义但不渲染（见 PrefSpec.hidden）
+        val specs = Prefs.visible("群发")
         if (specs.isEmpty()) {
             root.addView(Rows.note(ctx, "群发域暂无可配置项"))
         } else {
