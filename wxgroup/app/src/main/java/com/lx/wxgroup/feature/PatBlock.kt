@@ -18,10 +18,32 @@ import java.util.HashSet
  * 聊天页双击对方头像不触发拍一拍。备选方向是阻断拍一拍消息的收发
  * （`shouldBlockIncoming`，判据在 [PatLogic]），二选一由真机取证结果定。
  *
- * ## 取证状态（2026-10，lane/pat）
- * `docs/取证结论.md` **没有拍一拍相关锚点**：8.0.48/2588 GP 的拍一拍触发类、
- * 方法和参数个数尚未定位。下面三个常量故意留空/-1，**不能用猜测的混淆名
- * 误拦普通头像点击**；填入真机锚点后 install 会反射校验。
+ * ## ✅ 取证结论（2026-10-19，静态反编译 + 真机行为双向印证）
+ * 手势侧**走不通**：真机 `GestureDetector#onTouchEvent` 探针只抓到
+ * `android.view.ViewRootImplExtImpl$ScrollGestureListener`（系统自己的滚动手势），
+ * 微信头像双击**根本没注册 doubleTap listener**，所以手势层拿不到任何微信类名。
+ *
+ * 改走**静态反编译**（`tools/_r4_dexscan.py` + `_r4_dexref.py`，扫 `base.apk` 的 15 个 dex）：
+ * ```
+ * classes4.dex 关键词 patted（11 处常量）
+ *   Lzx2/j;#d        "scene %d, sendPatMsg to %s, pattedUser %s"   ← 发送执行体（本文件主锚点）
+ *   Lwx2/a;#c        "</fromUser><pattedUser>" "</pattedUser><template>"  ← 拼 pat XML
+ *   Lxx2/i;#run      ".sysmsg.pat.pattedusername"                  ← 接收侧解析
+ *   Lvx2/l;#onSceneEnd  "update pat msg svrId %d..."               ← pat 的 NetScene 回调
+ *   Ldh4/x;#e        ".pattedUser" → Lq54/db4;                     ← pat XML → 数据结构
+ *
+ * zx2/j#d()V 的调用点（invoke 反查，仅 2 处）：
+ *   com.tencent.mm.ui.chatting.view.ChattingAvatarImageView#performAccessibilityAction(I,Bundle)Z
+ *   zx2/d#handleMessage(Message)
+ * ```
+ * **双击头像 → `ChattingAvatarImageView.performAccessibilityAction` → `zx2/j#d()` → 发拍一拍**。
+ * 这也解释了手势探针为什么空手而归：微信走的是 **AccessibilityAction**，不是 GestureDetector。
+ *
+ * 拦截点选 `zx2/j#d()` 而不选 UI 层的三个理由：
+ * 1. 它是「sendPatMsg」这条日志所在的执行体，拦掉后**只有拍一拍不发**，
+ *    不影响头像单击、不影响无障碍服务、不影响 `performAccessibilityAction` 的其它分支；
+ * 2. 无参 void，跳过实现只要 `param.result = null`，没有返回值语义要猜；
+ * 3. 业务层锚点同时覆盖 `zx2/d#handleMessage` 那条旁路（同一执行体）。
  *
  * 取证入口（零猜测锚点，随时可跑）：
  * ```
@@ -41,9 +63,11 @@ import java.util.HashSet
  */
 object PatBlock {
 
-    private const val PAT_TRIGGER_CLASS_8048 = "" // 待取证
-    private const val PAT_TRIGGER_METHOD_8048 = "" // 待取证
-    private const val PAT_TRIGGER_ARG_COUNT_8048 = -1 // 待取证
+    // zx2/j#d()V：拍一拍发送执行体（日志 "scene %d, sendPatMsg to %s, pattedUser %s" 所在方法）
+    // 来源：classes4.dex 静态反编译，调用方含 ChattingAvatarImageView#performAccessibilityAction
+    private const val PAT_TRIGGER_CLASS_8048 = "zx2.j"
+    private const val PAT_TRIGGER_METHOD_8048 = "d"
+    private const val PAT_TRIGGER_ARG_COUNT_8048 = 0
 
     @Volatile
     private var installed = false
@@ -75,6 +99,22 @@ object PatBlock {
     /** 已 dump 过的 doubleTap listener 类名，用来去重（同一个类只打一次栈） */
     private val dumpedListeners = Collections.synchronizedSet(HashSet<String>())
 
+    // ------------------------------------------------------------------ UI 层锚点（取证用，默认关）
+
+    /**
+     * 聊天页头像 View —— `zx2/j#d()` 的上层调用者之一（**非混淆名**，静态反编译 + invoke 反查）。
+     * 双击头像走的是它的 `performAccessibilityAction`，不是 GestureDetector。
+     * 这里**只取证不拦截**：拦截统一落在业务层 `zx2/j#d()`（理由见类注释），
+     * 本探针只用来确认「双击到底带哪个 action 进来」、给将来留备选锚点。
+     */
+    private const val PAT_UI_CLASS_8048 = "com.tencent.mm.ui.chatting.view.ChattingAvatarImageView"
+    private const val PAT_UI_METHOD_8048 = "performAccessibilityAction"
+
+    @Volatile
+    private var uiProbeHook: XC_MethodHook.Unhook? = null
+
+    private val uiProbeHits = java.util.concurrent.atomic.AtomicInteger(0)
+
     fun install(lpparam: XC_LoadPackage.LoadPackageParam) {
         runCatching {
             hostLoader = lpparam.classLoader
@@ -82,29 +122,43 @@ object PatBlock {
                 LogX.i("QUIET PAT skipped: 8.0.48 trigger anchor pending evidence (probe: op=quiet sub=pat sub2=dbltap)")
                 return
             }
-            val triggerClass = runCatching {
-                Class.forName(PAT_TRIGGER_CLASS_8048, false, lpparam.classLoader)
-            }.getOrNull() ?: run {
-                LogX.i("QUIET PAT skipped: trigger class not found")
-                return
+            if (tryInstall(lpparam.classLoader)) return
+            // 混淆类在 classes4.dex 里，模块注入可能早于该 dex 被 touch。
+            // 失败不放弃：主线程延迟重试几次（与 RedPacket.ensureCallbacks 同一套路）。
+            val h = android.os.Handler(android.os.Looper.getMainLooper())
+            for (d in longArrayOf(1500L, 4000L, 10_000L)) {
+                h.postDelayed({ runCatching { tryInstall(lpparam.classLoader) } }, d)
             }
-            val methods = triggerClass.declaredMethods.filter { method ->
-                method.name == PAT_TRIGGER_METHOD_8048 &&
-                    (PAT_TRIGGER_ARG_COUNT_8048 < 0 ||
-                        method.parameterTypes.size == PAT_TRIGGER_ARG_COUNT_8048)
-            }
-            if (methods.isEmpty()) {
-                LogX.i("QUIET PAT skipped: trigger method not found")
-                return
-            }
-            methods.forEach { method -> hook(method) }
-            hookedMethods = methods.size
-            installed = true
-            LogX.i("QUIET PAT installed hooks=${methods.size}")
         }.onFailure {
             installed = false
             LogX.i("QUIET PAT install failed: ${it.javaClass.simpleName}")
         }
+    }
+
+    /** 挂一次；成功返回 true。幂等：已 installed 直接 true（延迟重试不会重复 hook） */
+    private fun tryInstall(cl: ClassLoader): Boolean {
+        if (installed) return true
+        val triggerClass = runCatching {
+            Class.forName(PAT_TRIGGER_CLASS_8048, false, cl)
+        }.getOrNull() ?: run {
+            LogX.i("QUIET PAT retry: class ${PAT_TRIGGER_CLASS_8048} not found yet")
+            return false
+        }
+        val methods = triggerClass.declaredMethods.filter { method ->
+            method.name == PAT_TRIGGER_METHOD_8048 &&
+                (PAT_TRIGGER_ARG_COUNT_8048 < 0 ||
+                    method.parameterTypes.size == PAT_TRIGGER_ARG_COUNT_8048)
+        }
+        if (methods.isEmpty()) {
+            LogX.i("QUIET PAT retry: method ${PAT_TRIGGER_METHOD_8048}/${PAT_TRIGGER_ARG_COUNT_8048} not found")
+            return false
+        }
+        methods.forEach { method -> hook(method) }
+        hookedMethods = methods.size
+        installed = true
+        LogX.i("QUIET PAT installed class=${PAT_TRIGGER_CLASS_8048} hooks=${methods.size} " +
+            "sig=${methods.joinToString { it.toString() }}")
+        return true
     }
 
     private fun hook(method: Method) {
@@ -247,13 +301,70 @@ object PatBlock {
         }
     }
 
+    /**
+     * 运行时确认混淆锚点还在：静态反编译拿到的是 `base.apk` 里的名字，
+     * 真机上万一 dex 没加载 / 名字变了，这里能一眼看出来（不必靠「功能不生效」反推）。
+     */
+    private fun probeClass(): String {
+        val cl = hostLoader ?: return "cls: no host loader (模块没注入?)"
+        val c = runCatching { Class.forName(PAT_TRIGGER_CLASS_8048, false, cl) }.getOrNull()
+            ?: return "cls ${PAT_TRIGGER_CLASS_8048} NOT FOUND —— dex 未加载或版本不符，" +
+                "重跑静态取证：python tools/_r4_dexref.py classes4.dex patted"
+        val ms = c.declaredMethods.filter { it.name == PAT_TRIGGER_METHOD_8048 }
+        if (ms.isEmpty()) return "cls ${PAT_TRIGGER_CLASS_8048} FOUND but no method ${PAT_TRIGGER_METHOD_8048}"
+        return "cls ${PAT_TRIGGER_CLASS_8048} OK, ${PAT_TRIGGER_METHOD_8048} 候选：\n" +
+            ms.joinToString("\n") { "  ${it.name}(${it.parameterTypes.joinToString { p -> p.simpleName }})->${it.returnType.simpleName}" }
+    }
+
+    /** 头像 View 的 AccessibilityAction 取证探针（只打日志，不拦） */
+    private fun setUiProbe(on: Boolean): String = runCatching {
+        if (!on) {
+            val h = uiProbeHook ?: return "uiprobe already off (hits=${uiProbeHits.get()})"
+            val ok = runCatching { h.unhook() }.isSuccess
+            if (ok) uiProbeHook = null
+            return "uiprobe off removed=$ok hits=${uiProbeHits.get()}"
+        }
+        if (uiProbeHook != null) return "uiprobe already on hits=${uiProbeHits.get()}"
+        val cl = hostLoader ?: return "uiprobe: no host loader"
+        val c = runCatching { Class.forName(PAT_UI_CLASS_8048, false, cl) }.getOrNull()
+            ?: return "uiprobe: class not found ${PAT_UI_CLASS_8048}"
+        val m = runCatching {
+            c.getDeclaredMethod(PAT_UI_METHOD_8048, java.lang.Integer.TYPE, android.os.Bundle::class.java)
+        }.getOrNull() ?: return "uiprobe: method not found ${PAT_UI_METHOD_8048}(int,Bundle)"
+        uiProbeHook = XposedBridge.hookMethod(m, uiProbeCallback)
+        LogX.i("PATDBG uiprobe installed ${PAT_UI_CLASS_8048}#${PAT_UI_METHOD_8048}")
+        "uiprobe on: 去聊天页双击头像，然后 dev.py q PATDBG"
+    }.getOrElse { "uiprobe error=${it.javaClass.simpleName}" }
+
+    private val uiProbeCallback = object : XC_MethodHook() {
+        override fun beforeHookedMethod(param: MethodHookParam) {
+            runCatching {
+                if (uiProbeHits.get() >= PatLogic.MAX_STACK_DUMPS) return
+                val action = param.args.getOrNull(0)
+                val n = uiProbeHits.incrementAndGet()
+                LogX.i("PATDBG uiact #$n action=$action bundle=${param.args.getOrNull(1)}")
+                val st = Thread.currentThread().stackTrace
+                for (i in 0 until kotlin.math.min(st.size, 12)) {
+                    val f = st[i]
+                    if (f.className.startsWith("com.lx.wxgroup") ||
+                        f.className.startsWith("de.robv.android.xposed")
+                    ) continue
+                    LogX.i("PATDBG   #$i ${f.className}#${f.methodName}")
+                }
+            }
+        }
+    }
+
     fun probe(sub: String): String = runCatching {
         when (sub.lowercase()) {
-            "status" -> "installed=$installed hooks=$hookedMethods blocked=${blocked.get()} enabled=${Kv.getBool(Keys.CHAT_DISABLE_PAT)} dbltap=$dbltapLogging dumps=${stackDumps.get()}/${PatLogic.MAX_STACK_DUMPS} listeners=${dumpedListeners.size}"
-            "anchor" -> "class=${PAT_TRIGGER_CLASS_8048.ifBlank { "待取证" }} method=${PAT_TRIGGER_METHOD_8048.ifBlank { "待取证" }} argc=$PAT_TRIGGER_ARG_COUNT_8048 (evidence: op=quiet sub=pat sub2=dbltap)"
+            "status" -> "installed=$installed hooks=$hookedMethods blocked=${blocked.get()} enabled=${Kv.getBool(Keys.CHAT_DISABLE_PAT)} dbltap=$dbltapLogging dumps=${stackDumps.get()}/${PatLogic.MAX_STACK_DUMPS} listeners=${dumpedListeners.size} uiprobe=${uiProbeHook != null}"
+            "anchor" -> "class=${PAT_TRIGGER_CLASS_8048.ifBlank { "待取证" }} method=${PAT_TRIGGER_METHOD_8048.ifBlank { "待取证" }} argc=$PAT_TRIGGER_ARG_COUNT_8048 ui=${PAT_UI_CLASS_8048}#${PAT_UI_METHOD_8048}"
+            "cls" -> probeClass()
             "dbltap" -> setDbltap(true)
             "dbltapoff" -> setDbltap(false)
-            else -> "subs=status,anchor,dbltap,dbltapoff"
+            "uiprobe" -> setUiProbe(true)
+            "uiprobeoff" -> setUiProbe(false)
+            else -> "subs=status,anchor,cls,dbltap,dbltapoff,uiprobe,uiprobeoff"
         }
     }.getOrElse { "error=${it.javaClass.simpleName}" }
 }

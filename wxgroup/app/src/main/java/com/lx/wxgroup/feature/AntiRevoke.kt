@@ -343,6 +343,10 @@ object AntiRevoke {
             msgDb = param.thisObject
             // ContactLabel / rcontact 与 message 同库；首次拿到常驻句柄即后台预热标签索引。
             LabelSource.warmUp()
+            // 群显示名同库同表（rcontact 的 conRemark/nickname），句柄就绪就一起预热。
+            // 不预热也能工作（第一条群通知会把线程带起来），但那样「防止被@」的名单里
+            // 配了群名的用户在冷启动后第一条通知上会漏判一次。
+            GroupNameSource.warmUp()
         }
 
         // 采样：证明钩子真的被调用了（节流到 5 秒一条）。

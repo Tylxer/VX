@@ -123,26 +123,25 @@ object PatLogic {
      * 纯函数：入参是字符串列表（来自反射枚举 / 日志），出参是命中的子列表，
      * 不改动入参、不发反射、不碰 Android。**命中的只是候选，必须人工过目确认**
      * 才能回填 PatBlock 锚点——混淆名里 `pat` 也可能是毫不相干的类。
+     *
+     * 输出**去重并保持首次出现顺序**：真机取证时入参来自多份栈 dump
+     * （见 docs/拍一拍下一轮取证清单.md「结果 C」），同一个类会在多帧里重复出现。
+     * 保序 = 保留「越靠前越接近触发调用」的栈序线索，故**刻意不排序**。
      */
-    fun classCandidates(names: List<String>): List<String> {
-        if (names.isEmpty()) return emptyList()
-        val out = ArrayList<String>()
-        for (n in names) {
-            val lower = n.lowercase()
-            if (CLASS_KEYWORDS.any { lower.contains(it) }) out.add(n)
-        }
-        return out
-    }
+    fun classCandidates(names: List<String>): List<String> = candidates(names, CLASS_KEYWORDS)
 
     /** 同 [classCandidates]，用于方法名。 */
-    fun methodCandidates(names: List<String>): List<String> {
+    fun methodCandidates(names: List<String>): List<String> = candidates(names, METHOD_KEYWORDS)
+
+    /** [classCandidates] / [methodCandidates] 的公共实现：子串命中 + 去重 + 保序。 */
+    private fun candidates(names: List<String>, keywords: List<String>): List<String> {
         if (names.isEmpty()) return emptyList()
-        val out = ArrayList<String>()
+        val out = LinkedHashSet<String>()
         for (n in names) {
             val lower = n.lowercase()
-            if (METHOD_KEYWORDS.any { lower.contains(it) }) out.add(n)
+            if (keywords.any { lower.contains(it) }) out.add(n)
         }
-        return out
+        return out.toList()
     }
 
     // ------------------------------------------------------------------ 取证探针限流

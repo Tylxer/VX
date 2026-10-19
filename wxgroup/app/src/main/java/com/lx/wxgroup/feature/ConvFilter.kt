@@ -830,6 +830,8 @@ object ConvFilter {
 
             val db = GroupDb.current()
             val enabled = runCatching { Kv.getBool(Keys.CHAT_GROUP_ROW_ENABLED) }.getOrDefault(true)
+            // 未读角标开关：整个 rebuild 只读这一次（每行读会把滚动变成查库）
+            val showUnread = runCatching { Kv.getBool(Keys.CHAT_SHOW_UNREAD) }.getOrDefault(true)
             val filterId = currentGroupId()
 
             // ⚠️ 指纹**必须包含分组本身**：置顶 / 重命名 / 删分组改的是分组表，
@@ -839,7 +841,9 @@ object ConvFilter {
             val groups = if (db == null) emptyList()
             else runCatching { db.listGroups() }.getOrDefault(emptyList())
 
-            val stamp = "$n|$enabled|$filterId|${cachedMembers.hashCode()}|${groups.hashCode()}"
+            // ⚠️ 指纹**必须带上 showUnread**：只改这个开关时会话数/分组都没变，
+            // 少了它会被下面的「指纹相同直接返回」短路掉，表现为改了开关列表纹丝不动。
+            val stamp = "$n|$enabled|$filterId|$showUnread|${cachedMembers.hashCode()}|${groups.hashCode()}"
             if (snaps.isNotEmpty() && stamp == lastStamp) return@synchronized
             lastStamp = stamp
 
@@ -863,7 +867,7 @@ object ConvFilter {
                         for (g in groups) {
                             val wx = runCatching { db.memberWxids(g.id) }.getOrDefault(emptySet())
                             members[g.id] = wx
-                            newModels[g.id] = buildModel(db, g, wx)
+                            newModels[g.id] = buildModel(db, g, wx, showUnread)
                         }
                         models = newModels
                         ConvLayout.build(snaps, specs, members, enabled = true)
@@ -893,7 +897,12 @@ object ConvFilter {
         }
 
         /** A4 + A7：算出这个分组行该显示什么 */
-        private fun buildModel(db: GroupDb, g: Group, wx: Set<String>): GroupRowView.Model {
+        private fun buildModel(
+            db: GroupDb,
+            g: Group,
+            wx: Set<String>,
+            showUnread: Boolean
+        ): GroupRowView.Model {
             var timeMs = 0L
             var unread = 0
             var sender = ""
@@ -930,6 +939,7 @@ object ConvFilter {
                 lastMsg = msg,
                 timeMs = timeMs,
                 unread = unread,
+                showUnread = showUnread,
                 memberNames = names,
             )
         }

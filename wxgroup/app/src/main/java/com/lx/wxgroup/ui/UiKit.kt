@@ -6,6 +6,8 @@ import android.content.Context
 import android.graphics.Color
 import android.graphics.Typeface
 import android.graphics.drawable.GradientDrawable
+import android.os.Handler
+import android.os.Looper
 import android.text.InputType
 import android.util.TypedValue
 import android.view.ViewGroup
@@ -141,6 +143,27 @@ object UiKit {
     fun toast(ctx: Context, msg: String) {
         runCatching { Toast.makeText(ctx, msg, Toast.LENGTH_SHORT).show() }
             .onFailure { LogX.w("toast failed: ${it.javaClass.simpleName}") }
+    }
+
+    /**
+     * 后台线程干完活回主线程。
+     *
+     * 为什么统一在这里：`Handler(Looper.getMainLooper())` 每个类各建一个的写法
+     * 已经出现在 6 个文件里，而**回调里改 UI/弹窗必须回主线程**这条约束很容易漏
+     * （漏了的表现是偶发 `CalledFromWrongThreadException` 或 toast 不显示）。
+     * 已经在主线程时直接执行，省一次消息循环往返。
+     */
+    fun runOnMain(block: () -> Unit) {
+        if (Looper.myLooper() == Looper.getMainLooper()) {
+            runCatching(block).onFailure { LogX.w("runOnMain threw: ${it.javaClass.simpleName}") }
+            return
+        }
+        runCatching {
+            Handler(Looper.getMainLooper()).post {
+                runCatching(block)
+                    .onFailure { LogX.w("runOnMain threw: ${it.javaClass.simpleName}") }
+            }
+        }.onFailure { LogX.w("runOnMain post failed: ${it.javaClass.simpleName}") }
     }
 
     /** 单行输入对话框：新建分组 / 重命名都用它 */

@@ -5,6 +5,7 @@ import android.content.Context
 import android.database.Cursor
 import android.database.sqlite.SQLiteDatabase
 import android.database.sqlite.SQLiteOpenHelper
+import com.lx.wxgroup.util.LogX
 
 /**
  * 分组数据落地。
@@ -37,13 +38,14 @@ class GroupDb private constructor(context: Context) :
 
     companion object {
         const val DB_NAME = "wxgroup.db"
-        private const val DB_VERSION = 7
+        private const val DB_VERSION = 8
 
         private const val T_GROUP = "groups"
         private const val T_MEMBER = "group_member"
         private const val T_FRIEND = "friend_cache"
         private const val T_KV = "kv"
         private const val T_DND = "auto_dnd_done"
+        private const val T_SEEN = "group_seen"
         private const val T_RESCUED = "rescued"
         private const val T_SNS = "sns_archive"
 
@@ -96,6 +98,7 @@ class GroupDb private constructor(context: Context) :
         createDndTable(db)
         createRescuedTable(db)
         createSnsTable(db)
+        createSeenTable(db)
     }
 
     override fun onUpgrade(db: SQLiteDatabase, oldVersion: Int, newVersion: Int) {
@@ -154,6 +157,9 @@ class GroupDb private constructor(context: Context) :
         }
         if (oldVersion < 7) {
             createSnsTable(db)
+        }
+        if (oldVersion < 8) {
+            createSeenTable(db)
         }
     }
 
@@ -627,6 +633,74 @@ class GroupDb private constructor(context: Context) :
             put("handled_at", System.currentTimeMillis())
         }
         writableDatabase.insertWithOnConflict(T_DND, null, values, SQLiteDatabase.CONFLICT_IGNORE)
+    }
+
+    // ------------------------------------------------- 「见过的群」（新群判定的基线）
+
+    /**
+     * 建表：新加群自动免打扰的**持久化基线**。
+     *
+     * 为什么必须持久化（2026-10-18 真机踩坑）：原来基线只放内存，每次微信重启都
+     * 用当前会话列表重新快照 ⇒ 用户被拉进的新群在下一次启动时已经躺在列表里，
+     * 被当成"存量群"永远判 EXISTING，功能**重启即失效**。
+     */
+    private fun createSeenTable(db: SQLiteDatabase) {
+        db.execSQL(
+            """
+            CREATE TABLE IF NOT EXISTS $T_SEEN (
+                chatroom_id TEXT    PRIMARY KEY,
+                first_seen  INTEGER NOT NULL
+            )
+            """.trimIndent()
+        )
+    }
+
+    /** 已见过的群（跨重启的基线）。空集合 = 首次运行，调用方要做冷启动处理。 */
+    fun listSeenGroups(): Set<String> {
+        return runCatching {
+            readableDatabase.query(T_SEEN, arrayOf("chatroom_id"), null, null, null, null, null)
+                .use { cursor ->
+                    buildSet {
+                        while (cursor.moveToNext()) add(cursor.getString(0))
+                    }
+                }
+        }.onFailure { LogX.w("GroupDb listSeen failed: ${it.javaClass.simpleName}") }
+            .getOrDefault(emptySet())
+    }
+
+    /** 见过的群数量（判「是不是首次运行」用，比 list 全量再 size 省） */
+    fun seenCount(): Int {
+        return runCatching {
+            readableDatabase.query(T_SEEN, arrayOf("COUNT(*)"), null, null, null, null, null)
+                .use { c -> if (c.moveToFirst()) c.getInt(0) else 0 }
+        }.onFailure { 0 }.getOrDefault(0)
+    }
+
+    /**
+     * 批量登记"见过"。用事务 + CONFLICT_IGNORE，重复登记无害。
+     * 只在真正需要写时开事务，避免每次刷新都产生一次磁盘 IO。
+     */
+    fun markSeen(chatroomIds: Collection<String>) {
+        if (chatroomIds.isEmpty()) return
+        runCatching {
+            val now = System.currentTimeMillis()
+            writableDatabase.beginTransaction()
+            try {
+                val values = ContentValues()
+                for (id in chatroomIds) {
+                    if (id.isBlank()) continue
+                    values.clear()
+                    values.put("chatroom_id", id)
+                    values.put("first_seen", now)
+                    writableDatabase.insertWithOnConflict(
+                        T_SEEN, null, values, SQLiteDatabase.CONFLICT_IGNORE
+                    )
+                }
+                writableDatabase.setTransactionSuccessful()
+            } finally {
+                writableDatabase.endTransaction()
+            }
+        }.onFailure { LogX.w("GroupDb markSeen failed: ${it.javaClass.simpleName}") }
     }
 
     // ---------------------------------------------------------------- 成员

@@ -43,6 +43,14 @@ object GroupRowView {
         val timeMs: Long = 0L,
         /** A7：组内未读数求和 */
         val unread: Int = 0,
+        /**
+         * 是否渲染未读角标（=`chat.show_unread` 开关，`Keys.CHAT_SHOW_UNREAD`）。
+         *
+         * ⚠️ 由 [com.lx.wxgroup.feature.ConvFilter] 在 `rebuild()` 里**读一次**后传进来，
+         * **不在这里现读 Kv**：`build()` 是「每行、每次渲染」都跑的热路径，
+         * 而 `Kv.getString` 是一次 SQLite 查询 —— 放这儿等于把列表滚动变成查库。
+         */
+        val showUnread: Boolean = true,
         /** A4-c：整组没消息时展示的成员名（最多 3 个） */
         val memberNames: List<String> = emptyList(),
     )
@@ -113,7 +121,8 @@ object GroupRowView {
                 setTextColor(0xFFB0B0B0.toInt())
             })
         }
-        if (m.unread > 0) {
+        // 开关关掉就不画角标（判据由 ConvFilter 在 rebuild 时算好传进来，这里不读配置）
+        if (m.showUnread && m.unread > 0) {
             right.addView(unreadBadge(ctx, d, m.unread))
         }
         row.addView(right)
@@ -187,6 +196,9 @@ object GroupRowView {
     private fun unreadBadge(ctx: Context, d: Float, n: Int): TextView {
         return TextView(ctx).apply {
             text = if (n > 99) "99+" else n.toString()
+            // 给真机断言留个锚：uiautomator 看不到背景色，`dev.py ui 未读` 全靠这行
+            // （验证「显示未读」开关时，开关关掉它就应该整个消失）
+            contentDescription = "未读${n}"
             textSize = 11f
             setTextColor(0xFFFFFFFF.toInt())
             gravity = Gravity.CENTER

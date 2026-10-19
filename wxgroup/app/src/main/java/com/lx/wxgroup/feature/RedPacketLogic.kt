@@ -81,12 +81,20 @@ object RedPacketLogic {
     private const val SPARSE_PAGE_MAX_TEXTS = 8
 
     /**
+     * 应当被抹掉的「空白」。**不含** `\s` 默认覆盖不到的那些：
+     * JVM 的 `\s` 只有 ASCII 空白，真机多语言排版里的全角空格 U+3000、
+     * 不换行空格 U+00A0、零宽空格 U+200B 都不在其中（`"开　".trim()` 也不会动它们），
+     * 只靠 `\s` 会漏掉带这些空格的按钮文案。
+     */
+    private val WS = Regex("[\\s\\u00A0\\u1680\\u2000-\\u200B\\u202F\\u205F\\u3000\\uFEFF]+")
+
+    /**
      * 归一化：去空白 + 去首尾标点。
      * 真机上按钮文案可能带空格（多语言排版）或全角标点，直接全等会漏。
      */
     fun normalize(raw: String?): String {
         if (raw == null) return ""
-        val s = raw.replace("\\s+".toRegex(), "")
+        val s = raw.replace(WS, "")
         var a = 0
         var b = s.length
         while (a < b && isPunct(s[a])) a++
@@ -97,17 +105,26 @@ object RedPacketLogic {
     private fun isPunct(ch: Char): Boolean = ch in "!！。.,，、;；:：?？~～'\"“”‘’「」『』()（）[]【】"
 
     /**
-     * 文案判定。**先白名单全等，再黑名单子串**，其余一律 [Kind.IGNORE]。
+     * 文案判定：**白名单全等命中、且未命中黑名单子串**才算 [Kind.OPEN]；
+     * 黑名单子串命中判 [Kind.DENY]；其余 [Kind.IGNORE]。
      *
-     * 顺序不能反：黑名单里有「开通 / 开启」这种含「开」的词，
-     * 若先跑子串黑名单，白名单里的「开」就永远没机会命中。
-     * 全等匹配本身已经很窄，先判它不会放过危险文案。
+     * 判据顺序是刻意的：
+     *  1. 先过长度闸（超长的句子连黑名单都不必看）；
+     *  2. 再算黑名单子串 `denied`，**黑名单优先于白名单**——真出现某个文案既全等命中
+     *     [OPEN_TEXTS]、又含任一 [DENY_TOKENS] 子串的极端情况（配置被改坏 / 微信换了文案），
+     *     必须判 [Kind.DENY]（不点）而不是 [Kind.OPEN]（点）。总原则「误点比不点更糟」
+     *     在这一条上不打折扣；
+     *  3. 只有「命中白名单 **且** 未被黑名单否决」才判 [Kind.OPEN]。
+     *
+     * 单字的「开」不会被「开通 / 开启」这类黑名单词误伤（`"开".contains("开通")` 为 false），
+     * 所以黑名单优先不会把白名单里的「开」吃掉。
      */
     fun classify(raw: String?): Kind {
         val s = normalize(raw)
         if (s.isEmpty() || s.length > MAX_BTN_LEN) return Kind.IGNORE
-        if (s in OPEN_TEXTS) return Kind.OPEN
-        return if (DENY_TOKENS.any { s.contains(it) }) Kind.DENY else Kind.IGNORE
+        val denied = DENY_TOKENS.any { s.contains(it) }
+        if (s in OPEN_TEXTS && !denied) return Kind.OPEN
+        return if (denied) Kind.DENY else Kind.IGNORE
     }
 
     /** 是不是「拆红包」按钮文案 */
@@ -148,8 +165,16 @@ object RedPacketLogic {
         return looksLikeRedPacketPage(pageTexts)
     }
 
-    /** 页面上下文判定。命中任一关键词 = 红包界面；整屏文本极简时也放行（见 [SPARSE_PAGE_MAX_TEXTS]）*/
+    /**
+     * 页面上下文判定。命中任一关键词 = 红包界面；整屏文本极简时也放行（见 [SPARSE_PAGE_MAX_TEXTS]）。
+     *
+     * ⚠️ **空列表一律判 false**：`texts` 为空只可能是调用方没采到文本（真机上红包封面至少
+     * 有「发红包人 / 祝福语 / 按钮」三五个文本），此时的「什么都没看到」是**上下文未知**而非
+     * 「极简封面」。原实现让 `texts.size == 0 <= 8` 命中极简分支返回 true —— 那正相反，
+     * 会把「未知」当成「确认」，与「误点比不点更糟」冲突。
+     */
     fun looksLikeRedPacketPage(texts: List<String>): Boolean {
+        if (texts.isEmpty()) return false
         if (texts.any { t -> PAGE_TOKENS.any { t.contains(it) } }) return true
         return texts.size <= SPARSE_PAGE_MAX_TEXTS
     }

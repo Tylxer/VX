@@ -7,9 +7,11 @@ import de.robv.android.xposed.IXposedHookLoadPackage
 import de.robv.android.xposed.XC_MethodHook
 import de.robv.android.xposed.XposedHelpers
 import de.robv.android.xposed.callbacks.XC_LoadPackage
+import com.lx.wxgroup.core.ActivityResultRelay
 import com.lx.wxgroup.core.ContactSync
 import com.lx.wxgroup.core.DexKitLocator
 import com.lx.wxgroup.core.HostContext
+import com.lx.wxgroup.core.TextSender
 import com.lx.wxgroup.core.NotifyMute
 import com.lx.wxgroup.core.VersionGate
 import com.lx.wxgroup.data.GroupDb
@@ -41,7 +43,9 @@ import com.lx.wxgroup.probe.DexProbe
 import com.lx.wxgroup.probe.LabelHuntProbe
 import com.lx.wxgroup.probe.MenuHuntProbe
 import com.lx.wxgroup.probe.MenuProbe
+import com.lx.wxgroup.probe.MuteSetterProbe
 import com.lx.wxgroup.probe.RevokeHuntProbe
+import com.lx.wxgroup.probe.SendProbe
 import com.lx.wxgroup.probe.SnsHuntProbe
 import com.lx.wxgroup.probe.UiProbe
 import com.lx.wxgroup.util.LogX
@@ -114,9 +118,19 @@ class HookEntry : IXposedHookLoadPackage {
         RevokeHuntProbe.prepare(lpparam)
         SnsHuntProbe.prepare(lpparam)
         LabelHuntProbe.prepare(lpparam)
+        MuteSetterProbe.prepare(lpparam)
+        SendProbe.prepare(lpparam)
+        TextSender.prepare(lpparam)
 
         ContactSync.init(context)
         HostContext.setApp(context)
+
+        // ---- 6.7 备份：SAF 结果中继 ----
+        // 模块 APK 没有自己的 Activity，SAF 必须借宿主 Activity 发起、再截
+        // onActivityResult。挂的是 android.app.Activity 的框架方法（不受混淆影响）。
+        runCatching { ActivityResultRelay.install(lpparam.classLoader) }
+            .onFailure { LogX.w("ActivityResultRelay install failed: ${it.javaClass.simpleName}") }
+
         val db = GroupDb.open(context)
         LogX.i("db ready, groups=${db.countGroups()} friends=${db.countFriends()}")
 

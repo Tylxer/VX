@@ -193,26 +193,16 @@ object MainPage : PanelPage {
     )
 
     /**
-     * 群发页。执行链路依赖底层发送接口（锚点 S9，未定位），
-     * 所以「开始群发」还是占位 —— 界面与配置先就位，
-     * S9 打通后只需要把这个 onClick 换成真实调用。
+     * 群发页（需求 6.5）。
+     *
+     * 交给 [MassSendPage]（单例，任务状态活过面板重建 —— 群发是全程后台的），
+     * 不再用 `SettingPage` 占位：目标 / 内容 / 间隔三项配置在那一页里照样走 K2 渲染器。
+     *
+     * ⚠️ 执行链路依赖底层发送接口（锚点 S9，**未定位**）：`MassSendRunner.send`
+     * 恒返回 NO_CHANNEL，任务会照常走完全部目标，最后由弹窗如实告知
+     * 「完成 0/N · 未发送 N」并导出目标清单。**不假装发送成功。**
      */
-    fun broadcastPage(): PanelPage = SettingPage(
-        title = "群发",
-        domain = "群发",
-        onEnter = { onEnterSpec(it) },
-        tail = listOf(
-            SettingPage.Row("开始群发", asButton = true) {
-                val n = Kv.getList(Keys.BROADCAST_TARGETS).size
-                if (n == 0) {
-                    toast("还没选发送目标")
-                } else {
-                    toast("发送接口（S9）未定位，暂不能群发")
-                }
-            }
-        ),
-        footnote = "全自动后台执行，失败重试 1 次后跳过，全部结束弹「完成 n/m」；连续失败 5 条自动中止。",
-    )
+    fun broadcastPage(): PanelPage = MassSendPage
 
     private fun toast(msg: String) {
         val c = HostContext.activity() ?: HostContext.app() ?: return

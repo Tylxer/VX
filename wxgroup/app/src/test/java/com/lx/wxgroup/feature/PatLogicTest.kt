@@ -29,6 +29,9 @@ class PatLogicTest {
         assertFalse(PatLogic.enabled("truex"))
         assertFalse(PatLogic.enabled(" enabled"))
         assertFalse(PatLogic.enabled("2"))
+        // 只有空白 → 视同空值，按关
+        assertFalse(PatLogic.enabled("   "))
+        assertFalse(PatLogic.enabled("\t\n"))
     }
 
     // ------------------------------------------------------------------ 文本判据
@@ -141,6 +144,72 @@ class PatLogicTest {
         assertFalse(hits.contains("onCreate"))
     }
 
+    @Test
+    fun methodCandidatesHandleEmptyAndMiss() {
+        assertEquals(emptyList<String>(), PatLogic.methodCandidates(emptyList()))
+        assertEquals(emptyList<String>(), PatLogic.methodCandidates(listOf("sendText", "onCreate")))
+    }
+
+    // ------------------------------------------------------------------ 候选去重 / 保序
+
+    @Test
+    fun classCandidatesDedupeAndPreserveFirstSeenOrder() {
+        // 真机入参来自多份栈 dump（见 docs/拍一拍下一轮取证清单.md「结果 C」），
+        // 同一个类会在多帧重复出现；输出必须去重，且保留首次出现顺序 = 栈序线索。
+        val names = listOf(
+            "com.tencent.mm.ui.chatting.PatAvatarHelper", // 第 0 次出现
+            "com.tencent.mm.ui.LauncherUI",               // 不命中
+            "com.tencent.mm.ui.chatting.PatAvatarHelper", // 重复
+            "com.tencent.mm.ui.chatting.PaiPaiHelper",    // 第 1 个不同候选
+            "com.tencent.mm.ui.chatting.PatAvatarHelper", // 再重复
+        )
+        assertEquals(
+            listOf(
+                "com.tencent.mm.ui.chatting.PatAvatarHelper",
+                "com.tencent.mm.ui.chatting.PaiPaiHelper",
+            ),
+            PatLogic.classCandidates(names),
+        )
+    }
+
+    @Test
+    fun methodCandidatesDedupeAndPreserveFirstSeenOrder() {
+        val names = listOf("onDoubleTap", "onPatAvatar", "onDoubleTap", "paiPai", "onPatAvatar")
+        assertEquals(
+            listOf("onDoubleTap", "onPatAvatar", "paiPai"),
+            PatLogic.methodCandidates(names),
+        )
+    }
+
+    @Test
+    fun candidatesDoNotMutateInput() {
+        // 纯函数契约：不改动入参（探针侧可能传共享列表）
+        val input = mutableListOf("onDoubleTap", "a.PAT.b", "onCreate")
+        val snapshot = input.toList()
+        PatLogic.methodCandidates(input)
+        PatLogic.classCandidates(input)
+        assertEquals(snapshot, input)
+    }
+
+    @Test
+    fun blankNameElementsDoNotMatchNorCrash() {
+        // 空串 / 空白串元素不命中任何关键词，也不抛异常
+        assertEquals(emptyList<String>(), PatLogic.classCandidates(listOf("", "   ")))
+        assertEquals(emptyList<String>(), PatLogic.methodCandidates(listOf("", "   ")))
+    }
+
+    @Test
+    fun classKeywordsAreDeliberatelyLooseSubstringHeuristic() {
+        // 子串匹配的**已知假阳性**（Pattern / Patch 含 "pat"）是刻意的「宽进严出」：
+        // 候选只负责缩小人工确认范围，最终回填锚点必须人工过目
+        // （见 docs/拍一拍下一轮取证清单.md §五 交叉验证）。
+        // 锁住该行为，防止有人把它当 bug 收紧成精确匹配而漏掉混淆名。
+        assertEquals(
+            listOf("com.x.PatternBox", "com.x.Patcher"),
+            PatLogic.classCandidates(listOf("com.x.PatternBox", "com.x.Patcher")),
+        )
+    }
+
     // ------------------------------------------------------------------ 探针限流
 
     @Test
@@ -155,6 +224,9 @@ class PatLogicTest {
     fun stackDumpDueHonorsCustomMax() {
         assertTrue(PatLogic.stackDumpDue(2, max = 3))
         assertFalse(PatLogic.stackDumpDue(3, max = 3))
+        // 预算为 0 或负：一律不再打（防御性，探针理论上不会传负值）
+        assertFalse(PatLogic.stackDumpDue(0, max = 0))
+        assertFalse(PatLogic.stackDumpDue(0, max = -1))
     }
 
     @Test
@@ -178,6 +250,8 @@ class PatLogicTest {
         // 自定义预算同样生效
         assertTrue(PatLogic.shouldDumpListener(alreadySeen = false, count = 2, max = 3))
         assertFalse(PatLogic.shouldDumpListener(alreadySeen = false, count = 3, max = 3))
+        // 预算为 0：新类也不打
+        assertFalse(PatLogic.shouldDumpListener(alreadySeen = false, count = 0, max = 0))
     }
 
     @Test

@@ -7,6 +7,7 @@ import android.content.IntentFilter
 import android.os.Build
 import android.os.Handler
 import android.os.Looper
+import com.lx.wxgroup.core.ActivityResultRelay
 import com.lx.wxgroup.core.HostContext
 import java.io.File
 import com.lx.wxgroup.data.BackupFlow
@@ -66,6 +67,12 @@ object EntryReceiver {
     const val EXTRA_OP = "op"
     const val EXTRA_FILE = "file"
     const val EXTRA_REPLACE = "replace"
+
+    /**
+     * 二级子命令。各功能的探针各有自己的约定（`quiet` 用 `sub2`），
+     * 备份这边也统一读这个名字，避免再造一个。
+     */
+    const val EXTRA_SUB2 = "sub2"
 
     /** Context.RECEIVER_EXPORTED 的值，写成字面量是为了兼容低版本（见注释 2） */
     private const val FLAG_EXPORTED = 2
@@ -176,6 +183,10 @@ object EntryReceiver {
                         runCatching { com.lx.wxgroup.feature.SnsGuard.refresh() }
                         // 「显示动态[已删除]标签」也是开关，改完要让缓存立刻失效
                         runCatching { com.lx.wxgroup.feature.SnsTag.refresh() }
+                        // 「显示未读」是分组行角标的开关：改完必须让会话列表 rebuild，
+                        // 否则开关改了但列表不重绘 → 验收会得出「开关无效」的**假阴性**。
+                        // （rebuild() 里的重建指纹已包含该开关值，不会被「指纹相同」短路。）
+                        runCatching { com.lx.wxgroup.feature.ConvFilter.refresh() }
                         // 6.4 朋友圈三项：定时刷新/自动加载是 TTL 缓存，热刷立刻生效；
                         // 自动导出的根目录/名单同理
                         runCatching { com.lx.wxgroup.feature.MomentsAuto.refresh() }
@@ -198,6 +209,18 @@ object EntryReceiver {
                         val sub = intent.getStringExtra("sub") ?: "on"
                         val sec = intent.getIntExtra("sec", 30)
                         com.lx.wxgroup.probe.MenuHuntProbe.command(sub, sec)
+                    }
+                    // 「消息免打扰」开关 setter 栈回溯（hook 公开 API，定位微信处理类）
+                    // --es sub on|off|stat [--ei sec 60]
+                    // 真免打扰 setter 验证（core.RealMuteSetter，复刻微信自己的开关）：
+                    // --es sub dndread|dndset --es val <chatroomId> [--es sub2 off|f0|f1]
+                    // --es sub dndhook   （hook 工厂，看微信自己点开关时传的 int）
+                    "mute" -> {
+                        val sub = intent.getStringExtra("sub") ?: "on"
+                        val sec = intent.getIntExtra("sec", 60)
+                        val v = intent.getStringExtra("val")
+                        val sub2 = intent.getStringExtra("sub2")
+                        com.lx.wxgroup.probe.MuteSetterProbe.command(sub, sec, v, sub2)
                     }
                     // S5① 防撤回取证：抓「撤回」的写库与提示渲染调用栈
                     // --es sub on|off|flush|stat|clear [--ei sec 90]
@@ -311,6 +334,20 @@ object EntryReceiver {
                                 "cols" -> for (l in com.lx.wxgroup.feature.SnsGuard
                                     .snsInfoColumns()
                                 ) LogX.i("SNSG $l")
+                                // ── 「从归档恢复」的正式入口（上面三个的老名字仍在，等价）──
+                                // plan   = 只算计划、打印，不写库（安全，第一次先跑这个）
+                                // apply  = 真反插（--ei n 条数，钳到 MAX_BATCH=50）
+                                // pragma = 打印 pragma table_info(SnsInfo)，定位那 5 个未知列
+                                // 三者都不吃 id：恢复是**按归档批量**的，单条用 sub=restore
+                                "plan" -> for (l in com.lx.wxgroup.feature.SnsGuard
+                                    .restoreBatch(n, dry = true)
+                                ) LogX.i("SNSG $l")
+                                "apply" -> for (l in com.lx.wxgroup.feature.SnsGuard
+                                    .restoreBatch(n, dry = false)
+                                ) LogX.i("SNSG $l")
+                                "pragma" -> for (l in com.lx.wxgroup.feature.SnsGuard
+                                    .snsInfoColumns()
+                                ) LogX.i("SNSG $l")
                                 // 模拟微信真实两步删除（update 清可见位 → delete 行），
                                 // 走真实的拦截路径，用来验证「拦下 + 恢复可见 + 归档 + 贴标」
                                 "simdel" -> {
@@ -344,9 +381,15 @@ object EntryReceiver {
                     "snsc" -> {
                         val sub = intent.getStringExtra("sub") ?: "stat"
                         val id = intent.getLongExtra("id", 0L)
+                        val svr = intent.getLongExtra("svr", 1L)
+                        // seed 用的渲染键："createTime:talker:type"（见 docs/取证结论.md ⑩）
+                        val seedKey = intent.getStringExtra("key") ?: ""
                         io {
                             LogX.i("SNSCG " + com.lx.wxgroup.feature.SnsCommentGuard.probe(sub, id))
-                            LogX.i("SNSC " + com.lx.wxgroup.feature.SnsCommentTag.probe(sub, id))
+                            LogX.i(
+                                "SNSC " + com.lx.wxgroup.feature.SnsCommentTag
+                                    .probe(sub, id, svr, seedKey)
+                            )
                         }
                     }
                     // ---- 6.1 聊天：拍一拍 / 被@静音 / 免打扰时段 / 新加群自动免打扰 ----
@@ -374,7 +417,11 @@ object EntryReceiver {
                             "pat" -> LogX.i("QUIET " + com.lx.wxgroup.feature.PatBlock.probe(arg))
                             "at" -> LogX.i("QUIET " + com.lx.wxgroup.feature.MuteAt.probe(arg))
                             "dnd" -> LogX.i("QUIET " + com.lx.wxgroup.feature.DndWindow.probe(arg))
-                            "grp" -> LogX.i("QUIET " + com.lx.wxgroup.feature.AutoDndGroup.probe(arg))
+                            "grp" -> LogX.i(
+                                "QUIET " + com.lx.wxgroup.feature.AutoDndGroup.probe(
+                                    arg, intent.getStringExtra("val")
+                                )
+                            )
                             // 未知 sub：四项都过一遍（同样用 arg 当子命令）
                             else -> {
                                 LogX.i("QUIET " + com.lx.wxgroup.feature.PatBlock.probe(arg))
@@ -389,20 +436,13 @@ object EntryReceiver {
                         val sub = intent.getStringExtra("sub") ?: "stat"
                         LogX.i("REDPK " + com.lx.wxgroup.feature.RedPacket.probe(sub))
                     }
-                    // ---- 6.3 红包：消息层决策引擎的**取证探针** ----
-                    // ⚠️ 现在只有一个探针，没有 hook：取证结论里没有任何红包锚点，
-                    //    在拿到「红包消息的 type / 正文字段」实证之前不敢 hook 任何微信类。
-                    //    判据与决策引擎已就位（feature/LuckyLogic + JVM 单测），但两条识别判据
-                    //    的配置默认留空 → 引擎恒 Skip，不会有任何动作。
-                    //    --es sub cfg = 当前配置；rows = 最近 n 条 message 全字段；types = type 低位分布
-                    "lucky" -> {
-                        val sub = intent.getStringExtra("sub") ?: "cfg"
-                        val n = intent.getIntExtra("n", 12)
-                        // 读微信的消息库 → 必须走后台线程，否则 onReceive 卡成 ANR
-                        io {
-                            for (l in com.lx.wxgroup.probe.LuckyProbe.command(sub, n)) LogX.i(l)
-                        }
-                    }
+                    // ---- 6.3 红包：只有 UI 层（见上面 "redpacket"），没有消息层入口 ----
+                    // ⚠️ 曾有 op=lucky 的「消息层决策引擎」探针（LuckyProbe + LuckyLogic），
+                    //    2026-10-19 **整块删除**：`decide()` 在生产代码里零调用点，
+                    //    6 个配置项（decide/type_codes/text_markers/allow/exclude/max_attempts）
+                    //    只是"打开也不会有任何效果"的空壳，容易让人以为功能能做而实际不做。
+                    //    要恢复：`git show 86e7808:wxgroup/app/src/main/java/com/lx/wxgroup/feature/LuckyLogic.kt`
+                    //    但恢复前必须先取证出红包消息的 type 低位（见 docs/取证结论.md §6.3）。
                     // ---- 6.4 朋友圈：定时刷新 / 自动加载 / 自动导出 ----
                     // --es sub stat|env|act|refresh|load|rvmethods|export|img|scan|path [--ei n 5]
                     // ⚠️ refresh/load 会撩微信前台或甩列表，img/scan 要读库 → 都走后台线程
@@ -427,6 +467,25 @@ object EntryReceiver {
                         LogX.i(
                             "FORWARD " + com.lx.wxgroup.feature.ForceForward.probe(sub)
                         )
+                    }
+                    // ---- 6.5 群发（MassSendPage）：不依赖 UI 的驱动入口 ----
+                    // --es sub stat(默认)|start|pause|resume|stop
+                    // ⚠️ start **会真的发消息**（用当前 Kv 的 targets + last_text + interval）。
+                    //    脚本侧自带三重闸门；本分支不做目标数限制（与 UI 按钮路径一致）。
+                    //    与 UI 按钮共用 launchRun，所以跑的就是同一条链路。
+                    "broadcast" -> {
+                        val sub = intent.getStringExtra("sub") ?: "stat"
+                        LogX.i("MASSSEND " + com.lx.wxgroup.feature.MassSendPage.probe(sub))
+                    }
+                    // ---- S9 发送接口取证（SendProbe）----
+                    // --es sub probe = 只读反射枚举（安全，先跑这个）：验证 qf4/o4、
+                    //   hl0/r1、hl0/q1、hl0/q0 等类的运行时存在性 + 方法/字段签名。
+                    // --es sub test --es val <wxid> = 真发一条测试消息（只在 probe
+                    //   全绿且交叉验证后才用）。
+                    "send" -> {
+                        val sub = intent.getStringExtra("sub") ?: "probe"
+                        val v = intent.getStringExtra("val")
+                        com.lx.wxgroup.probe.SendProbe.command(sub, v)
                     }
                     // 防撤回调试：不打搅用户也能看清 message 表的 type / isSend 语义
                     // --es sub all = 不看撤回、直接列最近的普通消息；--ei n 12 = 条数
@@ -665,6 +724,94 @@ object EntryReceiver {
                         " settingsApplied=${out.stats.settingsApplied}" +
                         " reconcile=${out.reconcileOk}"
                 )
+            }
+            "saf" -> {
+                // SAF 链路诊断（只读，除 saf=launch 会真弹选择器）
+                //   sub=saf                 → 打状态（装钩数/等待中/host activity 有没拿到）
+                //   sub=saf sub2=launch     → 真发起一次 CREATE_DOCUMENT，验证能不能弹出来
+                //   sub=saf sub2=cancel     → 清掉挂起回调
+                val sub2 = intent.getStringExtra(EXTRA_SUB2)?.lowercase().orEmpty()
+                val act = HostContext.activity()
+                LogX.i(
+                    "SAFR probe sub2=$sub2 ${ActivityResultRelay.stat()} " +
+                        "hostActivity=${act?.javaClass?.simpleName ?: "null"}"
+                )
+                when (sub2) {
+                    "launch" -> {
+                        if (act == null) {
+                            LogX.w("SAFR probe launch: hostActivity=null（微信不在前台，先切回微信）")
+                        } else {
+                            val it2 = android.content.Intent(android.content.Intent.ACTION_CREATE_DOCUMENT)
+                                .apply {
+                                    addCategory(android.content.Intent.CATEGORY_OPENABLE)
+                                    type = "application/json"
+                                    putExtra(
+                                        android.content.Intent.EXTRA_TITLE,
+                                        "wxgroup-saf-probe.json"
+                                    )
+                                }
+                            val ok = ActivityResultRelay.launch(
+                                com.lx.wxgroup.data.BackupSafLogic.REQ_EXPORT, it2
+                            ) { code, result, uri ->
+                                LogX.i("SAFR probe result code=$code result=$result uri=$uri")
+                                // ⚠️ 探针要**真走一遍 exportToUri**，否则只验证了「选择器能弹 +
+                                //    uri 能拿到」，没验证「能不能往 SAF uri 里写」。
+                                //    上一次探针只打日志，结果是文件建出来了但 0 字节，看着像 bug。
+                                if (code == com.lx.wxgroup.data.BackupSafLogic.REQ_EXPORT &&
+                                    result == -1 && uri != null
+                                ) {
+                                    Thread {
+                                        val r = runCatching {
+                                            BackupIO.exportToUri(
+                                                HostContext.app() ?: context, db, uri
+                                            )
+                                        }.getOrNull()
+                                        LogX.i(
+                                            "SAFR probe write ${if (r != null) "OK" else "FAIL"}" +
+                                                " err=${BackupIO.lastError}" +
+                                                " groups=${r?.groups} members=${r?.members}"
+                                        )
+                                    }.start()
+                                }
+                            }
+                            LogX.i("SAFR probe launch returned=$ok")
+                        }
+                    }
+                    "import" -> {
+                        // 走 OPEN_DOCUMENT，验证「读」这一半（导出已单独验过）
+                        if (act == null) {
+                            LogX.w("SAFR probe import: hostActivity=null")
+                        } else {
+                            val it2 = android.content.Intent(android.content.Intent.ACTION_OPEN_DOCUMENT)
+                                .apply {
+                                    addCategory(android.content.Intent.CATEGORY_OPENABLE)
+                                    type = "*/*"
+                                }
+                            val ok = ActivityResultRelay.launch(
+                                com.lx.wxgroup.data.BackupSafLogic.REQ_IMPORT, it2
+                            ) { code, result, uri ->
+                                LogX.i("SAFR probe imb result code=$code result=$result uri=$uri")
+                                if (result == -1 && uri != null) {
+                                    val res = runCatching {
+                                        BackupIO.readDetailedFromUri(
+                                            HostContext.app() ?: context, uri
+                                        )
+                                    }.getOrNull()
+                                    val snap = res?.snapshot
+                                    LogX.i(
+                                        "SAFR probe read ${if (snap != null) "OK" else "FAIL"}" +
+                                            " err=${res?.error ?: BackupIO.lastError}" +
+                                            " groups=${snap?.groupCount} members=${snap?.memberCount}" +
+                                            " settings=${snap?.settings?.size} schema=${snap?.schema}"
+                                    )
+                                }
+                            }
+                            LogX.i("SAFR probe import returned=$ok")
+                        }
+                    }
+                    "cancel" -> ActivityResultRelay.cancel()
+                    else -> Unit
+                }
             }
             else -> LogX.w("ENTRY BACKUP unknown op=$op")
         }

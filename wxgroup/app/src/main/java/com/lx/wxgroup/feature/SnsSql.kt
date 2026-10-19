@@ -61,6 +61,32 @@ object SnsSql {
     /** snsId 恒为非零 64 位值，0 说明没解析出来 —— 按「不命中」处理，放行 */
     private fun nonZero(v: Long?): Long? = if (v == null || v == 0L) null else v
 
+    // ------------------------------------------------------------------ 反插 SQL（从归档恢复用）
+
+    /** `?,?,?` —— n 个占位符 */
+    fun placeholders(n: Int): String = if (n <= 0) "" else Array(n) { "?" }.joinToString(",")
+
+    /**
+     * 反插一行的 INSERT（全占位符，值走 bindArgs，**不拼字符串**）。
+     *
+     * @param cols 要写的列名，顺序必须跟 bindArgs 一致（用
+     *             `SnsRestoreLogic.columns()` / `SnsRestoreLogic.insertPuts` 拿，别手写）
+     * @param conflict [SnsRestoreLogic.CONFLICT_IGNORE]（=4）→ `OR IGNORE`；
+     *                 [SnsRestoreLogic.CONFLICT_REPLACE]（=5）→ `OR REPLACE`。
+     *                 写微信的 `SnsInfo` **只准传 4**，详见 [SnsRestoreLogic.conflictFor]。
+     *
+     * ⚠️ `insertWithOnConflict` 选不上时才走这条 `execSQL` 退路；两条路写的是同一批列、同一个冲突语义。
+     */
+    fun insertSql(table: String, cols: List<String>, conflict: Int): String {
+        if (cols.isEmpty()) return ""
+        val keyword = when (conflict) {
+            SnsRestoreLogic.CONFLICT_IGNORE -> "INSERT OR IGNORE INTO"
+            SnsRestoreLogic.CONFLICT_REPLACE -> "INSERT OR REPLACE INTO"
+            else -> "INSERT INTO"
+        }
+        return "$keyword $table (${cols.joinToString(",")}) VALUES (${placeholders(cols.size)})"
+    }
+
     /**
      * 参数化占位符取值：数一下 [at] 之前有几个 `?`，那个数就是它在 args 里的下标。
      *

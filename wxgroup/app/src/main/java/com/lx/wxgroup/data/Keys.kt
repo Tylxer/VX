@@ -124,53 +124,45 @@ object Keys {
      * 6.3-A：领取界面已经弹出之后，自动点一下「拆红包 / 開 / 领取」按钮。
      *
      * 这是 **UI 层**的东西（判据在 `feature/RedPacketLogic`），默认关。
+     *
+     * ⚠️ **红包域只有这一个开关 + 三个数值/名单项**（2026-10-19 收尾定）。
+     * 曾有一整套「消息层决策引擎」（`redpacket.decide` / `type_codes` / `text_markers` 等 6 个键
+     * + `LuckyLogic` + `LuckyProbe` + 496 行单测），但 `decide()` 在生产代码里**零调用点**，
+     * 打开开关不会有任何效果 —— 那是"看起来能自动抢红包、实际什么都不做"的空壳，已整块删除。
+     * 要恢复必须先取证出红包消息的 `type` 低位（见 `docs/取证结论.md` §6.3）。
      */
     const val REDPACKET_AUTO_OPEN = "redpacket.auto_open"
 
     /**
-     * 6.3-B：消息层**决策引擎**的总开关（判据在 `feature/LuckyLogic`）。
+     * 领取界面出现后的**基准**等待时长（ms）。
      *
-     * ⚠️ 它**只做识别与决策，不代用户领取**：产出 LuckyLogic.Verdict 之外没有任何
-     * 副作用，不点击、不调用微信的领取方法、不反射微信类。真要做自动领取，必须先
-     * 取证出锚点（见 LuckyLogic 类注释末尾的 HOOK_TODO）。默认关。
-     */
-    const val REDPACKET_DECIDE = "redpacket.decide"
-
-    /**
-     * 决策之后的等待时长。**下限 200ms**（`LuckyLogic.MIN_DELAY_MS`）：
-     * 0ms 秒抢是风控最容易识别的特征，也是用户最容易填出来的手误值，
-     * 所以在 `Prefs.clamp` 和 `LuckyLogic.clampDelay` 里都做了双重钳制。
+     * `RedPacket.scanDelays` 按它缩放成四拍扫描（base/3、base*3/4、base*11/8、base+2000）。
+     * **下限 200ms**：0ms 秒抢是风控最容易识别的特征，也是用户最容易填出来的手误值。
      */
     const val REDPACKET_DELAY_MS = "redpacket.delay_ms"
 
-    /** 同一个红包最多决策几次，超过就交回用户手动（防绕着失败打转）*/
+    /**
+     * 同一个红包最多试图点几次（= 最多派发几次触摸）。
+     *
+     * `RedPacket.maxAttempts` 读它，钳制在 1~4。默认 3：第一次空响后还给补发机会，
+     * 但不会无限连点。
+     */
     const val REDPACKET_MAX_ATTEMPTS = "redpacket.max_attempts"
 
     /**
      * 参与范围（TEXT，**裸文本不是 JSON**，逗号/顿号/空白分隔）。
      * 元素可以是 talker（`wxid_xxx` / `xxx@chatroom`）也可以是群显示名。
-     * **留空 = 全部会话**；非空 = 只对名单内的会话生效。
+     * **留空 = 全部会话**。
+     *
+     * ⚠️ **当前未接线**：UI 层（`RedPacket`）只在"用户已经手动点开红包"之后才动手，
+     * 那时没有会话筛选的余地 —— 用户点开的红包就是要拆的红包。
+     * 这两个键留给「消息层」用，但消息层已删除（见 [REDPACKET_AUTO_OPEN] 的注释）。
+     * 保留定义是为了**已备份的配置不丢**（`BackupFlow` 会按 `Prefs.ALL` 过滤）。
      */
     const val REDPACKET_ALLOW = "redpacket.allow"
 
-    /** 排除范围（格式同 [REDPACKET_ALLOW]，优先级更高：命中即不处理）*/
+    /** 排除范围（格式同 [REDPACKET_ALLOW]）。⚠️ 当前同样**未接线**，原因见上 */
     const val REDPACKET_EXCLUDE = "redpacket.exclude"
-
-    /**
-     * **待取证**：红包消息的 `message.type` **低位**清单（逗号分隔的整数，如 `2001`）。
-     *
-     * ⚠️ **刻意留空**。8.0.48 上红包对应的真实 type 没有实证（取证结论全文无红包锚点），
-     * 硬填一个数字就是猜。留空时这条判据关闭，引擎恒 `Skip`。
-     * 取证方式：`adb shell am broadcast -a com.lx.wxgroup.action.PROBE -p com.tencent.mm
-     * --es op lucky --es sub rows --ei n 20`（真发一个 0.01 红包后拉最近的 message 行）。
-     */
-    const val REDPACKET_TYPE_CODES = "redpacket.type_codes"
-
-    /**
-     * **待取证**：红包消息正文里的特征串（逗号分隔，子串匹配、忽略大小写）。
-     * 留空时这条判据关闭。**命中它只算「可疑」**（只记日志），不足以触发后续流程。
-     */
-    const val REDPACKET_TEXT_MARKERS = "redpacket.text_markers"
 
     // —— 朋友圈域 ——
     const val MOMENTS_AUTO_REFRESH = "moments.auto_refresh"
@@ -249,38 +241,25 @@ object Prefs {
             "调试：连自己撤回也拦（验证拦截是否生效用，测完关掉）"
         ),
 
-        // 红包域。⚠️ 取证前 type_codes / text_markers 留空 = 两条识别判据都关 = 引擎恒不动作
+        // 红包域。⚠️ 只有 UI 层 4 项（消息层引擎已删除，见 REDPACKET_AUTO_OPEN 的注释）
         PrefSpec(Keys.REDPACKET_AUTO_OPEN, PrefKind.SWITCH, "false", "红包", "自动点击拆红包"),
-        PrefSpec(
-            Keys.REDPACKET_DECIDE, PrefKind.SWITCH, "false", "红包",
-            "启用红包决策引擎（只识别与记录，不代领）"
-        ),
-        // ⚠️ 200 / 10000 与 LuckyLogic.MIN_DELAY_MS / MAX_DELAY_MS 是同一个数，
-        //    刻意不引 feature 包过来 —— data 是 feature 的下层。
-        //    真正在兜底的是 LuckyLogic.clampDelay（即使 UI 钳失效也会被拉回区间）。
+        // ⚠️ 200 / 10000 与 RedPacket.scanDelays 的钳制范围一致，刻意不引 feature 包过来
+        //    —— data 是 feature 的下层。真正在兜底的是 RedPacket 里的 coerceIn。
         PrefSpec(
             Keys.REDPACKET_DELAY_MS, PrefKind.NUMBER, "800", "红包", "识别后的等待时长",
             min = 200, max = 10_000, unit = "毫秒"
         ),
         PrefSpec(
-            Keys.REDPACKET_MAX_ATTEMPTS, PrefKind.NUMBER, "3", "红包", "同一红包最多试图决策几次",
-            min = 1, max = 10, unit = "次"
+            Keys.REDPACKET_MAX_ATTEMPTS, PrefKind.NUMBER, "3", "红包", "同一红包最多试图点击几次",
+            min = 1, max = 4, unit = "次"
         ),
         PrefSpec(
             Keys.REDPACKET_ALLOW, PrefKind.TEXT, "", "红包",
-            "参与范围（逗号分隔 wxid / 群名，留空=全部会话）"
+            "参与范围（逗号分隔 wxid / 群名，留空=全部；当前仅消息层使用，暂未接线）"
         ),
         PrefSpec(
             Keys.REDPACKET_EXCLUDE, PrefKind.TEXT, "", "红包",
-            "排除范围（逗号分隔，优先于参与范围）"
-        ),
-        PrefSpec(
-            Keys.REDPACKET_TYPE_CODES, PrefKind.TEXT, "", "红包",
-            "待取证：红包消息的 type 低位（逗号分隔整数，留空=不启用）"
-        ),
-        PrefSpec(
-            Keys.REDPACKET_TEXT_MARKERS, PrefKind.TEXT, "", "红包",
-            "待取证：红包消息正文特征串（逗号分隔，命中只记日志）"
+            "排除范围（逗号分隔，优先于参与范围；当前暂未接线）"
         ),
 
         // 朋友圈域

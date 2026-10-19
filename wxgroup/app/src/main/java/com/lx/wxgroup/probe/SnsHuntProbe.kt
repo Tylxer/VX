@@ -56,7 +56,18 @@ object SnsHuntProbe {
 
     private const val MAX_LINES = 260
 
-    private const val MAX_WINDOW_SEC = 180
+    /**
+     * catch 模式的日志行数上限。
+     *
+     * ⚠️ 为什么必须比默认大得多：实测（2026-10-17）无 key 的 catch 窗口只有 52 秒就把
+     * 260 行预算打满 —— 全是群消息 insert，真正的开关写入**根本没轮到**。
+     * 带 catchKey 时正常，但无 key 的对照试验必须给足预算，否则又白跑一轮。
+     */
+    private const val MAX_LINES_CATCH = 1500
+
+    private fun maxLines() = if (allWrites) MAX_LINES_CATCH else MAX_LINES
+
+    private const val MAX_WINDOW_SEC = 600
 
     private var loader: ClassLoader? = null
 
@@ -64,6 +75,26 @@ object SnsHuntProbe {
 
     @Volatile
     private var until = 0L
+
+    /**
+     * `catch` 模式：无条件记录**全部写操作**，不过 sns 表名/关键字过滤。
+     *
+     * 为什么需要：默认过滤只看 `TABLE_HINTS`(sns*) 与 `KEYWORDS`(delete/snsid)，
+     * 于是「群免打扰开关到底写了哪张表」这类取证会被**静默丢弃** ——
+     * 表现为 dump 前后一个字段都没变，看着像"微信没写库"，实际是探针没记。
+     */
+    @Volatile
+    private var allWrites = false
+
+    /**
+     * `catch` 的目标关键词过滤：非空时只记录 SQL/参数里含这个子串的写操作。
+     *
+     * 用例：`catch --es table 45396655401@chatroom` → 只抓「跟这个群有关」的写，
+     * 用户在手机上做任何动作都能对上，不用卡时间窗口。
+     * 为空时记录全部写操作（只适合 10~20 秒的极短窗）。
+     */
+    @Volatile
+    private var catchKey: String? = null
 
     private val counts = ConcurrentHashMap<String, Int>()
 
@@ -85,12 +116,28 @@ object SnsHuntProbe {
      */
     private val inProbe = ThreadLocal<Boolean>()
 
+    /**
+     * 防「同一次逻辑写被记两遍」。
+     *
+     * 成因：`SQLiteDatabase.insert/update/delete/execSQL` 内部会 `compileStatement` 后调
+     * `SQLiteStatement.executeInsert/executeUpdateDelete/execute` —— 库层与语句层**都会被挂到**。
+     * 原来的 key 只含 sig，两层不同 → 去重表也去不掉，于是每条日志占 2 行（各带一行栈），
+     * `MAX_LINES=260` 的预算直接减半，还容易被误读成"微信写了两遍"。
+     *
+     * 判据：**线程内深度计数**。库层 `beforeHookedMethod` +1、`afterHookedMethod` -1；
+     * 语句层看到深度 > 0 就跳过（它是库层的子调用，同一次写不该记两遍）。
+     * 用 ThreadLocal 是因为这两层调用必然同线程嵌套。
+     */
+    private val sqlWriteDepth = ThreadLocal.withInitial { 0 }
+
     private val mainHandler by lazy { Handler(Looper.getMainLooper()) }
 
     private val expireTask = Runnable {
         runCatching {
             flushInternal()
             uninstall()
+            allWrites = false
+            catchKey = null
             own("SNS window expired: all hooks removed")
         }
     }
@@ -122,9 +169,14 @@ object SnsHuntProbe {
     )
 
     /**
-     * ⚠️ `SQLiteStatement.executeInsert/executeUpdateDelete` **故意不挂**：
-     * 预编译语句调用时只有 handle，拿不到 SQL 也拿不到表名，是最热的执行路径，
-     * 挂了纯属白拖慢宿主。朋友圈的写入一定会走下面这些带表名的入口。
+     * ⚠️ `SQLiteStatement.executeInsert/executeUpdateDelete` 原本**故意不挂**（预编译语句调用时
+     * 只有 handle，拿不到 SQL，是最热的执行路径）。但 2026-10-17 取「群免打扰开关落点」时
+     * 发现：catch 模式开着、用户切了开关，日志里**一条相关写都没有** —— 全是消息/头像。
+     * 最可能的解释就是这类「设置写入」走预编译路径。
+     *
+     * 解法：只挂**执行**入口（不挂 compileStatement —— 那是热路径），
+     * 在回调里**反射读语句对象自带的 SQL 字段**（wcdb 的 `mSql` / AOSP 的 `mSql`）。
+     * 拿不到字段时打 `(sql?)`，不猜。
      */
     private val SQL_METHODS = listOf(
         "update", "updateWithOnConflict",
@@ -134,6 +186,17 @@ object SnsHuntProbe {
         "execSQL",
         "rawQuery", "rawQueryWithFactory", "query",
     )
+
+    /** 预编译语句的执行入口（SQL 从语句对象字段反射取） */
+    private val STMT_CLASSES = listOf(
+        "com.tencent.wcdb.database.SQLiteStatement",
+        "android.database.sqlite.SQLiteStatement",
+    )
+
+    private val STMT_METHODS = listOf("executeUpdateDelete", "executeInsert", "execute")
+
+    /** wcdb / AOSP 的 SQLiteProgram 里存 SQL 的字段名，按顺序试 */
+    private val SQL_FIELDS = listOf("mSql", "mSqlStatement", "sql")
 
     /** 查询类只打 SQL 不打栈：极热路径，24 帧栈会把日志刷爆 */
     private val NO_STACK_SIGS = listOf("rawQuery", "rawQueryWithFactory", "query")
@@ -155,6 +218,10 @@ object SnsHuntProbe {
                         counts.clear()
                         passed.set(0)
                         printed.set(0)
+                        // ⚠️ 必须显式清掉 catch 残留：否则先 `catch` 再 `on`，这个"默认"窗口
+                        // 实际是 catch 语义，而日志只打 `SNS on: ...`，取证结论会被静默污染。
+                        allWrites = false
+                        catchKey = null
                         mainHandler.removeCallbacks(expireTask)
                         mainHandler.postDelayed(expireTask, ms)
                         own("SNS on: window=${ms}ms hooks=${unhooks.size}")
@@ -172,7 +239,8 @@ object SnsHuntProbe {
             "clear" -> runCatching { File(LOG).delete() }
             "stat" -> own(
                 "SNS stat hooks=${unhooks.size} kinds=${counts.size} dbs=${dbs.size} " +
-                    "passed=${passed.get()} windowLeft=${(until - System.currentTimeMillis()).coerceAtLeast(0)}ms"
+                    "passed=${passed.get()} allWrites=$allWrites catchKey=${catchKey ?: "-"} " +
+                    "windowLeft=${(until - System.currentTimeMillis()).coerceAtLeast(0)}ms"
             )
             // 列所有已见库的表名 —— 回答「朋友圈数据到底在哪张表」
             "tables" -> dumpTables()
@@ -183,12 +251,100 @@ object SnsHuntProbe {
             "index" -> dumpIndexes(table)
             // 建表/建索引原始 DDL，人眼最不容易误读
             "ddl" -> dumpDdl(table)
+            /**
+             * 自检：wcdb 的语句类里 SQL 到底存在哪个字段。
+             *
+             * 为什么必需：`SQL_FIELDS`（mSql/mSqlStatement/sql）是**推测名**。若全错，
+             * 语句层就永远拿到 `(sql?)` → 一条都不记，而人会误以为"微信确实没写库"。
+             * 这条命令直接把真实字段名列出来，一次问清。
+             */
+            "stmtdiag" -> dumpStmtFields()
+            // 无条件记录全部写操作（短窗用）：回答「某个未知表被谁写了什么」
+            // 用法：sub=catch → 在手机上做一个动作 → 看日志里这条动作写了哪些表
+            //
+            // ⚠️ catch 自带 install + 开窗，**不需要先 sub=on**：
+            // 单独置标志而不挂钩子的话，钩子压根没装上，日志永远是空的。
+            "catch" -> {
+                val ms = sec.coerceIn(10, MAX_WINDOW_SEC) * 1000L
+                val key = table?.trim()?.takeIf { it.isNotEmpty() }
+                Thread {
+                    install()
+                    mainHandler.post {
+                        allWrites = true
+                        catchKey = key
+                        until = System.currentTimeMillis() + ms
+                        counts.clear()
+                        passed.set(0)
+                        printed.set(0)
+                        mainHandler.removeCallbacks(expireTask)
+                        mainHandler.postDelayed(expireTask, ms)
+                        own(
+                            "SNS catch ON: window=${ms}ms hooks=${unhooks.size} " +
+                                if (key != null) "只记含「$key」的写操作" else "全部写操作不过滤（短窗）"
+                        )
+                    }
+                }.start()
+            }
+            "catchoff" -> {
+                allWrites = false
+                catchKey = null
+                own(
+                    "SNS catch OFF (钩子仍在，窗口剩 " +
+                        "${(until - System.currentTimeMillis()).coerceAtLeast(0)}ms；要彻底停用发 sub=off)"
+                )
+            }
             else -> own("SNS unknown sub=$sub")
         }
     }
 
     // ------------------------------------------------------------------ 安装
 
+    /**
+     * 自检：把 wcdb / AOSP 语句类（及其父类链）的**全部字段**列出来。
+     *
+     * 回答的唯一问题：SQL 模板存在哪个字段名下？`SQL_FIELDS` 的候选名是猜的，
+     * 猜错 → 语句层永远 `(sql?)` → 静默零记录 → 误判成"微信没写库"。
+     * 顺带列出 declaredMethods，确认 `executeUpdateDelete` 等确实存在。
+     */
+    private fun dumpStmtFields() {
+        val cl = loader
+        if (cl == null) {
+            own("SNS stmtdiag: no classLoader")
+            return
+        }
+        for (name in STMT_CLASSES) {
+            val cls = runCatching { XposedHelpers.findClass(name, cl) }.getOrNull()
+            if (cls == null) {
+                own("SNS stmtdiag $name: 类不存在")
+                continue
+            }
+            own("SNS stmtdiag === $name ===")
+            var c: Class<*>? = cls
+            var depth = 0
+            while (c != null && c != Any::class.java && depth < 6) {
+                val fs = runCatching {
+                    c!!.declaredFields.joinToString(",") { "${it.name}:${it.type.simpleName}" }
+                }.getOrDefault("(读取失败)")
+                own("SNS   fields[${c.simpleName}] = ${fs.take(400)}")
+                c = c.superclass
+                depth++
+            }
+            val ms = runCatching {
+                cls.declaredMethods.joinToString(",") { it.name }.let {
+                    // 去重，方法多起来看着累
+                    it.split(",").distinct().joinToString(",")
+                }
+            }.getOrDefault("(读取失败)")
+            own("SNS   methods = ${ms.take(400)}")
+        }
+    }
+
+    /**
+     * ⚠️ `@Synchronized` 是必需的：`catch` 与 `on` 各自起裸线程调这里，快速连发广播会让
+     * 两次 `install()` 交错 —— LSPosed 的钩子集合是追加语义，同一方法会被挂**两个**回调，
+     * 于是每条日志都记两遍（看起来像"微信写了两次"）。
+     */
+    @Synchronized
     private fun install() {
         val cl = loader
         if (cl == null) {
@@ -201,12 +357,43 @@ object SnsHuntProbe {
         for (c in SQL_CLASSES) {
             for (m in SQL_METHODS) all(c, m, missing)
         }
+        // 预编译语句执行入口：SQL 从语句对象字段反射取（见 STMT_* 注释）
+        for (c in STMT_CLASSES) {
+            for (m in STMT_METHODS) allStmt(c, m, missing)
+        }
 
         if (missing.isEmpty()) {
             own("SNS install done: ${unhooks.size} hooks, all candidate classes present")
         } else {
             own("SNS install done: ${unhooks.size} hooks, missing=${missing.joinToString(",")}")
         }
+    }
+
+    /**
+     * 挂预编译语句的执行入口。与 [all] 的区别：这个回调要去**语句对象自己的字段**里
+     * 抠 SQL（`param.thisObject` 就是 SQLiteStatement），所以单独走一条路。
+     */
+    private fun allStmt(clsName: String, method: String, missing: MutableList<String>): Boolean {
+        val cl = loader ?: return false
+        val cls = runCatching { XposedHelpers.findClass(clsName, cl) }.getOrNull()
+        if (cls == null) {
+            // ⚠️ 单独记一条：否则会出现「语句层压根没挂上，install 汇总却打印
+            // all candidate classes present」的误导日志 —— 直接导致取证结论跑偏（以为没写库）。
+            if (missing.size < 20) missing.add("STMT-CLS-MISS $clsName")
+            return false
+        }
+        val set = runCatching {
+            XposedBridge.hookAllMethods(cls, method, stmtCallback("$clsName.$method"))
+                .toCollection(mutableListOf())
+        }.onFailure {
+            own("SNS  hook-fail $clsName.$method ${it.javaClass.simpleName}")
+        }.getOrNull()
+        if (set.isNullOrEmpty()) {
+            if (missing.size < 20) missing.add("STMT `$clsName.$method` (类在但方法未 declared)")
+            return false
+        }
+        synchronized(unhooks) { unhooks.addAll(set) }
+        return true
     }
 
     private fun uninstall() {
@@ -219,6 +406,9 @@ object SnsHuntProbe {
         counts.clear()
         passed.set(0)
         printed.set(0)
+        // 关钩子时一并复位 catch 语义，避免「off 之后 allWrites 还留着」
+        allWrites = false
+        catchKey = null
         stopWriter()
     }
 
@@ -248,6 +438,8 @@ object SnsHuntProbe {
             // ⚠️ 记 db 实例要**无条件**做（哪怕窗口没开也要记，否则 sub=tables 没数据）：
             // sub=tables 是取证的主要手段之一，它不依赖窗口。
             runCatching { param.thisObject?.let { synchronized(dbs) { dbs.add(it) } } }
+            // 库层调用可能内部再走语句层 → 深度 +1，让语句层跳过（避免同一次写记两遍）
+            runCatching { sqlWriteDepth.set(sqlWriteDepth.get() + 1) }
             runCatching {
                 if (System.currentTimeMillis() > until) return
                 if (inProbe.get() == true) return // 我们自己 dump schema 的查询，别记
@@ -256,9 +448,123 @@ object SnsHuntProbe {
                 runCatching { own("SNS  cb-error $sig ${it.javaClass.simpleName}") }
             }
         }
+
+        override fun afterHookedMethod(param: MethodHookParam) {
+            // 必须配对减回去：异常路径也要走到这里（Xposed 保证 after 会被调）
+            runCatching { sqlWriteDepth.set((sqlWriteDepth.get() - 1).coerceAtLeast(0)) }
+        }
+    }
+
+    /**
+     * 预编译语句执行回调：`param.thisObject` 是 SQLiteStatement，
+     * SQL 从它自己的字段（[SQL_FIELDS]）里抠。
+     *
+     * 绑定参数不在 `param.args` 上（bind 是更早的调用），所以只能看到 SQL 模板：
+     * 对「哪张表被写了」这个取证目标来说够用 —— 表名/列名都在模板里。
+     */
+    private fun stmtCallback(sig: String) = object : XC_MethodHook() {
+        override fun beforeHookedMethod(param: MethodHookParam) {
+            runCatching {
+                if (System.currentTimeMillis() > until) return
+                if (inProbe.get() == true) return
+                // ⚠️ 深度 > 0 表示这次执行是**库层调用的子步骤**（insert/update/delete 内部
+                // compileStatement→execute），库层那条已经记过了。不跳过就会同一次写记两遍。
+                if (sqlWriteDepth.get() > 0) return
+                val sql = sqlOf(param.thisObject)
+                val head = sql ?: "(sql?)"
+                val lower = head.lowercase()
+
+                // ⚠️ catch 模式必须**真的收窄**：早期版本写成 `hit || (allWrites && sql!=null)`，
+                // 结果 catchKey 被 OR 吸收、pass 恒真 → 记下全进程所有预编译语句，
+                // 与「只抓这个群」的预期正好相反。收窄逻辑必须和 recordSql 保持一致。
+                val pass = if (allWrites) {
+                    val k = catchKey
+                    sql != null && (k == null || head.contains(k, ignoreCase = true))
+                } else {
+                    TABLE_HINTS.any { lower.contains(it) } || KEYWORDS.any { lower.contains(it) }
+                }
+                if (!pass) {
+                    passed.incrementAndGet()
+                    return
+                }
+                val key = "$sig STMT ${head.take(if (allWrites) 160 else 100)}"
+                val n = counts.merge(key, 1) { a, b -> a + b } ?: 1
+                if (n == 1 && printed.get() < maxLines()) {
+                    printed.incrementAndGet()
+                    own("SNS $sig [STMT] thread=${Thread.currentThread().name} :: $head")
+                    own("SNS   at " + frames().joinToString(" <- "))
+                }
+            }.onFailure {
+                runCatching { own("SNS  stmt-error $sig ${it.javaClass.simpleName}") }
+            }
+        }
+    }
+
+    /**
+     * 反射从 SQLiteStatement / SQLiteProgram 里抠 SQL 模板。
+     *
+     * ⚠️ 按 Class 缓存解析结果：语句执行是热路径，catch 窗口可开 600 秒且覆盖全进程所有
+     * 预编译语句；`getObjectField` 命不中时会**每次抛 NoSuchFieldError**（XposedHelpers 无负缓存），
+     * 三次试探就是三次异常构造。缓存只存 `Class → Field?`（null 表示"这个类里都没有"）。
+     *
+     * ⛔ **必须用 synchronizedMap(HashMap)，不能用 ConcurrentHashMap**：后者**不允许 null value**，
+     * 而"这个类里没有 SQL 字段"正是最常见的负结果 —— 存 null 会在 `putVal` 处 NPE，
+     * 且发生在每帧都要走的库调用路径上（项目里已踩过一次，真机每帧崩）。
+     */
+    private val sqlFieldCache =
+        Collections.synchronizedMap(HashMap<Class<*>, java.lang.reflect.Field?>())
+
+    private fun sqlOf(stmt: Any?): String? {
+        if (stmt == null) return null
+        val cls = stmt.javaClass
+        val field = synchronized(sqlFieldCache) {
+            if (!sqlFieldCache.containsKey(cls)) {
+                // ⚠️ 必须沿**父类链**找：真机实证（`sub=stmtdiag`）显示 `mSql` 挂在
+                // `SQLiteProgram` 上，而 `SQLiteStatement` 本类字段为空。
+                // 只用 getDeclaredField 会永远拿不到 SQL ← 语句层静默零记录。
+                var c: Class<*>? = cls
+                var found: java.lang.reflect.Field? = null
+                var depth = 0
+                while (c != null && c != Any::class.java && depth < 6) {
+                    for (name in SQL_FIELDS) {
+                        val f = runCatching { c!!.getDeclaredField(name) }.getOrNull()
+                        if (f != null) {
+                            f.isAccessible = true
+                            found = f
+                            break
+                        }
+                    }
+                    if (found != null) break
+                    c = c.superclass
+                    depth++
+                }
+                sqlFieldCache[cls] = found
+            }
+            sqlFieldCache[cls]
+        } ?: return null
+        val v = runCatching { field.get(stmt) }.getOrNull()
+        return (v as? String)?.takeIf { it.isNotBlank() }
     }
 
     // ------------------------------------------------------------------ 记录
+
+    /**
+     * 把 SQL 参数摊平成可搜索文本。
+     *
+     * ⚠️ 存在的唯一理由：`args` 里常混着 `String[]`/`Object[]`（whereArgs / bindArgs），
+     * 它们 `toString()` 出来是 `[Ljava.lang.String;@1a2b` —— 内容全丢。
+     * 而「群 wxid 作为绑定参数传入」恰恰是最常见的写法，不摊平就等于放弃 catchKey 过滤。
+     * 数组/集合递归展开，深度只到 2 层（SQL 参数不会更深），防环。
+     */
+    private fun flat(v: Any?, depth: Int = 0): String {
+        if (v == null) return "null"
+        if (depth >= 2) return v.toString().take(40)
+        return when (v) {
+            is Array<*> -> v.joinToString(",") { flat(it, depth + 1) }.take(300)
+            is Iterable<*> -> v.joinToString(",") { flat(it, depth + 1) }.take(300)
+            else -> v.toString().take(200)
+        }
+    }
 
     private fun recordSql(sig: String, param: XC_MethodHook.MethodHookParam) {
         val args = param.args
@@ -266,8 +572,41 @@ object SnsHuntProbe {
         val headLower = head.lowercase()
         val tableHit = TABLE_HINTS.any { headLower.contains(it) }
         var kw = KEYWORDS.firstOrNull { headLower.contains(it) }
+        val isQuery = NO_STACK_SIGS.any { sig.contains(it) }
 
-        if (!tableHit && kw == null) {
+        // ⚠️ `catch` 模式：**记录写操作**。
+        //
+        // 为什么需要它：默认过滤只看 TABLE_HINTS(sns*) 与 KEYWORDS(delete/snsid)，
+        // 「某个未知表被写入」这类取证（例：群免打扰开关到底写哪儿）会被**静默丢弃**
+        // —— 于是 `sub=on` 之后一个字段都没变，看起来像"微信没写库"，其实是探针没记。
+        //
+        // 只放行**写**操作（query 一律跳过）：微信查询极热，全记必刷爆。
+        // catchKey 非空时再叠一层「SQL 或参数里必须含该子串」（例如目标群 wxid）。
+        var catchHit = false
+        if (allWrites && !isQuery) {
+            val k = catchKey
+            if (k == null) {
+                catchHit = true
+            } else {
+                // 参数在 args[1..] 里，先粗判 SQL 头，再判参数（wxid 通常作绑定参数传入）
+                val sb = StringBuilder(head)
+                if (args != null) {
+                    for (i in 1 until args.size) {
+                        val v = args[i] ?: continue
+                        // ⚠️ 数组必须摊开：`whereArgs`/`bindArgs` 是 String[]/Object[]，
+                        // 直接 toString() 只得到 `[Ljava.lang.String;@1a2b`，内容全丢。
+                        // 偏偏「群 id 走绑定参数」是最常见形态（update(t,'x=?',[roomid])），
+                        // 不摊开就会把 catchKey 明明命中的写操作静默丢弃。
+                        sb.append(' ').append(flat(v))
+                        if (sb.length > 1200) break
+                    }
+                }
+                catchHit = sb.contains(k, ignoreCase = true)
+            }
+        }
+        if (catchHit) {
+            // 落到下面的记录逻辑
+        } else if (!tableHit && kw == null) {
             passed.incrementAndGet()
             return
         }
@@ -287,16 +626,17 @@ object SnsHuntProbe {
         val tailStr = tail.toString()
         if (kw == null) kw = KEYWORDS.firstOrNull { tailStr.lowercase().contains(it) }
 
-        val isQuery = NO_STACK_SIGS.any { sig.contains(it) }
-        val headMax = if (isQuery) 500 else 80
+        val headMax = if (isQuery) 500 else if (allWrites) 260 else 80
         val dbPath = pathOf(param.thisObject)
         val detail = "db=${dbPath.take(60)} | " + head.take(headMax) + " | " + tailStr.take(240)
 
         // ⚠️ 取栈很贵（Throwable().stackTrace），只在「第一次见到这个调用点」时才取；
         // 写库是热路径，无条件取栈会明显拖慢微信。
-        val key = "$sig [${if (kw != null) "KW" else "TBL"}] ${detail.take(60)}"
+        // catch 模式下调宽 key 长度：不同表的前 60 字符可能撞在一起（update xxx set 之后才有表名差异）
+        val keyLen = if (allWrites) 110 else 60
+        val key = "$sig [${if (kw != null) "KW" else "TBL"}] ${detail.take(keyLen)}"
         val n = counts.merge(key, 1) { a, b -> a + b } ?: 1
-        if (n == 1 && printed.get() < MAX_LINES) {
+        if (n == 1 && printed.get() < maxLines()) {
             printed.incrementAndGet()
             val tag = if (kw != null) "[KW:$kw]" else "[TBL]"
             own("SNS $sig $tag thread=${Thread.currentThread().name} :: $detail")

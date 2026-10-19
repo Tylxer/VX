@@ -11,7 +11,7 @@ import android.widget.ListView
 import android.widget.PopupWindow
 import android.widget.TextView
 import com.lx.wxgroup.core.HostContext
-import com.lx.wxgroup.data.GroupDb
+import com.lx.wxgroup.core.TextSender
 import com.lx.wxgroup.ui.Panel
 import com.lx.wxgroup.ui.UiKit
 import com.lx.wxgroup.util.LogX
@@ -21,6 +21,8 @@ import de.robv.android.xposed.XposedBridge
 import de.robv.android.xposed.XposedHelpers
 import de.robv.android.xposed.callbacks.XC_LoadPackage
 import java.lang.ref.WeakReference
+import java.util.concurrent.ExecutorService
+import java.util.concurrent.Executors
 import java.util.concurrent.atomic.AtomicInteger
 import java.util.concurrent.atomic.AtomicLong
 
@@ -39,8 +41,9 @@ import java.util.concurrent.atomic.AtomicLong
  * - 认成 NONE → 静默放弃（别的浮层，绝不多手）。
  *
  * ## v1 边界（诚实声明，详见 [nativeForward] / [resendText] 与报告「取证缺口」）
- * - 菜单注入、目标选择（K3 选择器两段：好友·群聊 / 模块分组）、目标展开去重、
- *   排除当前会话、策略选择、汇总 toast —— **全部接通**，可上机验证；
+ * - 菜单注入、目标选择（K3 三 Tab 选择器 [ForwardPicker]：好友·群聊 / 模块分组 /
+ *   微信标签）、目标展开去重、排除当前会话、策略选择、批量执行与汇总 toast
+ *   —— **全部接通**，可上机验证；
  * - 「发出去」这一步**未接通**：原生转发锚点未取证（G1）、降级发送（K8）项目里
  *   根本不存在（G3）。未取证前两条发送分支恒记 failed —— **严禁猜微信内部
  *   类名/方法名**（猜错 = 崩微信）。
@@ -115,6 +118,20 @@ object ForceForward {
 
     @Volatile
     private var lastPressAt = 0L
+
+    private val mainHandler by lazy { Handler(Looper.getMainLooper()) }
+
+    /**
+     * 批量执行的单线程池。
+     *
+     * 单线程是刻意的：转发要**一个一个发**，并发发只会被微信自己的频率限制拦，
+     * 还让「第几条失败」的日志彻底失去意义。daemon 线程，不拖住微信退出。
+     */
+    private val exec: ExecutorService by lazy {
+        Executors.newSingleThreadExecutor { r ->
+            Thread(r, "wxg-forward").apply { isDaemon = true }
+        }
+    }
 
     // ------------------------------------------------------------ install
 
@@ -491,137 +508,111 @@ object ForceForward {
     }
 
     /**
-     * K3 选择器（[PickerPage]）选转发目标。
+     * K3 三 Tab 选择器（[ForwardPicker]）选转发目标。
      *
-     * 需求 6.6 要三个 Tab（好友·群聊 / 模块分组 / 微信标签）。微信标签段取自
-     * [LabelSource]（`ContactLabel` + `rcontact` 两份只读缓存）：段内 id 带 `t:` 前缀，
-     * 发送前由 [ForwardLogic.resolveTargets] 展开成人。
-     * [LabelSource.ready] 为 false（缓存还没灌进来）时不显示该段。
+     * 三个 Tab（好友·群聊 / 模块分组 / 微信标签）可混选；分组与标签在 [ForwardPicker]
+     * 内部展开并去重（同一人被多个分组/标签选中只发一次），回调拿到的已经是最终
+     * wxid 列表。当前会话（[currentChatTalker]）作为排除集传进去：列表里不显示，
+     * 展开结果里也不会出现（转发回原会话没意义）。
      */
     private fun openTargetPicker(snap: ForwardLogic.Snapshot) {
-        val ctx = HostContext.activity() ?: HostContext.app()
-        if (ctx == null) {
-            LogX.w("FF picker: no host context")
-            return
-        }
-        val db = GroupDb.current()
-        if (db == null) {
-            LogX.w("FF picker: db not ready")
-            return
-        }
-        val friends = runCatching { db.allRealFriends() }.getOrDefault(emptyList())
-        val groups = runCatching { db.listGroups() }.getOrDefault(emptyList())
-        val sections = ArrayList<PickerPage.Section>(2)
-        if (friends.isNotEmpty()) {
-            sections.add(
-                PickerPage.Section(
-                    "好友·群聊",
-                    friends.map { PickerPage.Item(it.wxid, it.displayName, it.wxid) }
-                )
-            )
-        }
-        if (groups.isNotEmpty()) {
-            sections.add(
-                PickerPage.Section(
-                    "模块分组",
-                    groups.map {
-                        PickerPage.Item(
-                            id = "${ForwardLogic.PREFIX_GROUP}${it.id}",
-                            title = it.name,
-                            subtitle = "分组 · ${db.countMembers(it.id)} 人",
-                        )
-                    }
-                )
-            )
-        }
-        if (LabelSource.ready()) {
-            val labels = LabelSource.allLabels()
-                .filter { !it.name.isNullOrBlank() }
-                .map {
-                    PickerPage.Item(
-                        id = "${ForwardLogic.PREFIX_LABEL}${it.id}",
-                        title = it.name!!,
-                        subtitle = "微信标签 · ${it.memberCount} 人",
-                    )
-                }
-            if (labels.isNotEmpty()) sections.add(PickerPage.Section("微信标签", labels))
-        }
-        if (sections.isEmpty()) {
-            UiKit.toast(ctx, "好友缓存为空，先去通讯录滚一遍再回来")
-            LogX.w("FF picker: no sections (friends=${friends.size} groups=${groups.size})")
-            return
-        }
-        LogX.i("FF picker open sections=${sections.size} friends=${friends.size} groups=${groups.size}")
+        val sourceChat = snap.sourceChat.ifBlank { currentChatTalker() }
+        val exclude = if (sourceChat.isBlank()) emptySet() else setOf(sourceChat)
+        LogX.i("FF picker open exclude=$sourceChat kind=${snap.kind} textLen=${snap.text.length}")
         Panel.open(
-            PickerPage(
+            ForwardPicker(
                 title = "转发到多个",
-                sections = sections,
-                multi = true,
-                hint = "分组、微信标签与好友可混选，发送前会展开成具体的人并去重；当前会话自动排除",
-            ) { ids -> execute(snap, ids) }
+                exclude = exclude,
+            ) { result -> execute(snap, result) }
         )
     }
 
     /**
-     * 展开目标 → 选策略 → 逐目标执行 → 汇总 toast。
+     * 选策略 → **后台线程**逐目标执行 → 汇总 toast。
+     *
+     * 为什么不留在主线程：目标数可能几百个（分组 / 标签展开后），逐个发是串行 IO，
+     * 卡住主线程会让微信 ANR。执行一律丢给 [exec]（单线程 daemon），
+     * toast 再 post 回主线程。
+     *
+     * 失败处理（需求「单条失败不中断整批」）：每个目标各自 `runCatching`，
+     * 抛异常 / 返回 false 都只计 failed，循环继续；**不加「连续失败 N 条中止」**
+     * （那是 6.5 群发的规则，本任务不继承）。
      *
      * v1 的诚实边界：两条发送链路都未接通（见 [nativeForward] / [resendText]），
      * 非 SKIP 分支全部记 failed；**sent==0 一律加「未实际发送」后缀**（含 SKIP：
      * 真机长按路径 kind 恒 UNKNOWN，恒走 SKIP 且 failed 恒 0，文案必须诚实）。
      * 链路接通后这里只需把对应分支换成真调用，计数与文案不用动。
      */
-    private fun execute(snap: ForwardLogic.Snapshot, picked: List<String>) {
+    private fun execute(snap: ForwardLogic.Snapshot, picked: ForwardPicker.Result) {
         runCatching {
-            val db = GroupDb.current()
-            val buckets = buildBuckets(db)
-            val sourceChat = snap.sourceChat.ifBlank { currentChatTalker() }
-            val exclude = if (sourceChat.isBlank()) emptySet() else setOf(sourceChat)
-            val targets = ForwardLogic.resolveTargets(picked, buckets, exclude)
-            val ctx = HostContext.activity() ?: HostContext.app()
+            val targets = picked.wxids
             if (targets.isEmpty()) {
-                LogX.i("FF no targets after resolve picked=${picked.size} exclude=$sourceChat")
-                if (ctx != null) UiKit.toast(ctx, "没有可转发的目标（分组为空或全部被排除）")
+                // 正常走不到（ForwardPicker.confirm 已挡一道），留着防探针/将来别的入口
+                LogX.w("FF execute: empty targets picked=${picked.picked}")
+                val c0 = HostContext.activity() ?: HostContext.app()
+                if (c0 != null) UiKit.toast(c0, "没有可转发的目标（分组为空或全部被排除）")
                 return
             }
             val plan = ForwardLogic.planFor(snap, nativeState())
             lastPlan = plan.strategy.name
             LogX.i(
                 "FORWARD plan strategy=${plan.strategy} reason=${plan.reason} " +
-                    "targets=${targets.size} kind=${snap.kind} textLen=${snap.text.length} " +
-                    "exclude=$sourceChat"
+                    "picked=${picked.picked} targets=${targets.size} " +
+                    "kind=${snap.kind} textLen=${snap.text.length}"
             )
-            var sent = 0
-            var degraded = 0
-            var skipped = 0
-            var failed = 0
-            when (plan.strategy) {
-                ForwardLogic.Strategy.NATIVE ->
-                    for (t in targets) {
-                        if (nativeForward(snap, t)) sent++ else failed++
-                    }
-                ForwardLogic.Strategy.RESEND_TEXT ->
-                    for (t in targets) {
-                        if (resendText(snap, t)) { sent++; degraded++ } else failed++
-                    }
-                ForwardLogic.Strategy.RESEND_FILE ->
-                    for (t in targets) {
-                        if (resendFile(snap, t)) { sent++; degraded++ } else failed++
-                    }
-                ForwardLogic.Strategy.SKIP -> skipped = targets.size
-            }
-            val msg = ForwardLogic.summary(sent, degraded, skipped, failed)
-            LogX.i("FORWARD done $msg plan=${plan.strategy}")
-            if (ctx != null) {
-                // sent==0 一律加后缀（含 SKIP）：真机长按路径 snapshotNow 的 kind 恒
-                // UNKNOWN（G2）→ planFor 首行 isCovered(UNKNOWN)=false 恒 SKIP，
-                // failed 也恒 0。若把 SKIP 排除在后缀条件外，toast 只剩「已发送 0 个
-                // 目标 · 跳过 N」，看着像成功了 —— 没发出去就必须说「未实际发送」。
-                val full = if (sent == 0) {
-                    "$msg（发送链路未接通，未实际发送，详见日志 FORWARD）"
-                } else msg
-                UiKit.toast(ctx, full)
-            }
+            exec.execute { runBatch(snap, plan, targets) }
         }.onFailure { LogX.e("FF execute failed", it) }
+    }
+
+    /** 批量执行的线程体：逐个目标发，单条失败只计数不中断 */
+    private fun runBatch(
+        snap: ForwardLogic.Snapshot,
+        plan: ForwardLogic.Plan,
+        targets: List<String>,
+    ) {
+        var sent = 0
+        var degraded = 0
+        var skipped = 0
+        var failed = 0
+        for (t in targets) {
+            if (plan.strategy == ForwardLogic.Strategy.SKIP) {
+                skipped++
+                continue
+            }
+            val ok = runCatching {
+                when (plan.strategy) {
+                    ForwardLogic.Strategy.NATIVE -> nativeForward(snap, t)
+                    ForwardLogic.Strategy.RESEND_TEXT -> resendText(snap, t)
+                    ForwardLogic.Strategy.RESEND_FILE -> resendFile(snap, t)
+                    ForwardLogic.Strategy.SKIP -> false
+                }
+            }.onFailure {
+                LogX.w("FORWARD target threw ${t.take(24)}: ${it.javaClass.simpleName}")
+            }.getOrDefault(false)
+            if (ok) {
+                sent++
+                // 走降级的都算「已作为普通消息发送，无转发标记」
+                if (plan.strategy != ForwardLogic.Strategy.NATIVE) degraded++
+            } else {
+                failed++
+            }
+        }
+        val msg = ForwardLogic.summary(sent, degraded, skipped, failed)
+        LogX.i("FORWARD done $msg plan=${plan.strategy} targets=${targets.size}")
+        mainHandler.post {
+            val ctx = HostContext.activity() ?: HostContext.app() ?: return@post
+            // sent==0 一律加后缀（含 SKIP）：真机长按路径 snapshotNow 的 kind 恒
+            // UNKNOWN（G2）→ planFor 首行 isCovered(UNKNOWN)=false 恒 SKIP，
+            // failed 也恒 0。若把 SKIP 排除在后缀条件外，toast 只剩「已发送 0 个
+            // 目标 · 跳过 N」，看着像成功了 —— 没发出去就必须说「未实际发送」。
+            val text = if (sent == 0) {
+                "$msg（发送链路未接通，未实际发送，详见日志 FORWARD）"
+            } else {
+                // 需求点名的降级提示：只要有一条走了重发分支就必须说清楚没有转发标记
+                if (degraded > 0) "$msg · ${ForwardLogic.TOAST_DEGRADED}" else msg
+            }
+            UiKit.toast(ctx, text)
+        }
     }
 
     /**
@@ -645,36 +636,18 @@ object ForceForward {
     /**
      * 降级重发文本（无转发标记）。
      *
-     * ⚠️ **v1 恒 false**：项目里没有任何「发消息」能力（K8 缺口 G3）——
-     * [com.lx.wxgroup.core.ChatOpener] 只是打开会话、[com.lx.wxgroup.core.MarkRead]
-     * 只改未读数，都不算发送；写消息库不产生真实投递。接通前恒 false。
+     * ✅ **已接通（2026-10-18，S9 端到端验证）**：走 [com.lx.wxgroup.core.TextSender.send]
+     * （`hl0/r1.b(talker)` → `q1.e(content)` → `q1.b()`，真机落库验证通过）。
+     * 链路缺失 / 反射失败时返回 false，上层按「失败」计数（重发文本没有重试，单条失败不中断）。
      */
     private fun resendText(snap: ForwardLogic.Snapshot, target: String): Boolean {
-        LogX.w("FORWARD resend-text unavailable (K8 send link missing, G3), target=${target.take(24)}")
-        return false
+        return TextSender.send(target, snap.text)
     }
 
     /** 降级重发文件。同 [resendText]：v1 恒 false（G3）。 */
     private fun resendFile(snap: ForwardLogic.Snapshot, target: String): Boolean {
         LogX.w("FORWARD resend-file unavailable (K8 send link missing, G3), target=${target.take(24)}")
         return false
-    }
-
-    // ------------------------------------------------------------ 数据
-
-    /** 分组 id → 成员 wxid；标签 id → 成员 wxid（来自 [LabelSource] 的只读缓存） */
-    private fun buildBuckets(db: GroupDb?): ForwardLogic.Buckets {
-        val groups = HashMap<String, List<String>>()
-        if (db != null) {
-            for (g in runCatching { db.listGroups() }.getOrDefault(emptyList())) {
-                val members = runCatching { db.memberWxids(g.id) }.getOrDefault(emptySet())
-                if (members.isNotEmpty()) groups[g.id.toString()] = members.toList()
-            }
-        }
-        return ForwardLogic.Buckets(
-            groups = groups,
-            labels = runCatching { LabelSource.membersByLabelId() }.getOrDefault(emptyMap()),
-        )
     }
 
     // ------------------------------------------------------------ 探针 / 自检

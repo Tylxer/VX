@@ -269,6 +269,244 @@ object MomentsLogic {
         sb.toString()
     }.getOrDefault("")
 
+    // ------------------------------------------------------------------ 图片原图留存
+
+    /**
+     * 32 位小写 hex 的 md5。朋友圈 content 的 BLOB 里混着这类串
+     * （2026-10-18 真机 `op=moments sub=img` 实测：
+     * `6ac4b5b0d7424bc7ba0fe9f8b9af8715` / `906834661446ea8dd11c6e2b2838d640` 等）。
+     *
+     * ⚠️ **不要**再写成「它们**是**原图在磁盘缓存里的键」—— 2026-10-18 后续设备实测
+     * **已否证**这个说法：把 4 个这类 md5 拿到
+     * `/sdcard` + `/data/user/0/com.tencent.mm` 上全盘 `find -name '<md5>*'`，
+     * **一个都搜不到**；`ls -lt image/` 里最近写入的文件是两天前的
+     * `reader_-255_<md5>.jpg`（那是公众号文章配图，不是朋友圈）。
+     * 结论：**朋友圈的图根本没被下载到本机**，所以 md5 无从对上 —— 这不是路径规则
+     * 写错，是「按 md5 找本地缓存」这条路本身在未缓存时不成立。
+     * 真正可行的线索是 content 里的**完整 CDN url**（见 [extractUrls]）。
+     */
+    private val MD5_RE = Regex("^[0-9a-f]{32}$")
+
+    /**
+     * 从 [mediaKeys] 产出的候选串里挑出 md5。
+     *
+     * 为什么要单独挑：`mediaKeys` 是「什么都吐出来对账用」的超集，里面还有 snsId、
+     * 无符号 snsId、URL 尾段、类型标记（`s` / `0`）。真正能当文件路径键的只有 md5。
+     *
+     * ⚠️ **只收小写**：微信自己落盘用小写 hex；大写形式无法判断大小写敏感性，
+     * 收进来只会在不区分大小写的文件系统上重复命中，收益为零。
+     */
+    fun md5sOf(keys: Collection<String>): List<String> =
+        keys.filter { MD5_RE.matches(it) }.distinct()
+
+    /** 直接从 BLOB 抽 md5（`md5sOf(mediaKeys(...))` 的组合快捷方式） */
+    fun md5sFrom(snsId: Long, blob: ByteArray?, urls: List<String> = emptyList()): List<String> =
+        md5sOf(mediaKeys(snsId, urls.ifEmpty { extractUrls(blob) }))
+
+    /**
+     * 原图缓存文件的**候选路径**。
+     *
+     * ⚠️ **本轮的诚实边界**：微信把朋友圈原图缓存放在哪个目录、用什么分层，**尚未取证**。
+     * 所以这里只产出「可能的形态」，由调用方 `File.exists()` 逐个实测 —— [pickExisting]
+     * 就是这么设计的（把存在性判断作为参数注入，本文件不做任何 IO）。
+     *
+     * 形态来自对微信其他缓存（头像/表情/语音）的通用做法，两种都试：
+     * 1. `root/<md5>` —— 单层扁平
+     * 2. `root/<md5[0..2]>/<md5>` —— 前两位分桶（微信多处缓存用这个）
+     */
+    fun imageCandidates(md5: String, roots: Collection<String>): List<String> {
+        if (!MD5_RE.matches(md5)) return emptyList()
+        val out = LinkedHashSet<String>()
+        for (r in roots) {
+            // 空白根单独判断：`"   ".trimEnd('/')` 仍是 `"   "`，直接拼会产出
+            // `"   /md5"` 这种不可能的路径，让 exists() 白跑一遍。
+            val base = r.trim().trimEnd('/')
+            if (base.isEmpty()) continue
+            out.add("$base/$md5")
+            out.add("$base/${md5.substring(0, 2)}/$md5")
+        }
+        return out.toList()
+    }
+
+    /**
+     * 从候选里挑第一个真实存在的。
+     *
+     * @param exists 存在性判定（注入进来，纯逻辑文件里不许写 `File.exists()`）
+     */
+    fun pickExisting(candidates: List<String>, exists: (String) -> Boolean): String? {
+        for (c in candidates) {
+            if (runCatching { exists(c) }.getOrDefault(false)) return c
+        }
+        return null
+    }
+
+    /**
+     * 头像 / 公众号图标不是原图，必须从图片导出里排除。
+     *
+     * 真机证据：`op=moments sub=img` 的 urls 里第一项常常是
+     * `https://wx.qlogo.cn/finderhead/ver_1/...` —— 那是发动态人的头像，
+     * 当成动态原图导出会把一堆头像混进用户目录。
+     */
+    fun isAvatarUrl(u: String): Boolean {
+        val l = u.lowercase()
+        return l.contains("qlogo.cn") ||
+            l.contains("finderhead") ||
+            l.contains("/avatar") ||
+            l.contains("avatar/")
+    }
+
+    /** 原图的扩展名：微信缓存多数不带扩展名，缺省按 jpg 存 */
+    fun extOf(path: String): String {
+        val name = path.substringAfterLast('/').substringBefore('?')
+        val dot = name.lastIndexOf('.')
+        if (dot <= 0 || dot == name.length - 1) return "jpg"
+        val ext = name.substring(dot + 1).lowercase()
+        // 只认图片扩展名，避免把 `md5.xxx` 这种怪名字的尾巴当扩展名
+        return if (ext in IMAGE_EXTS) ext else "jpg"
+    }
+
+    private val IMAGE_EXTS = setOf("jpg", "jpeg", "png", "gif", "webp", "bmp", "heic")
+
+    /** 导出图片的文件名：`snsId_序号.ext`（同一动态多张图靠序号区分） */
+    fun imageFileName(snsId: Long, index: Int, ext: String): String {
+        val e = ext.lowercase().takeIf { it in IMAGE_EXTS } ?: "jpg"
+        return "img_${snsId}_${index}.$e"
+    }
+
+    // ---------------------------------------------------------------- 原图下载（url 路线）
+
+    /**
+     * 媒体种类。**下载后以真实 Content-Type 为准覆盖这里的预判**，
+     * 这里只决定「要不要下载」和「兜底扩展名」。
+     */
+    enum class MediaKind { IMAGE, VIDEO, UNKNOWN }
+
+    /**
+     * url 分类判据（**全部来自 2026-10-18 真机 `op=moments sub=imgurl` 的实际输出**，不是猜）：
+     *
+     * - `http://wxapp.tc.qq.com/<n>/<n>/stodownload?encfilekey=…&token=…` —— 视频 / 大图。
+     *   ✅ **实测可下载**：设备上 curl 返回 HTTP 200、`video/mp4`、2826203 字节；
+     *   ✅ 端到端已通：`op=moments sub=imgdl` 真机落盘 `vid_-3412979636140764498_0.mp4`。
+     * - `http://shmmsns.qpic.cn/mmsns/<46位>/0` —— 朋友圈**图片**的 url 形态。
+     *   ❌ **实测下不来（结论已定死，2026-10-18 23:4x）**：8 个样本（含当场新抓的）**全部 400**，
+     *   加 `Referer: http://weixin.qq.com/`、加 iPhone UA、加 `?tp=jpg` **均无效**。
+     *    ⇒ 图片 CDN 需要微信侧的鉴权，裸 HTTP 取不到。**别再调这些参数了**。
+     * - 噪音：`mp.weixin.qq.com/s?…`（公众号文章正文链接，实测 302）、
+     *   `dldir1.qq.com/…/internet_news_media_auth_icon_…`（腾讯资源图标，实测 404）
+     *
+     * ## 对 6.4「原图留存」的结论
+     * 目前只有**视频 / stodownload 类**能存；**图片存不了**。图片要落地只剩两条路
+     * （都需再取证，本轮没做）：① hook 微信自己的图片下载器拿带鉴权的请求；
+     * ② 触发微信把图缓存到本地（用户点开大图）后走 md5 快速路径。
+     */
+    private val IMG_MARKS = listOf("mmsns", "qpic.cn")
+    private val VIDEO_MARKS = listOf("stodownload")
+    private val NOISE_MARKS = listOf("dldir1.qq.com", "mp.weixin.qq.com/s", "res.wx.qq.com")
+
+    /** 正文里的文章链接 / 资源图标 —— 都不是动态原图 */
+    fun isNoiseUrl(u: String): Boolean {
+        val l = u.lowercase()
+        return NOISE_MARKS.any { l.contains(it) }
+    }
+
+    /** 预判种类；头像素材与噪音都归 UNKNOWN（= 默认不下载） */
+    fun kindOfUrl(u: String): MediaKind {
+        if (isAvatarUrl(u) || isNoiseUrl(u)) return MediaKind.UNKNOWN
+        val l = u.lowercase()
+        if (VIDEO_MARKS.any { l.contains(it) }) return MediaKind.VIDEO
+        if (IMG_MARKS.any { l.contains(it) }) return MediaKind.IMAGE
+        return MediaKind.UNKNOWN
+    }
+
+    /**
+     * 值得下载的媒体 url（已排头像 + 噪音，去重保序）。
+     *
+     * @param includeUnknown 认不出的域名也下载。**默认 false** —— 宁可漏，
+     *                       也不能把一堆网页 HTML 当成图片存进用户目录。
+     */
+    fun mediaUrls(urls: List<String>, includeUnknown: Boolean = false): List<String> {
+        val out = LinkedHashSet<String>()
+        for (u in urls) {
+            val k = kindOfUrl(u)
+            if (k == MediaKind.UNKNOWN && !includeUnknown) continue
+            out.add(u)
+        }
+        return out.toList()
+    }
+
+    private val VIDEO_EXTS = setOf("mp4", "mov", "m4v")
+    private val CT_EXT = mapOf(
+        "image/jpeg" to "jpg", "image/jpg" to "jpg", "image/png" to "png",
+        "image/gif" to "gif", "image/webp" to "webp", "image/heic" to "heic",
+        "video/mp4" to "mp4", "video/quicktime" to "mov", "video/x-m4v" to "m4v",
+    )
+
+    /** 从 Content-Type 取扩展名；认不出返回 `""`（调用方按 [MediaKind] 兜底） */
+    fun extFromContentType(ct: String?): String {
+        val v = ct?.substringBefore(';')?.trim()?.lowercase().orEmpty()
+        return CT_EXT[v].orEmpty()
+    }
+
+    fun extOfKind(kind: MediaKind): String = if (kind == MediaKind.VIDEO) "mp4" else "jpg"
+
+    /**
+     * 落盘文件名。前缀按**最终扩展名**定（不按预判的 kind）——
+     * 真机实测过 `stodownload` 返回的是 `video/mp4`，若按 kind=VIDEO 猜还好，
+     * 但反过来「预判图片、实际视频」时叫 `img_xxx.mp4` 会误导，所以统一看 ext。
+     */
+    fun fileNameFor(snsId: Long, index: Int, kind: MediaKind, contentType: String?): String {
+        val ext = extFromContentType(contentType).ifEmpty { extOfKind(kind) }
+        val prefix = if (ext in VIDEO_EXTS) "vid" else "img"
+        return "${prefix}_${snsId}_${index}.$ext"
+    }
+
+    /**
+     * 图片缓存根目录候选（**2026-10-18 设备实测过目录结构，但命中率未知**）。
+     *
+     * 实测到的微信朋友圈相关目录（`adb shell ls` 直接看，不是猜）：
+     * - `/sdcard/Android/data/com.tencent.mm/MicroMsg/<userHash>/sns/temp` —— **存在但是空**
+     * - `/data/user/0/com.tencent.mm/MicroMsg/<userHash>/sns_aff` —— 存在
+     * - `/sdcard/Android/data/com.tencent.mm/cache/<hash>/sns` —— 存在
+     *
+     * ⚠️ **重大结论（2026-10-18 第二轮设备实测，已定死）**：本轮拿真机上取到的 4 个 md5
+     * （`6ac4b5b0…` / `9068346614…` / `59cdb4cf…` / `12fde739…`）
+     * 在 `/sdcard` + 整个 `/data/user/0/com.tencent.mm` 下**全盘 find 都搜不到**；
+     * 且 `image/` 目录最近写入的文件是 **2 天前**的 `reader_-255_<md5>.jpg`
+     * （公众号文章配图，与朋友圈无关），近两天 `/sdcard` 下**没有任何图片写入**。
+     *
+     * ⇒ 判定：**朋友圈的图从未下载到本机**（微信按需拉取，没主动点开大图就只在内存里画缩略）。
+     * 所以 [pickExisting] 全返回 null **是必然结果，不是 bug**。
+     *
+     * ## 对实现方向的结论
+     * 「按 md5 找本地缓存」这条路**在未缓存时不成立**，继续调目录规则是白费。
+     * 原图留存要改成**从 content 里的完整 CDN url 直接下载**
+     * （真机日志已吐出可用地址：
+     * `http://wxapp.tc.qq.com/251/20302/stodownload?enc…`、
+     * `http://shmmsns.qpic.cn/mmsns/<hash>…`）。
+     * 该方案需要联网 + 微信自己的 CDN 鉴权参数，**下一轮单独取证**，本轮不实现。
+     *
+     * 留着本函数的原因：若某天用户确实点开过大图（本地有缓存），走 md5 命中比下载快，
+     * 作为**快速路径**保留；但它不能再被当作主路径。
+     *
+     * @param externalRoot `/sdcard/Android/data/com.tencent.mm`（可空）
+     * @param userHash      MicroMsg 下的 32 位用户哈希目录名（可空）
+     */
+    fun imageRootCandidates(externalRoot: String?, userHash: String?): List<String> {
+        val out = LinkedHashSet<String>()
+        val ext = externalRoot?.trim()?.trimEnd('/').orEmpty()
+        if (ext.isEmpty()) return emptyList()
+        val uh = userHash?.trim()?.trimEnd('/').orEmpty()
+        if (uh.isNotEmpty()) {
+            // 实测存在的两个位置（`sns` 下有 `temp` 子目录，`temp` 本轮实测为空）
+            out.add("$ext/MicroMsg/$uh/sns")
+            out.add("$ext/MicroMsg/$uh/sns/temp")
+        }
+        // 实测存在的另一处：`cache/<hash>/sns`。hash 未知 → 由调用方在 cache 下自扫，
+        // 这里只给一个不带 hash 的根，让 exists() 至少能证明「根不存在」
+        out.add("$ext/cache")
+        return out.toList()
+    }
+
     // ------------------------------------------------------------------ text 文本渲染
 
     /** 渲染一条动态的 text 文本所需的最小字段集（[com.lx.wxgroup.data.GroupDb.SnsRow] 的投影） */

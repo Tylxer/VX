@@ -30,9 +30,10 @@ import java.util.concurrent.atomic.AtomicLong
  * - talker：NotificationItem.h，经 [QuietNotificationBridge] 的 id→talker 映射拿；
  * - 名单 / 别名：Kv.getList（JSON 数组）/ Kv.getString（裸文本）。
  *
- * ⚠️ 待取证：允许/排除名单支持「群名」元素，但通知链路目前拿不到群显示名
- * （extras 无 chatroom id），群名元素暂不命中；`op=quiet sub=at sub2=extras` 可
- * dump 最近一条通知的全部 extras，供下轮真机定「EXTRA_TITLE 是否即群名」的锚点。
+ * ✅ 已接通（2026-10-18，`rcontact.nickname` 取证）：允许/排除名单的「群名」元素
+ * 由 [GroupNameSource] 从 `rcontact` 取（群聊 conRemark 为空、nickname 才是群名），
+ * 读侧纯内存、不查库。冷启动首条通知若数据源尚未装载完，`nameOf` 返回 null，
+ * 该条退回 talker-only 匹配 —— 这是**可接受的降级**（下一条通知即恢复），不是 bug。
  *
  * 探针用法（op=quiet：`sub` 选中本功能，`sub2` 是本功能的子命令）：
  *   sub=at sub2=status | scope | aliases | map | extras
@@ -58,10 +59,10 @@ object MuteAt {
     internal fun shouldMute(notification: Notification, talker: String?): Boolean {
         return runCatching {
             if (!registered || !Kv.getBool(Keys.CHAT_MUTE_AT_ENABLED)) return false
-            // 群名元素暂不接线（待取证，见类注释）；锚点落地后把 null 换成真实群显示名
+            // 群名只读 [GroupNameSource] 的内存缓存，不查库；未就绪返回 null 即退回 talker 匹配
             if (!MuteAtLogic.groupInScope(
                     talker,
-                    null,
+                    talker?.let { GroupNameSource.nameOf(it) },
                     Kv.getList(Keys.CHAT_MUTE_AT_ALLOW),
                     Kv.getList(Keys.CHAT_MUTE_AT_EXCLUDE),
                 )
@@ -90,7 +91,17 @@ object MuteAt {
             "map" -> QuietNotificationBridge.mapStatus()
             // 取证用：最近一条通知的全部 extras（定「EXTRA_TITLE 是否即群名」锚点）
             "extras" -> QuietNotificationBridge.lastNotificationDump()
-            else -> "subs=status,scope,aliases,map,extras"
+            // ---- 群名桥（2026-10-18）：名单里配群名的用户，靠它验证命中 ----
+            // `sub=at sub2=grpstat`   数据源状态（ready/count/lastError）
+            // `sub=at sub2=grpname`   重装一次再打状态（只在后台线程查库）
+            // `sub=at sub2=grplist`   前若干个群名样本（核对 conRemark/nickname 取值）
+            "grpstat" -> GroupNameSource.stat()
+            "grpname" -> {
+                GroupNameSource.refreshBlocking(force = true)
+                GroupNameSource.stat()
+            }
+            "grplist" -> GroupNameSource.sampleText(8)
+            else -> "subs=status,scope,aliases,map,extras,grpstat,grpname,grplist"
         }
     }.getOrElse { "error=${it.javaClass.simpleName}" }
 }

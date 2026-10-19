@@ -37,8 +37,12 @@ import java.util.concurrent.atomic.AtomicInteger
  * - **「入群事件」无锚点**：取证结论里没有进群回调/事件的定位。按批准的退路实现为
  *   「检测到未见过的新群聊会话时置免打扰」：存量靠启动快照区分，快照未就绪前
  *   观察到的群一律按存量（宁漏设，也不把老群静音了）。
- * - **微信自身的「消息免打扰」开关状态未动**：写微信库/调微信设置接口没有锚点，
- *   本类的「免打扰」= 该群通知走静音通道（用户侧效果：不响铃不震动）。
+ * - **两层免打扰（2026-10-18 起）**：
+ *   1. **真开关**：[applyOne] 调 [com.lx.wxgroup.core.RealMuteSetter.setMuted] 发
+ *      oplog CGI，等价于用户在聊天信息页手动打开「消息免打扰」（真机双向验证通过）。
+ *   2. **即时静音**：仍然走 QuietNotificationBridge 改通知通道 —— 因为 CGI 的本地
+ *      sync 实测要**数十秒**，这段窗口里新群消息还是会响铃，靠静音通道顶住。
+ *   两条并行，任一条失败都不会互相拖累（真开关失败只打日志，静音照旧）。
  * - **「自建群不设」暂不生效**：判定群主需要 chatroom owner 锚点（NotificationItem /
  *   r4 均无此字段），取证结论未覆盖 → 待取证后补（[applyOne] 的 owner 参数预留）。
  * - **手动关掉后不再自动打开**：靠 GroupDb.auto_dnd_done 台账（重启仍有效）。
@@ -51,14 +55,65 @@ object AutoDndGroup {
     /** setAdapter 后等微信把 2900+ 会话填完再枚举，快照才准（毫秒）。 */
     private const val SNAPSHOT_DELAY_MS = 2500L
 
+    /**
+     * 会话列表刷新触发的新群扫描节流间隔（毫秒）。
+     * 微信刷新会话列表很频繁（新消息、撤回、草稿…），必须节流 + 后台遍历。
+     */
+    private const val SCAN_THROTTLE_MS = 30_000L
+
+    /**
+     * 一轮最多允许出现几个「新群」，超过就**只登记不设免打扰**。
+     *
+     * ⚠️ 这条是防最坏情况的保险丝：冷启动 seed 依赖「首次枚举拿到了全部老群」，
+     * 而会话列表可能被本项目自己的分组筛选裁剪、被「折叠的群聊」隐藏、或还没加载完，
+     * 一旦 seed 不全，下一轮扫描会把几百个老群当成新群**一次性全部免打扰**
+     * （用户侧不可逆）。正常入群一轮最多一两个，>3 一定是基线出了问题。
+     */
+    private const val MAX_FRESH_PER_ROUND = 3
+
+    /**
+     * 真免打扰 CGI 发出后多久复查一次本地状态（毫秒）。
+     * 实测 sync 延迟数十秒，取 60s 留足余量；未生效则补发一次。
+     */
+    private const val REALMUTE_VERIFY_DELAY_MS = 60_000L
+
     @Volatile
     private var installed = false
 
-    /** 存量群快照（模块启动时枚举会话列表得到）；快照就绪前一律按存量处理 */
+    /**
+     * 存量群基线 —— **持久化**在 `GroupDb.group_seen` 表。
+     *
+     * ⚠️ 原来它只在内存里、每次微信重启用当前会话列表重新快照，导致：用户被拉进的
+     * 新群在下一次启动时已经躺在列表里 → 被判成存量群 → **功能重启即失效**
+     * （2026-10-18 真机：`joined=0` 却 `baseline=731`，新群永远不动）。
+     * 改成跨重启累加：只有**从未见过**的群才算新群。
+     */
     private val baseline: MutableSet<String> = Collections.synchronizedSet(LinkedHashSet())
 
+    /**
+     * 冷启动是否已完成（= 基线里已经有历史数据）。
+     * 首次安装时基线为空，此时要把当前所有群一次性灌进基线并**全部跳过处理** ——
+     * 否则会把几百个老群全当成新群给免打扰掉。
+     */
     @Volatile
     private var baselineReady = false
+
+    /**
+     * 会话列表 adapter 引用：用于「列表刷新时扫描新群」（不依赖通知的触发源）。
+     * ⚠️ 用弱引用：强引用会一直拖住旧的 ListView / Activity，会话页重建后泄漏。
+     */
+    @Volatile
+    private var convAdapterRef: java.lang.ref.WeakReference<android.widget.ListAdapter>? = null
+
+    private val convAdapter: android.widget.ListAdapter?
+        get() = convAdapterRef?.get()
+
+    /** 扫描节流时间戳（[SCAN_THROTTLE_MS]） */
+    @Volatile
+    private var lastScanMs = 0L
+
+    /** convAdapter 为 null 的告警只打一次（避免刷屏） */
+    private val convAdapterWarned = java.util.concurrent.atomic.AtomicBoolean(false)
 
     /** 已登记/已记账的群（含从 GroupDb 台账恢复的），内存态去重用 */
     private val handled: MutableSet<String> = Collections.synchronizedSet(LinkedHashSet())
@@ -66,19 +121,33 @@ object AutoDndGroup {
     /** 本次进程内新登记过的群数（observer 可能在多线程回调，必须原子） */
     private val joined = AtomicInteger(0)
 
+    /** 宿主 classLoader：真 setter 反射要用（[applyOne]） */
+    @Volatile
+    private var hostLoader: ClassLoader? = null
+
+    /** 真 setter 必须主线程发 CGI（微信 CGI 链路依赖主线程上下文） */
+    private val mainHandler by lazy { android.os.Handler(android.os.Looper.getMainLooper()) }
+
     fun install(lpparam: XC_LoadPackage.LoadPackageParam) {
         runCatching {
-            // 重启恢复：台账里的群直接灌回 bridge 的静音集合，不用等它们再发通知
-            GroupDb.current()?.listDndHandled()?.forEach {
-                handled.add(it)
-                QuietNotificationBridge.markAutoDndTalker(it)
-            }
+            hostLoader = lpparam.classLoader
+            val db = GroupDb.current()
+            // 重启恢复：台账只用于「不重复处理」，**不再重挂静音通道**。
+            // ⚠️ 原来这里会把台账里的群重新 markAutoDndTalker，后果是用户在微信里手动
+            // 关掉免打扰后，一重启又被我们的静音通道盖住 → 表现为「关不掉」。
+            // 免打扰的持久性改由真开关（服务端 CGI）保证 —— 那才是用户自己认可的开关。
+            db?.listDndHandled()?.forEach { handled.add(it) }
+            // 恢复跨重启的存量基线（新群判定的依据）
+            val seen = db?.listSeenGroups().orEmpty()
+            baseline.addAll(seen)
+            baselineReady = seen.isNotEmpty()
             QuietNotificationBridge.addTalkerObserver(::onTalkerObserved)
             hookConversationList(lpparam)
+            hookAdapterChanged(lpparam)
             installed = true
             LogX.i(
-                "QUIET ADND installed restored=${handled.size} " +
-                    "enabled=${Kv.getBool(Keys.CHAT_AUTO_DND_NEW_GROUP)}"
+                "QUIET ADND installed restored=${handled.size} seen=${seen.size} " +
+                    "coldStartDone=$baselineReady enabled=${Kv.getBool(Keys.CHAT_AUTO_DND_NEW_GROUP)}"
             )
         }.onFailure {
             installed = false
@@ -103,8 +172,11 @@ object AutoDndGroup {
                     override fun afterHookedMethod(param: MethodHookParam) {
                         val list = param.thisObject as? android.widget.ListView ?: return
                         if (list.javaClass.name != CONV_LIST_CLASS) return
-                        if (baselineReady) return
                         val adapter = runCatching { list.adapter }.getOrNull() ?: return
+                        convAdapterRef = java.lang.ref.WeakReference(adapter) // 供「列表刷新时扫描新群」用
+                        // ⚠️ 不能因为 baselineReady 就跳过：基线的意义已经从「本次启动快照」
+                        // 变成「跨重启累加的已知集合」，每次启动都要拿当前列表跟它 diff，
+                        // 才能发现"上次启动之后才加进来的群"。
                         // HeaderViewListAdapter 的 count 含 header/footer，getItem 越界返回 null，均可安全跳过
                         Thread({
                             runCatching { snapshotBaseline(adapter) }
@@ -119,8 +191,89 @@ object AutoDndGroup {
         }.onFailure { LogX.i("QUIET ADND hook setAdapter failed: ${it.javaClass.simpleName}") }
     }
 
+    /**
+     * 启动时拿当前会话列表跟**持久化的已知集合** diff。
+     *
+     * - 首次运行（基线为空）：把所有现存群一次性灌进基线并全部跳过 —— 否则几百个
+     *   老群会被当成新群全免打扰掉。
+     * - 之后：只处理「从未见过」的群。
+     *
+     * ⚠️ 一个群都没枚举到时**不**置就绪，让判定继续走「存量群」（宁漏设也不错设老群）。
+     */
     private fun snapshotBaseline(adapter: android.widget.ListAdapter) {
         Thread.sleep(SNAPSHOT_DELAY_MS) // 等微信把数据填完再快照
+        val groups = runCatching { enumerateGroups(adapter) }.getOrNull()
+        if (groups.isNullOrEmpty()) {
+            LogX.i("QUIET ADND baseline NOT ready (groups=0) — 保持存量假设")
+            return
+        }
+        if (!baselineReady) {
+            synchronized(baseline) {
+                if (baselineReady) return
+                baseline.addAll(groups)
+                baselineReady = true
+            }
+            persistSeen(groups)
+            LogX.i("QUIET ADND cold start: seeded ${groups.size} groups (首次运行，全部按存量处理)")
+            // 落盘校验：库没打开/写入失败时这里会暴露（否则每次启动都重新冷启动，功能永不生效）
+            Thread({
+                Thread.sleep(2000)
+                val n = GroupDb.current()?.seenCount() ?: -1
+                if (n < groups.size) {
+                    LogX.w("QUIET ADND cold start 落盘异常: seenCount=$n < seeded=${groups.size}")
+                }
+            }, "wxgroup-adnd-verify").start()
+            return
+        }
+        diffAndApply(groups, "startup")
+    }
+
+    /**
+     * hook 会话列表刷新：被拉进新群时**不一定有通知**（已知边界），但会话列表一定会变。
+     * 这条触发源不依赖通知，是「入群即发现」的关键。
+     *
+     * 节流 [SCAN_THROTTLE_MS] + 后台线程遍历，避免高频刷新把主线程拖死。
+     */
+    private fun hookAdapterChanged(lpparam: XC_LoadPackage.LoadPackageParam) {
+        runCatching {
+            XposedHelpers.findAndHookMethod(
+                "android.widget.BaseAdapter",
+                lpparam.classLoader,
+                "notifyDataSetChanged",
+                object : XC_MethodHook() {
+                    override fun afterHookedMethod(param: MethodHookParam) {
+                        if (!baselineReady) return
+                        val now = System.currentTimeMillis()
+                        if (now - lastScanMs < SCAN_THROTTLE_MS) return
+                        lastScanMs = now
+                        val ad = convAdapter
+                        if (ad == null) {
+                            // 只告警一次：锚点 ConversationListView 类名一变就会长期为 null，
+                            // 无声 return 会让"新群扫描"这条触发源悄悄废掉且日志看不出来
+                            if (!convAdapterWarned.getAndSet(true)) {
+                                LogX.w("QUIET ADND scan: convAdapter=null（锚点类名变了？）新群扫描失效")
+                            }
+                            return
+                        }
+                        Thread({
+                            runCatching {
+                                val groups = enumerateGroups(ad)
+                                if (groups.isNotEmpty()) diffAndApply(groups, "scan")
+                            }.onFailure {
+                                LogX.i("QUIET ADND scan failed: ${it.javaClass.simpleName}")
+                            }
+                        }, "wxgroup-adnd-scan").start()
+                    }
+                }
+            )
+            LogX.i("QUIET ADND hooked BaseAdapter.notifyDataSetChanged (新群扫描)")
+        }.onFailure {
+            LogX.i("QUIET ADND hook notifyDataSetChanged failed: ${it.javaClass.simpleName}")
+        }
+    }
+
+    /** 枚举 adapter 里所有群聊 username（header/footer 的 getItem 返回 null，安全跳过） */
+    private fun enumerateGroups(adapter: android.widget.ListAdapter): Set<String> {
         val count = runCatching { adapter.count }.getOrDefault(0)
         val found = LinkedHashSet<String>()
         for (i in 0 until count) {
@@ -128,20 +281,47 @@ object AutoDndGroup {
             val username = ConvReader.username(item)
             if (QuietLogic.isGroupTalker(username)) found.add(username)
         }
-        // ⚠️ 快照不完整比没有快照更危险：一旦 baselineReady=true，所有不在快照里的
-        // 老群都会被 classifyGroup 判成 NEW → 第一条通知就把老群静音并写进台账
-        // （重启后仍静音，用户侧不可逆）。所以「一个群都没枚举到」时**不置就绪**，
-        // 让 classifyGroup 继续按「存量群」处理（宁漏设也不错设老群）。
-        if (count == 0 || found.isEmpty()) {
-            LogX.i("QUIET ADND baseline NOT ready (count=$count groups=${found.size}) — 保持存量假设")
+        return found
+    }
+
+    /** 与已知集合 diff：新群逐个处理，然后把所有群登记为"见过" */
+    private fun diffAndApply(groups: Set<String>, tag: String) {
+        // 开关关闭期间**不登记**：否则这段时间进的群被永久标成"见过"，
+        // 用户之后打开开关也不会补设，表现为静默失效。
+        if (!Kv.getBool(Keys.CHAT_AUTO_DND_NEW_GROUP)) return
+
+        val fresh = groups.filter { it !in baseline && it !in handled }
+        val toPersist = groups.filter { it !in baseline }
+        if (toPersist.isNotEmpty()) {
+            synchronized(baseline) { baseline.addAll(toPersist) }
+            persistSeen(toPersist)
+        }
+        if (fresh.isEmpty()) return
+        if (fresh.size > MAX_FRESH_PER_ROUND) {
+            // 保险丝：一轮冒出这么多新群，只可能是基线不全（筛选态/折叠群/没加载完），
+            // 宁可漏设也绝不批量误设 —— 误设免打扰对用户是不可逆的骚扰
+            LogX.w(
+                "QUIET ADND [$tag] 疑似基线不全：一轮出现 ${fresh.size} 个新群 " +
+                    "(>$MAX_FRESH_PER_ROUND)，只登记 seen、不设 DND -> ${fresh.take(3)}"
+            )
             return
         }
-        synchronized(baseline) {
-            if (baselineReady) return
-            baseline.addAll(found)
-            baselineReady = true
+        LogX.i("QUIET ADND [$tag] new groups=${fresh.size} -> ${fresh.map { it.take(20) }}")
+        for (id in fresh) applyOne(id, ownerWxid = null)
+    }
+
+    private fun persistSeen(ids: Collection<String>) {
+        val db = GroupDb.current()
+        if (db == null) {
+            // db 为 null 时 markSeen 不抛异常（?. 直接返回 null），runCatching 抓不到，
+            // 必须显式告警 —— 否则基线没落盘、每次启动都重新冷启动，功能永久不生效
+            LogX.w("QUIET ADND persistSeen: no db — 基线没落盘，重启后会重新冷启动")
+            return
         }
-        LogX.i("QUIET ADND baseline ready groups=${found.size} (of $count convs)")
+        Thread({
+            runCatching { db.markSeen(ids) }
+                .onFailure { LogX.i("QUIET ADND persistSeen failed: ${it.javaClass.simpleName}") }
+        }, "wxgroup-adnd-seen").start()
     }
 
     /**
@@ -153,6 +333,8 @@ object AutoDndGroup {
         val verdict = runCatching {
             QuietLogic.classifyGroup(talker, baseline, handled, baselineReady)
         }.getOrDefault(QuietLogic.GroupDndVerdict.EXISTING)
+        // 排查"新群没自动开"时先看这条：能定位是没触发、还是判成 EXISTING
+        LogX.d("QUIET ADND observe ${talker.take(24)} -> $verdict")
         if (verdict != QuietLogic.GroupDndVerdict.NEW) return
         applyOne(talker, ownerWxid = null)
     }
@@ -164,17 +346,22 @@ object AutoDndGroup {
      *   取证到 chatroom owner 锚点后按「群主是自己不设」补上（需求 6.1 第四条）。
      *   自身 wxid 同样未定位（取证结论 S8），两侧都无数据时该判定整体跳过。
      */
-    private fun applyOne(chatroomId: String, ownerWxid: String?) {
-        runCatching {
-            if (!Kv.getBool(Keys.CHAT_AUTO_DND_NEW_GROUP)) return
-            if (!QuietLogic.isGroupTalker(chatroomId)) return
+    private fun applyOne(chatroomId: String, ownerWxid: String?): Boolean {
+        return runCatching {
+            if (!Kv.getBool(Keys.CHAT_AUTO_DND_NEW_GROUP)) return@runCatching false
+            if (!QuietLogic.isGroupTalker(chatroomId)) return@runCatching false
             // 自建群不设 —— 暂不可用：ownerWxid / 自身 wxid 均无锚点（见 KDoc）
             val selfWxid: String? = null
             if (!ownerWxid.isNullOrBlank() && !selfWxid.isNullOrBlank() && ownerWxid == selfWxid) {
                 LogX.i("QUIET ADND skip own group $chatroomId")
-                return
+                return@runCatching false
             }
-            handled.add(chatroomId)
+            // ⚠️ 用 add() 的返回值当原子锁：新群涌入时 observer 可能多线程回调同一群，
+            //    check-then-act 会让两条都过判定 → 重复发 CGI、joined 重复计数
+            if (!handled.add(chatroomId)) {
+                LogX.d("QUIET ADND dup $chatroomId (already handled)")
+                return@runCatching false
+            }
             QuietNotificationBridge.markAutoDndTalker(chatroomId)
             joined.incrementAndGet()
             // 记账落后台线程：通知路径上不能做磁盘 IO
@@ -182,15 +369,79 @@ object AutoDndGroup {
                 runCatching { GroupDb.current()?.markDndHandled(chatroomId) }
                     .onFailure { LogX.i("QUIET ADND ledger failed: ${it.javaClass.simpleName}") }
             }, "wxgroup-adnd-ledger").start()
-            LogX.i("QUIET ADND muted ${chatroomId.take(24)} (new group → silent channel)")
+            LogX.i("QUIET ADND muted ${chatroomId.take(24)} (silent channel)")
+
+            // 真·免打扰开关：等价于用户手动打开微信自己的「消息免打扰」
+            // （RealMuteSetter 发 oplog CGI，2026-10-18 真机双向验证）
+            applyRealMute(chatroomId)
+            true
         }.onFailure { LogX.i("QUIET ADND apply failed: ${it.javaClass.simpleName}") }
+            .getOrDefault(false)
+    }
+
+    /**
+     * 真·免打扰开关：调 `RealMuteSetter` 发 oplog CGI，把微信自己的开关打开。
+     *
+     * - **必须主线程**：后台线程调 `b()` 不报错但 CGI 很可能不投递（02:26 那轮踩过）。
+     * - **失败只降级**：反射链路断了/微信升级导致混淆名失效时，静音通道（[applyOne]
+     *   前半段）已经生效，这里失败不影响用户侧"不响铃"，只是 UI 开关没变。
+     * - **sync 有延迟**：CGI 成功后本地状态数十秒才更新，别在这里复查判成败。
+     * - **不读状态直接发**：功能侧只做 mute=true，直接 `forceStateInt = 0` 跳过读状态。
+     *   理由（复核）："已是目标状态就 skip"这条门完全建立在 `S` 反相的单次标定上，
+     *   一旦某个群上 `S` 语义不成立，表现就是"日志正常、ok=true、什么都没发生" ——
+     *   真机上最难发现的失效模式。CGI 幂等，无条件发比"靠读状态拦"稳。
+     *   顺带避免在主线程做 `contactOf`（读联系人 DB）的 IO/ANR 风险。
+     */
+    private fun applyRealMute(chatroomId: String) {
+        val cl = hostLoader
+        if (cl == null) {
+            LogX.w("QUIET ADND realmute skip: no classLoader")
+            return
+        }
+        runCatching {
+            mainHandler.post {
+                val r = runCatching {
+                    // forceStateInt=0 —— 0 = 开启免打扰（真机标定，别改）
+                    com.lx.wxgroup.core.RealMuteSetter.setMuted(cl, chatroomId, true, 0)
+                }.getOrElse {
+                    LogX.w("QUIET ADND realmute threw: ${it.javaClass.simpleName}")
+                    return@post
+                }
+                LogX.i(
+                    "QUIET ADND realmute ok=${r.ok} sent=${r.sent} stateInt=${r.stateInt} " +
+                        "factory=${r.factoryClass} ${r.detail}"
+                )
+                if (!r.sent) {
+                    // 没真发出去：静音通道仍生效，但微信开关没变，必须留痕
+                    LogX.w("QUIET ADND realmute NOT sent for ${chatroomId.take(24)} — 只有静音通道")
+                    return@post
+                }
+                // 延迟复查：b() 返回 void，"没抛异常"≠"服务端真生效"。
+                // 这是唯一能发现"发了但没生效"的手段，失败再补发一次。
+                mainHandler.postDelayed({
+                    val muted = runCatching {
+                        com.lx.wxgroup.core.RealMuteSetter.isMuted(cl, chatroomId)
+                    }.getOrNull()
+                    if (muted == true) {
+                        LogX.i("QUIET ADND realmute verified ${chatroomId.take(24)} muted=true")
+                    } else {
+                        LogX.w("QUIET ADND realmute UNVERIFIED ${chatroomId.take(24)} muted=$muted — retry once")
+                        runCatching {
+                            com.lx.wxgroup.core.RealMuteSetter.setMuted(cl, chatroomId, true, 0)
+                        }.onFailure {
+                            LogX.w("QUIET ADND realmute retry threw: ${it.javaClass.simpleName}")
+                        }
+                    }
+                }, REALMUTE_VERIFY_DELAY_MS)
+            }
+        }.onFailure { LogX.w("QUIET ADND realmute post failed: ${it.javaClass.simpleName}") }
     }
 
     /**
      * 探针用法（入口 `op=quiet`：`sub` 选中本功能，`sub2` 是本功能的子命令）：
      *   `--es op quiet --es sub grp --es sub2 status|anchor|applied`
      */
-    fun probe(sub: String): String = runCatching {
+    fun probe(sub: String, intentVal: String? = null): String = runCatching {
         when (sub.lowercase()) {
             "status" ->
                 "installed=$installed enabled=${Kv.getBool(Keys.CHAT_AUTO_DND_NEW_GROUP)} " +
@@ -201,7 +452,34 @@ object AutoDndGroup {
                     "setter=QuietNotificationBridge(mChannelId rewrite) " +
                     "joinEvent=无锚点-降级为新群会话检测 owner=无锚点-自建群判定暂缺"
             "applied" -> "handled=${handled.toList()}"
-            else -> "subs=status,anchor,applied"
+            "seen" -> "seenCount=${baseline.size} coldStartDone=$baselineReady convAdapter=${convAdapter != null}"
+            /**
+             * 手动对指定群执行「新群自动免打扰」全流程（含真开关 CGI）。
+             * 两种用途：① 验证链路通不通；② 补救 —— 首次安装时该群已被吸进
+             * 存量基线（cold start），之后再也不会被自动处理，只能手动补。
+             *   `--es op quiet --es sub grp --es sub2 force --es val <chatroomId>`
+             */
+            "force" -> forceApply(
+                intentVal ?: ""
+            )
+            else -> "subs=status,anchor,applied,seen,force(--es val <chatroomId>)"
         }
     }.getOrElse { "error=${it.javaClass.simpleName}" }
+
+    /**
+     * 手动执行（[probe] 的 `force` 子命令）。绕过新群判定，直接走 [applyOne]，
+     * 连真开关 CGI 一起发 —— 用于验证链路 / 补救已被吸进存量基线的群。
+     */
+    private fun forceApply(chatroomId: String): String {
+        if (chatroomId.isBlank()) return "force: need --es val <chatroomId>"
+        if (!QuietLogic.isGroupTalker(chatroomId)) return "force: not a chatroom id"
+        // handled 里已有会被引擎的去重锁挡掉，这里先摘掉再执行
+        handled.remove(chatroomId)
+        val ok = applyOne(chatroomId, ownerWxid = null)
+        return if (ok) {
+            "force OK $chatroomId (看后续 QUIET ADND realmute 日志)"
+        } else {
+            "force FAILED $chatroomId — 检查：功能开关是否打开 / id 是否为群 / 日志里有无 reject"
+        }
+    }
 }
