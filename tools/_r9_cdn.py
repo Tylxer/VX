@@ -34,7 +34,9 @@
 | `sub=export val=<dir> n=<N>`       | ★把 <dir> 下最近 N 个文件拷到 `/sdcard/Android/data/com.tencent.mm/cache/r9cdn/`<br>（模块跑在微信进程里，有私有目录读权限；拷出来脚本才能 pull + 验 magic） | `CDN export <dst> src=<src> size=<bytes>` |
 | `sub=decode val=<file>`            | ★I-4 反证：模块侧 `BitmapFactory.decodeFile`（inJustDecodeBounds）判明文 | `CDN decode <file> w=<n> h=<n> ok=<0|1>`（ok=1 且 w>0 ⇒ 明文；探针未实现则脚本打 UNKNOWN(需探针)） |
 | `sub=imgpath val=<dir>|off`        | ★I-3：hook `jf3.f#k` 改写 `BatchSnsReqImageData.imageCachePath` | `CDN imgpath <dir>` / `CDN imgpath off` |
-| `sub=stat`                         | 探针自身状态                        | `CDN stat hooked=<0|1> hitK=<n> hitCB=<n> last=<iso>` |
+| `sub=stat`                         | 探针自身状态（**2026-10-20 加 proc/pid 两个字段**，供 I-0 判进程归属） | `CDN stat hooked=<0|1> proc=<进程名> pid=<n> hitK=<n> hitCB=<n> last=<iso>` |
+| `sub=reset`                        | 清探针计数器 + `SnsCdnImage` 熔断（**改判据前后必须清**，否则前后差值无意义） | `CDN reset ok` |
+| `sub=img`                          | `SnsCdnImage` 成品侧状态（H1/H3 是否装上、熔断态、回调计数） | `CDN img on=<0|1> parts=<n,cb,...> streak=<n> tripped=<0|1> cb=<n> err=<n> nopath=<n> req=<n>`<br>（`SnsCdnImage` 未装时打 `CDN img off`） |
 
 约定：日志前缀统一 `CDN `（**改了脚本就抓不到**），落
 `/sdcard/Android/data/com.tencent.mm/cache/wxgroup_dbg.txt`，logcat tag `WXGroup`。
@@ -77,6 +79,8 @@ ADB = r"C:\Users\lx\AppData\Local\Android\Sdk\platform-tools\adb.exe"
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 PKG = "com.tencent.mm"
+# 主进程名（与 core/VersionGate.kt:18 HOST_MAIN_PROCESS 一致）。I-0 判据用它。
+MAIN_PROC = "com.tencent.mm"
 ACTION = "com.lx.wxgroup.action.PROBE"
 DBG = "/sdcard/Android/data/com.tencent.mm/cache/wxgroup_dbg.txt"
 LOCAL_DBG = os.path.join(ROOT, "_dbg_pull.txt")            # 沿用 _r8_rows.py:44
@@ -415,7 +419,62 @@ def magic_of(head):
     return ("unknown/可能仍加密", h)
 
 
-# ---------------------------------------------------------------- I-1 / I-2 / I-3 / I-4
+# ---------------------------------------------------------------- I-0 / I-1 / I-2 / I-3 / I-4
+def run_i0():
+    """I-0：`ok0/x0`（CdnTransportEngine）跑在哪个进程 —— 全方案的**前置生死项**。
+
+    `HookEntry` 只在 `processName == "com.tencent.mm"` 装钩子（`VersionGate.isMainProcess`）。
+    若 CDN 回调实际发生在别的进程（`:push` / `:tools` / `:appbrand` …），H3 永远不触发，
+    后面 I-1~I-4 全部无从谈起。
+
+    ⚠️ 判据的**局限**（必须如实报告，别急着下结论）：
+      探针 `sub=stat` 跑在**广播被投递的那个进程**里，而广播由 `am broadcast -p com.tencent.mm`
+      发出，通常落在主进程 ⇒ 这个 `proc` 字段**只能证明「广播到达主进程」**，
+      **不能证明「CDN 回调也在主进程」**。
+      ⇒ 真判据是「`hitK` / `hitCB` 有没有涨」：涨了 = 回调确实在装钩子的进程里。
+      `proc` 字段的价值是**排除误判**：若 `proc` 不是主进程，说明连广播都没到主进程，
+      那么 `hooked=1` 本身就不可信。
+    """
+    cdn("stat")
+    time.sleep(1.5)
+    lines = pull()
+    hit = last_cdn(lines, "stat hooked=")
+    if not hit:
+        return ("UNKNOWN", "日志无 `CDN stat` ⇒ 探针未装/版本旧（见文件头第 0 节）")
+
+    m_proc = re.search(r"proc=(\S+)", hit)
+    m_hook = re.search(r"hooked=(\d)", hit)
+    proc = m_proc.group(1) if m_proc else "unknown"
+    hooked = m_hook.group(1) if m_hook else "?"
+
+    ev = hit.strip()
+    if hooked != "1":
+        return ("FAIL", "%s ⇒ 钩子没装上，先看 note 字段/类名是否变（findClass 失败）" % ev)
+    if proc != MAIN_PROC:
+        return ("FAIL", "%s ⇒ 广播落在了 %s 而非主进程，hooked/计数都不可信" % (ev, proc))
+    return ("PASS", "%s ⇒ 广播到达主进程且钩子已装（回调是否也在主进程，靠 hitK/hitCB 增量为准）" % ev)
+
+
+def run_i0_after_scroll(before_hitk, before_hitcb):
+    """滚屏后用命中计数判「CDN 回调确实落在装钩子的进程里」—— I-0 的**真正判据**。"""
+    cdn("stat")
+    time.sleep(1.5)
+    lines = pull()
+    hit = last_cdn(lines, "stat hooked=")
+    if not hit:
+        return ("UNKNOWN", "滚屏后无 `CDN stat`")
+    k = re.search(r"hitK=(\d+)", hit)
+    cb = re.search(r"hitCB=(\d+)", hit)
+    dk_now = int(k.group(1)) if k else 0
+    dcb_now = int(cb.group(1)) if cb else 0
+    dk_delta = dk_now - before_hitk
+    dcb_delta = dcb_now - before_hitcb
+    ev = "%s（增量 hitK=+%d hitCB=+%d）" % (hit.strip(), dk_delta, dcb_delta)
+    if dk_delta > 0 or dcb_delta > 0:
+        return ("PASS", ev + " ⇒ CDN 回调确实在装钩子的进程里，I-0 成立")
+    return ("FAIL", ev + " ⇒ 零回调：可能是进程不对，也可能只是没触发下载，需结合 sub=img/日志判断")
+
+
 def run_i1():
     """I-1：`dk.a()` 的运行时返回值。
 
@@ -621,20 +680,30 @@ def plan_of(a):
     p.append("2. op=logclear（日志 5000 行环形，测前必须清）")
     if a.apply:
         p.append("3. op=cdn sub=hook val=on + sub=cbon val=on   [写]")
+        p.append("   op=cdn sub=reset（清计数/熔断，防上一轮累积污染差值）")
+        p.append("   op=cdn sub=img（看 SnsCdnImage 的 H1/H3 是否装上）")
     else:
         p.append("3. 跳过 hook/强制（未加 --apply，只读）")
-    p.append("4. I-1：op=cdn sub=dk → 抓 `CDN dk ret=<bool>`")
-    p.append("5. I-2：%s → snapshot" % (a.dir or "用 op=cdn sub=paths 解析 picCachePath"))
+    p.append("4. I-0：op=cdn sub=stat → 看 hooked= / proc= / pid=（**前置生死项**）")
+    p.append("   · 这里只判「广播到达的进程对不对」，**不能**证明 CDN 回调也在该进程")
+    p.append("5. I-1：op=cdn sub=dk → 抓 `CDN dk ret=<bool>`")
+    p.append("6. I-2：%s → before snapshot" % (a.dir or "用 op=cdn sub=paths 解析 picCachePath"))
     if a.force and a.apply:
-        p.append("6. op=cdn sub=force val=true                  [写]")
-    p.append("7. 滚 %d 屏：input swipe %s" % (a.screens, " ".join(SWIPE)))
-    p.append("8. I-2：after snapshot，与前值做差")
+        p.append("6b. op=cdn sub=force val=true                 [写]")
+    if a.no_scroll:
+        p.append("7. （--no-scroll）跳过滚屏 ⇒ 第 8 步 hitK/hitCB 增量必为 0，I-0 只能给 UNKNOWN")
+    else:
+        p.append("7. 滚 %d 屏：input swipe %s" % (a.screens, " ".join(SWIPE)))
+    p.append("8. I-0 复判：再 pull 一次 stat，算 hitK/hitCB 增量（>0 才算回调落在本进程）")
+    p.append("9. I-2：after snapshot，与前值做差")
     if a.i3:
-        p.append("9. I-3：op=cdn sub=imgpath val=%s → 看该目录有没有新文件  [写]" % a.i3_dir)
-    p.append("10. I-4：新增文件先 op=cdn sub=export 拷到可读目录，再取头 16 字节判 magic + sub=decode 反证")
+        p.append("10. I-3：op=cdn sub=imgpath val=%s → 看该目录有没有新文件  [写]" % a.i3_dir)
+    else:
+        p.append("10. I-3 改写 imageCachePath：跳过（未加 --i3）")
+    p.append("11. I-4：新增文件先 op=cdn sub=export 拷到可读目录，再取头 16 字节判 magic + sub=decode 反证")
     if a.allow_stale:
         p.append("    ⚠️ --allow-stale：无新增时也采样老文件（verdict 标注非本次新增）")
-    p.append("11. 打印 verdict 块，并追加到 %s" % a.out)
+    p.append("12. 打印 verdict 块，并追加到 %s" % a.out)
     return p
 
 
@@ -673,14 +742,37 @@ def main():
         time.sleep(a.settle)
         lines = pull()
         print(" ", last_cdn(lines, "hook ") or "(无 CDN hook 行 ⇒ 模块侧缺 op=cdn sub=hook)")
+        # 2026-10-20：开工前清计数 + 熔断，否则「前后差值」会把上一轮的累积算进来（R9 的 B-1 教训）
+        cdn("reset")
+        time.sleep(a.settle)
+        lines = pull()
+        print(" ", last_cdn(lines, "reset") or "(无 CDN reset 行 ⇒ 探针版本旧)")
+        # 成品侧（SnsCdnImage）状态：判 H1/H3 到底装没装上
+        cdn("img")
+        time.sleep(a.settle)
+        lines = pull()
+        print(" ", last_cdn(lines, "img") or "(无 CDN img 行 ⇒ SnsCdnImage 未装)")
     else:
         print("  只读模式：未装 hook（要观测请先加 --apply）")
 
-    print("=== 4. I-1 dk.a() ===")
+    print("=== 4. I-0 进程归属（前置生死项）===")
+    i0, i0ev = run_i0()
+    print("  %s\n  证据：%s" % (i0, i0ev))
+    # 记下滚屏前的命中计数，滚屏后用增量做 I-0 的**真正判据**
+    lines = pull()
+    st = last_cdn(lines, "stat hooked=")
+    _k = re.search(r"hitK=(\d+)", st or "")
+    _c = re.search(r"hitCB=(\d+)", st or "")
+    hitk0 = int(_k.group(1)) if _k else 0
+    hitcb0 = int(_c.group(1)) if _c else 0
+    if i0 == "FAIL":
+        print("  ⚠️ I-0 未过 —— 按方案 §7，此后的 I-1~I-4 结论均不可采信（先查进程/类名）")
+
+    print("=== 5. I-1 dk.a() ===")
     i1, i1ev = run_i1()
     print("  ret = %s\n  证据：%s" % (i1, i1ev))
 
-    print("=== 5. I-2 落盘目录 ===")
+    print("=== 6. I-2 落盘目录 ===")
     dir_notes = []
     if a.dir:
         target, how = a.dir, "--dir 指定"
@@ -698,6 +790,7 @@ def main():
         before = after = dict(SNAP_EMPTY)
         i3line, i3before, i3_ran = ("(未启用 --i3)", dict(SNAP_EMPTY), False)
         samples, i4, stale = [], [], False
+        i0b, i0bev = None, "无落盘目录 ⇒ 未滚屏，未复判"
     else:
         print("  可用取数口径：%s" % ", ".join(probe_access(target)))
         before = snapshot(target)
@@ -712,7 +805,15 @@ def main():
             scroll(a.screens)
         time.sleep(a.settle)
 
-        print("=== 8. I-2 after ===")
+        # I-0 的真正判据：滚屏后看 hitK/hitCB 有没有增量（回调是否落在装钩子的进程里）
+        print("=== 8. I-0 复判（滚屏后回调增量）===")
+        if a.no_scroll:
+            i0b, i0bev = "SKIP", "--no-scroll ⇒ 没有滚屏就不会触发新下载，增量判据不成立"
+        else:
+            i0b, i0bev = run_i0_after_scroll(hitk0, hitcb0)
+        print("  %s\n  证据：%s" % (i0b, i0bev))
+
+        print("=== 9. I-2 after ===")
         after = snapshot(target)
         print("  after : files=%d bytes=%d via %s" % (after["files"], after["bytes"], after["method"]))
         print("  差量  : files=%+d bytes=%+d" % (after["files"] - before["files"],
@@ -726,7 +827,7 @@ def main():
         i3before = None
         i3_ran = bool(a.apply and a.i3)
         if i3_ran:
-            print("=== 9. I-3 改写 imageCachePath ===")
+            print("=== 10. I-3 改写 imageCachePath ===")
             i3line, i3before = run_i3(a.i3_dir)
             print(" ", i3line.strip())
             if not a.no_scroll:
@@ -737,7 +838,7 @@ def main():
             i3line = "%s；%s files=%d→%d" % (i3line.strip(), a.i3_dir,
                                              i3before["files"], i3after["files"])
 
-        print("=== 10. I-4 magic bytes ===")
+        print("=== 11. I-4 magic bytes ===")
         samples = pick_samples(after, before, a.sample)
         stale = False
         if not samples and a.allow_stale:
@@ -770,7 +871,10 @@ def main():
     else:
         i4verdict, i4ev = "UNKNOWN", "无样本（I-2 没新增文件，或目录读不到）"
 
-    if i1 == "UNKNOWN":
+    if i0 == "FAIL":
+        concl = ("⛔ **I-0 未过（生死项）：%s** ⇒ 本轮的 I-1~I-4 结论一律不可采信，"
+                 "先修进程/类名问题再重跑" % i0ev)
+    elif i1 == "UNKNOWN":
         concl = "待补探针：模块侧缺 op=cdn sub=dk/sub=ls（见文件头第 0 节），本轮无结论"
     elif after["files"] > before["files"]:
         concl = "批量通路**可落盘**（%s 增加了 %d 个文件）；%s" % (
@@ -783,8 +887,19 @@ def main():
             "开关若未强制 true 请加 --apply --force 再跑" if not (a.apply and a.force)
             else "批量通路大概率仍不通（需结合 I-1 看是真的下了还是没触发）")
 
+    # I-0 复判（真判据）零回调时给结论加限定 —— 别让「没落盘」被误读成「通路不通」：
+    # 也可能是**回调根本没进这个进程**，那是完全不同的根因（改 hook 位置，而不是改逻辑）。
+    if i0b == "FAIL" and not concl.startswith("⛔"):
+        concl = "⚠️ I-0 复判零回调（hitK/hitCB 均无增量）⇒ 回调可能不在本进程，" \
+                "结论需降级看待。%s" % concl
+
     v = []
     v.append("==== R9-CDN VERDICT ====")
+    v.append("I-0 回调进程归属       : %-7s (证据：%s)" % (i0, i0ev))
+    if i0b is not None:
+        v.append("I-0 滚屏后回调增量     : %-7s (证据：%s)" % (i0b, i0bev))
+    else:
+        v.append("I-0 滚屏后回调增量     : SKIP    (无落盘目录 / 未滚屏 ⇒ 未跑)")
     v.append("I-1 dk.a()            : %-7s (证据：%s)" % (i1, i1ev))
     v.append("I-2 落盘文件数(前→后)  : %d → %d   (目录：%s；口径：%s；汇总：%s)" % (
         before["files"], after["files"], target or "-",

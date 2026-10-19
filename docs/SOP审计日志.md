@@ -144,3 +144,41 @@
 - `assembleDebug` **EXIT=0**（9s，无代码改动属增量空跑）。
 - `testDebugUnitTest` **EXIT=0**，实跑 **525 条 / 0 失败 / 0 跳过**（`test-results/*.xml` 时间戳 03:42:20，非陈旧产物）。
 - 全程**未碰 adb**，符合「正式开发等用户通知」的协作边界。
+
+### R11（2026-10-20 04:0x~05:0x）— **首轮真正跑满 6 项的轮次**
+
+| ① 分包 | ② 档位 | ③ 文件 | ④ 设备锁 | ⑤ 重排 | ⑥ 复核 | 总体 |
+|---|---|---|---|---|---|---|
+| **PASS** | **PASS** | **PASS** | **PASS** | **PASS** | **PASS** | 合规 |
+
+| # | 判定 | 证据 |
+|---|---|---|
+| **①** 分包下限 | **PASS** | 本期改动独立功能文件 **6 个源码 + 2 测试 + 1 脚本**。§四① 表：≥3 独立文件 ⇒ ≥2 实现 lane。**实际派 4 个**（I2/L1/I1/I3），超额。<br>🔑 之所以切成 4 条而不是 2 条：契约文件 `_cache/r11_contracts.md` 把产物切成**互不重叠**（I2 独占 `Keys.kt`、L1 独占两个纯逻辑文件、I1 独占 `SnsCdnImage.kt`、I3 独占 `SnsCdnProbe.kt`），拆开边界清晰、单条体量小、被打断时损失小（§五「有界子步」原则） |
+| **②** 档位显式 | **PASS** | 4 条 lane 全部**显式传 `model=`**，无一条靠继承。事后从子代理独立 transcript 的 `providerData.requestModelId` 回填：<br>I2 = `custom-local:deepseek-v4-flash-202605`（规划 Flash ⇒ **一致**）<br>L1/I1/I3/V2 = `custom-local:deepseek-v4-pro-202606`（规划 Pro ⇒ **全部一致**）<br>⇒ 本轮 **5/5 路由零漂移**。判据设计（L1 熔断语义 + 魔数表）、Hook 链路（I1）、反射（I3）、复核（V2）都按 §四② 归 Pro；I2 是纯照抄登记 ⇒ Flash |
+| **③** 文件不重叠 | **PASS** | 4 条 lane 的独占文件**零交集**（契约文件逐条划线）。<br>⚠️ 唯一有交叠风险的是 `SnsCdnImage.kt`：I1 建好后主 agent 又改了 ~60 行（B-1 拆分 / wifiOnly / 时钟域 / hookAllMethods）。这是**串行接管**不是并行写 —— I1 已交付完毕后我才动，无并发冲突。<br>`git status --short` 已核：11 个文件全部为本轮预期产物，无意外文件 |
+| **④** 设备锁 | **PASS** | 全程**未碰 adb**（无 `dev.py` / `adb` 调用），`gradle_run.py` 只跑 `assembleDebug` + `testDebugUnitTest`（本地）。<br>符合用户「本 round 明确不碰设备」的边界，也符合「正式开发等用户通知」 |
+| **⑤** 轮次重排 | **PASS** | 已在 `docs/并行开发轮次计划.md` 写入 **R11 段**（完成表 + 本 round 不做表 + R12 待办分「离线/真机」两栏）。<br>🔑 该段还记了一条**上机前警告**：主 agent 修完 V2 复核项后**未再过第二遍复核**，而 B-1 拆 `cfg()`/`refreshCfg()` 是唯一「改了异步语义」的地方 ⇒ 建议上机前对它单独复核 |
+| **⑥** 真机前复核 | **PASS** | 本轮**没装包**，但按用户级铁律「真机测试前必须交叉验证」，我在离线阶段就把 1109 行 diff 交给 Pro 复核（V2 = `agent-b2cf51e3`），报告 `_cache/r11_review.md` 判「**不可上机**」。<br>**AI 复核 + 自查双通道**：V2 抓到 1 BLOCKING + 4 建议；我另自查出 3 条 V2 漏掉的（见下）。<br>⚠️ 未做第二遍复核 —— 已在计划里显式登记为风险，不隐瞒 |
+
+**V2 复核抓到的最重要一条（值得写进方法论）**
+
+> **「模块里所有同步 IO 都必须在热路径之外」不是只有 `LogX` 一条。**
+> B-1 的形式是：`enabled()` → `cfg()` → TTL 到期时**同步** `Kv.getBool` → `GroupDb.getPref` →
+> `readableDatabase.query`。**SQLite 读和文件写是同量级的磁盘 IO**，且它伪装成「读一个配置」看起来很轻。
+> 而 `onC2CDownloadCompleted` 是**每张图都调**的 xposed 回调。
+> ⇒ 同类自查清单：看到「读配置 / 读开关 / 查 DB」出现在回调里，一律要问「这个读会不会落盘」。
+
+**主 agent 自查出、V2 未提的 3 条（说明复核不能替代自查）**
+
+| 项 | 性质 |
+|---|---|
+| **时钟域错乱** | `breaker.hit(now)` 传 `currentTimeMillis()`，`breaker.blocked()` 传 `elapsedRealtime()` ⇒ 同一 `tripAt` 被两套时钟比较，熔断冷却判定**静默错乱**。这类 bug 单测抓不到（两个函数各自都「对」），只有通读调用链才看得见 |
+| **`android.app.ActivityThread` 是 `@hide`** | 编译期 `Unresolved reference`。这是「照抄 Android 知识」的坑：`ActivityThread.currentProcessName()` 在网上到处都这么写，但在 SDK 里不可见 |
+| **`gradle_run.py` 吞掉 Kotlin 报错** | 错误过滤用 `"^e:"` 做 substring 匹配（不是正则锚点）⇒ 失败时只见 `BUILD FAILED`，真实错误全丢。**这会让后续每次编译失败都白查一轮**，属工具链级隐患 |
+
+**产物与验证**
+- 新增/改动：`Keys.kt`(+8) / `SnsCdnBreaker.kt`(73) / `SnsCdnCheckLogic.kt`(93) / `SnsCdnImage.kt`(~360) /
+  `SnsCdnProbe.kt`(547) / `HookEntry.kt`(接线) + 两个测试(287) + `tools/_r9_cdn.py`(+60)。
+- `assembleDebug` **EXIT=0**（9s）。
+- `testDebugUnitTest` **EXIT=0**，实跑 **552 条 / 0 失败 / 0 错误 / 0 跳过**（XML 解析核验，基线 525 ⇒ +27）。
+- 全程**未碰 adb**。

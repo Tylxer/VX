@@ -55,6 +55,8 @@ import java.util.concurrent.atomic.AtomicInteger
  * sub=ls val=<dir>          用微信进程权限列目录
  * sub=export val=<dir> n=N  把最近 N 个文件拷到可读 cache 目录（I-4 验 magic）
  * sub=imgpath val=<dir>|off I-3 改写 imageCachePath
+ * sub=reset                 清本探针计数器 + 熔断（SnsCdnImage.resetBreaker）
+ * sub=img                   打 SnsCdnImage.stateLine() 状态行（已自带 `CDN img ` 前缀）
  * sub=stat                  自身状态
  * ```
  */
@@ -171,6 +173,11 @@ object SnsCdnProbe {
                     imgPathDir = if (v == "off" || v.isNullOrBlank()) null else v
                     own("CDN imgpath " + (imgPathDir ?: "off"))
                 }
+                "reset" -> doReset()
+                "img" -> own(
+                    runCatching { com.lx.wxgroup.feature.SnsCdnImage.stateLine() }
+                        .getOrDefault("CDN img off")
+                )
                 "stat" -> doStat()
                 else -> own("CDN unknown sub=$sub")
             }
@@ -465,13 +472,27 @@ object SnsCdnProbe {
         }
     }
 
-    /** `sub=stat`：自身状态（hooked / 命中计数 / 最近回调时间 + 安装失败原因 note） */
+    /** `sub=stat`：自身状态（hooked / 进程 / 命中计数 / 最近回调时间 + 安装失败原因 note） */
     private fun doStat() {
         val hooked = if (unhooks.isNotEmpty()) 1 else 0
+        val proc = currentProcessName()
+        val pid = android.os.Process.myPid()
         val lastIso = if (lastCbAt == 0L) "-"
         else SimpleDateFormat("yyyy-MM-dd'T'HH:mm:ss.SSS", Locale.US).format(Date(lastCbAt))
-        own("CDN stat hooked=$hooked hitK=${hitK.get()} hitCB=${hitCB.get()} last=$lastIso")
+        own("CDN stat hooked=$hooked proc=$proc pid=$pid hitK=${hitK.get()} hitCB=${hitCB.get()} last=$lastIso")
         if (installNote.isNotEmpty()) own("CDN stat note=$installNote")
+    }
+
+    /** `sub=reset`：清本探针自身计数器 + 熔断（SnsCdnImage 未装时静默忽略） */
+    private fun doReset() {
+        hitK.set(0)
+        hitCB.set(0)
+        lastCbAt = 0L
+        lastPicParent = null
+        observedDirs.clear()
+        installNote = ""
+        runCatching { com.lx.wxgroup.feature.SnsCdnImage.resetBreaker() }
+        own("CDN reset ok")
     }
 
     // ---------------------------------------------------------------- 内部工具
@@ -509,6 +530,33 @@ object SnsCdnProbe {
     }
 
     private fun bool(v: Boolean?): String = if (v == null) "unknown" else v.toString()
+
+    /**
+     * 进程名三级降级：ActivityThread（反射，`@hide` API）→ /proc/self/cmdline → unknown
+     *
+     * ⚠️ `android.app.ActivityThread` 是 **`@hide` API**，编译期**不可见**
+     * （直接用会报 `Unresolved reference 'ActivityThread'`，本文件已踩过一次）。
+     * 只能在运行期反射调用 —— 模块跑在宿主进程里，这个类一定存在。
+     *
+     * ⚠️ 第二级必须判空串：`/proc/self/cmdline` 读失败时 `readBytes()` 会抛（已 runCatching 兜住），
+     * 但读到空内容会返回 `""`，此时**不能**当成有效进程名，要继续降级到 unknown。
+     */
+    private fun currentProcessName(): String {
+        val byReflect = runCatching {
+            val cls = Class.forName("android.app.ActivityThread")
+            cls.getMethod("currentProcessName").invoke(null) as? String
+        }.getOrNull()
+        if (!byReflect.isNullOrBlank()) return byReflect
+
+        val byCmdline = runCatching {
+            String(File("/proc/self/cmdline").readBytes())
+                .substringBefore('\u0000')
+                .trim()
+        }.getOrNull()
+        if (!byCmdline.isNullOrBlank()) return byCmdline
+
+        return "unknown"
+    }
 
     private fun own(msg: String) = runCatching { LogX.i(msg) }
 }

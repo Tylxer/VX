@@ -25,6 +25,7 @@ import com.lx.wxgroup.feature.ConvMenuInject
 import com.lx.wxgroup.feature.ForceForward
 import com.lx.wxgroup.feature.GroupBar
 import com.lx.wxgroup.feature.ScrollDock
+import com.lx.wxgroup.feature.SnsCdnImage
 import com.lx.wxgroup.feature.SnsGuard
 import com.lx.wxgroup.feature.SnsTag
 import com.lx.wxgroup.feature.SnsCommentGuard
@@ -284,6 +285,16 @@ class HookEntry : IXposedHookLoadPackage {
         runCatching {
             MomentsAuto.install(lpparam)
         }.onFailure { LogX.e("MomentsAuto install failed", it) }
+
+        // ---- 6.4 朋友圈：图片 CDN 批量下载（默认关；只在 WiFi 下放行）----
+        // 思路：hook dk.a() 强制返回 true 打开微信自己的批量图片下载通路，再在
+        // onC2CDownloadCompleted 里读出参 picCachePath，把文件拷到外部可读目录。
+        // 我们自己**不发 HTTP、不解 aeskey** —— 让微信自己下、自己解。
+        // ⚠️ 开关默认关：开门后走的是微信非默认代码路径（流量/风控/崩溃三个面），
+        // 必须先过真机 I-0~I-4 才允许默认开。实现见 feature/SnsCdnImage.kt 类注释。
+        runCatching {
+            SnsCdnImage.install(lpparam)
+        }.onFailure { LogX.e("SnsCdnImage install failed", it) }
 
         // ---- 6.4 朋友圈：自动导出（sns_archive → 文本文件；图片规则未取证，只留探针）----
         // 没有任何 hook：后台 5 分钟一拍，导出间隔 10 分钟，单航班后台线程。

@@ -44,3 +44,16 @@ keys = ("^e:", "FAILED", "BUILD ", "tests completed", "error:", "Exception")
 for line in out.splitlines():
     if any(k.strip() in line for k in keys):
         print(line)
+
+# ⚠️ 上面这轮过滤是 substring 匹配，`"^e:"` 实际是**字面量 `^e:`**（不是正则锚点），
+#    ⇒ Kotlin 报错行（真实格式 `e: file:///...`）一条都不会被打印，只剩
+#    `compileDebugKotlin FAILED` + `BUILD FAILED`，真实错误全丢（2026-10-20 R11 踩到）。
+#    这里补一轮真正的编译错误提取，保证失败时**一定有原因可看**。
+errs = [
+    ln for ln in out.splitlines()
+    if ln.lstrip().startswith("e:") or " error: " in ln or ln.startswith("> Task") and "FAILED" in ln
+]
+if errs:
+    print("--- compile errors ---")
+    for ln in errs[:60]:
+        print(ln)

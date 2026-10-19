@@ -172,6 +172,12 @@ object Keys {
     const val MOMENTS_EXPORT_PATH = "moments.export_path"
     const val MOMENTS_EXPORT_LIST = "moments.export_list"
 
+    /** 朋友圈图片走 CDN 时的批量下载开关 */
+    const val SNS_CDN_IMG = "sns.cdn_img"
+
+    /** 朋友圈图片落盘时是否改写路径 */
+    const val SNS_CDN_REWRITE_PATH = "sns.cdn_rewrite_path"
+
     /**
      * 定时刷新 / 自动导出的**内部状态**（epoch millis 字符串，读不到按 0 = 从没做过）。
      *
@@ -272,6 +278,8 @@ object Prefs {
         PrefSpec(Keys.MOMENTS_AUTO_EXPORT, PrefKind.SWITCH, "false", "朋友圈", "自动导出朋友圈动态"),
         PrefSpec(Keys.MOMENTS_EXPORT_PATH, PrefKind.PATH, DEFAULT_EXPORT_PATH, "朋友圈", "路径"),
         PrefSpec(Keys.MOMENTS_EXPORT_LIST, PrefKind.ENTER, "[]", "朋友圈", "设置自动导出名单"),
+        PrefSpec(Keys.SNS_CDN_IMG, PrefKind.SWITCH, "false", "朋友圈", "批量下载图片"),
+        PrefSpec(Keys.SNS_CDN_REWRITE_PATH, PrefKind.SWITCH, "false", "朋友圈", "改写落盘路径"),
 
         // 群发域
         PrefSpec(
