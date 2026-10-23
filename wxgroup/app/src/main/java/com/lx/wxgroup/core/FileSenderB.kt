@@ -32,33 +32,68 @@ import java.util.LinkedList
  *           而 u0.l 在 q.i==6 时返回 0x41000031（= 1090519089）
  * ```
  *
- * ## 第 7 / 第 8 个形参（`v24` / `v25`）—— ⚠️ 这段我写反过两次，以本节为准
+ * ## 第 7 / 第 8 个形参（`v24` / `v25`）—— ⚠️ 这段我错了三次，以本节为准
  *
+ * ### 先记 Dalvik 两条指令语义（我第三次才搞对，这是全部错误的根）
+ *
+ * | 指令 | 含义 |
+ * |---|---|
+ * | `if-eqz  vAA, +BBBB` | **为零**则跳转（`e` = equal zero） |
+ * | `if-nez  vAA, +BBBB` | **非零**则跳转（`n` = not equal zero） |
+ *
+ * 自证（`r5.j` 自己的 `fileData` 空判，`_cache/_r13_r5j.txt` `001c`~`0037`）：
+ * ```
+ * 0018  iget-object v0, v4, WXFileObject.fileData:[B
+ * 001c  if-eqz v0, 0026      ; fileData == null → 跳 0026（去查 filePath）
+ * 001e  array-length v0, v0
+ * 001f  if-nez v0, 0023      ; length != 0 → 跳 0023
+ * 0021  move v0, v5  (#1)    ; 落到这里 = length == 0
+ * 0023  move v0, v6  (#0)    ; 跳来 = length != 0
+ * 0024  if-eqz v0, 0036
+ * 0026  iget-object v0, v4, WXFileObject.filePath   ← 只有 fileData 为空才查 filePath
+ * ```
+ * 若 `if-nez` 是「为零跳转」，上面就会变成「fileData 非空时才查 filePath」——
+ * 与紧接着的 `checkArgs fail, both arguments is null` 完全说不通。
+ * **只有 `if-nez` = 非零跳转才自洽。**
+ *
+ * ### 再看门控
  * ```
  * 0183  iget-object v4, v1, Ljj/k0;.field_appId      ; v4 = appInfo.field_appId
  * 0187  o.f(v4, "field_appId")                       ; Kotlin 非空断言
- * 018a  if-nez   v2, 0190    ; v2 = p7 ⇒ p7 == 0 时跳 0190 【保留 v4】
- * 018c  if-eqz   v25, 0190   ; v25 = p8 ⇒ p8 == 0 时跳 0190 【保留 v4】
- * 018e  const-string v4, ""  ; ★ 只有【p7 != 0 且 p8 != 0】才清空
+ * 018a  if-nez v2, 0190    ; v2 = p7 ⇒ p7 != 0 时跳 0190 【保留 appId】
+ * 018c  if-eqz v25, 0190   ; v25 = p8 ⇒ p8 == 0 时跳 0190 【保留 appId】
+ * 018e  const-string v4, ""  ; ★ 落到这里 = p7 == 0 且 p8 != 0 → 清空
  * 0190  move-object v5, v4   ; v5 = 最终 appId → u0.A 第 2 参
  * ```
+ * ⇒ **清空条件是 `!p7 && p8`**（不是 `p7 && p8`）。
  *
- * ⇒ **清空条件是 `p7 && p8`。任一为 false 都保留 appId。**
- * 两句跳转目标相同 ⇒ 是 **OR 关系**，别只读一句就下结论（我踩过）。
+ * ### p7 / p8 分别是什么（都追到了源头）
  *
- * `p7` 的真实身份（4 跳追出来的，见 `docs/取证结论.md` §「p7 / p8 的真实语义」）：
+ * `p7` = **`TokenValid`**
  * ```
- * SendAppMessageWrapperUI.onCreate 639fbe  Bundle "SendAppMessageWrapper_TokenValid"
- *                                  639fca  iput-boolean → UI.p:Z   ★ getBoolean 默认值 = true
- *   → s6 63acb6 iget UI.p:Z → r5.l p7
- *   → r5.d p7 → n5.h 844f44 → r5.j p7
+ * WXEntryActivity.t6        0520  putExtra("SendAppMessageWrapper_TokenValid", WXEntryActivity.i)
+ * SendAppMessageWrapperUI.onCreate 639fca  iput-boolean → UI.p:Z
+ * SendAppMessageWrapperUI.s6 63acb6~63ad0e  UI.p → r5.l 第 6 参(Z) → r5.d p7 → n5.h → r5.j p7
  * ```
- * ⇒ `p7` = **`TokenValid`**，微信自己给的默认值就是 `true`。
- * 它被搬进 `app/a.a`（`app/b3.doScene` → `q54/x6.v` → 上行 proto），`app/a.<init>` 的默认值也是 1，
- * 两条独立证据都指向 `true`，且**没有别的副作用**。
+ * 默认值：Bundle 里没这个 key 时 `getBoolean(key, const/4 #1)` ⇒ `true`。
+ * ⚠️ 但微信走 `WXEntryActivity` 时写入的是 `WXEntryActivity.i` 的真实值，不一定是 true。
  *
- * `p8` 在本链路上**没有任何字段读点**，只参与 `018c`。`p7 = true` 时 `018a` 直接跳走，
- * `018c` 根本不执行 ⇒ p8 取任意值都不影响结果，给 `false` 只是双保险。
+ * `p8` = **`blockInvalidToken`**（不是我之前以为的无关字段）
+ * ```
+ * SendAppMessageWrapperUI.s6 63acba~63ad0e  q6() → r5.l 第 7 参(Z) → r5.d p8 → n5.i → r5.j p8
+ * q6() 的实现 638ad8~638afe：返回 UI.t:Z，日志原文 "blockInvalidToken block %b"
+ * ```
+ *
+ * ### 我们为什么传 `(p7=true, p8=false)`
+ *
+ * 清空条件是 `!p7 && p8`。取 `p7=true` 时 `018a` 直接跳到 `0190`，
+ * **`018c` 根本不会执行** ⇒ appId 一定保留，与 p8 取值无关。
+ * 这是**为了保住自己精心填的 `field_appId` 不被清成 `""`**，不是复刻微信某个场景。
+ * 探针的目的是验「type=6 链路能不能通」，`q.d=""` 对 type=6 路径零影响
+ * （`u0.l` 只在 `i==3` 分支读 `q.d`），所以两种取值都不影响发送结果。
+ *
+ * ⚠️ 若将来把这条链接进**正式业务**，必须按真实场景重算 p7/p8，
+ * 不能沿用探针这两个值。
  *
  * ## 判据（真机执行，按顺序）
  *
@@ -246,8 +281,8 @@ object FileSenderB {
                 "",            // 4  → u0.A p6
                 "",            // 5  → u0.A p7
                 0,             // 6  → u0.A p8
-                true,          // 7  ★ TokenValid；true ⇒ 018a 直接跳 0190，保留 appId
-                false,         // 8  只在 p7 为 false 时才被 018c 读到，这里给 false 是双保险
+                true,          // 7  TokenValid=true ⇒ 018a 直接跳 0190，appId 必保留
+                false,         // 8  blockInvalidToken；p7=true 时 018c 不执行，此值无影响
                 "",            // 9  → r5.h p2
                 "",            // 10 → r5.h p3
                 null,          // 11 Object
