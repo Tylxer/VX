@@ -144,10 +144,15 @@ class Dex:
         ret = self.types[ret_idx] if ret_idx < len(self.types) else "?"
         params = []
         if params_off:
-            p = params_off
-            n, p = uleb(b, p)
-            for _ in range(n):
-                t, p = uleb(b, p)
+            # ⚠️ **这里原来用 uleb128 解析，是错的**（2026-10-24 由 R14 取证子代理发现）：
+            #    DEX 的 `type_list` 是 `{ u4 size; u2 items[]; }`，**不是** uleb128 编码。
+            #    用 uleb 读会全部得到 type_idx=0（本批 dex 的 type 0 恰好是 `B`），
+            #    症状是每个方法都显示成 `(BB)V` / `(BBB)V` —— **参数个数碰巧对
+            #    （u4 首字节读对了），但类型全是假的**。
+            #    ⇒ 此前任何靠 `methods_of()` 判**参数类型**的结论都要重跑；判个数的不受影响。
+            n, = struct.unpack_from("<I", b, params_off)
+            for i in range(n):
+                t, = struct.unpack_from("<H", b, params_off + 4 + 2 * i)
                 params.append(self.types[t] if t < len(self.types) else "?")
         return "(" + "".join(params) + ")" + ret
 
