@@ -299,20 +299,29 @@ def dir_scan_module(d, n=200):
     time.sleep(1.5)
     lines = pull()
     sum_idx = None
+    # ⚠️ **不能用 startswith**（2026-10-24 真机踩到）：日志行实际是
+    #    `01:07:31.842 Thread-140 CDN ls /data/... files=0 bytes=0`，
+    #    前面有时间+线程前缀 ⇒ `startswith("CDN ls ")` 恒 False ⇒ sum_idx 恒 None
+    #    ⇒ 又被上面那个 4 元组 return 变成 ValueError，双重复合故障。
+    #    跟 `last_cdn()` 一样用**子串匹配**（那边写对了，这边写错了）。
     for i in range(len(lines) - 1, -1, -1):
-        if lines[i].startswith("CDN ls "):
+        if "CDN ls " in lines[i]:
             sum_idx = i
             break
+    # ⚠️ **三个 return 的元素个数必须一致**（2026-10-24 真机踩到）：
+    #    早期分支返回 4 元组而调用处按 5 个解包 ⇒ `ValueError: not enough values to unpack`，
+    #    把真正的原因（模块根本没打出 `CDN ls` 汇总行）掩盖成一句看不懂的 ValueError。
+    #    ⇒ 协议改动时**所有 return 一起改**，别只改成功的那条。
     if sum_idx is None:
-        return (False, [], 0, 0)
+        return (False, [], 0, 0, "")        # 日志里没有 `CDN ls ` 汇总行
     m_sum = re.search(r"files=(\d+) bytes=(\d+)", lines[sum_idx])
     if not m_sum:
-        return (False, [], 0, 0)
+        return (False, [], 0, 0, lines[sum_idx].strip())
     files = int(m_sum.group(1))
     bytes_sum = int(m_sum.group(2))
     ent = []
     for ln in lines[sum_idx + 1:]:
-        m = re.match(r"^CDN f (.+?) size=(\d+)\s*$", ln)
+        m = re.search(r"CDN f (.+?) size=(\d+)", ln)   # 同上：不能用 `^` 锚行首
         if m:
             ent.append((m.group(1).strip(), int(m.group(2))))
     return (True, ent, files, bytes_sum, lines[sum_idx].strip())
@@ -337,7 +346,10 @@ def snapshot(d, n=200):
                 ok, ent = fn(d)
                 files, bytes_sum, sumline = len(ent), sum(s for _, s in ent), ""
         except Exception as e:                      # 超时/设备掉线不该让用户看 traceback
-            print("    %s 异常：%s" % (method, e.__class__.__name__))
+            # ⚠️ 只打 `e.__class__.__name__` 是**没有信息量**的（2026-10-24 真机踩到）：
+            #    打了 5 行「ValueError」却不知道哪个 int() 炸的，只能靠猜。
+            #    必须带上消息本体和目录，否则等于没报错。
+            print("    %s 异常：%s: %s  (dir=%s)" % (method, e.__class__.__name__, e, d))
             continue
         if ok:
             names = sorted([p for p, _ in ent])
@@ -420,8 +432,16 @@ def magic_of(head):
 
 
 # ---------------------------------------------------------------- I-0 / I-1 / I-2 / I-3 / I-4
-def run_i0():
+def run_i0(apply_mode=False):
     """I-0：`ok0/x0`（CdnTransportEngine）跑在哪个进程 —— 全方案的**前置生死项**。
+
+    ⚠️ **只读模式下 `hooked=0` 是预期值，不是 FAIL**（2026-10-24 真机踩到）：
+    未加 `--apply` 时脚本**故意不发** `sub=hook val=on`，所以钩子必然没装。
+    旧版把这种 `hooked=0` 一律判 FAIL 并提示「findClass 失败」，还连带用
+    「I-0 未过 ⇒ I-1~I-4 不可采信」把 I-1 的**有效**结论（`dk.a()` 是纯反射，
+    不依赖任何 hook）一起废掉 —— 白跑一轮。
+    ⇒ 未 --apply 时判 **SKIP**，只有「已 apply 却仍 hooked=0」才判 FAIL。
+
 
     `HookEntry` 只在 `processName == "com.tencent.mm"` 装钩子（`VersionGate.isMainProcess`）。
     若 CDN 回调实际发生在别的进程（`:push` / `:tools` / `:appbrand` …），H3 永远不触发，
@@ -449,7 +469,11 @@ def run_i0():
 
     ev = hit.strip()
     if hooked != "1":
-        return ("FAIL", "%s ⇒ 钩子没装上，先看 note 字段/类名是否变（findClass 失败）" % ev)
+        if not apply_mode:
+            return ("SKIP", "%s ⇒ 只读模式未装 hook（hooked=0 是**预期**的）；"
+                            "要观测回调增量须加 --apply。**这不代表类名/进程有问题**" % ev)
+        return ("FAIL", "%s ⇒ 已 --apply 却仍 hooked=0，才是真的装钩失败，"
+                        "先看 note 字段/类名是否变（findClass 失败）" % ev)
     if proc != MAIN_PROC:
         return ("FAIL", "%s ⇒ 广播落在了 %s 而非主进程，hooked/计数都不可信" % (ev, proc))
     return ("PASS", "%s ⇒ 广播到达主进程且钩子已装（回调是否也在主进程，靠 hitK/hitCB 增量为准）" % ev)
@@ -756,7 +780,7 @@ def main():
         print("  只读模式：未装 hook（要观测请先加 --apply）")
 
     print("=== 4. I-0 进程归属（前置生死项）===")
-    i0, i0ev = run_i0()
+    i0, i0ev = run_i0(apply_mode=a.apply)
     print("  %s\n  证据：%s" % (i0, i0ev))
     # 记下滚屏前的命中计数，滚屏后用增量做 I-0 的**真正判据**
     lines = pull()
@@ -766,7 +790,9 @@ def main():
     hitk0 = int(_k.group(1)) if _k else 0
     hitcb0 = int(_c.group(1)) if _c else 0
     if i0 == "FAIL":
-        print("  ⚠️ I-0 未过 —— 按方案 §7，此后的 I-1~I-4 结论均不可采信（先查进程/类名）")
+        print("  ⚠️ I-0 未过 —— 按方案 §7，此后的 **I-2~I-4**（依赖回调/落盘）结论不可采信，"
+              "先查进程/类名。")
+        print("     ✋ 但 **I-1 不受影响**：`dk.a()` 是纯反射调用，不依赖任何 hook。")
 
     print("=== 5. I-1 dk.a() ===")
     i1, i1ev = run_i1()
@@ -790,7 +816,31 @@ def main():
         before = after = dict(SNAP_EMPTY)
         i3line, i3before, i3_ran = ("(未启用 --i3)", dict(SNAP_EMPTY), False)
         samples, i4, stale = [], [], False
-        i0b, i0bev = None, "无落盘目录 ⇒ 未滚屏，未复判"
+        # ⚠️ **但滚屏和 I-0 复判仍要做**（2026-10-24 真机踩到）：
+        #    I-0 的真正判据是 `hitK/hitCB` 增量，它只依赖钩子命中，**不依赖落盘目录**。
+        #    旧版在这里直接跳过滚屏 ⇒ I-0 永远停在「广播到达主进程」这一半，
+        #    真正判据一次都没跑到。
+        if a.apply and a.force:
+            print("=== 6. 强制 dk.a()=true（仍要强制：否则滚屏不触发批量下载）===")
+            print(" ", do_force(True).strip())
+        print("=== 7. 滚 %d 屏（仍要滚：I-0 复判不依赖目录）===" % a.screens)
+        if not a.no_scroll:
+            scroll(a.screens)
+        time.sleep(a.settle)
+        print("=== 8. I-0 复判（滚屏后回调增量）===")
+        if a.no_scroll:
+            i0b, i0bev = "SKIP", "--no-scroll ⇒ 没有滚屏就不会触发新下载，增量判据不成立"
+        else:
+            i0b, i0bev = run_i0_after_scroll(hitk0, hitcb0)
+        print("  %s\n  证据：%s" % (i0b, i0bev))
+        # ★ 滚屏后再问一次 paths：真正触发了下载的话，探针会观测到 picCachePath，
+        #   这比 DIR_CANDIDATES 猜目录靠谱得多（候选全不存在时这是唯一出路）
+        print("=== 8b. 滚屏后 paths（找真实落盘目录）===")
+        cdn("paths")
+        time.sleep(1.5)
+        for ln in pull():
+            if "CDN path" in ln:
+                print("   ", ln.strip()[:200])
     else:
         print("  可用取数口径：%s" % ", ".join(probe_access(target)))
         before = snapshot(target)
@@ -872,8 +922,11 @@ def main():
         i4verdict, i4ev = "UNKNOWN", "无样本（I-2 没新增文件，或目录读不到）"
 
     if i0 == "FAIL":
-        concl = ("⛔ **I-0 未过（生死项）：%s** ⇒ 本轮的 I-1~I-4 结论一律不可采信，"
-                 "先修进程/类名问题再重跑" % i0ev)
+        concl = ("⛔ **I-0 未过（生死项）：%s** ⇒ 本轮依赖回调/落盘的 I-2~I-4 结论不可采信，"
+                 "先修进程/类名问题再重跑。✋ **I-1（`dk.a()`）不受影响**（纯反射，不依赖 hook）" % i0ev)
+    elif i0 == "SKIP":
+        concl = ("⏸ **I-0 跳过**：%s ⇒ 加 `--apply` 重跑才能拿到回调归属；"
+                 "本轮 I-1 仍有效，I-2~I-4 待定" % i0ev)
     elif i1 == "UNKNOWN":
         concl = "待补探针：模块侧缺 op=cdn sub=dk/sub=ls（见文件头第 0 节），本轮无结论"
     elif after["files"] > before["files"]:
