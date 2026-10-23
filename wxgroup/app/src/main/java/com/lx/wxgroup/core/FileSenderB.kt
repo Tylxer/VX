@@ -61,6 +61,13 @@ import java.util.LinkedList
  * `018c` 根本不执行 ⇒ p8 取任意值都不影响结果，给 `false` 只是双保险。
  *
  * ## 判据（真机执行，按顺序）
+ *
+ * ⚠️ **返回串里的 `dispatched` 只代表「反射调用没抛异常」，不代表消息发出去了。**
+ * `r5.j` 是 **void、内部异步**：`r5.c` 先投 `hn4/t0` 线程池（tag `SendWXMediaMessageCopyFile`），
+ * 复制完文件才入网。函数正常返回时消息可能还没落库，甚至可能已经失败但回调走了别的分支。
+ * 项目里已有的判据「不抛 ≠ 送达」在这里同样成立 —— 所以文案刻意写成 `NOT-SENT-YET`，
+ * 唯一有效判据是第 3 条（查库）。
+ *
  * 1. 日志出现 `FILEB r5=...` 且无 `checkArgs fail` / `copyFile failed`；
  * 2. 日志 `MicroMsg.AppMsgLogic` 出现 `summerbig content url:`（说明 `u0.D` 走到了）；
  * 3. `select type,isSend from message where talker=? order by createTime desc limit 1`
@@ -247,8 +254,8 @@ object FileSenderB {
                 null,          // 12 a5
                 null           // 13 b5 ⇒ app/a 的 d/e/f 全 null
             )
-            "sent talker=${talker.take(24)} size=${f.length()} name=${f.name.take(40)} " +
-                "expectType=$TYPE_FILE_APPMSG"
+            "dispatched talker=${talker.take(24)} size=${f.length()} name=${f.name.take(40)} " +
+                "expectType=$TYPE_FILE_APPMSG —— NOT-SENT-YET(异步，须查库确认)"
         }.getOrElse { "error=${it.javaClass.simpleName}:${it.message?.take(120)}" }
     }
 }
