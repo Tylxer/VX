@@ -51,8 +51,13 @@ sync)
     # 真要改就用手机上的 LSPosed 管理器勾选。
     P=$("$ADB" shell pm path $PKG | tr -d '\r' | sed 's/^package://')
     echo "当前 APK 路径: $P"
-    "$ADB" shell "su -c 'cp /data/adb/lspd/config/modules_config.db /sdcard/_m.db && chmod 666 /sdcard/_m.db'" >/dev/null 2>&1
-    "$ADB" pull /sdcard/_m.db "$ROOT/_cache/_m.db" >/dev/null 2>&1
+    # ⚠️ LSPosed 的 db 是 **WAL 模式**，主 db 往往还没 checkpoint（mtime 停在几天前），
+    #    新数据全在 -wal 里。只 cp 主 db ⇒ 读到的是 WAL 之前的旧内容 ⇒ apk_path **必然误报 STALE**。
+    #    2026-10-24 实测：主 db mtime = 10-19 23:36，-wal 416KB mtime = 本次安装时刻；
+    #    带三件套回放后 apk_path/enabled/scope 全部正确 —— 假警报，白折腾一次「去管理器勾选」。
+    #    ⇒ 必须 db + -wal + -shm 三件套一起 cp、一起 pull，本地 sqlite 才会回放 WAL。
+    "$ADB" shell "su -c 'cp /data/adb/lspd/config/modules_config.db /sdcard/_m.db && cp /data/adb/lspd/config/modules_config.db-wal /sdcard/_m.db-wal && cp /data/adb/lspd/config/modules_config.db-shm /sdcard/_m.db-shm && chmod 666 /sdcard/_m.db*'" >/dev/null 2>&1
+    for f in _m.db _m.db-wal _m.db-shm; do "$ADB" pull "/sdcard/$f" "$ROOT/_cache/$f" >/dev/null 2>&1; done
     PKGNAME=$PKG APKPATH="$P" HOSTPKG=$HOST "$PY" "$ROOT/tools/_check.py" "$ROOT/_cache/_m.db"
     ;;
 test)

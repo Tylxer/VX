@@ -8,11 +8,11 @@ pkg = os.environ["PKGNAME"]
 apkp = os.environ["APKPATH"]
 host = os.environ["HOSTPKG"]
 
-# 只读打开，避免产生 -wal 文件
-try:
-    con = sqlite3.connect("file:%s?mode=ro" % p.replace("\\", "/"), uri=True)
-except Exception:
-    con = sqlite3.connect(p)
+# ⚠️ 必须用**普通可写**模式打开，不能用 mode=ro：
+#    LSPosed 的 db 是 WAL 模式，新数据全在 -wal 里，只读模式无法回放 WAL ⇒
+#    读出来的是旧内容（症状：apk_path 恒 STALE，实际配置是对的）。
+#    dev.sh sync 已把 db/-wal/-shm 三件套一起 pull 下来，这里打开即自动回放。
+con = sqlite3.connect(p)
 cur = con.cursor()
 
 ok = True

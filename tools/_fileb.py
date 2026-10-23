@@ -81,7 +81,15 @@ def do_send(talker, path):
     # 若传的是本地 Windows 路径，先 adb push 到 /sdcard/Download/
     dev_path = path
     if not path.startswith("/"):
-        dev_path = "/sdcard/Download/" + os.path.basename(path)
+        # ⚠️ **不能 push 到 `/sdcard/Download/`**（2026-10-24 真机踩到）：
+        #    那里 push 出来的文件是 `-rw-rw---- shell media_rw`，微信是另一个 uid
+        #    （u0_a363）且不在 media_rw 组 ⇒ `File.canRead()` = false ⇒ 探针回
+        #    `unreadable:<path>`，**看着像链路问题，实际是纯权限问题**。
+        #    ⛔ 而且 `/sdcard` 是 FUSE，**chmod 完全无效**（连 `su -c chmod 666` 都改不动），
+        #    所以别想着 chmod 补救，换目录才是正解。
+        #    ⇒ 用微信自己的 app 专属外部目录：那里面 push 出来的文件是 `-rw-rw-rw-`（666），
+        #      微信可读。顺带这个目录本来就是模块写日志的地方，权限已验证过。
+        dev_path = "/sdcard/Android/data/com.tencent.mm/cache/" + os.path.basename(path)
         step("push 到设备：%s" % dev_path)
         import subprocess
         from _lib import ADB
