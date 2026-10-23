@@ -11,6 +11,7 @@ import android.widget.ListView
 import android.widget.PopupWindow
 import android.widget.TextView
 import com.lx.wxgroup.core.FileSender
+import com.lx.wxgroup.core.FileSenderB
 import com.lx.wxgroup.core.HostContext
 import com.lx.wxgroup.core.TextSender
 import com.lx.wxgroup.ui.Panel
@@ -696,8 +697,10 @@ object ForceForward {
      * - `pick`  不走长按，直接打开选择器跑一遍「选目标→展开→策略→汇总」（半自动验收）
      * - `filerdy`  文件重发（A 档）链路就绪性：`resendFile.ready=` + 可发种类清单。**不发消息**，
      *              真机首验先跑这个再跑正式菜单，避免把「链路没 prepare」误判成「发送失败」
+     * - `filebrdy` 普通文件（B 档 `qf4/r5`）探针就绪性。**不发消息**
+     * - `fileb`    普通文件（B 档）**真发**。⚠️ 会真的发消息，必须带 `--es talker` + `--es val`
      */
-    fun probe(sub: String): String = runCatching {
+    fun probe(sub: String, talker: String = "", path: String = ""): String = runCatching {
         when (sub.lowercase()) {
             "stat" ->
                 "enabled=$enabled popups=${popupsSeen.get()} injected=${injected.get()} " +
@@ -729,7 +732,16 @@ object ForceForward {
                 // A 档文件重发链路就绪性（不发消息，只报状态）：真机首验先跑这个
                 "resendFile.ready=${FileSender.ready()} " +
                     "kinds=${ForwardLogic.Kind.entries.filter { ForwardLogic.canResendFile(it) }}"
-            else -> "subs=stat,on,off,dump,pick,filerdy"
+            "filebrdy" ->
+                // B 档（普通文件 qf4/r5）探针就绪性：不发消息
+                "fileb.ready=${FileSenderB.ready()} expectType=${FileSenderB.TYPE_FILE_APPMSG}"
+            "fileb" ->
+                // B 档探针：真发一个普通文件。⚠️ 会真的发消息，只在真机取证时用。
+                // 用法：op=forward sub=fileb --es talker <wxid> --es val <本地绝对路径>
+                //
+                // ⚠️ 本分支会复制文件 + 入网，**必须由调用方投后台线程**（见 EntryReceiver）。
+                "fileb " + FileSenderB.probe(talker, path)
+            else -> "subs=stat,on,off,dump,pick,filerdy,filebrdy,fileb"
         }
     }.getOrElse { "error=${it.javaClass.simpleName}" }
 

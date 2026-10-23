@@ -60,8 +60,17 @@ import java.io.File
  * 正解是 `modelimage/o3.j()` 工厂 + `o3.E/F/K/H` 字段 + `q1.h=20`，这套**尚未取证完整**，
  * 此刻接入等于赌微信不崩 ⇒ 先不做，等独立取证。
  *
- * 普通文件（appmsg type=6）同理：`qf4/o4` 里没有发普通文件的公开方法，
- * `hl0/o1` 的 APPMSG 常量在 classes7.dex 全文零引用。
+ * 普通文件（appmsg type=6）的正解入口是 **`qf4/r5`**，不是 `qf4/o4`：
+ * `r5.l(Context, Intent, app/m, WXMediaMessage, ...)` 是类型分派器，`getType()==6` 时
+ * 造 `qf4/d5(WXFileObject)` 包成 Runnable 投池；执行体是 `r5.j(...)`（13 参）。
+ * 它内部对每个 talker 调 `u0.A(WXMediaMessage, appId, appName, talker, 2, "", "", 0, app/a)`，
+ * 而 `u0.A → u0.B → u0.D` 三层的寄存器映射与 `te0/q` 字段写入已全部审计完
+ * （2026-10-23 R13，见 `docs/取证结论.md` §「补充闭合」）。
+ *
+ * ⚠️ 但**本类没有实现**它：`r5.j` 需要一个 `app/m` 实例（只读两个字段，可造），
+ * 还要真机验证 `message` 表落库 `type=1090519089`。在 A 档（图片）真机通过之前不接，
+ * 理由同全项目铁律「严禁猜微信内部 API」。
+ * 探针已备好：`op=forward sub=fileb --es talker <wxid> --es val <path>`。
  *
  * ## 边界（诚实声明，与 [TextSender] 一致）
  * - `l1.a()` 返回的是「是否成功**入队**」，不是「对端已收到」；

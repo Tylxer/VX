@@ -12,6 +12,7 @@ import com.lx.wxgroup.core.ContactSync
 import com.lx.wxgroup.core.DexKitLocator
 import com.lx.wxgroup.core.HostContext
 import com.lx.wxgroup.core.FileSender
+import com.lx.wxgroup.core.FileSenderB
 import com.lx.wxgroup.core.TextSender
 import com.lx.wxgroup.core.NotifyMute
 import com.lx.wxgroup.core.VersionGate
@@ -124,6 +125,7 @@ class HookEntry : IXposedHookLoadPackage {
         SendProbe.prepare(lpparam)
         TextSender.prepare(lpparam)
         FileSender.prepare(lpparam)
+        FileSenderB.prepare(lpparam)   // B 档探针：只在 op=forward sub=fileb 手动触发
 
         ContactSync.init(context)
         HostContext.setApp(context)

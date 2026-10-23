@@ -473,9 +473,22 @@ object EntryReceiver {
                     // 菜单文案清单（认人判据取证）；pick = 跳过长按直接打开选择器自检。
                     "forward" -> {
                         val sub = intent.getStringExtra("sub") ?: "stat"
-                        LogX.i(
-                            "FORWARD " + com.lx.wxgroup.feature.ForceForward.probe(sub)
-                        )
+                        val talker = intent.getStringExtra("talker") ?: ""
+                        val v = intent.getStringExtra("val") ?: ""
+                        if (sub.equals("fileb", ignoreCase = true)) {
+                            // ⚠️ B 档探针会**复制文件 + 入网**，不能跑在主线程（会卡微信/ANR）
+                            io {
+                                LogX.i("FORWARD " + com.lx.wxgroup.feature.ForceForward.probe(
+                                    sub, talker, v
+                                ))
+                            }
+                        } else {
+                            LogX.i(
+                                "FORWARD " + com.lx.wxgroup.feature.ForceForward.probe(
+                                    sub, talker, v
+                                )
+                            )
+                        }
                     }
                     // ---- 6.5 群发（MassSendPage）：不依赖 UI 的驱动入口 ----
                     // --es sub stat(默认)|start|pause|resume|stop

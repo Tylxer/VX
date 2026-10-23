@@ -618,3 +618,134 @@ R13 把这 492 行审完了，**结论是：上一版的担心找错了位置**�
 
 **仍然只能真机验的 1 条**：`message` 表落库 `type=1090519089`、对端能显示下载。
 静态取证到此为止，没有更多可挖的。
+
+## 新增工具
+
+- **`tools/_r13_sigmap.py`** —— 按 `registers/ins/access` 精确解「第 N 个形参落在哪个 v 寄存器」。
+  用法 `python tools/_r13_sigmap.py <切片> <完整反汇编>`。带断言 `this + 形参占位 == ins`。
+- **`tools/_r13_findclass.py`** —— 跨全部 dex 按 **`class_defs`** 定位类真正定义在哪个 dex，
+  并列出构造/方法。用法 `python tools/_r13_findclass.py Lcom/.../m;`。
+
+## ⛔ 工具自己的 bug（差点把结论带错，务必记住）
+
+写 `_r13_findclass.py` 时把 **`class_defs` 数组下标** 和 **`type_ids` 下标** 搞混了：
+
+```python
+# 错的：用 class_idx（type 下标）去算 class_def 地址
+base = self.class_defs_off + 32 * class_idx
+# 对的：用遍历时的 def_index
+base = self.class_defs_off + 32 * def_index
+```
+
+**症状极具欺骗性**：工具不报错，正常输出「DEFINED in classes4.dex」「super = Ljj/k0」，
+只有构造函数列表是错的 —— 于是 `app/m` / `WXFileObject` / `WXMediaMessage`
+**全部**被误报成「只有 `<init>(B)V`，没有无参构造」。
+
+我一度据此在探针里加了一段「改用父类 `jj/k0` 造实例」的绕行代码。修好工具后实测四个类
+**都有 `<init>()V`**，那段绕行完全没必要，已删除。
+
+**判据**：
+> 一个工具如果对**多个互不相关的类**给出**同一个可疑结论**（这里是「都只有 `<init>(B)V`」），
+> 先怀疑工具，不要相信巧合。尤其 `opensdk` 的 `WXFileObject`/`WXMediaMessage` 是公开 SDK 类，
+> 本来就该有无参构造 —— 这种「与常识冲突」的批量结论是工具 bug 的强信号。
+
+补充判据（`class_defs` vs `type_ids`）：`type_ids` 记录的是「被引用的类型」，
+所以 `grep 'Lcom/.../m;'` 会在**每个** dex 里命中 1 次；判断「定义在哪」只能看 `class_defs`。
+这条坑 R11 已经踩过一次（`_r4_dexref.py`），R13 换了工具又踩了一次，
+说明**只要用 dex 二进制解析就必须显式区分这两个下标空间**。
+
+---
+
+# R13b（2026-10-23）：B 档探针代码落地 + 自查揪出 3 个真机必错的 bug
+
+**起因**：R13 把「普通文件发送」静态取证做到顶之后，写 `core/FileSenderB.kt` 探针。
+写代码的过程反过来暴露了 R13 文档里两处**读反的结论**和一处在 R12 就写错的类结构。
+**这轮的价值不在于写出探针，而在于「写代码逼着把结论验了一遍」。**
+
+## 三个 bug（全部真机必错，全部离线抓到）
+
+### bug 1 · `qf4/r5` 根本没有 `a()` 工厂
+
+R12/R13 两轮文档里都写「`qf4/r5` 单例：`static a` + `a()` 工厂」。实际：
+
+```
+qf4/r5 的 Direct methods 只有四个：
+  <clinit>()V
+  a(Lqf4/r5;Lte0/q;Lq54/vb6;)V      ← 3 参、返回 void，跟"工厂"毫无关系（这是上报函数）
+  e(...)   i(...)   l(...)
+```
+
+`a()` **作为无参静态工厂并不存在**。单例是在 `<clinit>` 里建的：
+
+```
+846a84  qf4.r5.<clinit>
+846a94  new-instance v0, Lqf4/r5
+846a98  invoke-direct {v0}, <init>()V
+846a9e  sput-object v0, Lqf4/r5;.a
+```
+
+⇒ 正确写法是 `XposedHelpers.getStaticObjectField(r5Cls, "a")`。
+
+**为什么之前没被发现**：`a()` 那个 3 参方法名字确实叫 `a`，且 `javap` 式的「有没有 a」一查就"有"。
+**判据**：光看方法名不够，必须看**描述符**。名字相同、描述符不同就是两个方法。
+
+### bug 2 · `p7/p8` 的门控条件读反了两次
+
+真代码：
+
+```
+018a  if-nez v2, 0190     ; v2 = p7
+018c  if-eqz v25, 0190    ; v25 = p8
+018e  const-string v4, ""
+0190  move-object v5, v4
+```
+
+| 版本 | 说法 | 错在哪 |
+|---|---|---|
+| R13 初版 | 「传 `false` 会把 appId 强制成 `""`」 | 只看见 `018c`，漏了 `018a` |
+| R13b 第一稿 | 「传 `true` 才保留 appId」 | 把 `018c` 的 `eqz` 也当「true 才保留」，两句自相矛盾 |
+
+**正确**：两句跳转目标相同（都是 `0190`）⇒ **OR 关系**，落到 fallthrough（清空）的是「两者都不满足」，
+即清空条件为 `p7 && p8`。
+
+**判据**：`if-nez` / `if-eqz` 相邻且跳转目标相同时，不能只读一句。
+目标是同一 label ⇒ OR；落到 fallthrough 的是「全部不满足」。
+
+### bug 3 · 追 p7 时差点又踩「寄存器跨基本块」的坑
+
+`v2` 在 `0x0056` 被 `move-object/from16 v2, v28` 覆盖成第 11 个形参（Object）。
+若只看「最后一条写 v2 的指令」会得出「`018a` 的 v2 是第 11 参」这个荒谬结论。
+实际那条路径在 `0x005b: return-void` 就结束了，与 `018a` 所在的循环体**互斥**。
+
+**判据**：判断「某寄存器在某点是什么值」必须**限定在所在基本块内**，
+不能全局扫最后一条写 —— 这是控制流分析的基本要求，不是反汇编器 bug。
+
+## 顺带确证：p7 到底是什么（4 跳）
+
+```
+SendAppMessageWrapperUI.onCreate  639fbe  Bundle "SendAppMessageWrapper_TokenValid"
+                                  639fca  iput-boolean → UI.p:Z
+                                          getBoolean 的默认参数 v5 = const/4 #1 ⇒ 默认 true
+        ↓
+SendAppMessageWrapperUI.s6        63acb6  iget-boolean UI.p:Z → 传给 r5.l 的 p7
+        ↓
+qf4/r5.l → qf4/r5.d               846c78  签名 (…,I,Z,Z,String,I,String,I,a5,b5)
+        ↓
+qf4/n5.<init>                     844f44  iput-boolean v8 → n5.h:Z
+                                  844f48  iput-boolean v9 → n5.i:Z
+        ↓
+qf4/n5.a    844fe6  n5.h → r5.j 的 p7，n5.i → r5.j 的 p8
+```
+
+⇒ **`p7` = `TokenValid`**，微信自己的默认值就是 `true`。
+它被搬进 `app/a.a`（`019c` 的 `r5.h`），最终经 `app/b3.doScene` → `q54/x6.v` 上行。
+`app/a.<init>` 给这个字段的默认值也是 `1`（`4c4bc6: const/4 v0,#1`）—— 两条独立证据一致。
+
+`p8` 在整条链路上**没有任何字段读写点**，只参与 `018c`；
+`p7 = true` 时 `018a` 直接跳走，`018c` 永不执行 ⇒ p8 任意值都无影响。
+
+## 本轮也纠正了 R12 的一处措辞
+
+R12 写「`app/a` 纯 POJO 6 字段，反射调 `r5.a().j(...)`」。
+上半句对，下半句错（见 bug 1）。**同一份文档里对了一半，比全错更容易骗过复核**，
+因为读者看到「6 字段」被验证过，就默认同句的后半段也验证过。
