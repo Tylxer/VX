@@ -210,11 +210,17 @@ def main():
         print("  -- 静态字段 --")
         for idx, fl in sfields:
             f = d.field_id(idx)
-            print("     %-8s %s.%s" % (hex(fl), f[0] if f else "?", f[2] if f else idx))
+            if f:
+                print("     %-8s %-42s %s" % (hex(fl), f[1], f[2]))
+            else:
+                print("     %-8s <bad idx %d>" % (hex(fl), idx))
         print("  -- 实例字段 --")
         for idx, fl in ifields:
             f = d.field_id(idx)
-            print("     %-8s %s.%s" % (hex(fl), f[0] if f else "?", f[2] if f else idx))
+            if f:
+                print("     %-8s %-42s %s" % (hex(fl), f[1], f[2]))
+            else:
+                print("     %-8s <bad idx %d>" % (hex(fl), idx))
 
         for tag, ms in (("direct", dmethods), ("virtual", vmethods)):
             print("  -- %s 方法 --" % tag)
