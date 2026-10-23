@@ -50,14 +50,14 @@ import java.util.concurrent.atomic.AtomicInteger
  * sub=dk                    ★真调一次 dk.a()，打返回值 + native allowBatchImageDownload() + dk.j
  * sub=force val=true|off    让 dk.a() 返回 true（I-2 增量）
  * sub=cbon val=on|off       记录 onC2CDownloadCompleted 回调
- * sub=reqmp val=on|off      记录 ok0.x0#n 批量请求入参
+ * sub=reqmp val=on|off      记录 ok0.x0#n 批量请求入参（读不到时打 CDN reqerr reason=<why> n=<k>）
  * sub=paths                 打印已观测落盘目录
  * sub=ls val=<dir>          用微信进程权限列目录
  * sub=export val=<dir> n=N  把最近 N 个文件拷到可读 cache 目录（I-4 验 magic）
  * sub=imgpath val=<dir>|off I-3 改写 imageCachePath
  * sub=reset                 清本探针计数器 + 熔断（SnsCdnImage.resetBreaker）
  * sub=img                   打 SnsCdnImage.stateLine() 状态行（已自带 `CDN img ` 前缀）
- * sub=stat                  自身状态
+ * sub=stat                  自身状态（追加 hitN/hitPicE/hitPicNE/hitDir/hitNoField，见 doStat）
  * ```
  */
 object SnsCdnProbe {
@@ -118,6 +118,37 @@ object SnsCdnProbe {
 
     /** `ok0.x0#onC2CDownloadCompleted` 命中计数 */
     private val hitCB = AtomicInteger()
+
+    /**
+     * `ok0.x0#n` **进入次数**（每次 `beforeHookedMethod` +1，不论后面读到还是读不到 `l1`）。
+     *
+     * ⚠️ 这是原来的观测缺口：`sub=reqmp` 一条 `CDN req` 都没打时，**无法区分**
+     * 「`ok0.x0#n` 从来没被调用（类名漂移 / 走了别的批量下载路径）」与
+     * 「调用了但 `l1` 读不到或为空」。有 `hitN` 之后：`hitN=0` ⇒ 前者，`hitN>0` ⇒ 后者。
+     * ⚠️ `hookAllMethods(cls,"n")` 会挂同名**所有重载**，所以 `hitN` 也可能包含其它
+     * `n(...)` 重载（_request侧地名冲突_），真机解读时要结合 `reqerr` 的 reason 一起看。
+     */
+    private val hitN = AtomicInteger()
+
+    /** 回调里 `C2CDownloadResult.picCachePath` 是 **null 或空串** 的次数 */
+    private val hitPicE = AtomicInteger()
+
+    /** 回调里 `C2CDownloadResult.picCachePath` **非空** 的次数 */
+    private val hitPicNE = AtomicInteger()
+
+    /**
+     * 回调里 `picCachePath` **字段本身就取不到**（`NoSuchFieldError`）的次数。
+     *
+     * 与 [hitPicE] 必须分开计：`picCachePath` 在 Java 层只有 `<init>` 里写过一次空串、
+     * 0 条读 ⇒ 真值由 native（Mars）用 JNI 填 ⇒ **空串是「字段存在但 Mars 没填」**，
+     * 而 NoSuchFieldError 是「字段名漂移」。两者下一步完全不同（前者是 native 侧问题，
+     * 后者要重新静态确认字段名）。
+     */
+    private val hitNoField = AtomicInteger()
+
+    /** reqerr 节流：同类原因最多打前 [REQERR_FIRST] 次，之后只在计数为 2 的幂时补一条（热路径别刷屏） */
+    private const val REQERR_FIRST = 3
+    private val reqErrCount = ConcurrentHashMap<String, AtomicInteger>()
 
     /** 最近一次回调的时间戳（stat 的 last 字段） */
     @Volatile
@@ -288,12 +319,20 @@ object SnsCdnProbe {
                 hitCB.incrementAndGet()
                 lastCbAt = System.currentTimeMillis()
                 val result = param.args.getOrNull(1) ?: return
-                val pic = readString(result, F_RES_PIC_PATH)
-                if (!pic.isNullOrEmpty()) {
-                    val parent = File(pic).parent ?: pic
-                    lastPicParent = parent
-                    observedDirs.add(parent)
+                // ⚠️ 关键区分：字段**不存在**（NoSuchFieldError，类名/字段名漂移）
+                // vs 字段存在但值是 null/空串（由 native Mars 用 JNI 填，这次没填）。
+                // 老代码用 getOrNull() 把两者都吞成 null ⇒ `pic=none` 无法归因。
+                val (state, raw) = readField(result, F_RES_PIC_PATH)
+                val pic = raw as? String
+                if (pic.isNullOrEmpty()) {
+                    if (state == ReadState.NO_FIELD) hitNoField.incrementAndGet()
+                    else hitPicE.incrementAndGet()
+                    return
                 }
+                hitPicNE.incrementAndGet()
+                val parent = File(pic).parent ?: pic
+                lastPicParent = parent
+                observedDirs.add(parent)
             }
         }
     }
@@ -305,9 +344,33 @@ object SnsCdnProbe {
      */
     private fun reqHook() = object : XC_MethodHook() {
         override fun beforeHookedMethod(param: MethodHookParam) {
+            hitN.incrementAndGet()
             runCatching {
-                val req = param.args.getOrNull(0) ?: return
-                val arr = readObject(req, F_REQ_IMAGES) as? Array<*> ?: return
+                val req = param.args.getOrNull(0)
+                if (req == null) {
+                    ownReqErr("no-arg0")
+                    return
+                }
+                val (state, raw) = readField(req, F_REQ_IMAGES)
+                if (state == ReadState.NO_FIELD) {
+                    ownReqErr("l1-nofield")
+                    return
+                }
+                if (raw == null) {
+                    // 字段在、值确实是 null（或反射取值抛了别的异常）
+                    ownReqErr("l1-null")
+                    return
+                }
+                val arr = raw as? Array<*>
+                if (arr == null) {
+                    // ⚠️ 静态取证说 l1 是 Array，真机若不是 ⇒ dex 版本不符，这是关键信号
+                    ownReqErr("l1-not-array cls=${raw.javaClass.name}")
+                    return
+                }
+                if (arr.isEmpty()) {
+                    ownReqErr("l1-empty")
+                    return
+                }
                 val target = imgPathDir
                 for (el in arr) {
                     if (el == null) continue
@@ -315,7 +378,7 @@ object SnsCdnProbe {
                     collectImageDir(el)
                 }
                 if (reqmpOn) logReq(req, arr)
-            }
+            }.onFailure { ownReqErr("ex:" + (it.javaClass.simpleName ?: "?")) }
         }
     }
 
@@ -479,7 +542,13 @@ object SnsCdnProbe {
         val pid = android.os.Process.myPid()
         val lastIso = if (lastCbAt == 0L) "-"
         else SimpleDateFormat("yyyy-MM-dd'T'HH:mm:ss.SSS", Locale.US).format(Date(lastCbAt))
-        own("CDN stat hooked=$hooked proc=$proc pid=$pid hitK=${hitK.get()} hitCB=${hitCB.get()} last=$lastIso")
+        // ⚠️ 行首必须是 `CDN stat hooked=`（脚本 tools/_r9_cdn.py 用 last_cdn(lines,"stat hooked=")
+        //    子串匹配），新字段一律追加在行尾，别插到 hooked= 前面。
+        own(
+            "CDN stat hooked=$hooked proc=$proc pid=$pid hitK=${hitK.get()} hitCB=${hitCB.get()} " +
+                "last=$lastIso hitN=${hitN.get()} hitPicE=${hitPicE.get()} hitPicNE=${hitPicNE.get()} " +
+                "hitDir=${observedDirs.size} hitNoField=${hitNoField.get()}"
+        )
         if (installNote.isNotEmpty()) own("CDN stat note=$installNote")
     }
 
@@ -487,6 +556,11 @@ object SnsCdnProbe {
     private fun doReset() {
         hitK.set(0)
         hitCB.set(0)
+        hitN.set(0)
+        hitPicE.set(0)
+        hitPicNE.set(0)
+        hitNoField.set(0)
+        reqErrCount.clear()
         lastCbAt = 0L
         lastPicParent = null
         observedDirs.clear()
@@ -514,16 +588,45 @@ object SnsCdnProbe {
     }
 
     private fun readString(obj: Any?, field: String): String? =
-        if (obj == null) null
-        else runCatching { XposedHelpers.getObjectField(obj, field) as? String }.getOrNull()
+        readField(obj, field).second as? String
 
     private fun readInt(obj: Any?, field: String): Int =
         if (obj == null) 0
         else runCatching { XposedHelpers.getIntField(obj, field) }.getOrDefault(0)
 
-    private fun readObject(obj: Any?, field: String): Any? =
-        if (obj == null) null
-        else runCatching { XposedHelpers.getObjectField(obj, field) }.getOrNull()
+    private fun readObject(obj: Any?, field: String): Any? = readField(obj, field).second
+
+    /** 字段读取的**归因状态**：OK 取到了 / NO_FIELD 字段不存在 / OTHER 其它失败（类型转换、非法访问等） */
+    private enum class ReadState { OK, NO_FIELD, OTHER }
+
+    /**
+     * 读实例字段并保留**失败原因**（原来的 `getOrNull()` 会把 NoSuchFieldError 和空值混为一谈）。
+     * XposedHelpers 找不到字段时抛 `NoSuchFieldError`（可能包在 InvocationTargetException 里），
+     * 所以要沿 cause 链找一遍。
+     */
+    private fun readField(obj: Any?, field: String): Pair<ReadState, Any?> {
+        if (obj == null) return ReadState.OTHER to null
+        return runCatching { ReadState.OK to XposedHelpers.getObjectField(obj, field) }
+            .getOrElse { (if (hasNoFieldCause(it)) ReadState.NO_FIELD else ReadState.OTHER) to null }
+    }
+
+    private fun hasNoFieldCause(t: Throwable): Boolean {
+        var e: Throwable? = t
+        while (e != null) {
+            if (e is NoSuchFieldError) return true
+            e = e.cause
+        }
+        return false
+    }
+
+    /**
+     * `CDN reqerr reason=<具体原因> n=<累计次数>` —— 同类原因只打前 [REQERR_FIRST] 次，
+     * 之后按 2 的幂稀疏补打（保证高频时也能看出「还在持续发生」，但不刷屏）。
+     */
+    private fun ownReqErr(reason: String) {
+        val c = reqErrCount.computeIfAbsent(reason) { AtomicInteger() }.incrementAndGet()
+        if (c <= REQERR_FIRST || Integer.bitCount(c) == 1) own("CDN reqerr reason=$reason n=$c")
+    }
 
     private fun writeObject(obj: Any, field: String, value: Any?) {
         runCatching { XposedHelpers.setObjectField(obj, field, value) }
