@@ -83,7 +83,54 @@ object FileSenderB {
         loader = lpparam.classLoader
     }
 
-    fun ready(): Boolean = loader != null
+    /**
+     * 就绪性：**不只是** `loader != null`，还要真的能把 6 个关键类加载出来。
+     *
+     * ⚠️ 只判 `loader != null` 太弱 —— `prepare()` 在 `HookEntry` 里无条件调用，
+     * 所以它恒为 true，真机 `filebrdy` 会给一个假阳性「ready=true」，
+     * 然后 `fileb` 才在 `findClass` 上炸，白白多跑一轮。
+     *
+     * 这里按**失败顺序**逐个探测，返回第一个失败的类名，便于一眼定位是版本变了还是包名不匹配：
+     * 顺序刻意与 `probe()` 的执行顺序一致。
+     */
+    fun ready(): String {
+        val cl = loader ?: return "no-classLoader"
+        val need = listOf(
+            "com.tencent.mm.opensdk.modelmsg.WXFileObject",
+            "com.tencent.mm.opensdk.modelmsg.WXMediaMessage",
+            "com.tencent.mm.pluginsdk.model.app.a",
+            "com.tencent.mm.pluginsdk.model.app.m",
+            "qf4.r5",
+            "qf4.a5",
+            "qf4.b5"
+        )
+        for (n in need) {
+            val ok = runCatching { XposedHelpers.findClass(n, cl) }.isSuccess
+            if (!ok) return "missing:$n"
+        }
+        // 单例字段是否存在（`<clinit>` 可能还没跑，但字段本身必须在）
+        val hasSingleton = runCatching {
+            XposedHelpers.findField(XposedHelpers.findClass("qf4.r5", cl), "a")
+        }.isSuccess
+        if (!hasSingleton) return "missing:qf4.r5.a"
+        // `j` 的 13 参签名是否对得上（版本漂移的第一现场）
+        val sigOk = runCatching {
+            XposedHelpers.findClass("qf4.r5", cl).getDeclaredMethod(
+                "j",
+                XposedHelpers.findClass("com.tencent.mm.pluginsdk.model.app.m", cl),
+                XposedHelpers.findClass("com.tencent.mm.opensdk.modelmsg.WXMediaMessage", cl),
+                LinkedList::class.java,
+                String::class.java, String::class.java,
+                Int::class.javaPrimitiveType,
+                Boolean::class.javaPrimitiveType, Boolean::class.javaPrimitiveType,
+                String::class.java, String::class.java, Any::class.java,
+                XposedHelpers.findClass("qf4.a5", cl),
+                XposedHelpers.findClass("qf4.b5", cl)
+            )
+        }.isSuccess
+        if (!sigOk) return "missing:qf4.r5.j(13参签名不匹配)"
+        return "ok"
+    }
 
     /**
      * 探针：把一个本地文件发给 [talker]。

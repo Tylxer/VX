@@ -733,7 +733,8 @@ object ForceForward {
                 "resendFile.ready=${FileSender.ready()} " +
                     "kinds=${ForwardLogic.Kind.entries.filter { ForwardLogic.canResendFile(it) }}"
             "filebrdy" ->
-                // B 档（普通文件 qf4/r5）探针就绪性：不发消息
+                // B 档（普通文件 qf4/r5）探针就绪性：不发消息。
+                // ready 返回 "ok" 才算真就绪；其余返回 "missing:<第一个缺失项>"，一眼定位。
                 "fileb.ready=${FileSenderB.ready()} expectType=${FileSenderB.TYPE_FILE_APPMSG}"
             "fileb" ->
                 // B 档探针：真发一个普通文件。⚠️ 会真的发消息，只在真机取证时用。
