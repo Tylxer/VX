@@ -36,24 +36,26 @@
 
 > 需要现场跑场景/盯实时 logcat 才入设备锁；基于**已落盘证据**（日志片段 / diff / 已知坑）推理可并行。
 
-## 三、派发模板
+## 三、派发模板（token 优先）
+
+> **省 token 三原则**：① 共享上下文外置（已知坑/纪律只引用路径，不内联复述）；② 给路径/锚点让子代理自己读，**勿贴全文或整段 diff**；③ 限输出（只回 diff 摘要 + 自测，Pro 限 200 行内）。
 
 **Flash（体力活，同消息发多个 = 并行）**
 
 ```
 Agent(subagent_type="general-purpose", model="deepseek-v4-flash-202605",
-  prompt="<目标>。独占文件：<路径>，不得改其它文件。不跑 gradle、不碰 adb。
-          先写盘再回报；回报只给 git diff 摘要 + 自测结果。")
+  prompt="任务：<一句话目标>。独占：<路径>，勿改其它。
+          照 docs/取证结论.md 锚点接线；纪律见 routine.md §四（自行读，不重述）。
+          不跑 gradle/不碰 adb；先写盘再回报；回报仅 diff 摘要+自测。")
 ```
 
 **Pro（推理 / 复核）**
 
 ```
-Agent(subagent_type="general-purpose", model="deepseek-v4-pro",
-  prompt="现象/改动：<贴 git diff 正文，不要给路径>
-          已知坑：Kotlin apply 静默失效 / adapter 未挂 / 字段反相 / ConcurrentHashMap 禁 null
-          要求：推导根因 + 最小修复 diff + 回滚路径 + 边界漏项清单。
-          先写盘再回报。")
+Agent(subagent_type="general-purpose", model="custom-local:deepseek-v4-pro",
+  prompt="任务：<一句话目标>。改动：<贴 git diff 或给 文件路径+行号，勿贴全文>。
+          已知坑见 docs/取证结论.md 与 routine.md §四（自行读，不重述）。
+          要求：根因+最小修复 diff+回滚路径+边界漏项。先写盘再回报；输出限 200 行内。")
 ```
 
 **prompt 必带的三句**
