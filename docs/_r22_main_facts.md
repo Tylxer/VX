@@ -103,7 +103,7 @@ inner.registerDataSetObserver(object : DataSetObserver() {
 
 ### F11 · 历史定案与代码矛盾，已查实「performItemClick 零命中」
 
-- `docs/取证结论.md:17`：「行点击走每行自己的 OnClickListener，不走 `performItemClick`（`onItemClick` hook 零命中）」
+- `docs/取证结论.md`：「行点击走每行自己的 OnClickListener，不走 `performItemClick`（`onItemClick` hook 零命中）」
 - `wxgroup/_dbg_pull.txt:16-20`（真机日志）：三条 `K7: hooked ...performItemClick` **都装上了**
 - 但同一日志 `K7 performClick conv` **出现 0 次**（`_dbg_pull.txt` / `_backlog.txt` grep 计数均 0）
 - `.workbuddy/memory/2026-10-10.md`「关键实测结论」原文同 F11 上半句，并称「WeChat 在 `getView` 时就把正确的会话绑在行上了」

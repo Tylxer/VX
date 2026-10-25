@@ -33,7 +33,7 @@
 `hitNoField=` 里也没有 `hitK=` 子串（N-o-F ≠ K）。`\d+` 贪婪也无害——
 每个字段后都是空格边界。
 
-另外确认全仓没有其他消费者断言 stat 行格式（只有 `docs/取证结论.md:1976`
+另外确认全仓没有其他消费者断言 stat 行格式（只有 `docs/取证结论.md`
 和 `_cache/*.md` 里的历史样本，非代码）。
 
 ## 2. 热路径（`onC2CDownloadCompleted`，每张图） —— PASS

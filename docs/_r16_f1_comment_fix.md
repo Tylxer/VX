@@ -126,8 +126,8 @@
 |---|---|
 | 位置 | `SnsCdnImage.kt:81`（`Cfg` 声明上方，新增 4 行注释） |
 | 原文 | `private data class Cfg(val enabled: Boolean, val rewritePath: Boolean)` —— 字段 `rewritePath` 无任何说明，且全文件零读取点 |
-| 新文 | 声明上方加 4 行 `//` 注释：<br>`// ⚠️ 字段 `rewritePath`（`sns.cdn_rewrite_path`）**当前零消费点** —— 只被 refreshCfg() 写入、`<br>`// 全文件（乃至全仓）没有任何读取点。批量下载路线已于 2026-10-24 定案放弃`<br>`// （docs/取证结论.md ⑫.9：`picCachePath` 字段存在但恒空，hitPicE=7 / hitNoField=0；`<br>`// 批量请求 ok0.x0#n 从未触发，hitN=0）⇒ 这条路走不通。对应开关在 Keys.kt 里已标 hidden。`<br>**声明本身一字未改**（保持单行原样）。 |
-| 依据 | `grep rewritePath SnsCdnImage.kt` 全文件仅 :81 声明与 :98 `refreshCfg()` 的构造写入，无读取 ✅；`grep SNS_CDN_REWRITE_PATH` 全仓仅 `Keys.kt:199`（定义）、`Keys.kt:318`（`hidden = true`）、`SnsCdnImage.kt:98`（写）✅。`docs/取证结论.md` ⑫.9 记录 `picCachePath` 恒空、`hitPicE=7/hitNoField=0`、`hitN=0`。 |
+| 新文 | 声明上方加 4 行 `//` 注释：<br>`// ⚠️ 字段 `rewritePath`（`sns.cdn_rewrite_path`）**当前零消费点** —— 只被 refreshCfg() 写入、`<br>`// 全文件（乃至全仓）没有任何读取点。批量下载路线已于 2026-10-24 定案放弃`<br>`// （docs/conclusions/moments_cdn.md：`picCachePath` 字段存在但恒空，hitPicE=7 / hitNoField=0；`<br>`// 批量请求 ok0.x0#n 从未触发，hitN=0）⇒ 这条路走不通。对应开关在 Keys.kt 里已标 hidden。`<br>**声明本身一字未改**（保持单行原样）。 |
+| 依据 | `grep rewritePath SnsCdnImage.kt` 全文件仅 :81 声明与 :98 `refreshCfg()` 的构造写入，无读取 ✅；`grep SNS_CDN_REWRITE_PATH` 全仓仅 `Keys.kt:199`（定义）、`Keys.kt:318`（`hidden = true`）、`SnsCdnImage.kt:98`（写）✅。`docs/conclusions/moments_cdn.md` 记录 `picCachePath` 恒空、`hitPicE=7/hitNoField=0`、`hitN=0`。 |
 
 ---
 

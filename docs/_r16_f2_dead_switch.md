@@ -26,7 +26,7 @@ lane：F2（本轮唯一实现 lane）
 
 ```kotlin
 // ⚠️ 下面两项是「用户改了也没用」的死开关，故 hidden = true（保留定义、不渲染）。
-//    真机定案（docs/取证结论.md ⑫.9，2026-10-24）两条判据：
+//    真机定案（docs/conclusions/moments_cdn.md，2026-10-24）两条判据：
 //      ① picCachePath 字段**存在但恒为空**（hitPicE=7 / hitNoField=0）⇒ 拿不到落盘路径；
 //      ② 批量下载请求 `ok0.x0#n` **一次都没被调用**（hitN=0）⇒ 批量通路根本没发生。
 //    ⇒ CDN 批量下载这条路走不通，朋友圈图片已改道「SNS 缓存直读」。
@@ -106,7 +106,7 @@ $ grep -c "\.rewritePath" wxgroup/app/src/main/java/com/lx/wxgroup/feature/SnsCd
 全仓范围再确认（`grep -rn "rewrite_path"`）只有三处：`Keys.kt` 的定义、`Keys.kt` 的 `PrefSpec`、
 `SnsCdnImage.kt:98` 的写入；无任何 feature/UI 读取。
 
-配合 `⑫.9` 的两条真机判据（`docs/取证结论.md:2076-2090`）：
+配合 `⑫.9` 的两条真机判据（`docs/取证结论.md`）：
 
 ```
 hitK=1 hitCB=7 hitN=0 hitPicE=7 hitPicNE=0 hitDir=0 hitNoField=0

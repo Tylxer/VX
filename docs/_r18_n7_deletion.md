@@ -84,7 +84,7 @@
 1. **121 个单测是纯粹的领域知识沉淀**（`diffDeleted` 三态、`planTags` 幂等、
    `renderKey` = `createTime:talker:type` 的规范化规则）。这些结论本身是对的，
    只是功能不做了。删掉等于把「评论 proto 不带 commentSvrID 该怎么办」的解法一起扔掉。
-2. `docs/取证结论.md` ⑩ 段大量引用这些实现里的判据名，直接删会让文档指向空处。
+2. `docs/conclusions/comment.md`大量引用这些实现里的判据名，直接删会让文档指向空处。
 3. 若将来重启该需求，从 `docs/_r18_snscomment_backup/` 拿回比重新取证便宜得多。
 
 **成本**：284KB 磁盘 + 零构建开销（不在 `src/` 下）。**收益**：可逆。

@@ -38,7 +38,7 @@
 
 - 证据 A：`wxgroup/_dbg_pull.txt:17-19` 三行 `K7: hooked …performItemClick`（AdapterView / ListView /
   ConversationListView 全挂上）；但 `grep -c "K7 performClick conv" _dbg_pull.txt` = **0**（`_backlog.txt` 同 0）。
-- 证据 B：`docs/取证结论.md:17`（标注「不要推翻」）「行点击走**每行自己的 OnClickListener**，
+- 证据 B：`docs/取证结论.md`（标注「不要推翻」）「行点击走**每行自己的 OnClickListener**，
   不走 `performItemClick`（`onItemClick` hook 零命中）」；`.workbuddy/memory/2026-10-10.md:42` 同义。
 
 ⇒ 现象 3 的「点错人」**不可能**由 `realPosition` 换算错引起（那条代码在 8.0.48 上不执行）。
@@ -351,7 +351,7 @@ C 族说明：`ConvLayout` 是纯函数，无法直接表达「refresh 是否被
 
 ### 7.2 取证结论修订措辞（F11 第二问）
 
-建议在 `docs/取证结论.md:17` 后追加一条：
+建议在 `docs/取证结论.md` 后追加一条：
 > **（R22 修订）`ConvFilter.hookItemClick`/`realPosition` 在 8.0.48 上是死代码**：三层
 > `performItemClick` hook 均已挂上（`_dbg_pull.txt:17-19`）但 `K7 performClick conv` 零命中，
 > 会话行点击由微信行内 `View.OnClickListener` 承担。该 hook 仅作防御保留，不承担正确性职责；

@@ -209,7 +209,7 @@ P1（建议修，非阻断）：第 4 条 —— `getItem(int)` 存在协变+桥
 1. **纯注释零逻辑**：`git diff` 确认只加了 4 行注释，无代码变更。
 2. **注释准确**：
    - `rewritePath` 零消费点：全仓 grep 确认 `SNS_CDN_REWRITE_PATH` 只在 `refreshCfg()`（SnsCdnImage.kt:102）被写入 `Cfg.rewritePath`，全文件无读取点。
-   - 判死理由引用 `docs/取证结论.md ⑫.9`：`picCachePath` 字段恒空（hitPicE=7/hitNoField=0）、批量请求 `ok0.x0#n` 未触发（hitN=0），与 Keys.kt 注释一致。
+   - 判死理由引用 `docs/conclusions/moments_cdn.md`：`picCachePath` 字段恒空（hitPicE=7/hitNoField=0）、批量请求 `ok0.x0#n` 未触发（hitN=0），与 Keys.kt 注释一致。
 
 无问题。
 
