@@ -173,7 +173,7 @@ class Dex:
                         continue
                     found = self._code_find(code_off, targets)
                     for t in found:
-                        mcls, mname = self.methods[prev] if prev < len(self.methods) else ("?", "?")
+                        mcls, mname, _p = self.methods[prev] if prev < len(self.methods) else ("?", "?", 0)
                         hits[t].append((cls_name, mcls, mname))
         return hits
 

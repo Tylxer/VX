@@ -43,6 +43,15 @@ bc("--es", "op", "redpacket", "--es", "sub", "stat")
 time.sleep(3)
 
 step("UI 断言：微信界面还活着")
+# ⚠️ 断言前必须先回主页：上一步的探针若把微信留在朋友圈/聊天页，主页文案「微信」「通讯录」
+# 当然找不到，会假报失败（2026-10-24 真机踩到）。连按两次返回再断言。
+sh("shell", "input", "keyevent", "4")
+time.sleep(1)
+sh("shell", "input", "keyevent", "4")
+time.sleep(2)
+ensure_foreground()
+time.sleep(2)
+print("  act:", top())
 ui("微信")
 ui("通讯录")
 

@@ -52,6 +52,18 @@ def pull():
         return ""
 
 
+def getkv(key):
+    """读当前配置值（`PROBE kv <key> = <val>` 形态）。
+
+    ⚠️ 设备无 sqlite3 ⇒ 只能走广播；读不到返回 None（调用方须跳过复位，别写坏配置）。
+    """
+    import re
+    bc("--es", "op", "kvget", "--es", "key", key)
+    time.sleep(1.5)
+    m = re.search(r"PROBE kv %s = (\S+)" % re.escape(key), pull())
+    return m.group(1) if m else None
+
+
 def dump(tag, keys=("QUIET", "MUTEAT", "DND", "GRP")):
     txt = pull()
     print("\n=== %s ===" % tag)
@@ -70,49 +82,69 @@ def main():
     bc("--es", "op", "logclear")
     time.sleep(1)
 
-    # ---- 静态自检 ----
-    bc("--es", "op", "kvset", "--es", "key", "chat.mute_at_enabled", "--es", "val", "true")
-    time.sleep(1)
-    bc("--es", "op", "kvset", "--es", "key", "chat.auto_dnd_new_group", "--es", "val", "true")
-    time.sleep(1)
+    # 记住用户原值，结束/异常时复位（2026-10-24 修：原版无条件置 true 且不复位，
+    # 会把用户本来就关着的功能偷偷打开，真机上很难察觉）
+    restore = {}
 
-    if DND_NOW:
-        now = datetime.now()
-        s = (now - timedelta(minutes=5)).strftime("%H:%M")
-        e = (now + timedelta(hours=2)).strftime("%H:%M")
-        print(">>> 免打扰时段设为 %s ~ %s（覆盖当前时刻）" % (s, e))
-        bc("--es", "op", "kvset", "--es", "key", "chat.dnd_enabled", "--es", "val", "true")
-        time.sleep(1)
-        bc("--es", "op", "kvset", "--es", "key", "chat.dnd_start", "--es", "val", s)
-        time.sleep(1)
-        bc("--es", "op", "kvset", "--es", "key", "chat.dnd_end", "--es", "val", e)
+    def setkv(key, val):
+        if key not in restore:
+            restore[key] = getkv(key)
+        bc("--es", "op", "kvset", "--es", "key", key, "--es", "val", str(val))
         time.sleep(1)
 
-    bc("--es", "op", "quiet", "--es", "sub", "at", "--es", "sub2", "status")
-    time.sleep(2)
-    bc("--es", "op", "quiet", "--es", "sub", "at", "--es", "sub2", "scope")
-    time.sleep(2)
-    bc("--es", "op", "quiet", "--es", "sub", "at", "--es", "sub2", "grpstat")
-    time.sleep(2)
-    bc("--es", "op", "quiet", "--es", "sub", "at", "--es", "sub2", "grplist")
-    time.sleep(2)
-    bc("--es", "op", "quiet", "--es", "sub", "dnd", "--es", "sub2", "status")
-    time.sleep(2)
-    bc("--es", "op", "quiet", "--es", "sub", "grp", "--es", "sub2", "status")
-    time.sleep(2)
-    dump("静态自检")
+    try:
+        # ---- 静态自检 ----
+        setkv("chat.mute_at_enabled", "true")
+        setkv("chat.auto_dnd_new_group", "true")
 
-    if WAIT <= 0:
-        return
+        if DND_NOW:
+            now = datetime.now()
+            s = (now - timedelta(minutes=5)).strftime("%H:%M")
+            e = (now + timedelta(hours=2)).strftime("%H:%M")
+            print(">>> 免打扰时段设为 %s ~ %s（覆盖当前时刻）" % (s, e))
+            setkv("chat.dnd_enabled", "true")
+            setkv("chat.dnd_start", s)
+            setkv("chat.dnd_end", e)
 
-    print("\n>>> 现在请：让另一个账号在群里 @ 你（或用小号发一条 @ 你的消息）")
-    print(">>> 等待 %d 秒..." % WAIT)
-    for i in range(WAIT // 10):
-        time.sleep(10)
-        print("    ...%ds" % ((i + 1) * 10))
-    bc("--es", "op", "quiet", "--es", "sub", "at", "--es", "sub2", "status")
-    time.sleep(2)
-    dump("被@场景结果")
+        bc("--es", "op", "quiet", "--es", "sub", "at", "--es", "sub2", "status")
+        time.sleep(2)
+        bc("--es", "op", "quiet", "--es", "sub", "at", "--es", "sub2", "scope")
+        time.sleep(2)
+        bc("--es", "op", "quiet", "--es", "sub", "at", "--es", "sub2", "grpstat")
+        time.sleep(2)
+        bc("--es", "op", "quiet", "--es", "sub", "at", "--es", "sub2", "grplist")
+        time.sleep(2)
+        # ⚠️ status 不含 active；时段判定**只能**看 sub2=window（2026-10-24 修）
+        bc("--es", "op", "quiet", "--es", "sub", "dnd", "--es", "sub2", "status")
+        time.sleep(2)
+        bc("--es", "op", "quiet", "--es", "sub", "dnd", "--es", "sub2", "window")
+        time.sleep(2)
+        bc("--es", "op", "quiet", "--es", "sub", "grp", "--es", "sub2", "status")
+        time.sleep(2)
+        dump("静态自检")
+
+        if WAIT <= 0:
+            return
+
+        print("\n>>> 现在请：让另一个账号在群里 @ 你（或用小号发一条 @ 你的消息）")
+        print(">>> 等待 %d 秒..." % WAIT)
+        for i in range(WAIT // 10):
+            time.sleep(10)
+            print("    ...%ds" % ((i + 1) * 10))
+        bc("--es", "op", "quiet", "--es", "sub", "at", "--es", "sub2", "status")
+        time.sleep(2)
+        dump("被@场景结果")
+    finally:
+        # 无论正常结束还是 Ctrl-C，都把改过的键复位
+        if restore:
+            print("\n=== 复位本次改动的配置 ===")
+            for k, v in restore.items():
+                if v is None:
+                    print("    %s 原值未知，跳过（请手工确认）" % k)
+                    continue
+                bc("--es", "op", "kvset", "--es", "key", k, "--es", "val", str(v))
+                time.sleep(1)
+                print("    %s -> %s（原值）" % (k, v))
 
 
 if __name__ == "__main__":

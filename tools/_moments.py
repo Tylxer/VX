@@ -3,7 +3,7 @@
 用法: python tools/_moments.py           开三项 → 进朋友圈 → 甩底 → 导出 → 查目录
       python tools/_moments.py --off      反向对照（全关，预期零新增文件）
       python tools/_moments.py --ls       只查导出目录
-      python tools/_moments.py --img      图片对账探针（mediaKeys 候选 vs 真实文件名）
+      python tools/_moments.py --img      图片对账探针（SNS 磁盘缓存直读链路）
 
 ✅ 这一组**可全自动**（不涉及发消息/花钱），导出目录的文件数就是硬判据，不用看截图。
 
@@ -14,8 +14,11 @@
   4. `sub=load` 后 `MOMENT autoload grow a -> b`          → 自动加载真的拉到了更多
      （grow 来自 onBind 里 getData().size 变大的自观测，是最硬的信号）
   5. `sub=export` 后目录文件数增加                        → 文本导出落地
-     ⚠️ 图片（原图）命名规则未取证：COPY_IMAGES=false，只打 `MOMENT img ... keys=[...]`
-     候选串供对账，用 --img 单独跑。
+     ⚠️ 图片（原图）留存的**正解**是 SNS 磁盘缓存直读（R19 真机验通 `hit=6`），
+     用 --img 跑 `sub=snsidx` + `sub=snsprobe` 对账。
+     ⛔ 旧的 md5 候选路线（`sub=img` / `sub=imgtry`）**已于 R20 物理删除** ——
+     三次真机证伪（R15 分桶 0.68% / R16 全盘 find 零结果 / R19 文件名是 20 位数字串不含 md5）。
+     见 `docs/_r19_a4_probe.md` 与 `docs/_r20_a8_del.md`。
 
 ⏳ 定时刷新的「显式 Intent 重进时间线是否真拉服务端」也是待取证项：
    自动触发路径要等 60s 一拍 + 充电/WiFi，场景里用 `sub=refresh` 手动验证同一链路。
@@ -51,15 +54,25 @@ if LS:
     raise SystemExit(0)
 
 if IMG:
-    step("图片对账探针：最近 5 条归档的 mediaKeys 候选")
+    # ⛔ R20（A8 收敛）：这里原来打的是 `sub=img`（旧 md5 候选对账），该探针已物理删除
+    #    （见 docs/_r20_a8_del.md）。空调用会静默无输出，改成新链路的两条只读探针。
+    step("图片对账：① 缓存索引能否建起来 ② mediaId 能否命中文件名")
     ensure_foreground()
     logclear()
-    moments("img", 5)
+    moments("snsidx")
     time.sleep(3)
+    moments("snsprobe", 20)
+    time.sleep(5)
     pull_dbg()
-    print("--- 日志 ---")
-    grep(r"MOMENT img", 10)
-    print("done（把 keys/urls 跟真机朋友圈缓存目录里的真实文件名对账）")
+    print("--- 索引 ---")
+    grep(r"MOMENT snsidx", 5)
+    print("--- 逐条对账 ---")
+    grep(r"MOMENT snsprobe", 30)
+    print(
+        "判据：names>0 才有得比；hit=<文件名> = 链路通；\n"
+        "      ids=0 且 noMedia≈rows = mediaId 路径错（改 MomentsLogic.PROTO_FIELD_*）；\n"
+        "      ⚠️ names=0 通常是微信冷启清空了 sns 缓存 —— 先进一次朋友圈上滑重建，不是链路坏了。"
+    )
     raise SystemExit(0)
 
 step("拉起微信 + 清日志")

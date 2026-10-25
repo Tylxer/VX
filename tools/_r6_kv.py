@@ -115,6 +115,9 @@ def main():
         print("\n=== 回读（应为 false / false）===")
         tail(25, "PROBE kv")
     elif cmd == "snsc":
+        # ⛔ 2026-10-24 N7：评论域代码已物理删除，op=snsc 探针已移除。
+        #    这里保留分支只为让老命令行不报「未知命令」；实际 probe 只会返回
+        #    「OP snsc 已移除」的告警。取证方法论见 tools/_r6_snsc.py 横幅。
         sub = sys.argv[2] if len(sys.argv) > 2 else "stat"
         probe("snsc", sub=sub)
         time.sleep(2.0)
