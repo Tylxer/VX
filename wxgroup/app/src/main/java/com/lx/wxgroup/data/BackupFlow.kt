@@ -199,6 +199,21 @@ object BackupFlow {
                     "added=${plan.membersAdded}, actual created=$created added=$added"
             )
         }
+        // K7：恢复改变了分组与成员关系，会话列表的分组行必须重算。
+        //
+        // 为什么放在这里而不是每个 db.addMembers 之后：恢复是一**批**操作，
+        // 中途每个组都刷一次列表既浪费（`refreshMembers` 最终有 250ms 去抖，中间那几次白跑）
+        // 又会让用户看到「组一个个冒出来」的中间态。整批结束刷一次即可。
+        //
+        // ⚠️ 必须是 `refreshMembers()` 而不是 `refresh()`：恢复改的是 `group_member` 表，
+        // `refresh()` 只重算 layout、**不重读** `cachedMembers`，筛选态下会拿旧成员集算，
+        // 表现就是「恢复完了分组行成员数还是旧的」。`refreshMembers()` 会先重读成员再重建。
+        //
+        // ⚠️ 也不能直接 notifyAdapter：`ConvFilter` 内部会 mainHandler.post + 去抖 +
+        // rememberAnchor/restoreAnchor，直接 notify 会把列表拽回顶部
+        //（见 ConvFilter 里 headerAnchor 的注释）。
+        runCatching { com.lx.wxgroup.feature.ConvFilter.refreshMembers() }
+            .onFailure { LogX.w("BACKUP refresh conv members failed: ${it.javaClass.simpleName}") }
         return Outcome(stats, plan, ok, safetyFile)
     }
 }

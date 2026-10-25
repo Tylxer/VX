@@ -1502,7 +1502,15 @@ object GroupBar {
             val db = GroupDb.current() ?: return@input
             val id = db.createGroup(name)
             LogX.i("BAR create id=$id name=$name")
-            if (id > 0) refresh(bar) else UiKit.toast(ctx, "已存在同名分组")
+            if (id > 0) {
+                refresh(bar)
+                // 会话列表也要插一行「没有会话的分组行」（ConvLayout 规则 4）。
+                // 少了这一步，从横条建的分组要等下一次收消息才出现在会话列表里 ——
+                // 而 GroupManagerPage 建组那条路径早就通知了，两条入口行为必须一致。
+                ConvFilter.refreshMembers()
+            } else {
+                UiKit.toast(ctx, "已存在同名分组")
+            }
         }
     }
 

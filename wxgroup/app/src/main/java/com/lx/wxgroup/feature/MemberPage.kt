@@ -68,6 +68,8 @@ object MemberPage {
             val m = adapter.getItem(position)
             db.removeMember(groupId, m.wxid)
             adapter.reload()
+            // 成员关系变了 ⇒ 重读 cachedMembers 再重算（refresh() 不重读成员，筛选态下会无效）
+            ConvFilter.refreshMembers()
             dialog.setTitle("$groupName（${db.countMembers(groupId)} 人）")
             UiKit.toast(ctx, "已移出：${m.displayName ?: m.wxid}")
             LogX.i("MEM remove group=$groupId wxid=${m.wxid}")
@@ -82,6 +84,8 @@ object MemberPage {
                 UiKit.confirm(ctx, "清空本组", "移除「$groupName」下的全部成员？") {
                     val n = db.clearMembers(groupId)
                     adapter.reload()
+                    // 成员关系变了 ⇒ 重读 cachedMembers 再重算（refresh() 不重读成员，筛选态下会无效）
+                    ConvFilter.refreshMembers()
                     dialog.setTitle("$groupName（${db.countMembers(groupId)} 人）")
                     UiKit.toast(ctx, "已移除 $n 人")
                     LogX.i("MEM clear group=$groupId n=$n")

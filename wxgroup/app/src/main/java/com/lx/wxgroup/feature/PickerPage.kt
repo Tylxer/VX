@@ -65,12 +65,14 @@ class PickerPage(
         counter = UiKit.label(ctx, "", 13f, bold = true)
         root.addView(counter)
 
-        val search = EditText(ctx).apply {
+        // R21：AlertDialog 骨架清掉 ALT_FOCUSABLE_IM 后系统才接受 IME 请求，
+        // 这里再补一发显式 showSoftInput，保证点击/聚焦即弹（见 UiKit 的 KDoc）
+        val search = UiKit.bindSoftInput(EditText(ctx).apply {
             this.hint = "搜索"
             inputType = InputType.TYPE_CLASS_TEXT
             maxLines = 1
             textSize = 14f
-        }
+        })
         root.addView(search)
 
         adapter = Adapter(ctx, sections, selected)

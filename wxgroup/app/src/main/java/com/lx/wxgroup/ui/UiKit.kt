@@ -12,6 +12,7 @@ import android.text.InputType
 import android.util.TypedValue
 import android.view.ViewGroup
 import android.view.WindowManager
+import android.view.inputmethod.InputMethodManager
 import android.widget.EditText
 import android.widget.LinearLayout
 import android.widget.ListView
@@ -146,6 +147,63 @@ object UiKit {
     }
 
     /**
+     * 让 [edit] 在「被点击 / 拿到焦点」时主动拉起输入法。
+     *
+     * 为什么需要这个：模块所有页面都长在 [Panel] 的 AlertDialog 里，而 AlertDialog 骨架
+     * 默认给窗口打 `FLAG_ALT_FOCUSABLE_IM`（替代焦点模式）。R21 已在
+     * `Panel.openInternal()` 里把这个 flag 清掉，但**历史沉淀是**：只要还有任何一条路径
+     * 走到带该 flag 的窗口（或系统版本行为差异导致窗口属性没及时刷新），
+     * `showSoftInput()` 就会被 InputMethodManager 直接丢弃 —— 表现为控件
+     * `focused=true` 却 `mInputShown=false`、`sessionRequested=false`。
+     * 所以这里不只依赖系统的「聚焦自动弹」链路，而是在点击/聚焦时显式请求一次，
+     * 让 `clearFlags` 之后系统**才会接受**的这个请求真正生效。
+     *
+     * 参数用 `0`（不是 `SHOW_IMPLICIT`）：`SHOW_IMPLICIT` 只是「非用户直接发起」的
+     * 语义标记，对微信这类宿主已被系统视为前台的应用没有实际差别；传 0 兼容性最广
+     * （`SHOW_IMPLICIT` 是 API 11+，虽然现在都满足，但没必要引入分支）。
+     *
+     * 返回 [edit] 本身，便于 `.let { ... }` 链式接在构造之后。
+     */
+    fun bindSoftInput(edit: EditText): EditText {
+        val kick = { v: EditText ->
+            runCatching {
+                val imm = v.context.getSystemService(Context.INPUT_METHOD_SERVICE) as? InputMethodManager
+                imm?.showSoftInput(v, 0)
+            }.onFailure { LogX.w("UiKit showSoftInput failed: ${it.javaClass.simpleName}") }
+        }
+        // ⚠️ `setOnClickListener` / `setOnFocusChangeListener` 是**覆盖式**的：
+        // 调用方若在 bindSoftInput 之后又设了同位置的 listener，本助手就会被静默顶掉
+        // （与 `ListView.adapter` 同一类坑）。四个调用点当前都只用 addTextChangedListener，
+        // 所以安全；新增调用点前先确认它不在这两个位置上挂东西。
+        edit.setOnClickListener { v -> kick(v as EditText) }
+        edit.setOnFocusChangeListener { v, hasFocus -> if (hasFocus) kick(v as EditText) }
+        return edit
+    }
+
+    /**
+     * 清掉窗口上的 `FLAG_ALT_FOCUSABLE_IM`（= 替代焦点模式）。
+     *
+     * `AlertDialog` 骨架默认就给窗口打这个 flag，AOSP 语义下带它的窗口**不会被自动拉起 IME**
+     * —— 典型表现是输入框 `focused=true` 却 `mInputShown=false`、`sessionRequested=false`，
+     * 点了没反应。
+     *
+     * ⚠️ **必须对每个自建 Dialog 单独调用**：`Panel` 里清的是 `Panel` 自己那个 dialog，
+     * 管不到 `BatchPicker`（裸 `AlertDialog.Builder`）和 `GroupDetailPage`（裸 `Dialog`）。
+     * 少一处就是一处的搜索框不弹输入法。
+     *
+     * 传 Dialog 而不是 Window：`getWindow()` 在 `create()` / `new Dialog()` 之后即非空，
+     * 但 `show()` 之前窗口还没 addView 到 WMS ⇒ 此时改 flag 最干净，不会有
+     * 「先带 flag 加窗、再清 flag」的竞态。
+     */
+    fun clearAltFocusableIm(dialog: Dialog, tag: String = "") {
+        runCatching {
+            dialog.window?.clearFlags(WindowManager.LayoutParams.FLAG_ALT_FOCUSABLE_IM)
+        }.onFailure {
+            LogX.w("UiKit clearAltFocusableIm$tag failed: ${it.javaClass.simpleName}")
+        }
+    }
+
+    /**
      * 后台线程干完活回主线程。
      *
      * 为什么统一在这里：`Handler(Looper.getMainLooper())` 每个类各建一个的写法
@@ -195,6 +253,9 @@ object UiKit {
             .setPositiveButton("确定", null)
             .create()
             .apply {
+                // ⛔ R21：这个 dialog 不走 Panel，Panel 清的 flag 管不到它 ——
+                // 不清这里，新建分组时点输入框同样不弹键盘（此前一直如此，只是没人报）。
+                clearAltFocusableIm(this, " input")
                 setOnShowListener {
                     getButton(AlertDialog.BUTTON_POSITIVE).setOnClickListener {
                         val v = edit.text?.toString()?.trim().orEmpty()

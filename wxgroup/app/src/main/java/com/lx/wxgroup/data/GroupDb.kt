@@ -340,7 +340,22 @@ class GroupDb private constructor(context: Context) :
 
     // ---------------------------------------------------------------- 朋友圈动态归档
 
-    /** 一条朋友圈动态的完整快照（含三个 BLOB） */
+    /**
+     * 一条朋友圈动态的完整快照（含三个 BLOB）。
+     *
+     * ## ⛔ 只有 `at` 有默认值 —— 其余 13 个字段**必须显式写**
+     * 这容易踩：想构造一个「只查了 7 列」的半行（只读导出需要的列，避免把
+     * `content`/`attrBuf`/`postBuf` 三个 BLOB 全捞进内存）时，直觉是「没查的列留默认值」，
+     * 但**它们没有默认值**，编译会直接报 `No value passed for parameter 'subType'` 等 **6 条**。
+     * 正确写法是显式填 `0` / `null`（语义等价，读法本来就不碰它们）。
+     *
+     * 📌 R20 实例：`SnsGuard.liveRows()` 构造半行时漏填，`compileDebugKotlin` 报了 5 条，
+     * 属两个 lane 接口脱节（`docs/_r20_sample_src.md` §7 有记录）。
+     *
+     * ⛔ 也别指望用 `copy()` 补：`copy()` 只能改已有实例的字段，
+     * 而「缺列的完整快照」根本不该被造出来 —— 拿半行去 `archiveSns` 会用残缺快照
+     * 覆盖掉 `readRow` 存下的完整快照，而 `archiveSns` 是「首条为准」，覆盖不回来。
+     */
     data class SnsRow(
         val snsId: Long,
         val userName: String?,
@@ -830,6 +845,27 @@ class GroupDb private constructor(context: Context) :
             return buildList {
                 while (cursor.moveToNext()) add(cursor.toMember())
             }
+        }
+    }
+
+    /**
+     * 按 wxid 反查 `group_member` 里快照的备注名（`wxid` 是主键 ⇒ 单行命中）。
+     *
+     * 用途：[com.lx.wxgroup.feature.ConvFilter] 算分组行摘要时，会话的发送者
+     * 未必是好友（群聊成员、已删好友都可能是"已归组但不在通讯录"的人）。
+     * `findFriend` 查不到就回落成裸 `wxid`，显示成 `wxid_abc123` 很难看 ——
+     * 用加人那一刻存下的备注名兜底。
+     *
+     * ⚠️ **调用顺序必须是 `findFriend` 优先**：`friend_cache` 是通讯录实时快照，
+     * 用户改备注立刻反映；这里的 `display_name` 只是 `addMember` 时的快照
+     * （见 `addMember`）。反过来会一直显示旧备注。
+     */
+    fun findMember(wxid: String): GroupMember? {
+        if (wxid.isBlank()) return null
+        readableDatabase.query(
+            T_MEMBER, null, "wxid=?", arrayOf(wxid), null, null, null
+        ).use { cursor ->
+            return if (cursor.moveToFirst()) cursor.toMember() else null
         }
     }
 

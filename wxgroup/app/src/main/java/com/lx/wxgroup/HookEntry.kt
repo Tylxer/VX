@@ -26,12 +26,12 @@ import com.lx.wxgroup.feature.AntiRevokeHint
 import com.lx.wxgroup.feature.ConvMenuInject
 import com.lx.wxgroup.feature.ForceForward
 import com.lx.wxgroup.feature.GroupBar
+import com.lx.wxgroup.feature.HintBadge
 import com.lx.wxgroup.feature.ScrollDock
 import com.lx.wxgroup.feature.SnsCdnImage
 import com.lx.wxgroup.feature.SnsGuard
 import com.lx.wxgroup.feature.SnsTag
-import com.lx.wxgroup.feature.SnsCommentGuard
-import com.lx.wxgroup.feature.SnsCommentTag
+import com.lx.wxgroup.feature.VoiceGuard
 import com.lx.wxgroup.feature.MomentsAuto
 import com.lx.wxgroup.feature.MomentsExport
 import com.lx.wxgroup.feature.PatBlock
@@ -211,6 +211,14 @@ class HookEntry : IXposedHookLoadPackage {
             AntiRevokeHint.install(lpparam)
         }.onFailure { LogX.e("AntiRevokeHint install failed", it) }
 
+        // ---- 防撤回·语音播放修复（6.2 补丁）：拦 voiceinfo 的 DELETE ----
+        // 根因：微信撤回语音时先 DELETE voiceinfo 下载记录（AntiRevoke 只拦了后面的
+        // UPDATE message），导致气泡在、voiceinfo 行没了、播放器查不到下载状态点不动。
+        // 判据走 data/VoiceGuardLogic（纯函数，有单测），详情见 feature/VoiceGuard.kt。
+        runCatching {
+            VoiceGuard.install(lpparam)
+        }.onFailure { LogX.e("VoiceGuard install failed", it) }
+
         // ---- 防撤回·朋友圈动态防删除（6.2 第二项）：拦住 DELETE FROM SnsInfo 并归档整行 ----
         // ⚠️ 朋友圈是**独立的库** SnsMicroMsg.db，不是 EnMicroMsg.db。
         // 删动态是物理 DELETE 整行（不是改标记），所以策略是「拦 + 归档」而不是「拦 + 改写」。
@@ -226,6 +234,18 @@ class HookEntry : IXposedHookLoadPackage {
         runCatching {
             SnsTag.install(lpparam)
         }.onFailure { LogX.e("SnsTag install failed", it) }
+
+        // ---- 防撤回·「已阻止撤回」角标（6.2 显示撤回提示的新实现，R21d 方案 1）----
+        // 落点：会话页 adapter 的 onBindViewHolder（q3，super=androidx RecyclerView.Adapter）。
+        // ⛔ 旧做法是往微信 message 表插一条负数 msgId 的 type=10000 提示行，已废 ——
+        //    两个致命问题：① 微信 h9.convertFrom 校验 msgId 下界，负数一律 throw fr4.b
+        //    ⇒ 进那个会话就闪退；② createTime 用撤回时刻，微信按 createTime 排序 ⇒
+        //    提示行永远排在末尾，与原文隔几十条消息（用户报障「不相邻」）。
+        // 现在不插行、不写库，靠 onBindViewHolder 绑定时按 msgId 反查 rescued 表，
+        // 把角标画在**原文那个 itemView** 上 ⇒ 物理上不可能与原文分离。
+        runCatching {
+            HintBadge.install(lpparam)
+        }.onFailure { LogX.e("HintBadge install failed", it) }
 
         // ---- K9：通知静音过滤器（防止被@ + 免打扰时段 + 微信来电放行）----
         // ⚠️ 2026-10-17 停用：静音域已统一到 QuietNotificationBridge（MuteAt /
@@ -267,21 +287,17 @@ class HookEntry : IXposedHookLoadPackage {
         }.onFailure { LogX.e("RedPacket install failed", it) }
 
         // ---- 6.2 防撤回：朋友圈**评论**防删除 + 评论 [已删除] 标签 ----
-        // ⚠️ 与动态不同：删评论前微信可能已重写 SnsInfo.attrBuf（评论可见列表的载体），
-        // 所以除了拦 delete SnsComment 还要做 attrBuf 差量检测与还原。细节见
-        // feature/SnsCommentGuard.kt 类注释；attrBuf 是否被重写**尚未实证**，靠 probe 取证。
-        // ⛔ 2026-10-20 用户决定：评论域（评论防删除 + [已删除]标签）功能已停止，不再安装 hook。
-        // 实现完整保留在 feature/SnsCommentGuard.kt / feature/SnsCommentTag.kt / feature/SnsCommentLogic.kt（冻结，不删）。
-        // 恢复时：取消下面这段注释即可（连同 SnsCommentTag.install 一起）。
-        // runCatching {
-        //     SnsCommentGuard.install(lpparam)
-        // }.onFailure { LogX.e("SnsCommentGuard install failed", it) }
-
-        // ---- 6.2 防撤回：朋友圈评论「[已删除]」标签 ----
-        // ⛔ 2026-10-20 同上：评论域功能已停止，不再安装 hook。
-        // runCatching {
-        //     SnsCommentTag.install(lpparam)
-        // }.onFailure { LogX.e("SnsCommentTag install failed", it) }
+        // ⛔ 2026-10-20 用户决定停止该功能；2026-10-24 用户决定**物理删除**代码。
+        // 原实现（SnsCommentGuard / SnsCommentTag / SnsCommentLogic / SnsCommentLabelLogic
+        // + 两个测试，约 207KB / 121 个单测）已从本仓库移除，此处不再有 hook 安装点。
+        //
+        // 技术原因（留档，供将来若重启该需求时少走弯路）：
+        // 评论的**可见列表**载体是 `SnsInfo.attrBuf`（protobuf），而 `SnsComment` 是另一份
+        // 明细表；删评论前微信可能已重写 attrBuf，只保住 `SnsComment` 行不一定够。
+        // 更硬的一条：UI 层评论 proto **不带 commentSvrID**（`q54/q95` 的 `q`/`r` 恒 0）
+        // ⇒ 无法按 svrId 精确匹配，只能退到渲染键 `"createTime:talker:type"`
+        // （= `s1.q1.isExistComment`）做模糊匹配，`rows=0` / `del=0` 两项 P0 始终未定案。
+        // 详见 `docs/取证结论.md` ⑩ 段。
 
         // ---- 6.4 朋友圈：定时刷新 + 自动加载（默认关；刷新要充电/WiFi 任一满足）----
         // 刷新 = 到点时把时间线 Activity 显式拉起来（类名运行时捕获，不猜包名）；

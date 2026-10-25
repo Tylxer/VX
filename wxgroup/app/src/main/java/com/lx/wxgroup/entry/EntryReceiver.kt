@@ -194,6 +194,12 @@ object EntryReceiver {
                         // 「显示撤回提示」也是反着生效的开关（关=隐藏），同样要立刻重读。
                         // ⚠️ 用 invalidate 而不是 refresh：清单可能刚增删过提示行，缓存要失效
                         runCatching { com.lx.wxgroup.feature.AntiRevokeHint.invalidate() }
+                        // R21d 角标：`antirevoke.show_hint` 同时是 `HintBadge.on()` 的输入之一。
+                        // ⚠️ `enabled` 是 30 秒 TTL 缓存 —— 不在这里主动 refresh，则改完开关后
+                        //    30 秒内 `on()` 仍返回旧值，sweep 也不摘角标 ⇒ 验收会得出
+                        //    「开关无效」的**假阴性**（R21d 真机实测踩过：hint=false 但角标还在）。
+                        // refresh() 内部 enabled=false 时会调 ensureSweep()，2 秒后自动摘干净。
+                        runCatching { com.lx.wxgroup.feature.HintBadge.refresh() }
                         // 「恢复默认显示」要立刻把库里那些消息改写/还原一次（内部走后台线程）。
                         // ⚠️ 走 sync 而不是直接 applyView：sync 内部有「目标状态已对齐」判断，
                         // 重复调用不会把库反复改写两遍
@@ -306,6 +312,23 @@ object EntryReceiver {
                                 "cmts" -> for (l in com.lx.wxgroup.feature.SnsGuard.comments(n)) {
                                     LogX.i(l)
                                 }
+                                // **A4 取证（R19）**：扫**当前 SnsInfo** 的 content 抽 mediaId 数字串候选。
+                                // ⚠️ 与 `op=moments sub=snsprobe` 的区别：那个扫**归档表**（已被删的动态），
+                                //    这个扫**当前朋友圈**（与 sns 磁盘缓存同期的图）⇒ 才可能对上文件名。
+                                // --es sub mid --ei n 8
+                                "mid" -> for (l in com.lx.wxgroup.feature.SnsGuard.probeMediaIds(n)) {
+                                    LogX.i(l)
+                                }
+                                // A4 第二步：递归定位 mediaId 在 content 里的**字段路径**
+                                // --es sub mpath --ei n 5
+                                "mpath" -> for (l in com.lx.wxgroup.feature.SnsGuard.probeMediaPaths(n)) {
+                                    LogX.i(l)
+                                }
+                                // **A4 端到端验收**：解 mediaId → 与磁盘缓存对账 → `hit>0` 才算 A4 通
+                                // --es sub hit --ei n 10
+                                "hit" -> for (l in com.lx.wxgroup.feature.SnsGuard.probeHit(n)) {
+                                    LogX.i(l)
+                                }
                                 // 归档里每条的**当前** localFlag（dump 里的 flag 是快照，别当依据）
                                 "flags" -> for (l in com.lx.wxgroup.feature.SnsGuard.flags()) {
                                     LogX.i("SNSG $l")
@@ -386,21 +409,17 @@ object EntryReceiver {
                         }
                     }
                     // ---- 6.2 防撤回：朋友圈**评论**防删除 + 评论 [已删除] 标签 ----
-                    // ⚠️ 这两个都要读微信的 SnsMicroMsg.db → 走后台线程（onReceive 在主线程）
-                    "snsc" -> {
-                        val sub = intent.getStringExtra("sub") ?: "stat"
-                        val id = intent.getLongExtra("id", 0L)
-                        val svr = intent.getLongExtra("svr", 1L)
-                        // seed 用的渲染键："createTime:talker:type"（见 docs/取证结论.md ⑩）
-                        val seedKey = intent.getStringExtra("key") ?: ""
-                        io {
-                            LogX.i("SNSCG " + com.lx.wxgroup.feature.SnsCommentGuard.probe(sub, id))
-                            LogX.i(
-                                "SNSC " + com.lx.wxgroup.feature.SnsCommentTag
-                                    .probe(sub, id, svr, seedKey)
-                            )
-                        }
-                    }
+                    // ⛔ 2026-10-24 用户决定物理删除评论域代码（SnsCommentGuard / SnsCommentTag /
+                    //    SnsCommentLogic / SnsCommentLabelLogic + 两个测试）。
+                    //    ⚠️ 这里**故意保留一个显式提示分支**、而不是整段删掉：
+                    //    整段删掉后 `op=snsc` 会落到 when 的 default（若将来 default 变成
+                    //    「未知 op」告警）或干脆静默，而老脚本/老文档里还写着这个 op
+                    //    ⇒ 排查的人会以为「模块没生效」而不是「这个功能已被删除」。
+                    //    留一句明确日志，把排查方向直接掰正。
+                    "snsc" -> LogX.w(
+                        "OP snsc 已移除：朋友圈评论防删除 / [已删除]标签功能于 2026-10-20 停止，" +
+                            "代码于 2026-10-24 物理删除。若仍需取证评论表，用 op=sns --es sub cmts"
+                    )
                     // ---- 6.1 聊天：拍一拍 / 被@静音 / 免打扰时段 / 新加群自动免打扰 ----
                     // --es sub at|pat|dnd|grp     路由到哪个功能（默认 at）
                     //                            给个其它值（如 all）→ 四项各打一遍
@@ -518,24 +537,30 @@ object EntryReceiver {
                         val sub = intent.getStringExtra("sub") ?: ""
                         val n = intent.getIntExtra("n", 8)
                         io {
+                            // 先打当前开关快照：用户报「开关改了没反应」时，
+                            // 这是区分「开关没生效」和「生效了但逻辑没跑到」的第一手线索
+                            LogX.i(com.lx.wxgroup.feature.AntiRevoke.currentConfigLine())
                             for (line in com.lx.wxgroup.feature.AntiRevoke.dumpRecent(
                                 n, sub != "all"
                             )) LogX.i("ARDUMP $line")
                         }
                     }
-                    // 手动往微信库插一条提示行，用来验证「显示撤回提示」的插入链路通不通
-                    // --es talker <wxid> [--es text "测试提示"]
+                    // ⛔ **已废（R21d 方案 1）**：原来往微信 message 表插一条提示行来验证插入链路。
+                    // 那条路会让微信闪退（负数 msgId 被 h9.convertFrom 拒绝），已彻底关闭。
+                    // 保留这个 op 只为让老脚本不报「未知 op」，**恒返回 0 且不写库**。
                     "arins" -> {
                         val t = intent.getStringExtra("talker") ?: ""
                         val x = intent.getStringExtra("text") ?: "测试提示"
                         io {
                             val id = com.lx.wxgroup.feature.RevokeRescue.insertHint(t, x)
-                            LogX.i("ARINS msgId=$id talker=${t.take(12)} text=${x.take(24)}")
+                            LogX.w("ARINS DISABLED (R21d 方案1) msgId=$id talker=${t.take(12)} text=${x.take(24)}")
                         }
                     }
-                    // 删掉我们自己插进去的提示行（**安全阀**）。
-                    // ⚠️ 提示行是写进微信库的，卸载模块也不会消失，必须留一个手动清理的入口。
-                    // 用法：--ei id -1 删单条；不带 id 则删全部（负 msgId 全是我们自己的行）
+                    // 删掉历史遗留的负数 msgId 行（**安全阀 + 自检**）。
+                    // ⚠️ 这些行是旧版本写进微信库的，卸载模块也不会消失，
+                    // 留着就会让微信**进那个会话就闪退**。启动自检会自动清一次，
+                    // 这里留手动入口以防自检没跑到（比如库句柄一直没捕获）。
+                    // 用法：--ei id -1 删单条；不带 id 则删全部（负 msgId 全是我们自己插的）
                     "ardel" -> {
                         // ⚠️ 不能用 getLongExtra 配 `--ei id N`：adb 的 --ei 存的是 Integer，
                         // 而 getLongExtra 遇到非 Long 会**静默返回默认值 0** ——
@@ -548,6 +573,29 @@ object EntryReceiver {
                             else -> 0L
                         }
                         io { LogX.i("ARDEL " + com.lx.wxgroup.feature.RevokeRescue.deleteHints(id)) }
+                    }
+                    // ---- 防撤回·「已阻止撤回」角标 自诊断（R21d 方案 1）----
+                    // 角标不出现时，按 stat 的 6 个数顺序看：
+                    //   binds>0 → chat>0 → resolved≈chat → hits>0 → added>0，最后看 masked/verifyFail。
+                    // ⚠️ **不许包 io { }**：dump/fake/unfake 都要读/改 View，离开主线程必抛
+                    //   （BroadcastReceiver.onReceive 本来就在主线程，正好直接用）。
+                    //   只有 stat 是纯读计数器，但也一并在主线程打，省得两套线程模型。
+                    // 用法：
+                    //   --es op hintbadge --es sub stat        （看计数器）
+                    //   --es op hintbadge --es sub dump        （逐条列屏幕上的 msgId + 命没命中 + 落点）
+                    //   --es op hintbadge --es sub fake  --es id <dump 里的 u= 值>   （人工造角标验样式）
+                    //   --es op hintbadge --es sub unfake
+                    "hintbadge" -> {
+                        val sub = intent.getStringExtra("sub") ?: "stat"
+                        when (sub) {
+                            "stat" -> LogX.i(com.lx.wxgroup.feature.HintBadge.stat())
+                            "dump" -> LogX.i(com.lx.wxgroup.feature.HintBadge.dump())
+                            "fake" -> LogX.i(
+                                com.lx.wxgroup.feature.HintBadge.fake(intent.getStringExtra("id").orEmpty())
+                            )
+                            "unfake" -> LogX.i(com.lx.wxgroup.feature.HintBadge.unfake())
+                            else -> LogX.i("HINTBADGE unknown sub=$sub")
+                        }
                     }
                     // 「隐藏撤回提示」自检：区分「条件没命中行」和「命中了但界面有缓存」
                     // --es talker <wxid> [--ei n 58]

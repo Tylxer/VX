@@ -81,6 +81,19 @@ object ConvFilter {
     /** 重建去抖：微信一有新消息就 notify，2900 条全量重读会卡 */
     private const val REBUILD_DEBOUNCE_MS = 250L
 
+    /**
+     * R22 性能探针的报警阈值（毫秒）。
+     *
+     * R1 修复后 `readSnaps(n)` 从「条数变化才走的冷路径」变成「**每次** rebuild 都走
+     * 的热路径」，2900 项逐条 `wrapped.getItem(i)` + 反射读字段。`getItem` 的实现体
+     * 在微信 dex 里，静态判不出成本 ⇒ 用这个探针在真机上量。
+     *
+     * 判据：单次 `snaps` 或整次 rebuild 超过 8ms（≈ 半帧的一半）就打日志。
+     * 若真机日志里反复出现，说明该退化成「先比 count + 首末 wxid，不符才全量读」
+     * 的两段式（代价：中部局部重排可能漏检）。
+     */
+    private const val PROBE_WARN_MS = 8L
+
     private val mainHandler by lazy { Handler(Looper.getMainLooper()) }
 
     /** listView -> 我们装进去的包装 */
@@ -106,6 +119,28 @@ object ConvFilter {
 
     @Volatile
     private var cachedMembers: Set<String> = emptySet()
+
+    /**
+     * 成员关系版本号：每次「加/删成员」递增一次（见 [refreshMembers]）。
+     *
+     * 收纳态下成员变化不落在 [cachedMembers]（收纳态 cachedId==0，cachedMembers 恒为空），
+     * 而是落在每个 [GroupedAdapter] 自己的 [GroupedAdapter.memberSets] 里 —— 而 memberSets
+     * 不在配置指纹（configStamp）里。用这个单调版本号让每个 wrapper 的下一次 [GroupedAdapter.rebuild]
+     * 强制全量重读 memberSets，避免被「指纹相同」短路。筛选态也顺带受益。
+     */
+    @Volatile
+    private var membersVersion = 0
+
+    /**
+     * 摘要版本号：每次「未读数/摘要变了但 timeMs 没变」时递增一次（见 [refreshSummaries]）。
+     *
+     * 为什么单独需要一个：轻量路径用 [GroupedAdapter.timeFingerprint] 判「摘要要不要重算」，
+     * 而那个指纹只滚 `timeMs`（`readSnaps` 的产出里没有 unread）。**标记已读**恰好是
+     * 「unread 变 0、timeMs 不动」—— 指纹不变 ⇒ 直接 return ⇒ 分组行未读角标残留到下一条消息。
+     * 用这个单调版本号让那一次 rebuild 跳过「完全没变」的短路。
+     */
+    @Volatile
+    private var summariesVersion = 0
 
     private var rebuildPending = false
 
@@ -142,7 +177,6 @@ object ConvFilter {
 
     fun install(lpparam: XC_LoadPackage.LoadPackageParam) {
         hookSetAdapter(lpparam)
-        hookItemClick(lpparam)
         hookListeners(lpparam)
         hookBackExit(lpparam)
     }
@@ -263,8 +297,11 @@ object ConvFilter {
     }
 
     /**
-     * 点击走 [hookItemClick]，长按仍走 listener 包装（长按没有"位置会被二次解释"
-     * 的问题，包一层就够）。
+     * 长按链路：在 `setOnItemLongClickListener` 上包一层，做位置重映射。
+     *
+     * ⚠️ 点击**不走这里**，也不走任何 hook —— 真机实证：会话行的点击由微信自己
+     * 在 `getView` 时绑到行上（每行自己的 `OnClickListener`），`performItemClick`
+     * **一次都不会被调到**。详见 [LongClickRemap] 的注释。
      */
     private fun hookListeners(lpparam: XC_LoadPackage.LoadPackageParam) {
         runCatching {
@@ -282,67 +319,7 @@ object ConvFilter {
         }.onFailure { LogX.d("K7: hook setOnItemLongClickListener failed") }
     }
 
-    /**
-     * 点击重映射：**直接改 `performItemClick` 的 position 参数**。
-     *
-     * 为什么不包装 OnItemClickListener（旧做法，已废弃）：微信的
-     * ConversationListView 自己覆写了 setter/getter，我们 getter 读回来的未必
-     * 是自己包的那层，于是每 set 一次就套一层；套两层时一次点击会触发两次
-     * `onItemClick`，外层把重映射后的 18 传给内层，内层又拿 18 当显示位置重算
-     * 成 -1 —— 表现就是「点会话行完全没反应」。
-     *
-     * 改在 `performItemClick` 上做，链路上只有我们自己一次、且不改动微信的
-     * listener 对象，从根上消掉嵌套。用 `hookAllMethods` 是为了连子类
-     * （ConversationListView）自己的覆写也一起抓。
-     */
-    private fun hookItemClick(lpparam: XC_LoadPackage.LoadPackageParam) {
-        // ⚠️ 必须挂满整条继承链：`XposedBridge.hookAllMethods(cls, ...)` 只扫
-        // **cls 自己声明**的方法，不会递归子类。而 ListView 覆写了
-        // `performItemClick`，微信的 ConversationListView 很可能又覆写了一层 ——
-        // 只挂 AdapterView 的话一次都不会触发（实测：日志里 "hooked
-        // AdapterView.performItemClick" 有，点击却毫无动静）。
-        val cb = object : XC_MethodHook() {
-            override fun beforeHookedMethod(param: MethodHookParam) {
-                val list = param.thisObject as? ListView ?: return
-                if (list.javaClass.name != LIST_CLASS) return
-                val pos = param.args.getOrNull(1) as? Int ?: return
-
-                val gid = groupIdAt(list, pos)
-                if (gid != ConvLayout.Layout.NOT_A_GROUP) {
-                    LogX.i("K7 performClick group row id=$gid pos=$pos")
-                    setGroup(gid)
-                    param.result = true          // 自己吃掉，别让微信看到分组行
-                    return
-                }
-
-                val real = realPosition(list, pos)
-                val headers = headerCount(list)
-                // 把 wxid 一起打出来：「点第 3 条打开第 5 条」是这套代码最难查的故障，
-                // 有 wxid 才能一眼看出换算对没对。
-                LogX.i(
-                    "K7 performClick conv pos=$pos headers=$headers real=$real " +
-                        "wxid=${wrappers[list]?.wxidOf(real - headers)} " +
-                        "size=${wrappers[list]?.size}"
-                )
-                if (real < 0) {
-                    param.result = true
-                    return
-                }
-                param.args[1] = real
-            }
-        }
-
-        for (cls in listOf("android.widget.AdapterView", "android.widget.ListView", LIST_CLASS)) {
-            runCatching {
-                XposedBridge.hookAllMethods(
-                    XposedHelpers.findClass(cls, lpparam.classLoader), "performItemClick", cb
-                )
-                LogX.i("K7: hooked $cls.performItemClick")
-            }.onFailure { LogX.d("K7: hook $cls.performItemClick n/a: ${it.javaClass.simpleName}") }
-        }
-    }
-
-    /** 长按 listener 包装（点击不在这里做，见 [hookItemClick]） */
+    /** 长按 listener 包装（点击由微信自己的行 OnClickListener 扛，见 [LongClickRemap]） */
     private fun wrapListeners(list: ListView) {
         // 我们自己 set 回去的那一次也会进 hook —— 必须挡住，否则无限递归（见 wrapping 注释）
         if (wrapping.get() == true) return
@@ -412,8 +389,8 @@ object ConvFilter {
         if (groupIdAt(list, rawPosition) != ConvLayout.Layout.NOT_A_GROUP) return null
         val real = realPosition(list, rawPosition)
         if (real < 0) return null
-        // ⚠️ 必须实时取（wxidNow），不能用快照 wxidOf —— 快照只在会话条数变化时重算，
-        // 收消息重排后条数不变，快照是旧顺序，会把「加入分组」加到别人头上。
+        // ⚠️ 必须实时取（wxidNow），不能用快照 wxidOf —— 快照虽然每次 rebuild 都会重读，
+        // 但 rebuild 去抖的窗口里可能是旧顺序，会把「加入分组」加到别人头上。
         return fa.wxidNow(real - headerCount(list)).takeIf { it.isNotBlank() }
     }
 
@@ -478,6 +455,51 @@ object ConvFilter {
                 }
             }, REBUILD_DEBOUNCE_MS)
         }
+    }
+
+    /**
+     * 分组/成员关系变了（加删成员、改成员、恢复备份等）之后调一次，让列表重算。
+     *
+     * 与 [refresh] 的区别：成员增删**不改变**会话条数/顺序/开关/分组表，会撞上
+     * [GroupedAdapter.rebuild] 的「配置指纹相同 → 短路」。这里分两件事补上：
+     *
+     * 1. 筛选态：重读 [cachedMembers]（当前筛选分组的成员集），让 configStamp 里的
+     *    `cachedMembers.hashCode()` 变化，自然触发全量重建。
+     * 2. 收纳态：递增 [membersVersion]，让每个 wrapper 的下一次 rebuild 强制重读
+     *    各自的 [GroupedAdapter.memberSets]（成员集不在 configStamp 里，只能靠版本号破短路）。
+     *
+     * **方案 X（只重读 cachedMembers，不动 cachedId）**：cachedId 由 [setGroup] 独占管理
+     * （写库 + 写缓存），不该被一个「数据变了」的通知改掉。若走 [refreshCache] 全量重读，
+     * 会在 [setGroup] 写 `FILTER_GROUP` 的竞态窗口内读到旧值并覆盖新 cachedId（丢失更新）。
+     * 这里 `currentGroupId()` 只在从未初始化（cachedId < 0）时懒读一次，属正常懒初始化，
+     * 之后不再从库重读。
+     */
+    fun refreshMembers() {
+        val id = currentGroupId()
+        val db = GroupDb.current()
+        cachedMembers = if (id > 0 && db != null) {
+            runCatching { db.memberWxids(id) }.getOrDefault(emptySet())
+        } else {
+            emptySet()
+        }
+        membersVersion++
+        refresh()
+    }
+
+    /**
+     * 分组行的**摘要内容**变了，但会话顺序和成员关系都没变时调一次。
+     *
+     * 目前唯一的调用方是 [com.lx.wxgroup.core.MarkRead]：「标记已读」把会话对象上的
+     * 未读字段清 0，**不动 conversationTime**。而轻量路径的判据
+     * [GroupedAdapter.timeFingerprint] 只看 timeMs ⇒ 会被判成「完全没变」直接短路，
+     * 分组行的未读角标就一直挂着，直到这个组来下一条消息。
+     *
+     * 与 [refreshMembers] 分开是因为语义不同：那个会重读 `cachedMembers`（成员关系变了），
+     * 这个只让摘要重算（成员关系没变）。合在一起也不会错，但会让「标记已读」多查一次库。
+     */
+    fun refreshSummaries() {
+        summariesVersion++
+        refresh()
     }
 
     /**
@@ -620,7 +642,10 @@ object ConvFilter {
         runCatching {
             inner.registerDataSetObserver(object : DataSetObserver() {
                 override fun onChanged() {
-                    runCatching { fa.rebuild(); fa.notifyDataSetChanged() }
+                    // 去抖重建：微信收消息时会高频 notify，直接 rebuild 会把
+                    // 2900 条的 readSnaps + 分组行摘要全压在主线程上。
+                    // 走 onDataChanged（轻量去抖，不碰滚动锚点）。
+                    runCatching { fa.onDataChanged() }
                 }
 
                 override fun onInvalidated() {
@@ -675,10 +700,17 @@ object ConvFilter {
     /**
      * 长按 listener 包装。
      *
-     * 点击**不走这里**：点击的位置会被微信二次解释（`getItemAtPosition`），
-     * 包装 listener 在真机上会因微信覆写 getter 而嵌套，导致一次点击两次回调、
-     * 位置被重算成 -1（点会话没反应）。点击统一由 [hookItemClick] 在
-     * `performItemClick` 上改参数，链路上只有一次。
+     * ⚠️ **点击不在这里做，也不在任何 hook 里做** —— 真机实证（`_dbg_pull.txt`）：
+     * 会话行的点击由微信自己在 `getView` 时绑到行上，走的是每行自己的
+     * `OnClickListener`，**`performItemClick` 一次都不会被调到**。
+     *
+     * 所以这里只包长按。曾经在 `AdapterView` / `ListView` / `ConversationListView`
+     * 三层的 `performItemClick` 上都挂过点击重映射，真机日志里
+     * `K7 performClick conv` **零命中** —— 是纯死代码，已删除（2026-10-25）。
+     *
+     * 由此推出一条重要结论：**改位置映射（`realPosition`）治不了「点错人」**。
+     * 点击位置由微信自己按它当前的列表算，我们能控制的只有 `layout` 本身 ——
+     * 必须保证 `layout` 不漏重建，行内容与会话的对应关系才不会错位。
      */
     private class LongClickRemap(
         private val list: ListView,
@@ -777,10 +809,37 @@ object ConvFilter {
         @Volatile
         private var models: Map<Long, GroupRowView.Model> = emptyMap()
 
+        /**
+         * 收纳态最近一次完整重建时读到的成员集合（分组 id -> 成员 wxid）。
+         *
+         * 「仅 timeMs/unread 变」的轻量路径里 models 重算要复用它，避免每帧都
+         * `db.memberWxids(g.id)` 查库（收纳态分组多时是 N 次 SQL 查询）。
+         *
+         * 成员集合在**完整重建**时刷新。成员增删改必须走 [ConvFilter.refreshMembers]
+         * 而非 [ConvFilter.refresh]：refresh 不重读 cachedMembers（筛选态），且成员变化
+         * 不落在 configStamp 的任何一项（收纳态）—— 只有 refreshMembers 递增
+         * [ConvFilter.membersVersion] 才能破掉「配置指纹相同」的短路，让下一次 rebuild
+         * 强制重读这里的 memberSets。
+         */
+        @Volatile
+        private var memberSets: Map<Long, Set<String>> = emptyMap()
+
         private val lock = Any()
 
         /** 上次 rebuild 的输入指纹；输入没变就直接复用，避免微信连续 notify 时反复全量重算 */
         private var lastStamp = ""
+
+        /** 上次 rebuild 的快照时间指纹：区分「仅 timeMs 变」与「完全没变」 */
+        private var lastTimeFp = 0L
+
+        /** 上次 rebuild 时消费到的成员版本号（见 [membersVersion]）；初始 -1 保证首次重建也强制 */
+        private var lastMembersVersion = -1
+
+        /** 上次 rebuild 时消费到的摘要版本号（见 [summariesVersion]） */
+        private var lastSummariesVersion = 0
+
+        /** observer 去抖标记（主线程读写，配合 mainHandler.post 串行） */
+        private var observerRebuildQueued = false
 
         val size: Int get() = layout.size
 
@@ -791,10 +850,10 @@ object ConvFilter {
          * 原始会话下标 -> wxid，**实时**读微信 adapter。
          *
          * ⚠️ 需要「现在这一行的真实 wxid」时必须用这个，不能用 [wxidOf]：
-         * [snaps] 只在**会话条数变化**时才重算（[rebuild] 里 `snaps.size != n`），
-         * 而收新消息导致的置顶/重排**条数不变** —— 快照会一直停在旧顺序上，
-         * 长按加分组就会加到别人头上。这里单次 `getItem` 读一次会话对象，
-         * 主线程开销可忽略。
+         * [snaps] 现在虽然每次 rebuild 都会重读（见 [rebuild]），但 rebuild 是
+         * **去抖**的 —— 收消息到重算之间有至多 [REBUILD_DEBOUNCE_MS] 的窗口，
+         * 期间快照可能是旧顺序，「长按加分组」这种一步都不能错的场景仍要实时取。
+         * 这里单次 `getItem` 读一次会话对象，主线程开销可忽略。
          */
         fun wxidNow(convIndex: Int): String = runCatching {
             ConvReader.username(wrapped.getItem(convIndex))
@@ -825,9 +884,21 @@ object ConvFilter {
             get() = runCatching { wrapped.viewTypeCount }.getOrDefault(1).coerceAtLeast(1)
 
         fun rebuild() = synchronized(lock) {
+            // ★ R22 性能探针：把 readSnaps 与整次 rebuild 的耗时量出来。
+            //
+            // 为什么必须量：R1 修复把「只在条数变化时读快照」改成了「**每次** rebuild
+            // 都 readSnaps(n)」，而 readSnaps 对 2900 项逐条 `wrapped.getItem(i)` +
+            // 两次反射读字段。旧代码里这条路径是冷路径（条数变化才走），现在是
+            // **每 250ms 最多一次**的主线程热路径。getItem 的实现体在微信 dex 里，
+            // 静态判不出成本 —— 只能用真机数据裁决。
+            //
+            // 判据：单次 readSnaps > 8ms 就该退化成「先比 count + 首末 wxid，
+            // 不符才全量读」的两段式（代价是中部局部重排可能漏检）。
+            //
+            // ⚠️ 只在超阈值时打日志：rebuild 每秒最多 4 次，每次都打会把日志刷爆
+            //（日志环形缓冲 5000 行，刷爆会把真正有用的取证日志挤掉）。
+            val tRebuild = android.os.SystemClock.uptimeMillis()
             val n = runCatching { wrapped.count }.getOrDefault(0)
-            if (snaps.size != n) snaps = readSnaps(n)
-
             val db = GroupDb.current()
             val enabled = runCatching { Kv.getBool(Keys.CHAT_GROUP_ROW_ENABLED) }.getOrDefault(true)
             // 未读角标开关：整个 rebuild 只读这一次（每行读会把滚动变成查库）
@@ -843,36 +914,162 @@ object ConvFilter {
 
             // ⚠️ 指纹**必须带上 showUnread**：只改这个开关时会话数/分组都没变，
             // 少了它会被下面的「指纹相同直接返回」短路掉，表现为改了开关列表纹丝不动。
-            val stamp = "$n|$enabled|$filterId|$showUnread|${cachedMembers.hashCode()}|${groups.hashCode()}"
-            if (snaps.isNotEmpty() && stamp == lastStamp) return@synchronized
-            lastStamp = stamp
+            // 这 6 项是「配置指纹」，不含会话顺序/时间（那些用 orderChanged + timeFingerprint 单独判）。
+            val configStamp = "$n|$enabled|$filterId|$showUnread|${cachedMembers.hashCode()}|${groups.hashCode()}"
+
+            // ★ R1 修复：每次都读最新快照。旧代码只在「条数变化」时才读
+            // （`if (snaps.size != n) snaps = readSnaps(n)`），但收新消息导致
+            // **重排而条数不变**时快照就永久冻结 —— layout 冻结 → 点错人。
+            // 这里先读新快照，再判断「顺序有没有变」决定要不要重算 layout。
+            val tSnaps = android.os.SystemClock.uptimeMillis()
+            val fresh = readSnaps(n)
+            val snapsCost = android.os.SystemClock.uptimeMillis() - tSnaps
+
+            // 顺序变了（wxid 序列变了 / 条数变了）⇒ layout 必须重算。
+            val orderDirty = fresh.size != snaps.size || ConvLayout.orderChanged(snaps, fresh)
+
+            // 成员关系版本变了（refreshMembers 触发）⇒ 收纳态 memberSets 得重读，
+            // 走全量重建破掉「配置指纹相同」的短路。
+            val membersDirty = membersVersion != lastMembersVersion
+
+            // 摘要版本变了（refreshSummaries 触发，目前只有「标记已读」用）⇒ 跳过下面的
+            // 「时间指纹相同就 return」，强制重算一次 models。标记已读只改 unread、
+            // 不改 timeMs，光靠 timeFingerprint 判不出来。
+            val summariesDirty = summariesVersion != lastSummariesVersion
+
+            if (!membersDirty && !orderDirty && configStamp == lastStamp && snaps.isNotEmpty()) {
+                // 配置和顺序都没变。剩下唯一的可能变化是 timeMs/unread（分组行摘要级），
+                // 用时间指纹区分「摘要变了」与「完全没变」。
+                val fp = timeFingerprint(fresh)
+                if (fp == lastTimeFp && !summariesDirty) {
+                    probeCost(tRebuild, snapsCost, n, "short-circuit")
+                    return@synchronized
+                }
+                snaps = fresh
+                lastTimeFp = fp
+                lastSummariesVersion = summariesVersion
+                // layout 复用，只重算分组行摘要（models）。成员集合复用上一次的
+                // （见 [memberSets] 注释：成员变化都走完整重建，这里不查库）。
+                if (filterId == NONE && db != null && enabled) {
+                    rebuildModels(db, groups, memberSets, showUnread)
+                }
+                probeCost(tRebuild, snapsCost, n, "light")
+                return@synchronized
+            }
+
+            snaps = fresh
+            lastStamp = configStamp
+            lastTimeFp = timeFingerprint(fresh)
+            lastMembersVersion = membersVersion
+            lastSummariesVersion = summariesVersion
 
             layout = when {
                 db == null || !enabled -> {
                     // 开关关掉 / DB 没就绪 = 零改动，一条会话都不能少
+                    memberSets = emptyMap()
+                    models = emptyMap()
                     ConvLayout.build(snaps, emptyList(), emptyMap(), enabled = false)
                 }
                 filterId > 0 -> {
+                    memberSets = emptyMap()
+                    models = emptyMap()
                     ConvLayout.filtered(snaps, cachedMembers)
                 }
                 else -> {
                     if (groups.isEmpty()) {
+                        memberSets = emptyMap()
+                        models = emptyMap()
                         ConvLayout.build(snaps, emptyList(), emptyMap(), enabled = false)
                     } else {
                         val specs = groups.map {
                             ConvLayout.GroupRowSpec(it.id, it.name, it.pinned, it.sortOrder)
                         }
                         val members = LinkedHashMap<Long, Set<String>>()
-                        val newModels = HashMap<Long, GroupRowView.Model>()
                         for (g in groups) {
-                            val wx = runCatching { db.memberWxids(g.id) }.getOrDefault(emptySet())
-                            members[g.id] = wx
-                            newModels[g.id] = buildModel(db, g, wx, showUnread)
+                            members[g.id] = runCatching { db.memberWxids(g.id) }.getOrDefault(emptySet())
                         }
-                        models = newModels
+                        memberSets = members
+                        rebuildModels(db, groups, members, showUnread)
                         ConvLayout.build(snaps, specs, members, enabled = true)
                     }
                 }
+            }
+            probeCost(tRebuild, snapsCost, n, "full")
+        }
+
+        /**
+         * R22 性能探针：只在超阈值时打日志。
+         *
+         * 阈值取 8ms（≈ 半帧 @60Hz 的一半）。低于它的都算健康，不打日志 ——
+         * rebuild 每秒最多 4 次，每次都打会把 5000 行环形日志刷爆，把真正有用的
+         * 取证日志挤掉。高于它才是「需要退化成两段式」的信号。
+         *
+         * `path` 说明这次走的是哪条分支（short-circuit / light / full），
+         * 拿真机日志时能一眼看出耗时花在哪。
+         */
+        private fun probeCost(tStart: Long, snapsCost: Long, n: Int, path: String) {
+            val total = android.os.SystemClock.uptimeMillis() - tStart
+            if (total < PROBE_WARN_MS && snapsCost < PROBE_WARN_MS) return
+            LogX.i("K7 perf n=$n snaps=${snapsCost}ms total=${total}ms path=$path")
+        }
+
+        /** 收纳态：用给定成员集合重算每个分组行的显示内容（摘要/时间/未读）。 */
+        private fun rebuildModels(
+            db: GroupDb,
+            groups: List<Group>,
+            members: Map<Long, Set<String>>,
+            showUnread: Boolean,
+        ) {
+            val newModels = HashMap<Long, GroupRowView.Model>(groups.size)
+            for (g in groups) {
+                newModels[g.id] = buildModel(db, g, members[g.id].orEmpty(), showUnread)
+            }
+            models = newModels
+        }
+
+        /**
+         * 快照的时间指纹：只累加 timeMs，用来区分「仅摘要变了」和「完全没变」。
+         *
+         * 不参与 [ConvLayout.orderChanged]（那是判 wxid 顺序，决定 layout 要不要重算），
+         * 这里只回答「分组行该显示的时间/未读有没有变」。纯 Long 运算，2900 项一遍过，
+         * 不分配对象。
+         *
+         * ⚠️ **这个指纹有盲区，不是万能的**：`unread` / `digest` 不在 [readSnaps] 的产出里，
+         * 只能拿 timeMs 当代理。
+         * - 「收新消息」⇒ 微信 bump `conversationTime` ⇒ 覆盖得到 ✅
+         * - 「**标记已读**」⇒ unread 清 0 但 **timeMs 不动** ⇒ 指纹不变 ⇒ 被判成"完全没变"，
+         *   分组行未读角标会一直挂着。**这不是边缘场景，是高频日常操作。**
+         *   所以 [ConvFilter.refreshSummaries] 专门维护 [summariesVersion] 来破这个短路 ——
+         *   任何「只改 unread 不改时间」的入口都必须走那条，别指望这个指纹。
+         *
+         * 没有直接把 unread 并进指纹：那要给 [readSnaps] 的每个 entry 加字段，等于把
+         * 2900 次 `ConvReader.unread` 反射读压进每 250ms 一次的主线程路径，不划算。
+         */
+        private fun timeFingerprint(snaps: List<ConvLayout.ConvEntry>): Long {
+            var h = 1125899906842597L
+            for (e in snaps) h = h * 31 + e.timeMs
+            return h
+        }
+
+        /**
+         * 微信数据变了（收消息 / 置顶变化）时的去抖重建。
+         *
+         * 为什么**不走 [ConvFilter.refresh]**：refresh 里 `rememberAnchor` +
+         * `restoreAnchor` 会用 `setSelectionFromTop(0, anchor)` 把列表滚回顶部，
+         * 那是给「用户主动操作（切分组/标记已读）」用的；收消息时用户可能正滚在
+         * 列表中段，滚回顶部会打断阅读。这里只去抖 + 重算 + notify，不碰滚动位置。
+         * 去抖复用一个 [ConvFilter.mainHandler] 和 [ConvFilter.REBUILD_DEBOUNCE_MS]，
+         * 不新造 Handler。
+         */
+        fun onDataChanged() {
+            mainHandler.post {
+                if (observerRebuildQueued) return@post
+                observerRebuildQueued = true
+                mainHandler.postDelayed({
+                    observerRebuildQueued = false
+                    runCatching { rebuild() }
+                    runCatching { notifyDataSetChanged() }
+                }, REBUILD_DEBOUNCE_MS)
             }
         }
 
@@ -896,6 +1093,30 @@ object ConvFilter {
             return out
         }
 
+        /**
+         * 按 wxid 取「能给人看的名字」，取不到就回落成 wxid 本身。
+         *
+         * 三级回落（顺序不能反）：
+         * 1. `findFriend` —— `friend_cache` 是通讯录**实时快照**，改备注立刻生效；
+         * 2. `findMember` —— `group_member.display_name` 是**加人那一刻**的快照，
+         *    覆盖「已归组但不在通讯录」的人（群内未加好友、已删好友）；
+         * 3. 裸 wxid。
+         *
+         * **为什么必须先 friend 后 member**：反过来的话，用户改了备注，分组行
+         * 会一直显示加人时的旧备注，直到把这个人移出再重新加回来。
+         *
+         * **为什么不传 groupId 用 membersOf**：`membersOf` 要整组几十~几百行只为
+         * 取一个名字，而 [buildModel] 是**按会话循环**调用的 ⇒ N+1 放大。
+         * `findMember` 是主键单行命中，成本可忽略。
+         *
+         * ⚠️ `?.displayName` 之后还要判空串：`display_name` 是可空 TEXT 列，
+         * 写入时来源本身也可能是空，只判 null 会渲染出「名字是空白」的行。
+         */
+        private fun nameOf(db: GroupDb, wxid: String): String = runCatching {
+            db.findFriend(wxid)?.displayName?.takeIf { it.isNotBlank() }
+                ?: db.findMember(wxid)?.displayName?.takeIf { it.isNotBlank() }
+        }.getOrNull() ?: wxid
+
         /** A4 + A7：算出这个分组行该显示什么 */
         private fun buildModel(
             db: GroupDb,
@@ -915,17 +1136,14 @@ object ConvFilter {
                     timeMs = snaps[i].timeMs
                     val item = runCatching { wrapped.getItem(i) }.getOrNull()
                     msg = ConvReader.digest(item)
-                    val w = snaps[i].wxid
-                    sender = runCatching { db.findFriend(w)?.displayName }.getOrNull() ?: w
+                    sender = nameOf(db, snaps[i].wxid)
                 }
                 unread += ConvReader.unread(runCatching { wrapped.getItem(i) }.getOrNull())
             }
 
             // A4-c：整组没消息 → 第二行显示前 3 个成员名
             val names = if (timeMs == 0L && wx.isNotEmpty()) {
-                wx.take(3).map { w ->
-                    runCatching { db.findFriend(w)?.displayName }.getOrNull() ?: w
-                }
+                wx.take(3).map { w -> nameOf(db, w) }
             } else {
                 emptyList()
             }

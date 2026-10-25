@@ -157,6 +157,41 @@ object ConvLayout {
         return Layout(rows)
     }
 
+    /**
+     * 判断两次快照的**会话顺序**是否变了（只看 wxid 序列，不看 timeMs）。
+     * 顺序变了 ⇒ layout 必须重算；只有 timeMs 变 ⇒ layout 可以复用。
+     *
+     * 为什么 timeMs 不参与：layout 的锚点只依赖「每条会话属于哪个分组 + 它在
+     * 微信列表里的下标」，跟时间戳无关。收新消息时 timeMs 会变但 wxid 顺序往往
+     * 不变 —— 这时分组行占据的位置（锚点下标）没动，layout 可以原样复用；只有
+     * 真正发生重排（wxid 顺序变化）时锚点才会移动，才需要重算 layout。若把
+     * timeMs 也算进来，「仅时间变化」会被误判成「重排」，白白做一次 O(n) 的
+     * 全量重建（2900 项的量级）。
+     *
+     * 时间复杂度 O(n)，不分配大对象：这个方法在每次 rebuild 都要跑一遍，
+     * 2900 项的量级下不能有拼接字符串或建 Map 之类的开销。
+     *
+     * ⚠️ **空 wxid = 顺序未知 ⇒ 一律返 true（强制重算）**。
+     * [com.lx.wxgroup.feature.ConvFilter] 的 `readSnaps` 在 `wrapped.getItem(i)`
+     * 返回 null 时会塞一个 `ConvEntry("")` 占位（下标必须对齐，不能跳）。那种位置
+     * 上「上一次读到空、这一次还读到空」并不代表底层没变 —— 只是两次都没读到，
+     * 底层那条会话可能已经换人了。若把空串当普通值比较（`"" == ""` → false），
+     * 这两次都会被判成「顺序没变」，layout 不重算，该行按旧下标渲染 → 又变成
+     * 「点错人」。空 wxid 在正常会话里不可能出现（[build] 里也会过滤 blank），
+     * 所以这里保守返 true 的代价只是「adapter 重载窗口里多跑一次全量重建」，
+     * 而漏判的代价是用户可见的点错人。
+     */
+    fun orderChanged(old: List<ConvEntry>, new: List<ConvEntry>): Boolean {
+        if (old.size != new.size) return true
+        for (i in old.indices) {
+            val a = old[i].wxid
+            val b = new[i].wxid
+            if (a.isBlank() || b.isBlank()) return true
+            if (a != b) return true
+        }
+        return false
+    }
+
     private fun passthrough(convs: List<ConvEntry>): List<ConvRow> =
         convs.indices.map { ConvRow.Conv(it) }
 

@@ -1,6 +1,5 @@
 package com.lx.wxgroup.feature
 
-import java.security.MessageDigest
 import java.time.Instant
 import java.time.ZoneId
 import java.time.ZonedDateTime
@@ -20,7 +19,7 @@ import java.util.Locale
  * ```
  * <导出路径>/昵称(wxid)/yyyy-MM-dd-HHmm/
  *      -3447438253133393222.txt    ← text 文本
- *      <原图>                       ← 图片（待取证，见 MomentsExport.COPY_IMAGES）
+ *      <原图>                       ← 图片（命名规则已取证 R15，见 MomentsExport.COPY_IMAGES）
  * ```
  * 昵称在前是为了**人读得懂**，括号里带 wxid 是为了**唯一**（昵称会重名、会改）。
  */
@@ -243,102 +242,23 @@ object MomentsLogic {
         return out.toList()
     }
 
-    /**
-     * 图片候选文件的匹配线索（**待取证**用）。
-     *
-     * 微信磁盘上的朋友圈缓存文件命名规则**还没取证**（是 url 的 md5？还是 snsId+序号？不知道）。
-     * 这里把**所有可能用来对上的串**都吐出来，由 `MomentsExport.probe("img")`
-     * 拿去跟真实文件名对账，对上哪种就把那条规则写进导出逻辑。
-     */
-    fun mediaKeys(snsId: Long, urls: List<String>): Set<String> {
-        val out = LinkedHashSet<String>()
-        out.add(snsId.toString())
-        out.add(java.lang.Long.toUnsignedString(snsId))
-        for (u in urls) {
-            val tail = u.substringAfterLast('/').substringBefore('?')
-            if (tail.isNotBlank()) out.add(tail)
-            out.add(md5Hex(u))
-        }
-        return out
-    }
-
-    fun md5Hex(s: String): String = runCatching {
-        val d = MessageDigest.getInstance("MD5").digest(s.toByteArray(Charsets.UTF_8))
-        val sb = StringBuilder(d.size * 2)
-        for (b in d) sb.append(((b.toInt() and 0xFF) + 0x100).toString(16).substring(1))
-        sb.toString()
-    }.getOrDefault("")
-
+    // ⛔ 已删于 R20（A8 收敛）：mediaKeys() / md5Hex() / MD5_RE / md5sOf() / imageCandidates() /
+    //    pickExisting() —— 旧 md5 路线已三次真机证伪
+    //    （R15 分桶 0.68% / R16 全盘 find 零结果 / R19 文件名是 20 位数字串不含 md5）。
+    //    正解见 docs/_r19_a4_probe.md。证据见 docs/_r20_a8_del.md。
+    //
+    //    ---- 迁移保留：原 MD5_RE KDoc 里仍有价值的取证结论（勿再踩） ----
+    //    · BLOB 里确实混着 32 位小写 hex（2026-10-18 实测 `6ac4b5b0d7424bc7ba…` 等），
+    //      **但不要**认为「它们就是原图在磁盘缓存里的键」—— 已被否证。
+    //    · 把 4 个这类 md5 拿到 `/sdcard` + `/data/user/0/com.tencent.mm` 全盘
+    //      `find -name '<md5>*'`，**一个都搜不到**（R16）。
+    //    · `ls -lt image/` 里最近写入的是两天前的 `reader_-255_<md5>.jpg` —— 那是公众号
+    //      文章配图，不是朋友圈。
+    //    · R15 真机确证缓存落在 `…/com.tencent.mm/cache/<hash32>/sns/<hex1>/<hex2>/`，
+    //      但文件名是 `snsb_`/`snsu_`/`snst_` + mediaId 派生（R19 实测是 20 位数字串），
+    //      **不含 md5** ⇒ 「md5 对不上」是**命名规则**问题，仍是必然。
+    //    · 现行正解是索引直扫：[mediaIdsFromContent] → [snsNameCandidates] → [matchSnsFileName]。
     // ------------------------------------------------------------------ 图片原图留存
-
-    /**
-     * 32 位小写 hex 的 md5。朋友圈 content 的 BLOB 里混着这类串
-     * （2026-10-18 真机 `op=moments sub=img` 实测：
-     * `6ac4b5b0d7424bc7ba0fe9f8b9af8715` / `906834661446ea8dd11c6e2b2838d640` 等）。
-     *
-     * ⚠️ **不要**再写成「它们**是**原图在磁盘缓存里的键」—— 2026-10-18 后续设备实测
-     * **已否证**这个说法：把 4 个这类 md5 拿到
-     * `/sdcard` + `/data/user/0/com.tencent.mm` 上全盘 `find -name '<md5>*'`，
-     * **一个都搜不到**；`ls -lt image/` 里最近写入的文件是两天前的
-     * `reader_-255_<md5>.jpg`（那是公众号文章配图，不是朋友圈）。
-     * 结论：**朋友圈的图根本没被下载到本机**，所以 md5 无从对上 —— 这不是路径规则
-     * 写错，是「按 md5 找本地缓存」这条路本身在未缓存时不成立。
-     * 真正可行的线索是 content 里的**完整 CDN url**（见 [extractUrls]）。
-     */
-    private val MD5_RE = Regex("^[0-9a-f]{32}$")
-
-    /**
-     * 从 [mediaKeys] 产出的候选串里挑出 md5。
-     *
-     * 为什么要单独挑：`mediaKeys` 是「什么都吐出来对账用」的超集，里面还有 snsId、
-     * 无符号 snsId、URL 尾段、类型标记（`s` / `0`）。真正能当文件路径键的只有 md5。
-     *
-     * ⚠️ **只收小写**：微信自己落盘用小写 hex；大写形式无法判断大小写敏感性，
-     * 收进来只会在不区分大小写的文件系统上重复命中，收益为零。
-     */
-    fun md5sOf(keys: Collection<String>): List<String> =
-        keys.filter { MD5_RE.matches(it) }.distinct()
-
-    /** 直接从 BLOB 抽 md5（`md5sOf(mediaKeys(...))` 的组合快捷方式） */
-    fun md5sFrom(snsId: Long, blob: ByteArray?, urls: List<String> = emptyList()): List<String> =
-        md5sOf(mediaKeys(snsId, urls.ifEmpty { extractUrls(blob) }))
-
-    /**
-     * 原图缓存文件的**候选路径**。
-     *
-     * ⚠️ **本轮的诚实边界**：微信把朋友圈原图缓存放在哪个目录、用什么分层，**尚未取证**。
-     * 所以这里只产出「可能的形态」，由调用方 `File.exists()` 逐个实测 —— [pickExisting]
-     * 就是这么设计的（把存在性判断作为参数注入，本文件不做任何 IO）。
-     *
-     * 形态来自对微信其他缓存（头像/表情/语音）的通用做法，两种都试：
-     * 1. `root/<md5>` —— 单层扁平
-     * 2. `root/<md5[0..2]>/<md5>` —— 前两位分桶（微信多处缓存用这个）
-     */
-    fun imageCandidates(md5: String, roots: Collection<String>): List<String> {
-        if (!MD5_RE.matches(md5)) return emptyList()
-        val out = LinkedHashSet<String>()
-        for (r in roots) {
-            // 空白根单独判断：`"   ".trimEnd('/')` 仍是 `"   "`，直接拼会产出
-            // `"   /md5"` 这种不可能的路径，让 exists() 白跑一遍。
-            val base = r.trim().trimEnd('/')
-            if (base.isEmpty()) continue
-            out.add("$base/$md5")
-            out.add("$base/${md5.substring(0, 2)}/$md5")
-        }
-        return out.toList()
-    }
-
-    /**
-     * 从候选里挑第一个真实存在的。
-     *
-     * @param exists 存在性判定（注入进来，纯逻辑文件里不许写 `File.exists()`）
-     */
-    fun pickExisting(candidates: List<String>, exists: (String) -> Boolean): String? {
-        for (c in candidates) {
-            if (runCatching { exists(c) }.getOrDefault(false)) return c
-        }
-        return null
-    }
 
     /**
      * 头像 / 公众号图标不是原图，必须从图片导出里排除。
@@ -371,6 +291,265 @@ object MomentsLogic {
     fun imageFileName(snsId: Long, index: Int, ext: String): String {
         val e = ext.lowercase().takeIf { it in IMAGE_EXTS } ?: "jpg"
         return "img_${snsId}_${index}.$e"
+    }
+
+    // ------------------------------------------------- SNS 磁盘缓存文件名匹配（R15）
+
+    /**
+     * 朋友圈图片缓存的三级文件名前缀（`Lbf3/t0` 的 `getSnsBigName` / `getSnsUserName` /
+     * `getSnsThumbName` 反汇编确证，见方案 Q3）。
+     *
+     * 真机样本：`snsb_<id>` 1.1~1.5MB（原图）、`snsu_<id>` 6~42KB（压缩）、
+     * `snst_<id>` 20~70KB（缩略）。
+     */
+    private const val SNS_PREFIX_BIG = "snsb_"
+    private const val SNS_PREFIX_MID = "snsu_"
+    private const val SNS_PREFIX_THUMB = "snst_"
+
+    /**
+     * 必须排除的缓存文件名前缀（方案 Q2b「已确认的补充事实」3/4）：
+     * - `snstblur_` 模糊占位图（语义不是内容）
+     * - `wxid_` 头像缓存（不是朋友圈图片）
+     * - `sight_` 视频（本轮只导图片，视频留后续）
+     */
+    private val SNS_EXCLUDE_PREFIXES = listOf("snstblur_", "wxid_", "sight_")
+
+    /**
+     * 复刻 `Lbf3/t0#s(String)`（fliterPre）—— 文件名里那段数字的真正来源。
+     *
+     * 反汇编语义：**从下标 0 开始**，跳过所有**前导的**连续 `'0'`，返回从第一个非 `'0'`
+     * 处到结尾的子串。
+     * 例：`"15038644089917813396"` → 首位非 `'0'`，**原样返回** `"15038644089917813396"`；
+     * `"0015038873180398883448"` → 跳前导 0 → `"15038873180398883448"`。
+     *
+     * ⚠️ 真机 mediaId 长度实测有 20/22/23/24/25/26/27/28 共 8 种，**不要截断到定长**。
+     *
+     * 证据：DEX 反汇编 `Lbf3/t0;->s` 的 `[19] const/4 v3,#0`（2026-10-24 复核，
+     * 见 docs/_r15_sns_cache_plan.md「重大订正」节）。
+     */
+    fun fliterPre(s: String): String {
+        if (s.isEmpty()) return ""
+        var i = 0
+        while (i < s.length && s[i] == '0') i++
+        return if (i >= s.length) "" else s.substring(i)
+    }
+
+    /**
+     * 候选**文件名**列表（不含目录），按优先级排序：原图 > 压缩 > 缩略。
+     *
+     * 每个前缀配两种键（方案 Q2b）：`fliterPre(mediaId)` 优先，`mediaId` 原值兜底
+     * （防 fliterPre 判断错）。`fliterPre` 为空时只留空键 ⇒ 三个前缀各一项（共 3 项），
+     * 这种候选必然匹配不到真机文件（真机 `<前缀>` 后面一定是数字，被
+     * [matchSnsFileName] 的边界规则拒掉），所以不会误命中。
+     *
+     * 最多 6 项：`[snsb_<pre>, snsb_<mid>, snsu_<pre>, snsu_<mid>, snst_<pre>, snst_<mid>]`
+     */
+    fun snsNameCandidates(mediaId: String): List<String> {
+        if (mediaId.isEmpty()) return emptyList()
+        val pre = fliterPre(mediaId)
+        val keys = LinkedHashSet<String>(2)
+        keys.add(pre)
+        if (pre.isNotEmpty()) keys.add(mediaId)
+        val prefixes = arrayOf(SNS_PREFIX_BIG, SNS_PREFIX_MID, SNS_PREFIX_THUMB)
+        val out = ArrayList<String>(prefixes.size * keys.size)
+        for (p in prefixes) for (k in keys) out.add(p + k)
+        return out
+    }
+
+    /**
+     * 文件名白名单：只认 `snsb_` / `snsu_` / `snst_`，并排除
+     * `snstblur_` / `wxid_` / `sight_`。
+     *
+     * 这是**外层过滤**（建索引时用），不混进 [fliterPre] / [snsNameCandidates] /
+     * [matchSnsFileName] 的字符串匹配里，三者保持纯字符串语义。
+     */
+    fun isSnsMediaName(name: String): Boolean {
+        if (name.isEmpty()) return false
+        for (x in SNS_EXCLUDE_PREFIXES) if (name.startsWith(x)) return false
+        return name.startsWith(SNS_PREFIX_BIG) ||
+            name.startsWith(SNS_PREFIX_MID) ||
+            name.startsWith(SNS_PREFIX_THUMB)
+    }
+
+    /**
+     * 在**文件名索引**里找 [cand] 对应的真实文件名（方案 Q2b 的 `lookup`）。
+     *
+     * 两级：
+     * 1. 精确命中 → 直接返回
+     * 2. 前缀兜底（处理 `&enc<n>` / `_V2` 这类尾巴），但要求 `cand` 之后的下一个字符
+     *    **不是数字** —— 否则 `snst_150` 会把 `snst_1503...` 误判成同一条动态的图。
+     *
+     * 多个前缀候选时返回**字典序最小**的那个，保证跨设备/跨次运行结果确定（单测可断言）。
+     *
+     * @return 命中的文件名（不是路径；路径由调用方的 Map 查），没有则 null
+     */
+    fun matchSnsFileName(index: Set<String>, cand: String): String? {
+        if (index.isEmpty() || cand.isEmpty()) return null
+        if (index.contains(cand)) return cand
+        var best: String? = null
+        for (n in index) {
+            // 必须比 cand 长：等长且不等的情况上面精确命中已排除
+            if (n.length <= cand.length) continue
+            if (!n.startsWith(cand)) continue
+            val next = n[cand.length]
+            if (next in '0'..'9') continue
+            if (best == null || n < best) best = n
+        }
+        return best
+    }
+
+    // --------------------------------------------- protobuf 通用线格式（R15 · Q1 mediaId）
+
+    /**
+     * mediaId 链路的三个字段号（方案 Q1，DEX 已闭环）。
+     *
+     * ⚠️ **只用字段号，不用类名**：`TimeLineObject.ContentObj` / `i40.h` / `vm3.d` 这些
+     * 混淆名每次微信升级都可能变（`q54/vm3` 换个包就没了），但**线上协议的字段号是稳定的**。
+     * 所以这里按 protobuf 通用线格式手走字节，⛔ 绝不反射调 `vm3.parseFrom`。
+     *
+     * ## ⛔ R19 真机实测推翻了 R15 的字段号定案（2026-10-25）
+     * R15 定的是 `content --6--> ContentObj --8--> 媒体对象 --1--> mediaId`。
+     * 但真机 `op=snsg sub=mpath`（递归扫 protobuf、定位「≥18 位纯数字 ASCII 串」叶子）实测：
+     * ```
+     * MIDPATH snsId=... p=1(20),8>5>1(20),8>5>29(19),8>5>32(19)
+     * ```
+     * ⇒ 真正的 mediaId 路径是 **8 → 5 → 1**，不是 6 → 8 → 1。
+     * 决定性交叉验证（同一批 content，两条路径各解一次去比对设备缓存文件名）：
+     * - 顶层字段 1 的 20 位串：在 41 个真实缓存文件名里 **0 命中**；
+     * - `8>5>1` 的 20 位串：**命中**（`15039549883662348966` 等 4 个精确命中
+     *   `snst_<同名>.<...>` 缓存文件）。
+     * 且 `ids=0` 的旧现象与「字段 6 内没有字段 8」完全吻合（`in6` 实测无 8）。
+     *
+     * **保留旧路径作为回退**：若新路径解空，再试一次 `6 → 8 → 1`。
+     * 理由：不同版本/不同形态的动态（归档表 vs 当前表）结构可能有差异，
+     * 回退的成本是几次字节扫描，收益是抗版本漂移。
+     *
+     * ```
+     * content(BLOB) --8--> 容器 --5(repeated)--> 媒体对象 --1--> mediaId   ← 主路径（R19 实测）
+     * content(BLOB) --6--> ContentObj --8(repeated)--> 媒体对象 --1--> mediaId  ← 回退（R15 旧定案）
+     * ```
+     */
+    private const val PROTO_FIELD_CONTENT_OBJ = 8
+    private const val PROTO_FIELD_MEDIA_LIST = 5
+    private const val PROTO_FIELD_MEDIA_ID = 1
+    private const val LEGACY_FIELD_CONTENT_OBJ = 6
+    private const val LEGACY_FIELD_MEDIA_LIST = 8
+
+    /**
+     * 读一个 protobuf varint 的 **public 转发**（原实现仍为 private）。
+     *
+     * 为什么要有它：`MomentsExport` 的 `snsprobe` 探针要枚举 content 的**顶层字段号**
+     * 来判断 `PROTO_FIELD_*` 是否定错，需要直接扫线格式，而不是取某个已知字段。
+     * 只暴露读取能力，**不暴露任何字段语义常量**，业务路径不受影响。
+     */
+    fun readVarintPublic(b: ByteArray, start: Int): Pair<Long, Int>? = readVarint(b, start)
+
+    /** 读一个 protobuf varint；返回 (值, 下一个下标)；越界 / 超 64 位返回 null */
+    private fun readVarint(b: ByteArray, start: Int): Pair<Long, Int>? {
+        var value = 0L
+        var shift = 0
+        var i = start
+        while (i < b.size && shift < 64) {
+            val x = b[i].toInt() and 0xFF
+            value = value or ((x and 0x7F).toLong() shl shift)
+            i++
+            if (x and 0x80 == 0) return value to i
+            shift += 7
+        }
+        return null
+    }
+
+    /**
+     * 走 protobuf **通用线格式**，收集指定字段号（wiretype=2）出现的所有 length-delimited 段。
+     *
+     * 四种 wiretype 都按规范跳字节：0=varint、1=fixed64(+8)、2=length-delimited、
+     * 5=fixed32(+4)；3/4=group 不支持（现网朋友圈不用，遇到就整段作废）。
+     *
+     * @return 各段原始字节；**结构断裂**（字段号 0 / varint 越界 / 长度越界 / 跳字节出界）
+     *         时返回**空列表**，不抛异常、不返回半截结果（半截结果比空更危险：会让人以为解析成功）。
+     *
+     * ⚠️ 这不是「解析微信格式」：它只按 protobuf 规范跳字节，不解释任何字段语义。
+     */
+    fun protoSegments(b: ByteArray, field: Int): List<ByteArray> {
+        if (field <= 0 || b.isEmpty()) return emptyList()
+        val out = ArrayList<ByteArray>()
+        var i = 0
+        while (i < b.size) {
+            val t = readVarint(b, i) ?: return emptyList()
+            var pos = t.second
+            val tag = t.first
+            if (tag == 0L) return emptyList() // 字段号 0 非法
+            val f = (tag ushr 3).toInt()
+            when (tag and 0x07L) {
+                0L -> pos = (readVarint(b, pos) ?: return emptyList()).second
+                1L -> pos += 8                                    // fixed64
+                2L -> {
+                    val lv = readVarint(b, pos) ?: return emptyList()
+                    pos = lv.second
+                    val len = lv.first
+                    if (len < 0 || len > (b.size - pos).toLong()) return emptyList()
+                    val end = pos + len.toInt()
+                    if (f == field) out.add(b.copyOfRange(pos, end))
+                    pos = end
+                }
+                5L -> pos += 4                                    // fixed32
+                else -> return emptyList()                        // 3/4 = group，不支持
+            }
+            if (pos > b.size) return emptyList()
+            i = pos
+        }
+        return out
+    }
+
+    /**
+     * 取指定字段号（wiretype=2）的**第一个** UTF-8 String。
+     *
+     * @return 没有该字段 / 段为空 / 结构断裂 ⇒ null。**不抛异常。**
+     */
+    fun protoString(b: ByteArray, field: Int): String? {
+        val seg = protoSegments(b, field).firstOrNull() ?: return null
+        if (seg.isEmpty()) return null
+        return runCatching { String(seg, Charsets.UTF_8) }.getOrNull()
+    }
+
+    /**
+     * 一步到位：`content` → 容器(8) → 媒体列表(5) → 每个元素的 d(1)。
+     *
+     * ⛔ **字段号于 2026-10-25（R19）由真机取证改过**：原为 `6 → 8 → 1`，
+     * 实测 mediaId 实际在 `8 → 5 → 1`（证据见 [PROTO_FIELD_CONTENT_OBJ] 的 KDoc）。
+     * 新路径解空时回退到旧的 `6 → 8 → 1`，抗版本漂移。
+     *
+     * **契约（V1 钉死）**：返回的是 `vm3.d` **原值**，一个字符都不加工
+     * （不砍前缀、不截断、不加 `snsb_`）。下游 [snsNameCandidates] 会同时放
+     * `fliterPre(原值)` 和 `原值` 两个候选键，因此「只砍一次」和「已砍过」两种形态都能命中。
+     *
+     * 顺序 = 字节顺序（= 动态里的图片顺序），slot 序号靠它。
+     *
+     * `content == null` / 空 / 结构断裂 / 两条路径都取不到 ⇒
+     * 返回 `emptyList()`，**绝不抛异常**（上层有四态计数兜底）。
+     */
+    fun mediaIdsFromContent(content: ByteArray?): List<String> {
+        if (content == null || content.isEmpty()) return emptyList()
+        // 主路径（R19 真机实测）
+        val main = idsByPath(content, PROTO_FIELD_CONTENT_OBJ, PROTO_FIELD_MEDIA_LIST)
+        if (main.isNotEmpty()) return main
+        // 回退（R15 旧定案）
+        return idsByPath(content, LEGACY_FIELD_CONTENT_OBJ, LEGACY_FIELD_MEDIA_LIST)
+    }
+
+    /** 按「content → [objField] → [listField] → 1」取 mediaId；任一层取不到返回空表 */
+    private fun idsByPath(content: ByteArray, objField: Int, listField: Int): List<String> {
+        val obj = protoSegments(content, objField).firstOrNull() ?: return emptyList()
+        if (obj.isEmpty()) return emptyList()
+        val mediaList = protoSegments(obj, listField)
+        if (mediaList.isEmpty()) return emptyList()
+        val out = ArrayList<String>(mediaList.size)
+        for (m in mediaList) {
+            val id = protoString(m, PROTO_FIELD_MEDIA_ID) ?: continue
+            if (id.isEmpty()) continue
+            out.add(id)
+        }
+        return out
     }
 
     // ---------------------------------------------------------------- 原图下载（url 路线）
@@ -475,7 +654,7 @@ object MomentsLogic {
      * （公众号文章配图，与朋友圈无关），近两天 `/sdcard` 下**没有任何图片写入**。
      *
      * ⇒ 判定：**朋友圈的图从未下载到本机**（微信按需拉取，没主动点开大图就只在内存里画缩略）。
-     * 所以 [pickExisting] 全返回 null **是必然结果，不是 bug**。
+     * 所以旧 md5 路线（已于 R20 删除的 `pickExisting`）全返回 null **是必然结果，不是 bug**。
      *
      * ## 对实现方向的结论
      * 「按 md5 找本地缓存」这条路**在未缓存时不成立**，继续调目录规则是白费。

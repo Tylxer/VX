@@ -53,7 +53,12 @@ object MarkRead {
             }
         }
         LogX.i("MARK cleared=$n of ${wxids.size}")
-        if (n > 0) ConvFilter.refresh()
+        // ⚠️ 必须是 refreshSummaries()，不能是 refresh()：
+        // 标记已读只把会话对象上的未读清 0，**不动 conversationTime**。而列表重建的
+        // 轻量路径靠 timeFingerprint（只看 timeMs）判「摘要要不要重算」⇒ 用 refresh()
+        // 会被判成「完全没变」直接短路，分组行的未读角标一直挂着，直到这个组来下一条消息。
+        // refreshSummaries() 递增 summariesVersion 专门破这个短路。
+        if (n > 0) ConvFilter.refreshSummaries()
         return n
     }
 

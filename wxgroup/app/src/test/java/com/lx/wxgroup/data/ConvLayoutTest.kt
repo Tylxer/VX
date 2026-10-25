@@ -309,4 +309,72 @@ class ConvLayoutTest {
         val l = ConvLayout.build(c, listOf(group(1), group(2)), mapOf(1L to setOf("a")))
         assertEquals("G:1 | C:b | G:2", l.dump(c))
     }
+
+    // ------------------------------------------------------------ orderChanged（分层失效判据）
+
+    /** 长度不同：条数变化必须重算 layout */
+    @Test
+    fun orderChanged_different_length_returns_true() {
+        assertTrue(ConvLayout.orderChanged(convs("a", "b"), convs("a", "b", "c")))
+        assertTrue(ConvLayout.orderChanged(convs("a", "b", "c"), convs("a", "b")))
+    }
+
+    /** 条数相同、wxid 顺序不同：必须返回 true，否则 layout 冻结 → 点错人 */
+    @Test
+    fun orderChanged_reordered_returns_true() {
+        assertTrue(ConvLayout.orderChanged(convs("a", "b", "c"), convs("b", "a", "c")))
+        assertTrue(ConvLayout.orderChanged(convs("a", "b", "c"), convs("c", "b", "a")))
+    }
+
+    /** 只有 timeMs 变、顺序不变：layout 可复用，必须返回 false（timeMs 不参与顺序判据） */
+    @Test
+    fun orderChanged_same_order_different_time_returns_false() {
+        val old = listOf(
+            ConvLayout.ConvEntry("a", 100),
+            ConvLayout.ConvEntry("b", 200),
+            ConvLayout.ConvEntry("c", 300),
+        )
+        val new = listOf(
+            ConvLayout.ConvEntry("a", 999),
+            ConvLayout.ConvEntry("b", 888),
+            ConvLayout.ConvEntry("c", 777),
+        )
+        assertFalse(ConvLayout.orderChanged(old, new))
+    }
+
+    /** 完全相同：返回 false */
+    @Test
+    fun orderChanged_identical_returns_false() {
+        val a = listOf(ConvLayout.ConvEntry("a", 1), ConvLayout.ConvEntry("b", 2))
+        val b = listOf(ConvLayout.ConvEntry("a", 1), ConvLayout.ConvEntry("b", 2))
+        assertFalse(ConvLayout.orderChanged(a, b))
+    }
+
+    /** 空列表边界 */
+    @Test
+    fun orderChanged_empty_boundaries() {
+        assertFalse(ConvLayout.orderChanged(convs(), convs()))
+        assertTrue(ConvLayout.orderChanged(convs(), convs("a")))
+        assertTrue(ConvLayout.orderChanged(convs("a"), convs()))
+    }
+
+    /**
+     * 空 wxid 占位 = 顺序未知 ⇒ 必须返 true（保守强制重算）。
+     *
+     * `readSnaps` 在 `getItem(i)` 返回 null 时塞 `ConvEntry("")` 占位以对齐下标。
+     * 「两次都读到空」不代表底层没变 —— 只是两次都没读到，那条会话可能已经换人。
+     * 若把空串当普通值比（`"" == ""` → false），layout 不重算 ⇒ 该行按旧下标渲染
+     * ⇒ 又变成「点错人」。这条用例就是钉死这个保守判据。
+     */
+    @Test
+    fun orderChanged_blank_wxid_forces_true() {
+        // 两边都在同一位置读到 null 占位：仍然要重算
+        assertTrue(ConvLayout.orderChanged(convs("a", "", "c"), convs("a", "", "c")))
+        // 只有一边是空占位：同样必须重算
+        assertTrue(ConvLayout.orderChanged(convs("a", "", "c"), convs("a", "b", "c")))
+        assertTrue(ConvLayout.orderChanged(convs("a", "b", "c"), convs("a", "", "c")))
+        // 首尾位置也要覆盖（不能只判中间）
+        assertTrue(ConvLayout.orderChanged(convs("", "b"), convs("", "b")))
+        assertTrue(ConvLayout.orderChanged(convs("a", ""), convs("a", "")))
+    }
 }

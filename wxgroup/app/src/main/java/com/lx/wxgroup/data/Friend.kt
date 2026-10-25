@@ -28,33 +28,15 @@ data class Friend(
 }
 
 /**
- * wxid 的形态决定了它是什么东西 —— 这套规则来自微信的命名惯例，跨版本稳定。
+ * wxid 的形态决定了它是什么东西 —— 规则收敛到 [ContactFilter]（纯判据，可单测）。
+ * 这里只做「Kind → GroupDb.WxidType 的 Int」映射，判据本身不进这个带 Android 依赖的文件。
  */
 object WxidKind {
-    /** 普通好友：早期注册的 wxid_ 前缀，或后来改成可自定义微信号（这里是原始 id） */
-    private const val PREFIX_WXID = "wxid_"
-    /** 公众号 / 服务号 */
-    private const val PREFIX_GH = "gh_"
-    /** 群聊 */
-    private const val SUFFIX_CHATROOM = "@chatroom"
-    /** 微信团队 / 文件传输助手 / 系统号等，不属于可分组的联系人 */
-    private val SYSTEM_IDS = setOf(
-        "weixin", "filehelper", "newsapp", "fmessage", "floatbottle",
-        "medianote", "qqmail", "feedsapp", "voicevoipapp", "blogapp",
-        "masssendapp", "shakeapp", "lbsapp", "qqfriend", "readerapp",
-        "notifymessage", "qmessage", "helper_entry", "officialaccounts",
-        "notification_messages", "brandcontact", "contacthelper",
-    )
-
-    fun typeOf(wxid: String): Int = when {
-        wxid.isBlank() -> GroupDb.WxidType.UNKNOWN
-        wxid.endsWith(SUFFIX_CHATROOM) -> GroupDb.WxidType.CHATROOM
-        wxid.startsWith(PREFIX_GH) -> GroupDb.WxidType.OFFICIAL_ACCOUNT
-        wxid in SYSTEM_IDS -> GroupDb.WxidType.UNKNOWN
-        wxid.contains("@app") -> GroupDb.WxidType.UNKNOWN
-        wxid.startsWith(PREFIX_WXID) -> GroupDb.WxidType.FRIEND
-        // 老用户的原始 id 就是自定义微信号，没有 wxid_ 前缀
-        else -> GroupDb.WxidType.FRIEND
+    fun typeOf(wxid: String): Int = when (ContactFilter.classify(wxid)) {
+        ContactFilter.Kind.CHATROOM -> GroupDb.WxidType.CHATROOM
+        ContactFilter.Kind.OFFICIAL_ACCOUNT -> GroupDb.WxidType.OFFICIAL_ACCOUNT
+        ContactFilter.Kind.FRIEND -> GroupDb.WxidType.FRIEND
+        ContactFilter.Kind.UNKNOWN -> GroupDb.WxidType.UNKNOWN
     }
 }
 

@@ -3,6 +3,7 @@ package com.lx.wxgroup.feature
 import android.content.ContentValues
 import android.os.SystemClock
 import com.lx.wxgroup.data.GroupDb
+import com.lx.wxgroup.data.HintTextLogic
 import com.lx.wxgroup.data.Keys
 import com.lx.wxgroup.data.Kv
 import com.lx.wxgroup.util.LogX
@@ -47,17 +48,6 @@ object RevokeRescue {
     private const val REVOKE_FLAG = 0x10000000
 
     private const val CONFLICT_NONE = 0
-
-    /** 插入提示行时用：msgId 万一撞了就静默放弃，好过抛异常 */
-    private const val CONFLICT_IGNORE = 4
-
-    /**
-     * 「取 id 失败」的哨兵值。
-     *
-     * ⚠️ 不能是 0，更不能靠 `<= 0` 判断：提示行的 msgId 走**负数区间**，
-     * -1 / -2 都是合法的成功结果。
-     */
-    private const val BAD_ID = Long.MIN_VALUE
 
     /**
      * 最近一次真正对齐过的开关状态。`null` = 还一次都没同步过。
@@ -282,181 +272,56 @@ object RevokeRescue {
     }
 
     /**
-     * 由微信原本要写的撤回文案推出「已阻止」提示条的文案。
+     * 由微信原本要写的撤回文案 + 被救消息的原样，推出「已阻止」角标的文案。
      *
      * 微信要写的是 `"昵称" 撤回了一条消息`，我们只要把中间那截换掉就能带上昵称：
      * `"昵称" 尝试撤回一条消息（已阻止）`。比自己拼 `("xx")` 更准（群聊里是群昵称）。
+     *
+     * @param origType / [origContent] 被救消息的**原本** type / content（来自台账），
+     *        由 [HintTextLogic.summary] 折成内容摘要接在句尾（空摘要则不接）。
+     *
+     * 📌 R21d 起这条文案只给**角标**用（[com.lx.wxgroup.feature.HintBadge] 不直接用，
+     * 它只用 `HintTextLogic.summary`）；独立提示行的插入路径已废除。
      */
-    fun hintTextFrom(revokeContent: String?): String? {
-        if (revokeContent.isNullOrBlank()) return null
-        val who = revokeContent.substringBefore("撤回了一条消息").trim()
-        if (who.isEmpty()) return null
-        return "$who 尝试撤回一条消息（已阻止）"
+    fun hintTextFrom(revokeContent: String?, origType: Int, origContent: String?): String? {
+        val who = HintTextLogic.whoFrom(revokeContent) ?: return null
+        return HintTextLogic.buildHint(who, HintTextLogic.summary(origType, origContent))
     }
 
+    // ------------------------------------------------------------------ 启动自检
+
     /**
-     * 往微信的 `message` 表插一条**我们自己生成的**「已阻止」提示行。
+     * ⛔ **已废（2026-10-25 R21d，方案 1）—— 不许再往里写。**
      *
-     * 「显示撤回提示」打开时用：撤回被拦下了，但用户想知道「对方刚才想撤一条」。
+     * 曾经的做法：往微信 `message` 表插一条 `type=10000` 的「已阻止」提示行，
+     * msgId 走负数区间（`-1`、`-2`…）以避开与真实消息撞号。
      *
-     * ⚠️ 这是往微信库里写东西，风险比只改写高，所以：
-     * - 字段尽量给全，但**缺了也不会崩**（`message` 表没有必填约束，实测）；
-     * - 全程 `runCatching`，写不进去就返回 0，只记一行日志，绝不牵连微信；
-     * - 用 CONFLICT_IGNORE：万一 msgId 撞了，静默失败好过抛异常。
+     * ## 为什么废掉（两次独立定案，都不是猜的）
      *
-     * @return 新行的 msgId（可能是**负数**，见 [nextMsgId]）；0 = 没插进去
+     * **① 会让微信闪退。** 微信 `h9.convertFrom`（消息行反序列化）里校验
+     * `msgId` 必须 ≥ 一个下界（静态解析 `h9.x1`：`const-wide/16 0xE100`(=57600)
+     * + `cmp-long` + `if-lez` 放行 + `throw fr4.b`），**负数一律被拦**。
+     * 崩溃链：`ChattingUIFragment.V → s2.a → v2.k0 → j9.F8 → h9.convertFrom → h9.x1
+     * → fr4.a.g → fr4.a.h`，抛 `fr4.b: msgId not in the reasonable scope`。
+     * ⇒ 进任何含负数 msgId 行的会话**必崩**。详见 `docs/_r21d_crash_root.md`。
+     * ⚠️ 原注释里「微信永远不会生成负数 msgId，因此不可能撞号」这半句是对的，
+     * **但推论错**：微信不「生成」不代表它「肯读」。
+     *
+     * **② 位置必然错位。** 提示行 `createTime = System.currentTimeMillis()`
+     * （= 撤回那一刻），而原文 `createTime` 是**发出那一刻**。微信按 `createTime`
+     * 排序 ⇒ 提示行永远排在最后，与原文隔几十条消息。
+     * 这是「另起一条记录」这个做法本身的固有缺陷，改任何字段都治不好。
+     *
+     * ## 现在怎么做
+     * 改画**角标**：不插任何行，靠 `HintBadge` 挂 `onBindViewHolder`，
+     * 在**原文那个 itemView** 上画一个小标签 ⇒ 物理上不可能与原文分离。
+     *
+     * @return **恒为 0**（永远插不进去）。保留签名只为让 `arins` 调试 op 不炸。
      */
+    @Deprecated("R21d 方案 1：不再往 message 表插行（负数 msgId 会让微信闪退 + 位置错位）")
     fun insertHint(talker: String, hintText: String): Long {
-        if (talker.isBlank() || hintText.isBlank()) return 0
-        val db = AntiRevoke.wxDb()
-        if (db == null) {
-            LogX.w("RRV hint: no wx db yet")
-            return 0
-        }
-        val m = insertMethod(db)
-        if (m == null) {
-            LogX.w("RRV hint: no insert method on ${db.javaClass.name}")
-            return 0
-        }
-        val newId = nextMsgId(db)
-        // ⚠️ 必须是 == BAD_ID，不能写 <= 0：新 id 本来就是负数
-        if (newId == BAD_ID) {
-            LogX.w("RRV hint: nextMsgId failed")
-            return 0
-        }
-        return runCatching {
-            val cv = ContentValues().apply {
-                put("msgId", newId)
-                // msgSvrId 微信用来做服务端去重。跟 msgId 一样走负数区间，
-                // 既不可能跟真实消息撞，也不可能在 message 表若有唯一索引时互相撞。
-                put("msgSvrId", newId)
-                put("type", SYS_HINT)
-                put("isSend", 0)
-                put("talker", talker)
-                put("content", hintText)
-                put("createTime", System.currentTimeMillis())
-                put("status", 3)
-                put("flag", 0)
-                put("talkerId", 0)
-                put("msgSeq", 0)
-                put("bizChatId", -1)
-            }
-            AntiRevoke.selfWrite.set(true)
-            return try {
-                // 4 参 = insertWithOnConflict（带冲突策略），3 参 = 普通 insert
-                val row = if (m.parameterTypes.size == 4) {
-                    m.invoke(db, TABLE_MESSAGE, null, cv, CONFLICT_IGNORE)
-                } else {
-                    m.invoke(db, TABLE_MESSAGE, null, cv)
-                }
-                // ⚠️ **不能靠返回值判成功**：msgId 是负数时 rowid 就是那个负数，
-                // 而 -1 同时又代表「冲突/失败」——两种含义撞在一起，判不出来。
-                // 直接回查一次这一行在不在，最稳（插入是低频操作，多一次查询无所谓）。
-                if (rowExists(db, newId)) {
-                    LogX.i("RRV hint inserted msgId=$newId (row=$row) text=${hintText.take(24)}")
-                    newId
-                } else {
-                    LogX.w("RRV hint insert returned $row, row not found (msgId=$newId)")
-                    0L
-                }
-            } finally {
-                AntiRevoke.selfWrite.set(false)
-            }
-        }.onFailure {
-            LogX.w("RRV hint insert failed: ${it.javaClass.simpleName}: ${it.message?.take(60)}")
-        }.getOrDefault(0L)
-    }
-
-    /**
-     * 插入「已阻止」提示行，并且**只插一次**。
-     *
-     * ⚠️ 判重是必须的：拦下一次撤回后微信会重试同一条 update 上千次
-     * （实测 1966 次 / 7.5 分钟），不判重就会插出上千条一模一样的提示。
-     */
-    @Synchronized
-    fun insertHintOnce(rescuedMsgId: Long, talker: String, revokeContent: String?): Long {
-        val db = GroupDb.current() ?: return 0
-        // ⚠️ 用 != 0L 判「已经插过」：提示行 msgId 是**负数**，写 > 0 会让判重永远不成立，
-        // 于是微信的重试风暴（实测 1966 次）会插出上千条一模一样的提示行。
-        val existing = db.getRescued(rescuedMsgId)?.hintMsgId ?: 0
-        if (existing != 0L) return existing
-        val text = hintTextFrom(revokeContent) ?: return 0
-        val hintId = insertHint(talker, text)
-        if (hintId != 0L) db.setRescuedHint(rescuedMsgId, hintId)
-        return hintId
-    }
-
-    /**
-     * 回查某条 message 行在不在。
-     *
-     * 存在的理由：插入的返回值判不了成功 —— msgId 用负数时 `rowid` 就是那个负数，
-     * 而 `-1` 同时又表示「冲突 / 失败」，两种含义撞车。只能回查。
-     */
-    private fun rowExists(db: Any, msgId: Long): Boolean {
-        val m = rawQueryMethod(db) ?: return false
-        return runCatching {
-            val cur = m.invoke(
-                db,
-                AntiRevokeHint.BYPASS +
-                    "select 1 from $TABLE_MESSAGE where msgId=?",
-                argsFor(m, msgId.toString())
-            ) ?: return false
-            try {
-                XposedHelpers.callMethod(cur, "moveToFirst") as? Boolean == true
-            } finally {
-                runCatching { XposedHelpers.callMethod(cur, "close") }
-            }
-        }.getOrDefault(false)
-    }
-
-    /**
-     * 取下一个「已阻止」提示行专用的 msgId。
-     *
-     * ⚠️ **绝不能用 `max(msgId)+1`**：微信自己的 msgId 也是自增的，我们抢到 N 之后
-     * 微信下一条真实消息就会拿到同一个 N，`CONFLICT_IGNORE` 让**用户的真实新消息被静默丢弃**
-     * —— 这是本项目最硬的一条数据丢失路径。
-     *
-     * 所以提示行统一走**负数区间**（从 -1 往下）。微信永远不会生成负数 msgId，因此：
-     * - 不可能跟真实消息撞号；
-     * - 不会污染 `max(msgId)`，微信后续的自增完全不受影响。
-     *
-     * ⚠️⚠️ **负 id 会让所有「`> 0` 才算有效」的哨兵判据全部失效** —— 这是踩过一次的坑：
-     * `insertHint` 里 `if (newId <= 0) return 0` 对新 id 恒真（根本不插）、
-     * `row > 0` 判插入成功恒假、`hintMsgId > 0` 判重恒假（会重复插上千条）。
-     * **凡是装提示行 msgId 的地方一律用 `!= 0L` 判有效，失败哨兵用 [BAD_ID]。**
-     */
-    private fun nextMsgId(db: Any): Long {
-        val m = rawQueryMethod(db)
-        if (m == null) {
-            LogX.w("RRV nextMsgId: rawQuery not found")
-            return BAD_ID
-        }
-        return runCatching {
-            val cur = m.invoke(
-                db,
-                AntiRevokeHint.BYPASS +
-                    "select min(msgId) from $TABLE_MESSAGE where msgId < 0",
-                null
-            )
-            if (cur == null) {
-                LogX.w("RRV nextMsgId: null cursor")
-                return@runCatching BAD_ID
-            }
-            try {
-                if (XposedHelpers.callMethod(cur, "moveToFirst") as? Boolean != true) {
-                    LogX.w("RRV nextMsgId: no row")
-                    return@runCatching BAD_ID
-                }
-                // 还没有任何负数行时 min() 是 NULL → getLong 得 0，从 -1 开始
-                val min = (XposedHelpers.callMethod(cur, "getLong", 0) as? Long) ?: 0L
-                if (min == 0L) -1L else min - 1L
-            } finally {
-                runCatching { XposedHelpers.callMethod(cur, "close") }
-            }
-        }.onFailure {
-            LogX.w("RRV nextMsgId err ${it.javaClass.simpleName}: " +
-                "${(it.cause ?: it).message?.take(90)}")
-        }.getOrDefault(BAD_ID)
+        LogX.w("RRV hint DISABLED (R21d 方案1): talker=${talker.take(12)} text=${hintText.take(20)}")
+        return 0L
     }
 
     /** 拦下当场就要写的伪装字段（与 [valuesFor] 的 on=true 分支同一套规则） */
@@ -537,29 +402,12 @@ object RevokeRescue {
         return m
     }
 
-    private var insertRef: Method? = null
-
-    private fun insertMethod(db: Any): Method? {
-        insertRef?.let { return it }
-        val m = runCatching {
-            db.javaClass.methods.firstOrNull {
-                it.name == "insertWithOnConflict" &&
-                    it.parameterTypes.size == 4 &&
-                    it.parameterTypes[0] == String::class.java &&
-                    it.parameterTypes[1] == String::class.java &&
-                    it.parameterTypes[2] == ContentValues::class.java
-            } ?: db.javaClass.methods.firstOrNull {
-                // 降级：wcdb 未必暴露 4 参版本，3 参的 insert 也一样能写进去
-                it.name == "insert" &&
-                    it.parameterTypes.size == 3 &&
-                    it.parameterTypes[0] == String::class.java &&
-                    it.parameterTypes[1] == String::class.java &&
-                    it.parameterTypes[2] == ContentValues::class.java
-            }
-        }.getOrNull()
-        insertRef = m
-        return m
-    }
+    /**
+     * ⛔ **已删（R21d 方案 1）** 原来的 `insertMethod()` / `insertRef`：
+     * 它们是 `insertHint()` 的反射依赖，而 `insertHint()` 已废（不再往 `message` 表插行）。
+     * 现在全模块对微信 `message` 表**只读**（`rawQuery`）+ **只 update**（已有行），
+     * **零 insert** ⇒ 这条数据丢失/闪退路径从根上消失。
+     */
 
     /**
      * 删掉我们自己插入的「已阻止」提示行 —— **安全阀**。
@@ -596,6 +444,81 @@ object RevokeRescue {
         }.getOrElse {
             "err ${it.javaClass.simpleName}: ${(it.cause ?: it).message?.take(90)}"
         }
+    }
+
+    // ------------------------------------------------------------------ 启动自检
+
+    /** [selfCheckNegRows] 是否已经跑过（每个微信进程只跑一次） */
+    @Volatile
+    private var selfChecked = false
+
+    /**
+     * 启动自检：**清理历史遗留的负数 msgId 行**。
+     *
+     * ## 为什么必须有这一步
+     * 方案 1 之前的版本会往 `message` 表插负数 msgId 的提示行，而那些行是**写进微信库的**
+     * —— 卸载模块、清数据、换 APK 都不会让它们消失。它们留在库里就会让微信在
+     * **进入那个会话时闪退**（`fr4.b: msgId not in the reasonable scope`，
+     * 见 `docs/_r21d_crash_root.md` §1-§3）。
+     *
+     * 所以每次微信进程起来、拿到消息库句柄之后，必须主动扫一次：只要还有
+     * `msgId < 0` 的行就全删掉，并留一条 `LogX.w`。
+     *
+     * ## 为什么删「所有 `msgId < 0`」是安全的
+     * 微信**不会生成**负数 msgId（`msgId` 是自增主键的正整数区间）。所以负数行
+     * 只可能是**我们自己插的**。这条判据已由真机 dump 交叉验证：
+     * 当时库里恰好 10 条负数行，逐列 dump 后三重校验全过（`msgId<0` + `type=10000`
+     * + `content` 含阻止文案），见 `tools/_r21d_dump_neg_rows.py` 的产物
+     * `_r21d_neg_rows.json`。
+     *
+     * ⚠️ 但**仍然先查后删**，不做「无条件 DELETE」：查得到条数才能写进日志，
+     * 而「删了几条」是事后判断「这次自检到底干了什么」的唯一线索。
+     *
+     * ⚠️ 会写微信的库 ⇒ **必须在后台线程调**（`EntryReceiver` / bootstrap 里都是 io）。
+     * 内部自己 catch 全部异常，绝不牵连微信启动。
+     */
+    fun selfCheckNegRows() {
+        if (selfChecked) return
+        selfChecked = true
+        runCatching {
+            val db = AntiRevoke.wxDb()
+            if (db == null) {
+                // 句柄还没抓到：把标志复位，让下一次有机会再试。
+                // ⚠️ 不复位的话，这次没库就永久不再自检 —— 而负数行正是「进会话必崩」，
+                // 用户会以为模块坏了。
+                selfChecked = false
+                return
+            }
+            val n = countNegRows(db)
+            if (n <= 0) {
+                LogX.i("RRV selfcheck: no negative msgId rows (ok)")
+                return
+            }
+            LogX.w("RRV selfcheck: found $n negative msgId rows -> deleting (they crash wx)")
+            val r = deleteHints(0)
+            LogX.w("RRV selfcheck: cleanup result $r (was $n)")
+        }.onFailure {
+            LogX.w("RRV selfcheck failed: ${it.javaClass.simpleName}")
+        }
+    }
+
+    /** `select count(*) from message where msgId < 0`；-1 = 查不到（不是「没有」） */
+    private fun countNegRows(db: Any): Long {
+        val m = rawQueryMethod(db) ?: return -1
+        return runCatching {
+            val cur = m.invoke(
+                db,
+                AntiRevokeHint.BYPASS +
+                    "select count(*) from $TABLE_MESSAGE where msgId < 0",
+                null
+            ) ?: return -1
+            try {
+                if (XposedHelpers.callMethod(cur, "moveToFirst") as? Boolean != true) return -1
+                (XposedHelpers.callMethod(cur, "getLong", 0) as? Long) ?: -1
+            } finally {
+                runCatching { XposedHelpers.callMethod(cur, "close") }
+            }
+        }.getOrDefault(-1)
     }
 
     private const val MAX_CLEAR = 2000

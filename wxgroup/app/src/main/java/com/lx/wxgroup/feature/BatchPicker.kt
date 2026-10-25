@@ -76,12 +76,13 @@ object BatchPicker {
         val adapter = FriendAdapter(ctx, all.toMutableList(), selected)
 
         val counter = UiKit.label(ctx, "", 13f, bold = true)
-        val search = EditText(ctx).apply {
+        // R21：见 UiKit 中该助手的 KDoc
+        val search = UiKit.bindSoftInput(EditText(ctx).apply {
             hint = "搜索昵称 / 备注"
             inputType = InputType.TYPE_CLASS_TEXT
             maxLines = 1
             textSize = 14f
-        }
+        })
 
         val btnAll = android.widget.Button(ctx).apply { text = "全选可见" }
         val btnNone = android.widget.Button(ctx).apply { text = "清空选择" }
@@ -117,6 +118,10 @@ object BatchPicker {
             .setNegativeButton("取消", null)
             .setPositiveButton("确定", null)
             .create()
+
+        // ⛔ R21：这个 Dialog 不经过 Panel，Panel 里清的 flag 管不到它 ——
+        // 不清这里，搜索框照样不弹输入法（能拿到焦点，但 IME 永远不出现）。
+        UiKit.clearAltFocusableIm(dialog, " BatchPicker")
 
         list.setOnItemClickListener { _, _, position, _ ->
             val f = adapter.getItem(position)
@@ -164,6 +169,8 @@ object BatchPicker {
                 val ms = System.currentTimeMillis() - t1
                 val msg = "新增 $added 人 / 移出 $removed 人（${ms}ms）"
                 LogX.i("BATCH applied group=$groupId: $msg")
+                // 成员关系变了 ⇒ 重读 cachedMembers 再重算（refresh() 不重读成员，筛选态下会无效）
+                ConvFilter.refreshMembers()
                 UiKit.toast(ctx, msg)
                 dialog.dismiss()
             }

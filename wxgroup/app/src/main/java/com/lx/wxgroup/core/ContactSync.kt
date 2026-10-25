@@ -50,6 +50,11 @@ object ContactSync {
     /** 在 bootstrap 里用宿主的 Context 调一次，否则冷却时间没法持久化 */
     fun init(context: Context) {
         appContext = context.applicationContext
+        // R21：装 rcontact 直读的句柄捕获钩子（拿到 EnMicroMsg.db 即后台补 @openim）。
+        // 装在 bootstrap（attach）阶段，早于微信任何一次 rcontact 查询，句柄能自动捕获，
+        // 不依赖用户打开通讯录。判据/实现见 core/ContactSqlSource.kt。
+        runCatching { ContactSqlSource.install(context) }
+            .onFailure { LogX.w("SYNC ContactSqlSource install failed: ${it.javaClass.simpleName}") }
     }
 
     /** 由 UiProbe 在抓到通讯录列表时回调 */
@@ -142,6 +147,10 @@ object ContactSync {
     }.getOrNull() ?: 0
 
     private fun doSync(listView: View, adapter: Any) {
+        // R21 兜底：用户打开通讯录时，若 EnMicroMsg.db 句柄已捕获但 @openim 还没补成功，
+        // 再试一次（低频，非阻塞；正常情况启动时捕获钩子已自动补完，这里直接 no-op）。
+        ContactSqlSource.trySupplement()
+
         val t0 = System.currentTimeMillis()
 
         val db0 = GroupDb.current()

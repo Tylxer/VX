@@ -16,6 +16,7 @@ import android.widget.Toast
 import com.lx.wxgroup.core.HostContext
 import com.lx.wxgroup.data.Friend
 import com.lx.wxgroup.data.GroupDb
+import com.lx.wxgroup.ui.UiKit
 import com.lx.wxgroup.util.LogX
 
 /**
@@ -116,6 +117,10 @@ object GroupPicker {
             .setPositiveButton("确定", null)
             .create()
 
+        // ⛔ R21：这个 dialog 不走 Panel，Panel 清的 flag 管不到它 ——
+        // 不清这里，「新分组名称」输入框点了不弹键盘。
+        UiKit.clearAltFocusableIm(dialog, " GroupPicker")
+
         dialog.setOnShowListener {
             dialog.getButton(AlertDialog.BUTTON_POSITIVE).setOnClickListener {
                 apply(ctx, db, friend, nameInput.text?.toString()?.trim().orEmpty(), boxes)
@@ -152,6 +157,8 @@ object GroupPicker {
         }
         val msg = "已更新：加 $added 组 / 移 $removed 组"
         LogX.i("PICKER applied ${friend.wxid}: $msg")
+        // 成员关系变了 ⇒ 重读 cachedMembers 再重算（refresh() 不重读成员，筛选态下会无效）
+        if (target != null || added > 0 || removed > 0) ConvFilter.refreshMembers()
         runCatching { Toast.makeText(ctx, msg, Toast.LENGTH_SHORT).show() }
             .onFailure { LogX.w("PICKER toast failed: ${it.javaClass.simpleName}") }
     }

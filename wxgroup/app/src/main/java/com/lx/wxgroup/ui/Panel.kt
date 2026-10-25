@@ -163,6 +163,20 @@ object Panel {
             // 这里换成 pop()，才能「返回上一页」而不是「整个关掉」
             backBtn?.setOnClickListener { pop() }
             render()
+            // ⛔ R21：清 FLAG_ALT_FOCUSABLE_IM 必须放在这里、且**在 render() 之后**。
+            //
+            // AOSP `AlertController.installContent()` 里有：
+            //   if (mView == null || !canTextInput(mView)) mWindow.setFlags(FLAG_ALT_FOCUSABLE_IM, ...)
+            // 即「内容里找不到可输入控件 ⇒ 这个窗口不需要 IME ⇒ 打上替代焦点模式」。
+            //
+            // 而 installContent() 是在 show() → dispatchOnCreate() → AlertDialog.onCreate() 里跑的，
+            // **早于** OnShowListener（后者由 show() 末尾的 sendShowMessage() 触发）。
+            // Panel 的页面是**延迟渲染**的（render() 才 addView 真页面），show() 那一刻 scroll
+            // 里还是空的 ⇒ canTextInput=false ⇒ flag 被重新置上。
+            // ⚠️ 所以在 `d.show()` **之前**清是无效的，会被这一步覆盖（R21 复核实测推翻）。
+            UiKit.clearAltFocusableIm(d, " Panel")
+            // 兜底：万一某版本在 addView 之后还会再 setFlags，下一帧再清一次（幂等，无副作用）
+            d.window?.decorView?.post { UiKit.clearAltFocusableIm(d, " Panel(post)") }
         }
         d.setOnDismissListener {
             dialog = null

@@ -374,6 +374,8 @@ object Rows {
         if (resetTo != null) b.setNeutralButton("恢复默认", null)
 
         b.create().apply {
+            // ⛔ R21：不走 Panel 的 dialog 必须单独清 ALT_FOCUSABLE_IM，否则输入框点了不弹键盘
+            UiKit.clearAltFocusableIm(this, " Rows.input")
             setOnShowListener {
                 getButton(AlertDialog.BUTTON_POSITIVE).setOnClickListener {
                     dismiss()

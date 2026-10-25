@@ -73,12 +73,23 @@ object SnsCdnImage {
     private val batchReqTotal = AtomicInteger()
     private val copySeq = AtomicInteger()
 
-    @Volatile private var cfg = Cfg(false, false)
+    // ⛔ R20（A8 收敛）：`Cfg` 删掉 `rewritePath` 字段后，这里的初值也必须从
+    // `Cfg(false, false)` 改成单参 —— 漏改是 A8-del lane 与 SnsCdnImage 接口脱节
+    // 留下的编译错（主会话收口时修，`compileDebugKotlin` 实测抓出）。
+    @Volatile private var cfg = Cfg(false)
     @Volatile private var cfgAt = 0L
     @Volatile private var reqClassOk = true
     @Volatile private var parts = ""
 
-    private data class Cfg(val enabled: Boolean, val rewritePath: Boolean)
+    // ⛔ 已删于 R20（A8 收敛）：字段 `rewritePath`（`sns.cdn_rewrite_path`）—— 全仓**零读取点**，
+    // 唯一出现处是 refreshCfg() 的构造写入。判死依据：批量下载路线 2026-10-24 已定案放弃
+    // （docs/取证结论.md ⑫.9：`picCachePath` 字段存在但恒空，hitPicE=7 / hitNoField=0；
+    // 批量请求 ok0.x0#n 从未触发，hitN=0）⇒ 这条路走不通。
+    // 朋友圈原图留存的正解是 SNS 磁盘缓存直读（docs/_r19_a4_probe.md：rows=10 rowsHit=4 ids=7 hit=6）。
+    //
+    // ⚠️ key 本身仍在 `Keys.kt` 登记（`hidden = true`）且被 `PrefsVisibilityTest` 断言，
+    // **本次不动它** —— 删 const 会牵扯备份合并与 Kv 屏显，不属本 lane 边界。
+    private data class Cfg(val enabled: Boolean)
 
     // ---------------------------------------------------------------- 配置 / 熔断
 
@@ -95,7 +106,11 @@ object SnsCdnImage {
      */
     private fun refreshCfg() {
         val prev = cfg
-        val next = Cfg(Kv.getBool(Keys.SNS_CDN_IMG), Kv.getBool(Keys.SNS_CDN_REWRITE_PATH))
+        // ⛔ 已删于 R20（A8 收敛）：这里原本还有第二参 `Kv.getBool(Keys.SNS_CDN_REWRITE_PATH)`，
+        // 它唯一的作用是给零读取点的 `Cfg.rewritePath` 赋值。字段删了，这次多余的 SQLite 读
+        // 也一并去掉（`refreshCfg()` 每次都要跑，一次刷新两次 Kv.getBool = 两次磁盘查询）。
+        // ⚠️ key 本身仍在 `Keys.kt` 登记并被 `PrefsVisibilityTest` 断言，不受影响。
+        val next = Cfg(Kv.getBool(Keys.SNS_CDN_IMG))
         // 开关「关→开」边沿 ⇒ 清熔断
         if (!prev.enabled && next.enabled) breaker.reset()
         cfg = next

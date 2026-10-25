@@ -97,7 +97,8 @@ object GroupDetailPage {
         root.addView(bar)
 
         // ---- 搜索 ----
-        val search = EditText(ctx).apply {
+        // R21：见 UiKit 中该助手的 KDoc
+        val search = UiKit.bindSoftInput(EditText(ctx).apply {
             hint = "搜索成员"
             textSize = 14f
             setTextColor(UiKit.fgColor(ctx))
@@ -111,7 +112,7 @@ object GroupDetailPage {
                 rightMargin = pad
                 bottomMargin = UiKit.dp(ctx, 8)
             }
-        }
+        })
         root.addView(search)
 
         // ---- 成员列表 ----
@@ -145,6 +146,9 @@ object GroupDetailPage {
         root.addView(bottom)
 
         dialog.setContentView(root)
+        // ⛔ R21：裸 Dialog 不在 Panel 栈里，Panel 清的 flag 管不到它 ⇒ 单独清，
+        // 否则「搜索成员」框点了没反应（能拿到焦点，IME 不出现）。
+        UiKit.clearAltFocusableIm(dialog, " GroupDetailPage")
         dialog.setOnDismissListener { GroupBar.refreshAll() }
         close.setOnClickListener { dialog.dismiss() }
         manage.setOnClickListener { MemberPage.show(groupId, groupName) }
@@ -258,6 +262,8 @@ object GroupDetailPage {
                         val n = db.removeMember(groupId, member.wxid)
                         LogX.i("DETAIL remove group=$groupId wxid=${member.wxid} rows=$n")
                         adapter.remove(member)
+                        // 成员关系变了 ⇒ 重读 cachedMembers 再重算（refresh() 不重读成员，筛选态下会无效）
+                        ConvFilter.refreshMembers()
                     }
                     2 -> {
                         val friend = db.findFriend(member.wxid)

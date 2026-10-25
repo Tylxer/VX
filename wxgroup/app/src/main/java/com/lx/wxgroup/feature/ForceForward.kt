@@ -742,9 +742,365 @@ object ForceForward {
                 //
                 // ⚠️ 本分支会复制文件 + 入网，**必须由调用方投后台线程**（见 EntryReceiver）。
                 "fileb " + FileSenderB.probe(talker, path)
-            else -> "subs=stat,on,off,dump,pick,filerdy,filebrdy,fileb"
+            "msgsnap" -> msgsnapReport()
+            else -> "subs=stat,on,off,dump,pick,filerdy,filebrdy,fileb,msgsnap"
         }
     }.getOrElse { "error=${it.javaClass.simpleName}" }
+
+    // ------------------------------------------------------------ G2 探针（消息种类识别链）
+
+    /**
+     * G2 真机探针：一次抓全「长按的这条消息是什么」。
+     *
+     * 链路（全部为 `docs/_r16_g2_msgsnap.md` 里**反汇编坐实**的锚点，无一处猜测）：
+     *
+     * ```
+     * pressedView()（长按最深 View，已有）
+     *   → itemRoot = 向上 ≤12 层找「像单条消息根」的 View
+     *   → 再向上 ≤12 层找列表 View，用 [listKindOf] **按继承链**判定形态：
+     *        "recycler" = 继承链上有 ChattingRecyclerView（运行时是 ScrollControlRecyclerView）
+     *        "listview" = 继承链上有 ChattingListView    （运行时是 ScrollControlListView / view.l）
+     *     同时记录 MMChattingListView（外层容器）；parent 链没筛到时兜底调它的
+     *     `getListView()`（`iget-object T:u3; return`）直接拿列表对象 ⇒ 更硬
+     *   → 按 listKind 分派取 position：
+     *        recycler ⇒ 候选链 [F0, G0, getChildAdapterPosition, getChildLayoutPosition]
+     *                   不中再退化 A0scan（[getFirstVisiblePosition() ±50] 窗口遍历，比对 c3.d）
+     *        listview ⇒ getPositionForView(v)（ListView 继承来的真实实现）
+     *   → getBaseAdapter().getItem(position)   ⇒ Object（实际是 h9，需强转）
+     *   → h9.getMsgId() / h9.getType()         ⇒ 未混淆 getter
+     *   → field_isSend / field_imgPath         ⇒ 字段在父类 jj/m7，沿链反射
+     * ```
+     *
+     * ⚠️ 链路图第 2 步（找列表）**不能**用 `javaClass.name.contains("ChattingListView")`：
+     * 运行时对象是**子类**，类名里不含基类名（见 [listKindOf] 的 KDoc）。曾经因为这个
+     * `chatList` 恒 null、`listKind` 恒 `"none"`，整条分派逻辑变死代码（R16-V2 报，P0）。
+     *
+     * ⚠️ 三处易踩的坑（都已实测，别改回去）：
+     * 1. `ChattingListView` **没有** `getPositionForView` —— 它只继承 `ListView` 的同名方法；
+     *    只有 `ChattingRecyclerView` 自己声明了 `(View)I`。但 `ChattingRecyclerView` 那个
+     *    声明是**恒返回 -1 的空桩**（反汇编仅 `const/4 -1` + `return` 两条指令），
+     *    所以 **RecyclerView 形态不能走 `getPositionForView`**；
+     *    只有 listview 形态才走 `getPositionForView`（`ListView` 继承来的真实实现）。
+     *    ⚠️ 而且 `androidx.recyclerview.widget.RecyclerView` 当前被 R8 混淆，
+     *    `getChildAdapterPosition` 已更名为 `F0`、`getChildLayoutPosition` 更名 `G0`
+     *    （classes12.dex 反汇编实证：`(View)I` 签名只有 F0/G0 两个方法）。反射定位必须走
+     *    混淆名候选链 [F0, G0, getChildAdapterPosition, getChildLayoutPosition]，不能只试原名。
+     * 2. 取 adapter **只有混淆名 `m()`**（`ChattingListView` / `ChattingRecyclerView` 都是），
+     *    没有 `getAdapter`；未混淆的是 `MMChattingListView.getBaseAdapter()` ⇒ 优先用它。
+     * 3. `t3.getItem(I)` 返回 **`Object`**（不是 `h9`）；`eb4/q` 才返回具体 `h9`。
+     *    `getBaseAdapter()` 的静态类型是 `t3` ⇒ 拿回来是 `Any`，**按名字反射取值**，
+     *    不做 `as? h9` 强转（`h9` 是微信类，模块里没有也不需要编译期引用）。
+     *
+     * 全程 `runCatching` 单步兜底，**每一步失败都留可见痕迹**（`list=none` / `pos=-1` /
+     * `adapter=none` / `h9=none`），绝不静默吞成「看起来正常但全是 none」。
+     *
+     * ⚠️ **TTL 坑（真机取证必看）**：生产用的 [pressedView] 带 `BURST_TTL_MS=10s` 过期，
+     * 而 adb 发广播到模块收到**经常超过 10 秒**（`am start` + sleep + adb 往返）。
+     * 若直接用 [pressedView]，「长按 → 发广播」的取证会稳定拿到 null，
+     * 表现成 `view=none`，极易被误判成「adapter 链不通」。
+     * 所以探针走 [staleViewForProbe]：**忽略 TTL** 读最近一次长按的 View，
+     * 并额外打 `ageMs=` 标明它有多陈旧（真机上这个值会明显 >10000，属正常）。
+     */
+    private fun msgsnapReport(): String {
+        val v = staleViewForProbe()
+        val ageMs = synchronized(pressLock) {
+            if (burstStartAt == 0L) -1L else System.currentTimeMillis() - burstStartAt
+        }
+        val talker = currentChatTalker()
+        val viewName = v?.javaClass?.name?.substringAfterLast('.') ?: "none"
+        // ⚠️ 陈旧 View 若已从窗口摘下，getPositionForView 必然 -1 —— 这跟「链路不通」是两件事，
+        //    必须单独标出来，否则真机上会被误判成 adapter 链失败。
+        val attached = if (v == null) "n/a" else runCatching {
+            if (android.os.Build.VERSION.SDK_INT >= 19) v.isAttachedToWindow else true
+        }.getOrNull().toString()
+
+        var node: View? = v
+        var chatList: View? = null
+        // ⚠️ 必须把「继承链命中」和「类名像列表」分开存。
+        //    原因：从 itemRoot 往上走时，**内层**可能先遇到一个类名含 "Recycler" 的容器
+        //    （消息卡片里内嵌的横向列表之类）。若让 `unknown` 也能占住 chatList，
+        //    真正的聊天列表还没走到就被抢先占位，pos 恒 -1 却 listKind != "none"
+        //    ⇒ diagnose() 会误报「列表找到了但定位失败」，比 list=none 更难查。
+        //    ⇒ 继承链命中（recycler/listview）优先级最高，`unknown` 只作最后兜底。
+        var chatListLoose: View? = null
+        var outer: View? = null
+        var guard = 0
+        while (node != null && guard++ < 12) {
+            val n = node.javaClass.name
+            // ⛔ 不要用 n.contains("ChattingListView"/"ChattingRecyclerView") 找列表！
+            //    运行时对象是**子类**，类名里不含这两个基类名：
+            //      ScrollControlRecyclerView  (super = ChattingRecyclerView)
+            //      ScrollControlListView      (super = ChattingListView)
+            //      ui.chatting.view.l         (super = ScrollControlListView -> ChattingListView)
+            //    实测三者 contains("ChattingListView") 与 contains("ChattingRecyclerView") 全为 false
+            //    ⇒ 曾导致 chatList 恒 null、listKind 恒 "none"、整个分派逻辑是死代码（R16-V2 报）。
+            //    改为按继承链判定（见下方 listKindOf）。
+            if (chatList == null) {
+                when (listKindOf(node)) {
+                    "recycler", "listview" -> chatList = node
+                    "unknown" -> if (chatListLoose == null) chatListLoose = node
+                }
+            }
+            if (n.contains("MMChattingListView")) {
+                // ⚠️ 这个 contains 是**安全**的（已实测 MMChattingListView 全 dex 无子类），
+                //    但为了防御未来加子类，用继承链再确认一次。
+                outer = node
+                break
+            }
+            node = node.parent as? View
+        }
+        // 兜底路径 1：parent 链没筛到时，用 MMChattingListView.getListView()
+        // （`iget-object T:u3; return`）直接拿列表对象 —— 这比靠类名在 parent 链里猜更硬
+        // （T 字段在 l(Context) 里赋值，就是上面那三个子类之一）。
+        if (chatList == null && outer != null) {
+            chatList = runCatching {
+                outer.javaClass.getMethod("getListView").invoke(outer) as? View
+            }.getOrNull()
+        }
+        // 兜底路径 2：只有前两条都失败，才用「类名像列表」的那个（日志里会被标成 unknown）。
+        if (chatList == null) chatList = chatListLoose
+        val listKind = if (chatList == null) "none" else listKindOf(chatList)
+
+        // position：按 listKind 分派定位。
+        //  ⚠️ ChattingRecyclerView.getPositionForView 是恒 -1 的空桩（反汇编实证），
+        //    recycler 形态必须走 RecyclerView 自身定位，不能用它。
+        //
+        //  ⚠️ RecyclerView 在当前微信（8.0.48 / 2588 GP）的 dex 里被 R8 混淆：
+        //    `getChildAdapterPosition` 已更名为 `F0`，`getChildLayoutPosition` 更名为 `G0`
+        //    （classes12.dex 反汇编实证：`(View)I` 签名只有 F0/G0 两个方法）。
+        //    所以候选链是 [F0, G0, getChildAdapterPosition, getChildLayoutPosition]，
+        //    混淆名在前（当前版本可用）、原名在后（未混淆版本兜底）。
+        var pos = -1
+        var posVia = "none"
+        var posFail = "none"
+        if (chatList != null && v != null) {
+            // `unknown`（找到了像列表的对象但继承链不认识）时：类名里带 Recycler 的按 recycler 试，
+            // 否则按 listview 试 —— 都比直接放弃有信息量，且 posFail/posVia/listCls 会留下完整痕迹。
+            val effKind = when {
+                listKind == "recycler" -> "recycler"
+                listKind == "listview" -> "listview"
+                listKind == "unknown" && chatList.javaClass.name.contains("Recycler") -> "recycler"
+                else -> "listview"
+            }
+            if (effKind == "recycler") {
+                // ① 先找 item 根 View：从 v 沿 parent 链向上，直到 parent == chatList。
+                var itemRoot: View? = null
+                var n: View? = v
+                var g2 = 0
+                while (n != null && g2++ < 12) {
+                    if (n.parent === chatList) { itemRoot = n; break }
+                    n = n.parent as? View
+                }
+                if (itemRoot != null) {
+                    // ② 混淆名候选链：逐个 getMethod，第一个能拿到且 invoke >= 0 的胜出。
+                    //    顺序很重要：F0/G0 在前（当前版本），原名在后（未来版本兜底）。
+                    //    ⚠️ getMethod 期异常（NoSuchMethodException）与 invoke 期异常必须分开捕获：
+                    //       invoke 抛 ClassCastException（常被 InvocationTargetException 包着）
+                    //       说明传进去的 itemRoot 不是 RecyclerView 的直接 child（I0 里 check-cast
+                    //       LayoutParams 失败），是另一种失败，不能和「方法名不存在」混成 noMethod。
+                    val candidates = arrayOf("F0", "G0", "getChildAdapterPosition", "getChildLayoutPosition")
+                    var allMissing = true
+                    var sawClassCast = false
+                    for (name in candidates) {
+                        val m = runCatching {
+                            chatList.javaClass.getMethod(name, View::class.java)
+                        }.getOrNull()
+                        if (m == null) continue
+                        allMissing = false
+                        val r = runCatching { m.invoke(chatList, itemRoot) as Int }
+                        val p = r.getOrNull() ?: -1
+                        if (p >= 0) { pos = p; posVia = name; break }
+                        // 展开 cause 链找 ClassCastException（invoke 会包进 InvocationTargetException）
+                        var cause: Throwable? = r.exceptionOrNull()
+                        while (cause != null) {
+                            if (cause is ClassCastException) { sawClassCast = true; break }
+                            cause = cause.cause
+                        }
+                    }
+                    // ⚠️ 只有**最终没拿到 pos** 才记失败原因。
+                    //    否则会出现自相矛盾的日志：F0 抛 classCast → G0 成功拿到 5
+                    //    ⇒ `pos=5 posVia=G0 posFail=classCast`，diagnose() 会当成失败来判读。
+                    if (pos < 0) {
+                        if (allMissing) posFail = "noMethod"
+                        else if (sawClassCast) posFail = "classCast"
+                    }
+                } else {
+                    posFail = "itemRootNotFound"
+                }
+                // ③ A0 扫描降级为最后兜底：仅当候选链「全部没拿到方法」（noMethod）时才跑。
+                //    扫描用 getFirstVisiblePosition() 起点 + ±50 窗口，避免几千条的 O(N) 全扫
+                //    （这段跑在主线程长按回调里，全扫有 ANR 风险）。
+                //    ⚠️ 绝不调用 ChattingRecyclerView.v(I)（它忽略形参、恒返回第一个可见项，空壳），
+                //       只直接 A0(pos) 取 ViewHolder 比对其 d(itemView)。
+                if (itemRoot != null && pos < 0 && posFail == "noMethod") {
+                    var scanHit = -1
+                    runCatching {
+                        val a0 = chatList.javaClass.getMethod("A0", Int::class.javaPrimitiveType)
+                        val first = runCatching {
+                            chatList.javaClass.getMethod("getFirstVisiblePosition").invoke(chatList) as Int
+                        }.getOrNull() ?: -1
+                        val count = runCatching {
+                            chatList.javaClass.getMethod("getCount").invoke(chatList) as Int
+                        }.getOrNull() ?: 0
+                        // ⚠️ getFirstVisiblePosition 非 LinearLayoutManager 时返回 -1 ⇒ 必须判 >=0，
+                        //    否则窗口起点算错。拿不到时退化成从头扫但限 100 次。
+                        val from: Int
+                        val to: Int
+                        if (first >= 0) {
+                            // ⛔ 起点 = first（可见区第一个），**不再往前减 50**。
+                            //    原写法 `first - 50` 是错的（R17-V3 报，P1）：A0(i) =
+                            //    findViewHolderForAdapterPosition(i)，它只在本 position 有
+                            //    attach 的 ViewHolder 时返回非 null，**不可见的 position 返回
+                            //    null 是常态**。从 first-50 起扫，第一个 i 几乎必然落在
+                            //    ViewHolder 已被回收的区间 ⇒ 原 `?: break` 第一次迭代就退出，
+                            //    扫描永远扫不到真正可见的长按 item（只有列表停在顶部、
+                            //    from 被 coerce 到 0 时才可能命中）。
+                            //    长按的 item 必然可见 ⇒ 从 first 起扫是充分且最省的。
+                            from = first
+                            to = minOf(first + 50, count - 1)
+                        } else {
+                            from = 0
+                            to = minOf(100, count - 1)
+                        }
+                        for (i in from..to) {
+                            // ⛔ null 要 `continue` 不能 `break`（同 P1）：
+                            //    A0 返回 null 的原因不止「I 字段早退（layout 进行中）」，
+                            //    「该 position 的 ViewHolder 已回收」也是 null，而那恰恰是
+                            //    窗口里大多数 position 的常态。break 会让扫描在第二个 position
+                            //    就死掉。这里就 51~101 次反射，continue 完的开销可忽略。
+                            val vh = runCatching { a0.invoke(chatList, i) }.getOrNull() ?: continue
+                            val iv = XposedHelpers.getObjectField(vh, "d") as? View
+                            if (iv === itemRoot) { scanHit = i; break }
+                        }
+                    }
+                    if (scanHit >= 0) { pos = scanHit; posVia = "A0scan"; posFail = "none" }
+                }
+                // 候选链有方法但都返回 -1，或 A0 扫描也没命中
+                if (pos < 0 && posFail == "none") posFail = "returnedMinusOne"
+            } else {
+                // listview 形态：getPositionForView（ListView 继承来的真实实现）。
+                //  ⚠️ 失败要留原因，否则日志是 `pos=-1 posVia=none posFail=none`，
+                //    「方法没找到」和「方法找到了但返回 -1」两种情况分不开。
+                val m = runCatching {
+                    chatList.javaClass.getMethod("getPositionForView", View::class.java)
+                }.getOrNull()
+                if (m != null) {
+                    pos = runCatching { m.invoke(chatList, v) as Int }.getOrNull() ?: -1
+                    posVia = "getPositionForView"
+                    if (pos < 0) posFail = "returnedMinusOne"
+                } else {
+                    posFail = "noMethod"
+                }
+            }
+        }
+
+        // adapter：优先 MMChattingListView.getBaseAdapter()（未混淆名），退回 m()
+        var adapter: Any? = null
+        var adapterVia = "none"
+        if (outer != null) {
+            val m = runCatching { outer.javaClass.getMethod("getBaseAdapter") }.getOrNull()
+            if (m != null) {
+                adapter = runCatching { m.invoke(outer) }.getOrNull()
+                if (adapter != null) adapterVia = "getBaseAdapter"
+            }
+        }
+        if (adapter == null && chatList != null) {
+            val m = runCatching { chatList.javaClass.getMethod("m") }.getOrNull()
+            if (m != null) {
+                adapter = runCatching { m.invoke(chatList) }.getOrNull()
+                if (adapter != null) adapterVia = "m()"
+            }
+        }
+
+        var msgId = "none"
+        var type = "none"
+        var isSend = "none"
+        var imgPath = "none"
+        var h9Name = "none"
+        if (adapter != null && pos >= 0) {
+            val getItem = runCatching {
+                adapter.javaClass.getMethod("getItem", Int::class.javaPrimitiveType)
+            }.getOrNull()
+            val got = runCatching { getItem?.invoke(adapter, pos) }.getOrNull()
+            if (got != null) {
+                h9Name = got.javaClass.name.substringAfterLast('.')
+                // ⚠️ 未混淆 getter：getMsgId()J / getType()I（继承自 jj/m7）
+                msgId = runCatching {
+                    got.javaClass.getMethod("getMsgId").invoke(got)
+                }.getOrNull()?.toString() ?: "none"
+                type = runCatching {
+                    got.javaClass.getMethod("getType").invoke(got)
+                }.getOrNull()?.toString() ?: "none"
+                // ⚠️ 字段声明在父类 jj/m7（PRIVATE），XposedHelpers 沿类链找
+                isSend = runCatching {
+                    XposedHelpers.getObjectField(got, "field_isSend")
+                }.getOrNull()?.toString() ?: "none"
+                imgPath = runCatching {
+                    XposedHelpers.getObjectField(got, "field_imgPath") as? String
+                }.getOrNull()?.take(100) ?: "none"
+            }
+        }
+
+        return "FORWARD MSGSNAP talker=$talker view=$viewName ageMs=$ageMs attached=$attached " +
+            "list=$listKind listCls=${chatList?.javaClass?.name ?: "none"} " +
+            "pos=$pos posVia=$posVia posFail=$posFail " +
+            "adapter=${adapter?.javaClass?.name ?: "none"} " +
+            "adapterVia=$adapterVia h9=$h9Name msgId=$msgId type=$type isSend=$isSend " +
+            "imgPath=$imgPath menu=${lastChatMenuTexts.joinToString("|")}"
+    }
+
+    /**
+     * 判定一个 View 是不是聊天列表，以及是哪种形态 —— **按继承链判定，不靠类名字符串**。
+     *
+     * 为什么不能用 `javaClass.name.contains("ChattingListView")`：
+     * 运行时对象是子类，类名里**不含**基类名。实测（DEX `class_defs` 的 super 链）：
+     * - `ScrollControlRecyclerView` super = `ChattingRecyclerView`
+     * - `ScrollControlListView`     super = `ChattingListView`
+     * - `ui.chatting.view.l`        super = `ScrollControlListView` → `ChattingListView`
+     *
+     * 三者 `contains("ChattingListView")` / `contains("ChattingRecyclerView")` 全为 `false`
+     * ⇒ 曾导致 `chatList` 恒 null、`listKind` 恒 `"none"`，整条定位链路是死代码（R16-V2 报，P0）。
+     *
+     * @return `"recycler"` / `"listview"` / `"unknown"`（像列表但两条继承链都不认识，日志会带类名）/ 
+     *         `"notList"`（不是列表）
+     */
+    private fun listKindOf(view: View?): String {
+        if (view == null) return "notList"
+        var c: Class<*>? = view.javaClass
+        while (c != null) {
+            when (c.name) {
+                "com.tencent.mm.pluginsdk.ui.tools.ChattingRecyclerView" -> return "recycler"
+                "com.tencent.mm.pluginsdk.ui.tools.ChattingListView" -> return "listview"
+            }
+            c = c.superclass
+        }
+        // 继承链上没有那两个类 ⇒ 区分「完全不是列表」与「是列表但类名不认识（unknown）」
+        val nm = view.javaClass.name
+        return when {
+            // ⛔ 必须**先排除** MMChattingListView（R17-V3 报，P2）：
+            //    它是 MMSnapDownView 系的外壳（super=MMPullDownView），本身**不是列表**，
+            //    但类名里含 "ListView" 子串 ⇒ 会被下面那行判成 "unknown"，
+            //    于是在「严格命中失败」时它可能抢先占住 chatListLoose。
+            //    虽然兜底顺序把 getListView() 排在 loose 之前（通常能救回来），
+            //    但让一个外壳占住「可疑列表」位没有任何价值，只会让 listCls 传出误导性类名。
+            //    ⇒ 这一类直接判 notList。用 FQCN 精确比，避免误伤未来同前缀的真列表。
+            nm == "com.tencent.mm.ui.chatting.view.MMChattingListView" -> "notList"
+            nm.contains("Recycler") -> "unknown"
+            nm.contains("ListView") || nm.contains("AbsListView") -> "unknown"
+            else -> "notList"
+        }
+    }
+
+    /**
+     * 探针专用：**忽略 TTL** 读最近一次长按抓到的 View。
+     *
+     * 与 [pressedView] 的唯一区别就是跳过 `BURST_TTL_MS` 过期判断。
+     * 生产路径**必须**继续用 [pressedView]（过期就当作没有长按，避免拿陈旧 View 去发错消息）；
+     * 探针只是取证，陈旧 View 反而有用 —— 但它是否仍挂在窗口上要看 `isAttachedToWindow`。
+     */
+    private fun staleViewForProbe(): View? = synchronized(pressLock) {
+        burstDeepest?.get()
+    }
 
     // ------------------------------------------------------------ 基础设施
 

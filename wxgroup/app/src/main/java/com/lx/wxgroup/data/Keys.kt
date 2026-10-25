@@ -260,7 +260,10 @@ object Prefs {
         ),
         PrefSpec(Keys.ANTIREVOKE_COMMENT, PrefKind.SWITCH, "false", "防撤回", "防止评论撤回"),
         PrefSpec(Keys.ANTIREVOKE_COMMENT_DELETED_TAG, PrefKind.SWITCH, "false", "防撤回", "显示评论[已删除]标签"),
-        PrefSpec(Keys.ANTIREVOKE_SHOW_HINT, PrefKind.SWITCH, "false", "防撤回", "显示撤回提示"),
+        // 📌 R21d 起语义变更：原来是「插入一条独立的提示行」，现在是「在原文气泡上画角标」。
+        // 原因见 feature/RevokeRescue.kt 的 insertHint KDoc（负数 msgId 让微信闪退 + 提示行错位）。
+        // ⚠️ key 名不改（改名会让老用户的选择丢失），只改展示文案。
+        PrefSpec(Keys.ANTIREVOKE_SHOW_HINT, PrefKind.SWITCH, "false", "防撤回", "在原文上标「已阻止撤回」"),
         PrefSpec(Keys.ANTIREVOKE_RESTORE_VIEW, PrefKind.SWITCH, "false", "防撤回", "恢复默认显示"),
         PrefSpec(
             Keys.ANTIREVOKE_DEBUG_SELF, PrefKind.SWITCH, "false", "防撤回",
@@ -300,8 +303,28 @@ object Prefs {
         PrefSpec(Keys.MOMENTS_AUTO_EXPORT, PrefKind.SWITCH, "false", "朋友圈", "自动导出朋友圈动态"),
         PrefSpec(Keys.MOMENTS_EXPORT_PATH, PrefKind.PATH, DEFAULT_EXPORT_PATH, "朋友圈", "路径"),
         PrefSpec(Keys.MOMENTS_EXPORT_LIST, PrefKind.ENTER, "[]", "朋友圈", "设置自动导出名单"),
-        PrefSpec(Keys.SNS_CDN_IMG, PrefKind.SWITCH, "false", "朋友圈", "批量下载图片"),
-        PrefSpec(Keys.SNS_CDN_REWRITE_PATH, PrefKind.SWITCH, "false", "朋友圈", "改写落盘路径"),
+        // ⚠️ 下面两项从设置页下架（hidden = true，**定义保留**）。
+        //    两个 key 的「无效」原因**不同，别混写**：
+        //    - sns.cdn_img **有消费点**（SnsCdnImage.kt:102 读它做门控 H1 开门），但整条路已判死：
+        //      真机定案（docs/取证结论.md ⑫.9，2026-10-24）两条判据 ——
+        //        ① picCachePath 字段**存在但恒为空**（hitPicE=7 / hitNoField=0）⇒ 拿不到落盘路径；
+        //        ② 批量下载请求 `ok0.x0#n` **一次都没被调用**（hitN=0）⇒ 批量通路根本没发生。
+        //      ⇒ 打开它只会让微信走一条非默认代码路径，而我们依然拿不到图。
+        //      朋友圈图片已改道「SNS 缓存直读」（MomentsExport.buildSnsIndex），与此开关无关。
+        //    - sns.cdn_rewrite_path **零消费点**：Cfg.rewritePath 只在 refreshCfg() 被写入，
+        //      全类没有任何地方读它（grep 可验），属从未实现的预留。
+        //    ⛔ 为什么 hidden 而不是删定义：旧备份文件里可能带这两个 key，删定义会让
+        //      BackupFlow.knownKeys 当未知 key 丢弃，用户换机时静默丢配置且无任何症状。
+        PrefSpec(
+            Keys.SNS_CDN_IMG, PrefKind.SWITCH, "false", "朋友圈",
+            "批量下载图片（CDN 通路已判死：拿不到落盘路径）",
+            hidden = true
+        ),
+        PrefSpec(
+            Keys.SNS_CDN_REWRITE_PATH, PrefKind.SWITCH, "false", "朋友圈",
+            "改写落盘路径（未实现：全类零读取点）",
+            hidden = true
+        ),
 
         // 群发域
         PrefSpec(

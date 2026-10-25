@@ -198,6 +198,8 @@ object SnsCdnProbe {
                 }
                 "paths" -> doPaths()
                 "ls" -> doLs(v, n)
+                // 只列子目录名 —— 补 `scanDir` 丢弃子目录造成的盲区（见 doLsSubdirs KDoc）
+                "lsi" -> doLsSubdirs(v, n)
                 "decode" -> doDecode(v)
                 "export" -> doExport(v, n)
                 "imgpath" -> {
@@ -481,6 +483,45 @@ object SnsCdnProbe {
             own("CDN f ${f.absolutePath} size=${f.length()}")
         }
     }
+
+    /**
+     * `sub=lsi`：只列**子目录名**（[doLs] 的盲区补丁）。
+     *
+     * ⚠️ 为什么必须单独一个子命令：[scanDir] 里有 `if (f.isDirectory) continue`，
+     * ⇒ `CDN ls <dir> files=0` 有**三种**互不相同的含义，探针区分不了：
+     * ① 目录不存在 ② 目录存在但为空 ③ **目录存在但里面全是子目录**。
+     * 微信 `voice2/` 正是第 ③ 种（老式布局 `voice2/<msgId/100>/msg_<msgId>.amr`），
+     * 于是「voice2 files=0」被误读成「voice2 不存在」—— 2026-10-25 真机踩过，
+     * 白跑四轮脚本才定位到这一行 `continue`。
+     *
+     * 输出（**逐字**，脚本靠它匹配）：
+     * ```
+     * CDN lsi <dir> subdirs=N
+     * CDN d <绝对路径>/<目录名>        ← 无 size，靠 `CDN d ` 前缀与 `CDN f ` 区分
+     * ```
+     */
+    private fun doLsSubdirs(dir: String?, n: Int) {
+        val d = dir?.trim()
+        if (d.isNullOrEmpty()) {
+            own("CDN lsi <dir> subdirs=0 (no dir)")
+            return
+        }
+        // ⚠️ 这里**不**用 scanDir —— 它会把子目录丢掉，正是本子命令要解决的东西。
+        //    listFiles() 失败（无权限 / 不存在）返回 null，与「空目录」的 emptyList 区分开。
+        val list = runCatching { File(d).listFiles() }.getOrNull()
+        if (list == null) {
+            own("CDN lsi $d subdirs=0 (unreadable)")
+            return
+        }
+        val dirs = list.filter { it.isDirectory }.sortedBy { it.name }
+        own("CDN lsi $d subdirs=${dirs.size}")
+        val limit = n.coerceIn(1, 500)
+        for (f in dirs.take(limit)) {
+            own("CDN d ${f.absolutePath}")
+        }
+        if (dirs.size > limit) own("CDN lsi truncated=${dirs.size - limit}")
+    }
+
 
     /**
      * `sub=decode`：I-4 的**强判据**反证 —— 用 `BitmapFactory.decodeFile` 判文件是不是**明文可用图**。

@@ -20,12 +20,13 @@ package com.lx.wxgroup.feature
  *
  * 两种格式混写没有优先级之分，任一等价即命中；元素前后空白忽略，空元素忽略。
  *
- * ⚠️ **群名匹配已实现但未接线（待取证）**：通知链路上目前只能拿到 talker
- * （取证结论「通知静音」节：extras 里没有 chatroom id，contentIntent 反射取不到），
- * 拿不到群显示名，所以 [MuteAt] 现在传 groupName=null，群名元素暂时永远不命中。
- * 纯判据先按双格式写好测好；等拿到「talker → 群名」锚点（候选：通知 EXTRA_TITLE
- * 是否即群名，需真机确认，可用 `op=quiet sub=at sub2=extras` dump 最近一条通知的 extras）
- * 后只需在 hook 侧一行接线。
+ * ⚠️ **群名匹配已接线**：`MuteAt.kt:65` 已把 `GroupNameSource.nameOf(talker)` 传进
+ * [groupInScope] 的 groupName 参数（此前「传 null、群名永不命中」的旧描述已作废）。
+ *
+ * 数据源 `GroupNameSource` 走**懒加载**：`nameOf()` 内部会 `warmUp()`，首次拿到主库句柄后
+ * 才起后台 daemon 线程装载群名表（`msgDb` 在微信第一次写库前恒为 null，此时不起线程）。
+ * 所以**冷启动首条通知**若装载尚未完成，`nameOf` 返回 null ⇒ 该条**退回纯 talker 匹配**，
+ * 属预期降级，不是功能失效。真机探针 `GROUPNAME loads=0` 只说明**还没触发过装载**，不是失败。
  *
  * ## 二、优先级（写死，调换顺序 = 改语义）
  * 1. talker 缺失 / 空白 / 不是 `@chatroom` 结尾 → **不生效**。单聊没有

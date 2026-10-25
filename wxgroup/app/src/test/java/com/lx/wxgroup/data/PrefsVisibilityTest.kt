@@ -30,6 +30,10 @@ class PrefsVisibilityTest {
     private val expectedHidden = setOf(
         Keys.REDPACKET_ALLOW,
         Keys.REDPACKET_EXCLUDE,
+        // 朋友圈 CDN 批量下载两项：CDN 通路未打通（⑫.9：picCachePath 恒空、ok0.x0#n 从未触发），
+        // 且 sns.cdn_rewrite_path 在 SnsCdnImage.kt 里零消费点 ⇒ 改了没有任何效果。
+        Keys.SNS_CDN_IMG,
+        Keys.SNS_CDN_REWRITE_PATH,
     )
 
     // ------------------------------------------------------------ 三方约束
@@ -69,14 +73,16 @@ class PrefsVisibilityTest {
      */
     @Test
     fun byDomainKeepsHiddenButVisibleDropsIt() {
-        val domain = Prefs.spec(Keys.REDPACKET_ALLOW)!!.domain
-        val all = Prefs.byDomain(domain).map { it.key }
-        val shown = Prefs.visible(domain).map { it.key }
+        // 逐个 key 取它**自己所属的域**：hidden 项横跨「红包」「朋友圈」等多个域，
+        // 固定成某一个域会让别的域的键假失败。
         for (k in expectedHidden) {
+            val domain = Prefs.spec(k)!!.domain
+            val all = Prefs.byDomain(domain).map { it.key }
+            val shown = Prefs.visible(domain).map { it.key }
             assertTrue("byDomain 口径是全集，应包含 $k", k in all)
             assertFalse("visible 口径是渲染，不该包含 $k", k in shown)
+            assertTrue("visible 必须是 byDomain 的子集", all.containsAll(shown))
         }
-        assertTrue("visible 必须是 byDomain 的子集", all.containsAll(shown))
     }
 
     // ------------------------------------------------------------ hidden 语义本身

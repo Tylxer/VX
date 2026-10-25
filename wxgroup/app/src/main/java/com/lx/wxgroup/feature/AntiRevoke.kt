@@ -112,11 +112,32 @@ object AntiRevoke {
     private data class Config(
         val enabled: Boolean,
         val alsoSelf: Boolean,
-        /** 「显示撤回提示」：拦下之后要不要额外插一条我们自己生成的「已阻止」提示行 */
+        /**
+         * 「显示撤回提示」(`Keys.ANTIREVOKE_SHOW_HINT`)。
+         *
+         * 📌 R21d 起语义变更为「**是否在原文气泡上画『已阻止撤回』角标**」——
+         * 由 [HintBadge] 读同一个 key 做闸门。本类不再用它插提示行（那条路已废，
+         * 见 [RevokeRescue.insertHint] 的 KDoc）。
+         * 保留这个字段只为让 `dumpRecent()` / 诊断日志能打印当前开关值。
+         */
         val showHint: Boolean,
         /** 调试日志开关（Keys.DEBUG_LOG）：只有开着才把消息原文 / talker 写进日志 */
         val debugLog: Boolean,
     )
+
+    /**
+     * 当前配置快照（诊断用）。
+     *
+     * 📌 R21d 起 [Config.showHint] 本类内**零读取点**（提示行插入已废，角标由
+     * [HintBadge] 自己读同一个 key）。留这个取值出口是为了让 `adump` 能打印
+     * 真实开关值 —— 否则用户改了开关、界面上没反应时，日志里连「开关到底开没开」
+     * 都查不到，是最难排查的那类问题。
+     */
+    fun currentConfigLine(): String {
+        val c = config()
+        return "AR cfg enabled=${c.enabled} alsoSelf=${c.alsoSelf} " +
+            "showHint=${c.showHint}(→HintBadge) debug=${c.debugLog}"
+    }
 
     @Volatile
     private var config = Config(false, false, false, false)
@@ -347,6 +368,14 @@ object AntiRevoke {
             // 不预热也能工作（第一条群通知会把线程带起来），但那样「防止被@」的名单里
             // 配了群名的用户在冷启动后第一条通知上会漏判一次。
             GroupNameSource.warmUp()
+            // ⚠️ 启动自检：清掉历史遗留的负数 msgId 行。
+            // 旧版本往 message 表插过负数 msgId 的提示行，而那些行会让微信**进会话就闪退**
+            // （`fr4.b: msgId not in the reasonable scope`，见 docs/_r21d_crash_root.md）。
+            // 库句柄刚拿到是**唯一**能确定「现在真能查库」的时刻，所以挂在这里。
+            // 必须开线程：这是 update 热路径（DB 线程），查几十万行的 count 会卡住它。
+            Thread {
+                runCatching { RevokeRescue.selfCheckNegRows() }
+            }.apply { isDaemon = true; name = "rrv-selfcheck" }.start()
         }
 
         // 采样：证明钩子真的被调用了（节流到 5 秒一条）。
@@ -528,11 +557,15 @@ object AntiRevoke {
             runCatching {
                 if (RevokeRescue.record(id, talker ?: "", revokeText, extra)) {
                     RevokeRescue.applyOne(id, revokeText, extra)
-                    // 「显示撤回提示」：插一条我们自己生成的「已阻止」提示行。
-                    // ⚠️ 必须判重 —— 拦下之后微信会重试上千次，不判重会插出上千条提示。
-                    if (c.showHint && !talker.isNullOrBlank()) {
-                        RevokeRescue.insertHintOnce(id, talker, revokeText)
-                    }
+                    // ⛔ R21d 方案 1：这里**不再**插「已阻止」提示行。
+                    // 旧做法是往 message 表插一条负数 msgId 的 type=10000 行，两个致命问题：
+                    //   ① 微信 `h9.convertFrom` 会校验 msgId 下界，负数一律 `throw fr4.b`
+                    //      ⇒ 进那个会话就闪退（`docs/_r21d_crash_root.md`）
+                    //   ② createTime 用「撤回时刻」，微信按 createTime 排序 ⇒ 提示行
+                    //      永远排在末尾，与原文隔几十条消息（用户报障「不相邻」）
+                    // 现在改由 `HintBadge` 挂 onBindViewHolder，在**原文那条 itemView** 上
+                    // 画角标 ⇒ 不插行、不写库、物理上不可能与原文分离。
+                    // 角标只读台账（`rescued` 表），不需要在这里做任何事。
                 }
             }.onFailure { LogX.w("RRV hook failed: ${it.javaClass.simpleName}") }
         }

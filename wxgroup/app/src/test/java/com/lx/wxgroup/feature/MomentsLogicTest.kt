@@ -173,23 +173,16 @@ class MomentsLogicTest {
         assertTrue(urls.none { it.endsWith(",") || it.endsWith(".") })
     }
 
-    @Test
-    fun mediaKeysIncludeSignedUnsignedAndUrlTail() {
-        val keys = MomentsLogic.mediaKeys(REAL_SNS, listOf("https://x.cn/p/abcdef?w=1"))
-        assertTrue(keys.contains("-3447438253133393222"))
-        // ⚠️ 无符号值**不要手算**（手写常量极易错，原版这里就写错过一个）。
-        // 2^64 - 3447438253133393222 = 14999305820576158394（> Long.MAX_VALUE，不能写 L 字面量）
-        assertEquals("14999305820576158394", java.lang.Long.toUnsignedString(REAL_SNS))
-        assertTrue(keys.contains("abcdef"))
-        assertTrue(keys.contains(MomentsLogic.md5Hex("https://x.cn/p/abcdef?w=1")))
-    }
-
-    @Test
-    fun md5HexIs32Chars() {
-        assertEquals(32, MomentsLogic.md5Hex("abc").length)
-        assertEquals(MomentsLogic.md5Hex("abc"), MomentsLogic.md5Hex("abc"))
-        assertFalse(MomentsLogic.md5Hex("abc") == MomentsLogic.md5Hex("abd"))
-    }
+    // ⛔ 已删于 R20（A8 收敛）：mediaKeysIncludeSignedUnsignedAndUrlTail / md5HexIs32Chars
+    //    / md5sOfOnlyKeepsLowercase32Hex / md5sOfRejectsUppercaseAndWrongLength
+    //    / md5sOfDedupesAndKeepsEmpty / imageCandidatesProduceBothLayoutsPerRoot
+    //    / imageCandidatesIgnoreBadRootsAndBadMd5 / pickExistingReturnsFirstHit
+    //    / pickExistingNullWhenNothingExists / pickExistingSwallowsThrowingProbe —— 共 10 条。
+    //    它们测的符号（mediaKeys / md5Hex / md5sOf / imageCandidates / pickExisting）
+    //    已随旧 md5 路线一起物理删除。判死依据：R15 分桶 0.68% / R16 全盘 find 零结果
+    //    / R19 文件名是 20 位数字串不含 md5。正解见 docs/_r19_a4_probe.md，
+    //    证据见 docs/_r20_a8_del.md。
+    //    ⚠️ `imageRootCandidates*` 那组测试**保留**（函数在、且仍被测）。
 
     // ------------------------------------------------------------------ text 文本
 
@@ -369,91 +362,11 @@ class MomentsLogicTest {
     }
 
     // ------------------------------------------------------------ 图片原图留存（6.4）
-
-    @Test
-    fun md5sOfOnlyKeepsLowercase32Hex() {
-        // 真机 keys 的真实混合形态：snsId（负数）、无符号 snsId、类型标记、md5
-        val keys = listOf(
-            "-3412979636140764498",
-            "15033764437568787118",
-            "0\uFFFD",
-            "6ac4b5b0d7424bc7ba0fe9f8b9af8715",
-            "stodownload",
-            "906834661446ea8dd11c6e2b2838d640",
-            "s",
-            "0",
-        )
-        assertEquals(
-            listOf("6ac4b5b0d7424bc7ba0fe9f8b9af8715", "906834661446ea8dd11c6e2b2838d640"),
-            MomentsLogic.md5sOf(keys)
-        )
-    }
-
-    @Test
-    fun md5sOfRejectsUppercaseAndWrongLength() {
-        // 大写形式微信自己不用；收进来只会在不区分大小写的 fs 上重复命中
-        assertTrue(MomentsLogic.md5sOf(listOf("6AC4B5B0D7424BC7BA0FE9F8B9AF8715")).isEmpty())
-        assertTrue(MomentsLogic.md5sOf(listOf("6ac4b5b0d7424bc7ba0fe9f8b9af871")).isEmpty())   // 31
-        assertTrue(MomentsLogic.md5sOf(listOf("6ac4b5b0d7424bc7ba0fe9f8b9af87155")).isEmpty()) // 33
-        // 含非 hex 字符（g-z）
-        assertTrue(MomentsLogic.md5sOf(listOf("zac4b5b0d7424bc7ba0fe9f8b9af8715")).isEmpty())
-    }
-
-    @Test
-    fun md5sOfDedupesAndKeepsEmpty() {
-        val m = "0123456789abcdef0123456789abcdef"
-        assertEquals(listOf(m), MomentsLogic.md5sOf(listOf(m, m, m)))
-        assertTrue(MomentsLogic.md5sOf(emptyList()).isEmpty())
-    }
-
-    @Test
-    fun imageCandidatesProduceBothLayoutsPerRoot() {
-        val m = "0123456789abcdef0123456789abcdef"
-        val c = MomentsLogic.imageCandidates(m, listOf("/data/x/sns", "/data/x/img/"))
-        // 每个根产出两种形态：扁平 + 前两位分桶；结尾斜杠要归一
-        assertEquals(
-            listOf(
-                "/data/x/sns/$m",
-                "/data/x/sns/01/$m",
-                "/data/x/img/$m",
-                "/data/x/img/01/$m",
-            ),
-            c
-        )
-    }
-
-    @Test
-    fun imageCandidatesIgnoreBadRootsAndBadMd5() {
-        val m = "0123456789abcdef0123456789abcdef"
-        // 空根 / 纯斜杠根不产出任何东西
-        assertTrue(MomentsLogic.imageCandidates(m, listOf("", "   ", "/")).isEmpty())
-        // md5 不合法一个都不产出（防止把 snsId 当文件名去扫盘）
-        assertTrue(MomentsLogic.imageCandidates("not-a-md5", listOf("/data/x")).isEmpty())
-    }
-
-    @Test
-    fun pickExistingReturnsFirstHit() {
-        val cands = listOf("/a", "/b", "/c")
-        assertEquals("/b", MomentsLogic.pickExisting(cands) { it == "/b" })
-        assertEquals("/a", MomentsLogic.pickExisting(cands) { it == "/a" || it == "/b" })
-    }
-
-    @Test
-    fun pickExistingNullWhenNothingExists() {
-        assertNull(MomentsLogic.pickExisting(listOf("/a", "/b")) { false })
-        assertNull(MomentsLogic.pickExisting(emptyList()) { true })
-    }
-
-    @Test
-    fun pickExistingSwallowsThrowingProbe() {
-        // exists() 是注入进来的，真机上可能因为权限抛异常；不能让一条抛炸掉整轮导出
-        assertEquals(
-            "/b",
-            MomentsLogic.pickExisting(listOf("/a", "/b")) {
-                if (it == "/a") throw SecurityException("denied") else true
-            }
-        )
-    }
+    //
+    // ⛔ 已删于 R20（A8 收敛）：原 md5sOf* / imageCandidates* / pickExisting* 共 8 条 @Test。
+    //    它们测的符号已随旧 md5 路线一起物理删除。判死依据：R15 分桶 0.68%
+    //    / R16 全盘 find 零结果 / R19 文件名是 20 位数字串不含 md5。
+    //    正解见 docs/_r19_a4_probe.md，证据见 docs/_r20_a8_del.md。
 
     @Test
     fun avatarUrlsAreExcluded() {

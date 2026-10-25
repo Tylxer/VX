@@ -108,14 +108,15 @@ class ForwardPicker(
         }
         if (tabIndex >= tabs.size) tabIndex = 0
 
-        searchBox = EditText(ctx).apply {
+        // R21：见 UiKit 中该助手的 KDoc
+        searchBox = UiKit.bindSoftInput(EditText(ctx).apply {
             this.hint = "搜索昵称 / 备注 / 群名"
             inputType = InputType.TYPE_CLASS_TEXT
             maxLines = 1
             textSize = 14f
             setText(keyword)
             setSelection(keyword.length)
-        }
+        })
         root.addView(searchBox)
 
         if (tabs.size > 1) {

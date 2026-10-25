@@ -53,7 +53,20 @@ class GroupManagerPage : PanelPage {
             MemberPage.show(g.id, g.name)
         }
         list.setOnItemLongClickListener { _, _, position, _ ->
-            actions(ctx, db, adapter.getItem(position)) { adapter.reload() }
+            actions(ctx, db, adapter.getItem(position)) {
+                adapter.reload()
+                // 分组/成员关系变了 ⇒ 让 K7 会话列表重算分组行。
+                //
+                // 为什么统一放在 onChanged 里，而不是在每个 when 分支各补一行：
+                // 这个页面的 4 个操作（重命名 / 置顶 / 删除 / 以及挂在上面的成员增删）
+                // **每一个都会改分组行该显示的内容**，漏补任何一个都是同一个 bug 复发。
+                // 收口到 onChanged 一处，以后加新操作也不会漏。
+                //
+                // ⚠️ 必须是 refreshMembers() 而非 refresh()：删除分组会连带清掉
+                // `group_member` 里的成员关系（见下方 confirm 文案），而 refresh()
+                // 不重读 cachedMembers —— 筛选态下会拿旧成员集算，分组行成员数残留。
+                ConvFilter.refreshMembers()
+            }
             true
         }
 
@@ -63,6 +76,8 @@ class GroupManagerPage : PanelPage {
                     val id = db.createGroup(name)
                     if (id > 0) {
                         adapter.reload()
+                        // 新分组 ⇒ 会话列表要插一行「没有会话的分组行」（ConvLayout 规则 4）
+                        ConvFilter.refreshMembers()
                         UiKit.toast(ctx, "已创建：$name")
                         LogX.i("MGR create id=$id name=$name")
                     } else {
@@ -78,6 +93,8 @@ class GroupManagerPage : PanelPage {
                 UiKit.confirm(ctx, "清空成员", "将移除所有分组下的好友（分组保留），确认？") {
                     var n = 0
                     for (g in db.listGroups()) n += db.clearMembers(g.id)
+                    // 成员关系变了 ⇒ 重读 cachedMembers 再重算（refresh() 不重读成员，筛选态下会无效）
+                    ConvFilter.refreshMembers()
                     adapter.reload()
                     UiKit.toast(ctx, "已移除 $n 条成员关系")
                     LogX.i("MGR clear all members=$n")
@@ -158,6 +175,10 @@ class GroupManagerPage : PanelPage {
                 return
             }
             reload()
+            // 排序动了 sort_order ⇒ 会话列表里分组行（尤其"没有会话的垫底行"）的位置要跟着变。
+            // 分组表变更靠 configStamp 里的 groups.hashCode() 就能捕获，
+            // 所以这里用 refresh() 就够，不需要 refreshMembers()（成员关系没动）。
+            ConvFilter.refresh()
             LogX.d("MGR move id=${g.id} up=$up")
         }
     }

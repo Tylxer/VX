@@ -103,9 +103,19 @@ object SnsGuard {
         runCatching { XposedBridge.hookAllMethods(cls, "execSQL", sqlGuard) }
             .onSuccess { if (it.isNotEmpty()) ok += "execSQL" }
             .onFailure { LogX.e("SNS: hook execSQL failed", it) }
-        // ⚠️ 只挂 delete 和 execSQL 两个。update / insert / query 一律不挂：
+        // ✅ R20：**句柄捕获钩子**（拿到即自我卸载，见 [installCapture]）。
+        //   它不是常驻钩子，跟下面「常驻的两个」不是一回事，别按同一把尺子衡量。
+        runCatching { installCapture(cls) }
+            .onFailure { LogX.w("SNS: capture hook failed: ${it.javaClass.simpleName}") }
+        // ⚠️ **常驻**的只有 delete 和 execSQL 两个。update / insert / query 一律不挂：
         // 那是微信所有表（message / rcontact …）的写路径，挂上去等于给每次写库都加一层开销，
         // 而我们要的信息（原 localFlag）用 `| VISIBLE_BIT` 兜底已经够了。
+        //
+        // ⛔ 唯一例外是上面的 [installCapture]（`rawQuery`）：需求 6.4 的导出要扫
+        // **当前** SnsInfo（防撤回 = 在动态还看得见时留图，见 [listCurrentSns]），
+        // 而句柄只在「删」的路径上才会被记下来 —— 定时刷新朋友圈只会 INSERT/REPLACE，
+        // 永远触发不到 DELETE ⇒ 句柄恒为 null ⇒ 导出恒 0 行。
+        // 所以必须补一条捕获路径，且**拿到就卸载**（把常驻开销压成 0）。
         if (ok.isEmpty()) {
             LogX.w("SNS: no hook installed, sns guard disabled")
             return
@@ -182,6 +192,17 @@ object SnsGuard {
         val a = param.args ?: return
         if (a.isEmpty()) return
         val sql = a[0] as? String
+        // ✅ R20：顺手捕获**朋友圈库句柄**（理由见 [installCapture]）。
+        //    ⛔ 必须放在 `id == null` 早退**之前**：定时刷新朋友圈是 INSERT/REPLACE，
+        //    匹配不到删除 → 原来根本走不到 [isSnsDb]，句柄永远拿不到。
+        //    代价只在「SQL 里含 SnsInfo」时才付（一次 getPath 反射），不是每次 execSQL。
+        if (snsDb == null && sql?.contains(TABLE) == true) {
+            val db0 = param.thisObject
+            if (db0 != null && isSnsDb(db0)) {
+                LogX.i("SNS sns db captured via execSQL (导出扫当前 SnsInfo 已可用)")
+                unhookCapture()
+            }
+        }
         // ⚠️ 参数化 SQL（`where snsId=?`）的 id 在第二个参数里，必须一起传进去，
         // 否则 execSQL 形态对参数化写法**完全失效**（第一版就漏了）
         val id = SnsSql.matchDeleteSql(sql, a.getOrNull(1) as? Array<*>?)
@@ -267,6 +288,89 @@ object SnsGuard {
      * 微信删动态时先清掉这一位（实测落成 2），拦完 DELETE 必须置回去，否则界面不显示。
      */
     private const val VISIBLE_BIT = 16
+
+    // ------------------------------------------------------------------ 句柄捕获（R20）
+
+    /**
+     * 拿到句柄之前**唯一**多出来的钩子：`rawQuery`。
+     *
+     * ## 为什么必须有它
+     * [snsDb] 原来只在「DELETE 命中 SnsInfo」时被记下来（[isSnsDb]）。而需求 6.4 的
+     * 导出要扫**当前** SnsInfo（防撤回语义：动态还看得见的时候就把图留存下来，
+     * 见 [listCurrentSns]），定时刷新朋友圈走的是 INSERT/REPLACE —— **不产生 DELETE**。
+     * 于是句柄恒为 null，导出恒 0 行，且日志里只会看到「归档也没几条」，
+     * 根本看不出真因是「句柄没拿到」。
+     *
+     * ## 为什么可以接受它的开销
+     * - **拿到就卸载**（[unhookCapture]）：之后是零钩子，不是「常驻一层开销」；
+     * - 卸载前每次调用只做「`snsDb != null` 判空 + `sql.contains("SnsInfo")`」，
+     *   没有任何反射；
+     * - [CAPTURE_MAX_CALLS] 兜底：迟迟碰不到 SnsInfo（用户从不打开朋友圈）也认输卸载，
+     *   绝不做常驻钩子。
+     */
+    private val captureUnhooks =
+        java.util.Collections.synchronizedList(ArrayList<XC_MethodHook.Unhook>())
+
+    @Volatile
+    private var captureGaveUp = false
+
+    private val captureCalls = AtomicInteger(0)
+
+    /** 认输上限：这么多 rawQuery 里都没见过 `SnsInfo` 就卸载（防常驻） */
+    private const val CAPTURE_MAX_CALLS = 20_000
+
+    private fun installCapture(cls: Class<*>) {
+        if (snsDb != null) return
+        val set = runCatching { XposedBridge.hookAllMethods(cls, "rawQuery", captureHook) }
+            .onFailure { LogX.w("SNS: hook rawQuery failed: ${it.javaClass.simpleName}") }
+            .getOrNull()
+        if (set.isNullOrEmpty()) {
+            LogX.w("SNS: no rawQuery overload to hook, sns db capture disabled")
+            return
+        }
+        synchronized(captureUnhooks) { captureUnhooks.addAll(set) }
+        LogX.i("SNS capture hook installed rawQuery x${set.size} (拿到句柄即卸载)")
+    }
+
+    private val captureHook = object : XC_MethodHook() {
+        override fun beforeHookedMethod(param: MethodHookParam) {
+            runCatching {
+                // ① 已经拿到 / 已经认输 → 卸掉自己（这几行就是卸载前的全部开销）
+                if (snsDb != null || captureGaveUp) {
+                    unhookCapture()
+                    return
+                }
+                if (captureCalls.incrementAndGet() > CAPTURE_MAX_CALLS) {
+                    captureGaveUp = true
+                    unhookCapture()
+                    LogX.w("SNS capture gave up after $CAPTURE_MAX_CALLS rawQuery (扫当前 SnsInfo 不可用)")
+                    return
+                }
+                val sql = param.args?.getOrNull(0) as? String ?: return
+                if (!sql.contains(TABLE)) return
+                val db = param.thisObject ?: return
+                // isSnsDb 命中时会把句柄记进 [snsDb]（顺带校验路径）
+                if (isSnsDb(db)) {
+                    LogX.i("SNS sns db captured via rawQuery (导出扫当前 SnsInfo 已可用)")
+                    unhookCapture()
+                }
+            }.onFailure {
+                // 捕获是**附加收益**，绝不能因为它把微信的查询搞挂
+                LogX.w("SNS capture err: ${it.javaClass.simpleName}")
+            }
+        }
+    }
+
+    private fun unhookCapture() {
+        val list = synchronized(captureUnhooks) {
+            if (captureUnhooks.isEmpty()) return
+            ArrayList(captureUnhooks).also { captureUnhooks.clear() }
+        }
+        for (u in list) runCatching { u.unhook() }
+    }
+
+    /** 微信库句柄是否已捕获（=「扫当前 SnsInfo」这条路现在能不能走） */
+    fun snsReady(): Boolean = snsDb != null
 
     // ------------------------------------------------------------------ 归档
 
@@ -384,6 +488,157 @@ object SnsGuard {
             }
         }.getOrNull()
 
+    // ------------------------------------------------------------------ 当前 SnsInfo（R20：导出数据源）
+
+    /**
+     * **需求 6.4 自动导出的数据源（R20 改路由）**：读**当前** `SnsInfo` 里**可见**的动态，
+     * 键集分页一次一页。
+     *
+     * ## ⚠️ 语义：这是「防撤回」，不是「删除后抢救」
+     * 用户定案（2026-10-25）：本导出是**搭配定时刷新朋友圈**用的 —— 在动态**还看得见**
+     * 的时候就把它的图留存下来（**预防性留存**），而不是等它被删了再从 `sns_archive`
+     * 抢救。而微信的 sns 磁盘缓存 `…/cache/<hash32>/sns/<hex1>/<hex2>/snst_xxx`
+     * 里放的正是**当前可见**动态的图：R19 实测归档那 7 个 mediaId 在 72 个缓存文件里
+     * **0 命中** —— 扫归档时 `imgCopied` 恒为 0 是数据源选错了，不是取图链路坏了。
+     *
+     * ## 可见性过滤
+     * 只取 `(localFlag & 16) != 0` 的行。时间线查询的白名单
+     * `localFlag in (16,2064,18,2066,24,2072,…)` 里**每个值都置了 bit4(16)**，
+     * 所以按位判是白名单的等价超集；`localFlag=2`（微信删动态第一步清掉可见位）
+     * 的行会被排除 —— 那不是「当前可见」。
+     *
+     * ## ⚠️ 返回的是**半行**，只取导出需要的 7 列
+     * `attrBuf` / `postBuf` / `head` / `stringSeq` / `subType` / `serverExtFlag` **不读**
+     * （**显式**填 0/null —— `SnsRow` 对这几个字段没有默认值，不填编译不过，见 `liveRows`）。
+     * 朋友圈 `content` 动辄几十 KB，一页 100 行再搭两个 BLOB 就是几百 MB，
+     * 后台线程 OOM 会把微信带走（[GroupDb.listSnsArchiveBefore] 那边的同一条理由）。
+     *
+     * ⛔ **不要拿这里的行去归档**（`GroupDb.archiveSns`）：那是用一个残缺快照
+     * 覆盖掉 [readRow] 存下来的完整快照，而 archiveSns 是「首条为准」，覆盖不回来。
+     *
+     * @param createTime 上一页最后一行的 `createTime`；首轮传 `Long.MAX_VALUE`
+     * @param snsId 上一页最后一行的 `snsId`；首轮传 `Long.MAX_VALUE`。
+     *              ⚠️ 复合游标：只按 `createTime <` 会在页边界丢掉同一秒的行
+     * @return 一页行（`createTime desc, snsId desc`）；
+     *         **null = 拿不到微信库句柄**（[snsDb] 还没捕获到 —— 这次启动微信还没碰过
+     *         朋友圈库）。这不是错误，调用方必须**优雅降级**（退回扫归档），别弹窗。
+     */
+    fun listCurrentSns(createTime: Long, snsId: Long, limit: Int): List<GroupDb.SnsRow>? {
+        val db = snsDb ?: return null
+        val m = rawQueryMethod(db) ?: return null
+        // ⚠️ limit 来自调用方常量，仍钳一次：拼进 SQL 的值必须自己守住
+        val lim = limit.coerceIn(1, 200)
+        // ⚠️ select 列表**固定 7 列**，下面按下标读 —— 下标即契约。
+        //    列名（schema）对不上会让 SQLite 直接报错（被 runCatching 兜住并**告警**），
+        //    不会像 `select *` 那样静默取错列。
+        val sql = "select snsId,userName,createTime,type,sourceType,localFlag,content " +
+            "from $TABLE where (localFlag & $VISIBLE_BIT) != 0 " +
+            "and (createTime < ? or (createTime = ? and snsId < ?)) " +
+            "order by createTime desc, snsId desc limit $lim"
+        val args: Any = if (m.parameterTypes[1] == Array<String>::class.java) {
+            arrayOf(createTime.toString(), createTime.toString(), snsId.toString())
+        } else {
+            arrayOf<Any>(createTime.toString(), createTime.toString(), snsId.toString())
+        }
+        return liveRows(db, m, sql, args)
+    }
+
+    private fun liveRows(db: Any, m: Method, sql: String, args: Any): List<GroupDb.SnsRow> {
+        val out = ArrayList<GroupDb.SnsRow>()
+        val cur = runCatching { m.invoke(db, sql, args) }
+            .onFailure {
+                // ⛔ 不许静默吞：查不动 = 导出恒 0 行且看不出原因，必须留一行
+                LogX.w(
+                    "SNS live query failed ${it.javaClass.simpleName}: " +
+                        "${(it.cause ?: it).message?.take(80)}"
+                )
+            }
+            .getOrNull() ?: return out
+        try {
+            var guard = 0
+            while (guard++ < 5_000 &&
+                XposedHelpers.callMethod(cur, "moveToNext") as? Boolean == true
+            ) {
+                val id = cLong(cur, 0)
+                // snsId 是 Long 且**可能为负**（真机 -3447438253133393222）；
+                // 0 = 这一列没读出来，别把一堆 0 塞进去（会让去重把它们全并成一条）
+                if (id == 0L) continue
+                out += GroupDb.SnsRow(
+                    snsId = id,
+                    userName = cText(cur, 1),
+                    createTime = cLong(cur, 2),
+                    type = cLong(cur, 3).toInt(),
+                    sourceType = cLong(cur, 4).toInt(),
+                    localFlag = cLong(cur, 5).toInt(),
+                    // ⚠️ 五个「没查的列」必须**显式**填零值：`SnsRow` 对这五个字段
+                    //    没有默认值（只有 `at` 有）。原先 KDoc 写「留默认值」是错的 ——
+                    //    真实后果是编译报 `No value passed for parameter 'subType'` 等 **6 条**，
+                    //    R20 收口时由 `compileDebugKotlin` 抓出。填 0/null 与「留默认值」
+                    //    在语义上等价：下面的读法本来就不碰它们（只吃 7 列）。
+                    subType = 0,
+                    serverExtFlag = 0,
+                    head = null,
+                    stringSeq = null,
+                    content = cBlob(cur, 6),
+                    attrBuf = null,
+                    postBuf = null,
+                )
+            }
+        } finally {
+            runCatching { XposedHelpers.callMethod(cur, "close") }
+        }
+        return out
+    }
+
+    /**
+     * 读一列 Long。
+     *
+     * ⛔ R20b（复核 §2 #1，报告判为「整条链路**唯一**能把读失败伪装成 0 行、且零日志的点」）：
+     * 原来是一行 `runCatching{...}.getOrDefault(0L)`，**完全静默**。
+     * 后果链：`getLong` 反射失败 → 返回 0 → `liveRows` 里 `if (id == 0L) continue` 全部跳过
+     * → 单页恒空 → 上层当「这一页扫完了」切源 → 摘要 `rows=0 written=0`。
+     * 现场看到的症状是**「没有动态」**，实际是**「读不出来」**，两者排查方向相反。
+     *
+     * ⇒ 失败时留一行日志（`CLOG`）。**只打日志、不改返回值**：`getLong` 失败就返回 0
+     * 是本函数既定的契约（`id == 0` 在上层已有明确语义 = 这一列没读出来），
+     * 本次只补可观测性，不动行为 —— 避免把「补日志」变成「改语义」。
+     */
+    private fun cLong(cur: Any, i: Int): Long =
+        runCatching { XposedHelpers.callMethod(cur, "getLong", i) as? Long ?: 0L }
+            .onFailure {
+                LogX.w(
+                    "CLOG getLong[$i] failed ${it.javaClass.simpleName}: " +
+                        "${(it.cause ?: it).message?.take(60)}"
+                )
+            }
+            .getOrDefault(0L)
+
+    /**
+     * 读一列 String / ByteArray。同 [cLong] 的 R20b 补丁理由：
+     * 失败静默变 null ⇒ 上层看到「这个字段是空的」，而真相是「反射没读到」。
+     * `content` 走 [cBlob]，它空掉会让 `mediaIdsFromContent` 恒 0 ⇒ 图片永远导不出，
+     * 且日志上完全看不出原因。⇒ 失败留一行 `CLOG`，返回值契约不变。
+     */
+    private fun cText(cur: Any, i: Int): String? =
+        runCatching { XposedHelpers.callMethod(cur, "getString", i) as? String }
+            .onFailure {
+                LogX.w(
+                    "CLOG getString[$i] failed ${it.javaClass.simpleName}: " +
+                        "${(it.cause ?: it).message?.take(60)}"
+                )
+            }
+            .getOrNull()
+
+    private fun cBlob(cur: Any, i: Int): ByteArray? =
+        runCatching { XposedHelpers.callMethod(cur, "getBlob", i) as? ByteArray }
+            .onFailure {
+                LogX.w(
+                    "CLOG getBlob[$i] failed ${it.javaClass.simpleName}: " +
+                        "${(it.cause ?: it).message?.take(60)}"
+                )
+            }
+            .getOrNull()
+
     // ------------------------------------------------------------------ 诊断
 
     /** 归档清单（读我们自己的库，不碰微信库） */
@@ -486,7 +741,259 @@ object SnsGuard {
     }
 
     /**
+     * **A4 取证探针（R19）**：扫**当前** `SnsInfo`（不是归档表！）的 `content`，
+     * 抽出里面所有「连续 ASCII 数字 ≥15 位」的串作为 mediaId 候选。
+     *
+     * ## 为什么必须扫当前表而不是归档表
+     * `MomentsExport.probeSnsCache()` 扫的是 `GroupDb.listSnsArchive()` =
+     * **防撤回归档表**（历史**已被删除**的动态），而 sns 磁盘缓存里放的却是
+     * **当前朋友圈可见动态**的图 —— 两者**根本不重叠**。实测：归档的 7 个 mediaId
+     * 候选在设备 72 个缓存文件名里 **0 命中**。
+     * ⇒ 要验证「mediaId ↔ 缓存文件名」的对应关系，样本源必须换成当前 `SnsInfo`。
+     *
+     * ## 为什么用「抽数字串」而不是按 protobuf 字段号解析
+     * R15 定案的层级是 `content → 字段6 → 字段8 → 字段1`，但真机实测
+     * **字段 6 内部根本没有字段 8**（`in6=[1:5,2:5,3:2,4:2,5:2,6:2,7:0,9:0,10:0,11:0]`）
+     * ⇒ 按字段号取恒空（`ids=0`）。在字段号未知的情况下，**直接从字节里抽数字串**
+     * 是唯一不依赖字段号假设的办法：缓存文件名 `snst_15039549883688563348` 的
+     * 后缀就是 20 位数字串，若 content 里存在同样的串，抽出来就能和文件名对上。
+     *
+     * ⚠️ 日志单行有 **295 字符硬上限**（实测），候选最多打 3 个、每个截 24 位。
+     */
+    fun probeMediaIds(limit: Int = 5): List<String> {
+        val lim = MomentsLogic.clampProbeN(limit)
+        val db = snsDb ?: return listOf("no sns db yet (先让微信刷一次朋友圈，或删一条动态)")
+        val m = rawQueryMethod(db) ?: return listOf("no rawQuery on ${db.javaClass.name}")
+        return runCatching {
+            val args: Any? = null
+            val out = mutableListOf<String>()
+            val cur = m.invoke(
+                db,
+                "select snsId,content from $TABLE order by createTime desc limit $lim",
+                args,
+            ) ?: return listOf("null cursor")
+            try {
+                var n = 0
+                var withCand = 0
+                while (XposedHelpers.callMethod(cur, "moveToNext") as? Boolean == true) {
+                    val id = XposedHelpers.callMethod(cur, "getLong", 0) as? Long ?: 0
+                    val blob = runCatching {
+                        XposedHelpers.callMethod(cur, "getBlob", 1) as? ByteArray
+                    }.getOrNull()
+                    val cands = if (blob == null) emptyList() else digitRuns(blob, 15)
+                    if (cands.isNotEmpty()) withCand++
+                    out += "SNSMID snsId=$id len=${blob?.size ?: -1} " +
+                        "c=${if (cands.isEmpty()) "-" else cands.take(3).joinToString(",") { it.take(24) }}"
+                    n++
+                }
+                out.add(0, "SNSMID rows=$n withCand=$withCand (limit=$lim)")
+            } finally {
+                runCatching { XposedHelpers.callMethod(cur, "close") }
+            }
+            out
+        }.getOrElse { listOf("err ${it.javaClass.simpleName}: ${(it.cause ?: it).message?.take(80)}") }
+    }
+
+    /**
+     * **A4 取证探针（R19 第二步）**：递归解析 `content` 的 protobuf，
+     * 找出所有「值是 ≥18 位纯数字 ASCII 串」的叶子，打印它的**字段路径**。
+     *
+     * ## 为什么需要它
+     * [probeMediaIds] 已证明 mediaId **确实在 content 里**（19 个候选里 4 个
+     * 精确命中设备缓存文件名 `snst_<20位数字>`），但「从字节里抽数字串」只是取证手段，
+     * 不能作为正式实现 —— 正式实现必须按**字段号**解析。
+     * R15 定案的 `content → 6 → 8 → 1` 在这台设备上不成立（字段 6 内没有 8），
+     * 所以真正的路径未知，用它来定位。
+     *
+     * ## 输出形态
+     * `MIDPATH snsId=... p=1(20),6>3(20)` = 顶层字段 1 和「字段6→字段3」里各有 20 位数字串。
+     */
+    fun probeMediaPaths(limit: Int = 5): List<String> {
+        val lim = MomentsLogic.clampProbeN(limit)
+        val db = snsDb ?: return listOf("no sns db yet")
+        val m = rawQueryMethod(db) ?: return listOf("no rawQuery on ${db.javaClass.name}")
+        return runCatching {
+            val cur = m.invoke(
+                db,
+                "select snsId,content from $TABLE order by createTime desc limit $lim",
+                null,
+            ) ?: return listOf("null cursor")
+            try {
+                val out = mutableListOf<String>()
+                var n = 0
+                while (XposedHelpers.callMethod(cur, "moveToNext") as? Boolean == true) {
+                    val id = XposedHelpers.callMethod(cur, "getLong", 0) as? Long ?: 0
+                    val blob = runCatching {
+                        XposedHelpers.callMethod(cur, "getBlob", 1) as? ByteArray
+                    }.getOrNull()
+                    val paths = LinkedHashSet<String>()
+                    if (blob != null) scanDigitPaths(blob, "", paths, 0)
+                    out += "MIDPATH snsId=$id len=${blob?.size ?: -1} " +
+                        "p=${if (paths.isEmpty()) "-" else paths.take(5).joinToString(",")}"
+                    n++
+                }
+                out.add(0, "MIDPATH rows=$n (limit=$lim)")
+                out
+            } finally {
+                runCatching { XposedHelpers.callMethod(cur, "close") }
+            }
+        }.getOrElse { listOf("err ${it.javaClass.simpleName}: ${(it.cause ?: it).message?.take(80)}") }
+    }
+
+    /**
+     * **A4 端到端验收探针（R19）**：扫**当前** SnsInfo → 用 `MomentsLogic.mediaIdsFromContent`
+     * 解 mediaId → 与磁盘缓存文件名对账，报 `hit`。
+     *
+     * ## 这是 A4 的正式判据（`hit>0` 才算通过）
+     * `op=moments sub=snsprobe` 报 `hit=0` 有两个叠加原因，本探针两个都绕开：
+     * ① 它扫**归档表**（历史被删动态），缓存里是**当前**动态的图 ⇒ 样本根本不重叠；
+     * ② 它用的字段号是旧的 `6>8>1` ⇒ `ids=0`。
+     * 本探针扫当前表 + 用 R19 实测修正后的 `8>5>1`。
+     *
+     * ⚠️ 输出受 295 字符/行限制，命中文件名最多打 2 个、每个截 28 字符。
+     */
+    fun probeHit(limit: Int = 5): List<String> {
+        val lim = MomentsLogic.clampProbeN(limit)
+        val db = snsDb ?: return listOf("no sns db yet")
+        val m = rawQueryMethod(db) ?: return listOf("no rawQuery on ${db.javaClass.name}")
+        val cache = scanCacheNames()
+        return runCatching {
+            val cur = m.invoke(
+                db,
+                "select snsId,content from $TABLE order by createTime desc limit $lim",
+                null,
+            ) ?: return listOf("null cursor")
+            try {
+                val out = mutableListOf<String>("SNSHIT cacheFiles=${cache.size}")
+                var n = 0
+                var totalIds = 0
+                var totalHit = 0
+                var rowsHit = 0
+                while (XposedHelpers.callMethod(cur, "moveToNext") as? Boolean == true) {
+                    val id = XposedHelpers.callMethod(cur, "getLong", 0) as? Long ?: 0
+                    val blob = runCatching {
+                        XposedHelpers.callMethod(cur, "getBlob", 1) as? ByteArray
+                    }.getOrNull()
+                    val ids = MomentsLogic.mediaIdsFromContent(blob)
+                    val hits = LinkedHashSet<String>()
+                    for (mid in ids) {
+                        for (nm in MomentsLogic.snsNameCandidates(mid)) {
+                            val f = cache[nm]
+                            if (f != null) { hits.add(f); break }
+                        }
+                    }
+                    totalIds += ids.size
+                    totalHit += hits.size
+                    if (hits.isNotEmpty()) rowsHit++
+                    out += "SNSHIT snsId=$id ids=${ids.size} hit=${hits.size} " +
+                        "n=${if (hits.isEmpty()) "-" else hits.take(2).joinToString(",") { it.take(28) }}"
+                    n++
+                }
+                out += "SNSHIT sum rows=$n rowsHit=$rowsHit ids=$totalIds hit=$totalHit"
+                out
+            } finally {
+                runCatching { XposedHelpers.callMethod(cur, "close") }
+            }
+        }.getOrElse { listOf("err ${it.javaClass.simpleName}: ${(it.cause ?: it).message?.take(80)}") }
+    }
+
+    /**
+     * 扫 sns 磁盘缓存建 `Map<文件名,文件名>`。
+     * 路径 `/sdcard/Android/data/com.tencent.mm/cache/<hash32>/sns/<hex1>/<hex2>/<name>`。
+     *
+     * ⛔ **不做任何分桶/截断推算**：直接遍历两级目录建索引（R15 已定案：分桶公式
+     * 真机只中 0.68%，必须索引直扫）。
+     */
+    private fun scanCacheNames(): Map<String, String> {
+        val out = HashMap<String, String>()
+        val root = java.io.File("/sdcard/Android/data/com.tencent.mm/cache")
+        val dirs = root.listFiles() ?: return out
+        for (d in dirs) {
+            val sns = java.io.File(d, "sns")
+            if (!sns.isDirectory) continue
+            val h1s = sns.listFiles() ?: continue
+            for (h1 in h1s) {
+                val h2s = h1.listFiles() ?: continue
+                for (h2 in h2s) {
+                    val fs = h2.listFiles() ?: continue
+                    for (f in fs) if (f.isFile) out[f.name] = f.name
+                }
+            }
+        }
+        return out
+    }
+
+    /**
+     * 递归扫 protobuf：把「值 = 长度 ≥18 的纯数字 ASCII 串」的叶子路径记进 [out]。
+     * 非数字串的 wiretype=2 字段当作子消息继续下钻（限深 5、路径数上限 8，防爆）。
+     */
+    private fun scanDigitPaths(b: ByteArray, path: String, out: LinkedHashSet<String>, depth: Int) {
+        if (depth > 5 || out.size >= 8) return
+        var i = 0
+        var guard = 0
+        while (i < b.size && guard++ < 600) {
+            val tag = MomentsLogic.readVarintPublic(b, i) ?: return
+            i = tag.second
+            val field = (tag.first.toInt() ushr 3)
+            val wt = tag.first.toInt() and 7
+            if (field <= 0) return
+            when (wt) {
+                0 -> {
+                    val v = MomentsLogic.readVarintPublic(b, i) ?: return
+                    i = v.second
+                }
+                1 -> i += 8
+                5 -> i += 4
+                2 -> {
+                    val l = MomentsLogic.readVarintPublic(b, i) ?: return
+                    var j = l.second
+                    val len = l.first.toInt()
+                    if (len < 0 || j + len > b.size) return
+                    val sub = b.copyOfRange(j, j + len)
+                    if (sub.size >= 18 && sub.all { it.toInt() and 0xFF in 0x30..0x39 }) {
+                        out.add("$path$field(${sub.size})")
+                    } else {
+                        scanDigitPaths(sub, "$path$field>", out, depth + 1)
+                    }
+                    i = j + len
+                }
+                else -> return
+            }
+        }
+    }
+
+    /** 从字节里抽出所有长度 ≥[minLen] 的连续 ASCII 数字串（去重、保序） */
+    private fun digitRuns(b: ByteArray, minLen: Int): List<String> {
+        val out = LinkedHashSet<String>()
+        var s = -1
+        for (i in b.indices) {
+            val d = b[i].toInt() and 0xFF
+            if (d in 0x30..0x39) {
+                if (s < 0) s = i
+            } else {
+                if (s >= 0 && i - s >= minLen) out.add(String(b, s, i - s, Charsets.US_ASCII))
+                s = -1
+            }
+        }
+        if (s >= 0 && b.size - s >= minLen) out.add(String(b, s, b.size - s, Charsets.US_ASCII))
+        return out.toList()
+    }
+
+    /**
      * 评论表取证：列名 + 最近几行的全部列值。
+     *
+     * ## ✅ 去留已裁定（2026-10-25 用户拍板：**保留**）
+     * 评论域的**功能代码**（`SnsCommentGuard` / `SnsCommentTag` / `SnsCommentLogic` /
+     * `SnsCommentLabelLogic` + 121 个单测）已于 2026-10-24 物理删除（N7），
+     * 但**本探针保留**，理由三条：
+     * ① 它是 `SnsGuard` 的方法，`SnsGuard` 是**动态防撤回**的主体，与评论域不同源；
+     * ② 它是**评论表唯一的取证入口**（`EntryReceiver` 的 `op=sns --es sub cmts` 调它），
+     *    删了就没有办法再看评论表结构；
+     * ③ 这里的 `SnsComment` 是**数据库表名**（`select * from SnsComment`），
+     *    不是被删的那些类名 —— 两者只是同名。
+     *
+     * ⛔ 别因为「评论域已删」就顺手把这个也删掉：那是**同名误伤**，
+     *    见 `docs/_r18_n7_deletion.md` 的「哪些 SnsComment 不能删」段。
      *
      * 为什么先看这个：评论的**可见列表**存在 `SnsInfo.attrBuf`（protobuf），
      * 而 `SnsComment` 是另一份明细。做「评论[已删除]标签」前必须先确认：
