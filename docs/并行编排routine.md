@@ -43,7 +43,7 @@
 **Flash（体力活，同消息发多个 = 并行）**
 
 ```
-Agent(subagent_type="general-purpose", model="deepseek-v4-flash-202605",
+Agent(subagent_type="general-purpose", model="deepseek-v4.1-flash",
   prompt="任务：<一句话目标>。独占：<路径>，勿改其它。
           照 docs/conclusions/ 锚点接线；纪律见 routine.md §四（自行读，不重述）。
           不跑 gradle/不碰 adb；先写盘再回报；回报仅 diff 摘要+自测。")
@@ -52,7 +52,7 @@ Agent(subagent_type="general-purpose", model="deepseek-v4-flash-202605",
 **Pro（推理 / 复核）**
 
 ```
-Agent(subagent_type="general-purpose", model="custom-local:deepseek-v4-pro",
+Agent(subagent_type="general-purpose", model="deepseek-v4-pro",
   prompt="任务：<一句话目标>。改动：<贴 git diff 或给 文件路径+行号，勿贴全文>。
           已知坑见 docs/conclusions/ 与 routine.md §四（自行读，不重述）。
           要求：根因+最小修复 diff+回滚路径+边界漏项。先写盘再回报；输出限 200 行内。")
