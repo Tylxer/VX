@@ -31,7 +31,7 @@ import java.util.concurrent.atomic.AtomicLong
  *
  * ## 数据链
  * ```
- * ① 微信库 SnsInfo（当前可见，localFlag & 16 != 0）  ← 主数据源（防撤回语义）
+ * ① 微信库 SnsInfo（不按 localFlag 筛，仅按键集分页 —— R26 已证 bit16 不是可见位）  ← 主数据源（防撤回语义）
  *      → SnsGuard.listCurrentSns 键集分页（一次一页，不把 BLOB 全读进内存）
  * ② 模块库 sns_archive（SnsGuard 拦 DELETE 时归档的整行快照）  ← 补扫（已删的也要）
  *      → GroupDb.listSnsArchiveBefore 键集分页
@@ -63,9 +63,15 @@ import java.util.concurrent.atomic.AtomicLong
  * 新链路见 [buildSnsIndex] / [copyImagesForRow] / [probeSnsCache]：
  * 建文件名索引 → [MomentsLogic.snsNameCandidates] 出候选名 → [MomentsLogic.matchSnsFileName] 查表。
  *
- * [COPY_IMAGES] 因此**恒为 false**（真机复核未做，见常量处的说明），
- * 这里只把线索打出来 —— **严禁猜规则硬写**。
- * 文本文件里已经带了媒体 URL 段（renderText 的「---- 媒体 ----」），内容不丢。
+ * [Keys.MOMENTS_COPY_IMAGES] 于 R26 起是**用户开关**（默认关，UI 文案已写明只能取缓存里的图）。
+ * 打开后有两条补图路径，缺一不可：
+ * - 主循环：**本次新写 txt** 时顺手拷图（[copyImagesForRow]）；
+ * - 回填轮（[backfillImages]）：txt 已存在但图缺的，单独补 —— 主循环在去重处就 `continue` 了，
+ *   永远走不到拷贝，**只开开关不做回填 = 已导出的动态永远没图**。
+ *
+ * ⚠️ 能力边界（真机三次实测）：图只能来自微信本地 `sns/` 缓存 ⇒ 已删动态的图基本取不回
+ * （R19 归档 7 条 `hit=0`；2026-10-26 复测仍 `hit=0`），冷启还可能清空该缓存。
+ * 所以这是「顺手把刚看过的图存一份」，**不是图片备份**。UI/stat 都必须写清楚。
  *
  * ## 失败策略（需求 6.4「失败只弹窗」+ 决策 #11，2026-10-24 定案）
  * 路径不存在 / 建不成功 / 写不进 / 空间不足 / 写文件失败 / 整轮异常 →
@@ -127,6 +133,21 @@ internal class SnsScanCursor {
     }
 
     /**
+     * R27：把游标**恢复到持久化的低水位**（只有回填轮用；主循环每轮都从最新开始，
+     * 因为新动态必须优先 —— 那是防撤回语义）。
+     *
+     * ⚠️ `ct <= 0` 直接忽略、保持「从最新开始」：`ct = MAX_VALUE` 是「从头」的哨兵，
+     * 脏值传进来如果要么抛异常、要么让键集查询退化成「最新一页」——
+     * 后者看起来像恢复成功，实际每轮都在原地重扫，正是本函数要治的病。
+     */
+    fun seek(src: Src, ct: Long, sid: Long) {
+        if (ct <= 0L) return
+        this.src = src
+        this.ct = ct
+        this.sid = sid
+    }
+
+    /**
      * 这个 snsId 本轮该处理吗（`false` = 磁盘上已导出过 / 本轮已处理过）。
      *
      * ⚠️ snsId 是 **Long 且可能为负**（真机 `-3447438253133393222`）。
@@ -155,20 +176,47 @@ object MomentsExport {
     private const val TAG = "MOMENT"
 
     /**
-     * 图片导出总闸。**false = 不上真机跑**。
+     * 图片导出总闸 —— **R26 起改成配置键** [Keys.MOMENTS_COPY_IMAGES]（默认关）。
      *
-     * R15 起代码链路已就位（protobuf 取 mediaId + SNS 磁盘缓存索引直扫 + 候选名匹配 +
-     * 四态计数，见 [mediaIdsOf] / [buildSnsIndex] / [copyOneFromCache]）。
-     * mediaId 来源已于 R15-I2 接通（通用线格式，见 [MomentsLogic.mediaIdsFromContent]），
-     * 但**真机复核还没做**，`imgCopied` 到底能不能 >0 未经验证，**保持 false**。
+     * 历史：R15 起这里是 `const val COPY_IMAGES = false`，理由是「真机复核没做」。
+     * R19 已把 protobuf 字段号纠正成 `8 → 5 → 1`，并用只读探针验到 `hit=<文件名>`；
+     * R26 换成配置键：取证时不必每次重装包（编译期常量改一次要 cold start 两遍）。
+     *
+     * ⛔ **只有单闸**（配置键），刻意不加「编译期常量 AND 运行期配置」双闸：
+     * 两个闸语义重叠，现场排查「到底哪个关了」会变难。
      */
-    const val COPY_IMAGES = false
+    /**
+     * 图片的**来源定性**，只出现在 `stat()` 里，给读日志的人一个明确前提：
+     * 图只能来自微信本地 `sns/` 缓存，`imgFileMiss` 高是**预期**而不是链路坏。
+     */
+    private const val IMG_SOURCE_HINT = "cache-only"
+
+    /**
+     * 每轮 `img mid` 明细日志的行数上限。
+     *
+     * ⚠️ 真机日志是 **5000 行环形覆盖**。回填 / 大目录首轮会一次拷几百张图，
+     * 每张一行明细能把真判据（`hit=<文件名>`、`export done`）直接挤掉。
+     * 超过上限后**只计数不打行**，`stat()` 里的计数仍然准。
+     */
+    private const val IMG_LOG_MAX = 200
+
+    /** 回填轮最多处理多少条动态（防冷启后首轮疯狂补图把导出拖死） */
+    private const val MAX_BACKFILL_PER_RUN = 200
 
     private const val CFG_TTL_MS = 3_000L
 
     /** 例行判定间隔（导出本身还有 10 分钟的最小间隔，见 MomentsLogic.exportDue） */
     private const val TICK_MS = 5 * 60_000L
     private const val FIRST_TICK_MS = 30_000L
+
+    /**
+     * 「被戳一下」的最小间隔（见 [pokeExport]）。
+     *
+     * ⚠️ 刻意**远小于** `MomentsLogic.EXPORT_MIN_INTERVAL_MS`（10min）——
+     * 目的是让新动态分钟级落盘，而不是把这个值抬到跟定时 tick 一样、等于没做。
+     * 同时刻意**大于**导出一轮的典型耗时（真机千行级几秒），避免相邻两轮叠在一起。
+     */
+    private const val POKE_MIN_INTERVAL_MS = 60_000L
 
     /** 每页行数 / 单轮最多处理行数（BLOB 一页一页读，内存有界） */
     private const val PAGE = 100
@@ -195,7 +243,34 @@ object MomentsExport {
     private data class Config(
         val autoExport: Boolean,
         val root: String,
+        /** 配置里原样的名单（含 `g:` / `t:` 条目），仅用于日志展示 */
         val list: List<String>,
+        /**
+         * R24：名单**展开后**的具体 wxid 快照。
+         *
+         * 为什么在这里展开而不是在 [MomentsLogic.listHit] 里：`listHit` 在导出循环内
+         * 每行调用一次（几千次），不能查库；而它是纯判据（无 Android 依赖），
+         * 也不该知道 `group_member` 表长什么样。所以在 [refresh] 里一次性展开好，
+         * 循环里只拿这个 Set 比对。
+         *
+         * 语义与 [ListResolver] 一致：**空集 = 不过滤**（名单为空时才可能是空集，
+         * 见 [listUnrestricted]）；配了却展开为空时见 [listImpossible]。
+         */
+        val ids: Set<String> = emptySet(),
+        /** 名单配置是否为空（= 不过滤，导出全部） */
+        val listUnrestricted: Boolean = true,
+        /** 配了名单但一个 id 都展开不出来（分组被删 / 标签没同步）→ 一条都不导出 */
+        val listImpossible: Boolean = false,
+        /** R26：导出动态时同时拷图片（配置键 [Keys.MOMENTS_COPY_IMAGES]，默认 false） */
+        val copyImages: Boolean = false,
+        /**
+         * R28：排除广告（`sourceType & 32 != 0`，见 [MomentsLogic.isAd]）。
+         *
+         * ⛔ 判据是 **bit5(32)** 而不是 128：128 是「折叠/全文」位，
+         * 按它过滤会把 `sourceType=130`（128|2，正常折叠动态）整组误杀。
+         * 字面证据见 `docs/_r28_ad_flag_forensics.md`。
+         */
+        val excludeAd: Boolean = true,
     )
 
     @Volatile
@@ -216,10 +291,24 @@ object MomentsExport {
     /** 单航班：上一轮没跑完，绝不并发再起一轮（写同一棵树会互相踩） */
     private val running = AtomicBoolean(false)
 
+    /** [pokeExport] 的上次触发时刻；用 AtomicLong 才能让 CAS 真正挡住并发重复 */
+    private val lastPokeAt = AtomicLong(0L)
+
+    /**
+     * 空名单警告的跨轮 latch（见 [autoBlockedByEmptyList]）。
+     *
+     * ⚠️ 为什么要能被重置：用户「清空 → 配上 → 再清空」时应该再看到一次警告。
+     * 重置点在 [refresh]（名单非空就解除），不在这里判时间。
+     */
+    private val emptyListWarned = AtomicBoolean(false)
+
     private val runs = AtomicLong(0)
     private val written = AtomicLong(0)
     private val skipped = AtomicLong(0)
     private val listMiss = AtomicLong(0)
+
+    /** R28：累计因广告被跳过的条数 */
+    private val adSkipped = AtomicLong(0)
     private val errs = AtomicLong(0)
     // ⛔ 已删于 R20（A8 收敛）：imgProbeLogged / imgSeq —— 旧 md5 路线已三次真机证伪
     //    （R15 分桶 0.68% / R16 全盘 find 零结果 / R19 文件名是 20 位数字串不含 md5）。
@@ -246,6 +335,25 @@ object MomentsExport {
     private val imgNoMedia = AtomicLong(0)
 
     /**
+     * R26 第五态：**目标图已存在且非空**，直接跳过（不重拷）。
+     *
+     * ⚠️ 刻意**独立于四态**：四态口径是「按 mediaId 计的尝试结果」，而这一项是
+     * 「压根没尝试」。混进去会让方案 Q5 判据 #5「四态之和 = 已尝试 mediaId 总数」失真。
+     * 它存在的原因是回填轮：`copyOneFromCache` 会先 `dst.delete()` 再写，
+     * 没有这道短路，每轮回填等于把所有图重写一遍。
+     */
+    private val imgAlready = AtomicLong(0)
+
+    /**
+     * 本轮还剩多少行 `img mid` 明细可打（见 [IMG_LOG_MAX]）。
+     *
+     * 每轮导出开头重置为 [IMG_LOG_MAX]；打成 0 后置 -1 表示「本轮已截断、别再打提示」。
+     * 只在单航班的导出线程里读写（[running] 保证串行），故用普通 Int 即可。
+     */
+    @Volatile
+    private var imgDetailLeft = IMG_LOG_MAX
+
+    /**
      * 失败弹窗去重 latch（跨轮，见 [MomentsNotifyLogic.Latch]）。
      *
      * ⚠️ 取代旧的 `pathWarned` / `spaceWarned`：那俩是**轮内日志去重**（每轮开头重置，
@@ -269,22 +377,99 @@ object MomentsExport {
         runCatching { refresh() }
             .onFailure { LogX.w("$TAG export refresh failed: ${it.javaClass.simpleName}") }
         ensureTick(FIRST_TICK_MS)
-        LogX.i("$TAG export installed enabled=${config.autoExport} images=$COPY_IMAGES")
+        LogX.i("$TAG export installed enabled=${config.autoExport} images=${config.copyImages}")
     }
 
     fun refresh() {
+        val raw = Kv.getList(Keys.MOMENTS_EXPORT_LIST)
+        // R24：名单里可能有 `g:` / `t:` —— 在这里一次性展开成具体 wxid，
+        // 导出循环（几千次 listHit）就只比对 Set，不再碰库。见 Config.ids 的 KDoc。
+        val resolved = runCatching { resolveList(raw) }
+            .onFailure { LogX.w("$TAG resolve list failed: ${it.javaClass.simpleName}") }
+            .getOrDefault(ListResolver.Resolved(raw = raw))
         config = Config(
             autoExport = Kv.getBool(Keys.MOMENTS_AUTO_EXPORT),
-            root = Kv.getString(Keys.MOMENTS_EXPORT_PATH).ifBlank { Prefs.DEFAULT_EXPORT_PATH },
-            list = Kv.getList(Keys.MOMENTS_EXPORT_LIST),
+            root = resolveRoot(),
+            list = raw,
+            ids = resolved.ids,
+            listUnrestricted = resolved.unrestricted,
+            listImpossible = resolved.impossible,
+            copyImages = Kv.getBool(Keys.MOMENTS_COPY_IMAGES),
+            excludeAd = Kv.getBool(Keys.MOMENTS_EXCLUDE_AD),
         )
         cfgAt = android.os.SystemClock.elapsedRealtime()
         lastRunAtRead = 0L
+        // R28：名单配上了 ⇒ 解除空名单安全阀的警告 latch（见 [autoBlockedByEmptyList]）。
+        if (!resolved.unrestricted) emptyListWarned.set(false)
+    }
+
+    /**
+     * 取导出根目录，**顺手迁移旧的私有目录配置**。
+     *
+     * ⛔ 光改 `Prefs.DEFAULT_EXPORT_PATH` 对老用户无效 —— 他们的 kv 表里已经存着旧值，
+     * `ifBlank { DEFAULT }` 只兜空串。不迁移的话导出会继续落在
+     * `Android/data/com.tencent.mm/...`（用户看不见，等于白导），而且**静默**。
+     *
+     * 迁移动作 = 判定命中旧路径 ⇒ 用新默认值 **并写回 kv**。
+     * 写回是必须的：只在内存里换，下次 `refresh()` 又会读到旧值，每 3 秒重做一次。
+     *
+     * 只在 [MomentsLogic.isLegacyExportPath] 命中时动；用户自己选过的任何其他路径一律尊重。
+     */
+    private fun resolveRoot(): String {
+        val stored = Kv.getString(Keys.MOMENTS_EXPORT_PATH)
+        if (!MomentsLogic.isLegacyExportPath(stored, Prefs.LEGACY_EXPORT_PATH)) {
+            return stored.ifBlank { Prefs.DEFAULT_EXPORT_PATH }
+        }
+        Kv.putString(Keys.MOMENTS_EXPORT_PATH, Prefs.DEFAULT_EXPORT_PATH)
+        LogX.i("$TAG export path migrated: $stored -> ${Prefs.DEFAULT_EXPORT_PATH}")
+        return Prefs.DEFAULT_EXPORT_PATH
+    }
+
+    /**
+     * 把名单展开成 wxid 快照。
+     *
+     * ⚠️ 只在名单里**真有** `g:` / `t:` 时才去查分组 / 标签（大多数用户的名单是裸 wxid，
+     * 不该为此付一次全表查询的代价）。
+     */
+    private fun resolveList(raw: List<String>): ListResolver.Resolved {
+        val needBuckets = raw.any {
+            val s = it.trim()
+            s.startsWith(ListResolver.PREFIX_GROUP) || s.startsWith(ListResolver.PREFIX_LABEL)
+        }
+        if (!needBuckets) return ListResolver.expand(raw)
+        val groups = LinkedHashMap<String, List<String>>()
+        runCatching { GroupDb.current() }.getOrNull()?.let { db ->
+            for (g in runCatching { db.listGroups() }.getOrDefault(emptyList())) {
+                runCatching { groups[g.id.toString()] = db.memberWxids(g.id).toList() }
+            }
+        }
+        val labels = runCatching { LabelSource.membersByLabelId() }.getOrDefault(emptyMap())
+        return ListResolver.expand(raw, groups, labels)
     }
 
     private fun cfg(): Config {
         if (android.os.SystemClock.elapsedRealtime() - cfgAt > CFG_TTL_MS) refresh()
         return config
+    }
+
+    /**
+     * 名单命中判定（R24 版本，支持 `g:` / `t:`）。
+     *
+     * 与 [MomentsLogic.listHit] 的关系：后者是**纯字面比对**（wxid / 昵称 / `名字(wxid)`），
+     * 本函数在它前面加一层「名单已展开」的语义：
+     * - 名单没配 → 全部导出（`listUnrestricted`）；
+     * - 配了但展开不出任何人（分组被删、标签没同步）→ **一条都不导出**
+     *   （`listImpossible`）。⚠️ 绝不能在这里退回成「全部导出」——
+     *   用户明明只想导某几个人，退回成全量会把整个朋友圈都落了盘；
+     * - 否则先看展开后的 wxid 集合，再看原名单的字面/昵称匹配
+     *   （保留 `名字(wxid)` 这种手写格式的兼容）。
+     */
+    private fun listHitResolved(c: Config, wxid: String?, nick: String?): Boolean {
+        if (c.listUnrestricted) return true
+        if (c.listImpossible) return false
+        val w = wxid?.trim().orEmpty()
+        if (w.isNotEmpty() && w in c.ids) return true
+        return MomentsLogic.listHit(c.list, wxid, nick)
     }
 
     // ------------------------------------------------------------------ 调度
@@ -307,6 +492,7 @@ object MomentsExport {
     private fun onTick() {
         val c = cfg()
         if (!c.autoExport) return
+        if (autoBlockedByEmptyList(c)) return // R28 空名单安全阀
         val now = System.currentTimeMillis()
         if (now - lastRunAtRead > CFG_TTL_MS) {
             lastRunAt = Kv.getString(Keys.MOMENTS_LAST_EXPORT_AT).toLongOrNull() ?: 0L
@@ -321,9 +507,21 @@ object MomentsExport {
      *
      * ⚠️ 整个线程体必须包 runCatching：后台线程里逃逸出去的异常没人接，
      * 会走默认 UncaughtExceptionHandler 把微信杀掉。
+     *
+     * @return **是否由本次调用启动了新一轮**。
+     *   `true` = CAS 抢到单航班，线程已 start；
+     *   `false` = 已有一轮在跑，本次什么都没做。
+     *
+     * ⛔ 为什么必须返回这个值（R26 修正）：原先返回 Unit，探针只能打 `running=$running`，
+     *   而那个值有**两种互斥含义**混在一起 —— 「刚起成功」和「本来就在跑」都是 `true`，
+     *   真机排查时分不清是「启动成功」还是「上一轮卡死没退出」，得靠猜。
+     *   `pokeExport()` 的 KDoc 本来就写了「false = 被开关/节流/单航班挡住」，
+     *   但实现写的是 `!running.get()` —— 起成功后 `running` 已是 `true`，取反变 `false`，
+     *   **与文档完全相反**。该返回值当时唯一调用方（`MomentsAuto`）丢弃了它，
+     *   所以这个错只潜伏着没爆；现在把语义钉死在 `runAsync()` 这一层，两处一并正确。
      */
-    fun runAsync() {
-        if (!running.compareAndSet(false, true)) return
+    fun runAsync(): Boolean {
+        if (!running.compareAndSet(false, true)) return false
         Thread {
             try {
                 runCatching { LogX.i(runBlocking()) }
@@ -338,6 +536,83 @@ object MomentsExport {
                 running.set(false)
             }
         }.apply { isDaemon = true; name = "moments-export" }.start()
+        return true
+    }
+
+    /**
+     * 「动态有可能刚更新」时由外部（后台同步成功后）戳一下，本函数决定要不要真跑。
+     *
+     * ## 为什么需要它
+     *
+     * 用户要的语义是「名单里的好友一有**新动态被捕捉到**就保存」。
+     * 光靠定时 tick（`TICK_MS`=5min）＋ `EXPORT_MIN_INTERVAL_MS`=10min 的节流，
+     * 最坏情况下新动态要等 10 分钟才落盘 —— 「自动保存」体感上是延迟的。
+     * 后台同步刚跑完就是**最可能出现新动态的时刻**，到这里把那一轮提前。
+     *
+     * ## 安全边界（缺一条就会变成刷电话的电风扇）
+     *
+     * 1. **必须 `autoExport` 开着** —— 用户没开自动导出就绝不能替他导出；
+     * 2. **[POKE_MIN_INTERVAL_MS] 节流** —— 同步会按 `refresh interval` 反复触发，
+     *    每次都唤醒等于把导出间隔从 10min 塌成「同步一成功就跑一次」；
+     * 3. **不替代定时 tick** —— tick 仍然跑，本函数只是把「下一轮」提前。
+     *    tick 里原有的 `exportDue` 判据保持不变，两条路径互为兜底。
+     *
+     * ⚠️ 重复导出本身是**幂等**的（`scanExportedIds` 按文件名里的 snsId 去重，
+     * 已有的直接跳过），所以这里即使多跑一轮也不会产生重复文件；
+     * 节流纯粹是为了省电和省 IO，不是为了正确性。
+     *
+     * @return 是否真的起了一轮（false = 被开关/节流/单航班挡住）
+     */
+    fun pokeExport(reason: String = "bg-sync"): Boolean {
+        val c = cfg()
+        if (!c.autoExport) return false
+        if (autoBlockedByEmptyList(c)) return false // R28 空名单安全阀
+        val now = System.currentTimeMillis()
+        val last = lastPokeAt.get()
+        if (last > 0 && now - last < POKE_MIN_INTERVAL_MS) return false
+        if (!lastPokeAt.compareAndSet(last, now)) return false
+        LogX.i("$TAG poke reason=$reason")
+        // ⛔ 直接透传 runAsync() 的结果（R26 修正）：
+        //    原写法 `return !running.get()` 是**语义反的** —— 起成功后 running 立刻为 true，
+        //    取反得到 false，与「true = 真起了一轮」正好相反。详见 runAsync() 的 KDoc。
+        return runAsync()
+    }
+
+    /**
+     * ⛔ **自动路径的空名单安全阀**（R28）。
+     *
+     * ## 为什么必须挡
+     * 名单 `moments.export_list` 为空时 [ListResolver.Resolved.unrestricted] = true，
+     * 语义是**「不限制」** ⇒ 导出循环会命中**全部**朋友圈。
+     *
+     * 手动点「导出」时这是合理行为（用户明确要全量）。但**自动**路径上它是一台电风扇：
+     * 每 3 小时把整个归档扫一遍并持续产 txt，而需求要的是
+     * 「名单里好友的新动态被捕捉到才保存」—— **方向正好相反**。
+     *
+     * ⚠️ R26 真机就踩到过一次：验收时为省时间把名单临时收窄，文档与日志两处记载
+     * 不一致（一处记「已恢复成 1 人」，一处记「测试时清空」）。只要实际是 `[]`，
+     * 自动导出就会静默全量跑，且**没有任何症状**（只是持续产文件）。
+     *
+     * ## 挡的边界
+     * - 只挡 **自动**路径（[onTick] / [pokeExport]）；手动导出走 [runAsync] 不受影响，
+     *   「不限制 = 全量」的语义对手动场景保留。
+     * - 只挡 `unrestricted`（名单为空）。名单**配了但展开为空**（[ListResolver.Resolved.impossible]）
+     *   是另一种状态：那属于配置错误（分组/标签真的没人），由 [listHitResolved] 判成谁都不命中，
+     *   不归本阀管 —— 两者混同会让安全阀把「配置错误」也静默吞掉。
+     *
+     * @return true = 本次自动导出应被拦下
+     */
+    private fun autoBlockedByEmptyList(c: Config): Boolean {
+        if (!c.listUnrestricted) return false
+        // 只 warn 一次：自动路径每 5 分钟一拍，不打 latch 会刷屏。
+        // 名单被配上后由 refresh() 解除 latch ⇒ 再清空会重新提醒一次。
+        if (emptyListWarned.compareAndSet(false, true)) {
+            LogX.w(
+                "$TAG auto-export SKIPPED: 导出名单为空（语义=不限制，会把全部朋友圈导出）。" +
+                    "自动导出要求先配名单；如需全量，请手动点导出。"
+            )
+        }
+        return true
     }
 
     // ------------------------------------------------------------------ 导出一轮
@@ -434,9 +709,11 @@ object MomentsExport {
         }
 
         runs.incrementAndGet()
+        // R26：明细日志预算每轮重置（见 IMG_LOG_MAX —— 防大目录首轮把 5000 行环形日志灌满）
+        imgDetailLeft = IMG_LOG_MAX
         // 索引**单轮建一次**（方案 Q2b）：真机 1029 个文件一轮 listFiles 是毫秒级，
         // 但每条动态重建会放大几百倍。开关关着就不建，别白扫盘。
-        val snsIdx = if (COPY_IMAGES) buildSnsIndex() else null
+        val snsIdx = if (config.copyImages) buildSnsIndex() else null
         val exported = scanExportedIds(rootDir)
         val nickCache = HashMap<String, String>()
         val cur = SnsScanCursor()
@@ -445,6 +722,8 @@ object MomentsExport {
         var sk = 0
         var lm = 0
         var er = 0
+        /** R28：因广告被跳过的条数（对账用 —— 开着除广告却一条都没跳过，说明判据可能失效） */
+        var ad = 0
         var sinceSpace = 0
         var stop = false
         // 对账用：两个源各扫到多少行 / 当前源降级过几次（真机一眼看出数据源对不对）
@@ -499,8 +778,14 @@ object MomentsExport {
                     continue
                 }
                 val nick = nickOf(row.userName, nickCache)
-                if (!MomentsLogic.listHit(c.list, row.userName, nick)) {
+                if (!listHitResolved(c, row.userName, nick)) {
                     lm++
+                    continue
+                }
+                // R28 广告黑名单：命中名单之后再判广告，避免广告占用 listMiss 口径。
+                // 判据 = sourceType 的 bit5(32)（MomentsLogic.isAd），⛔ 不是 128。
+                if (c.excludeAd && MomentsLogic.isAd(row.sourceType)) {
+                    ad++
                     continue
                 }
                 val dir = File(MomentsLogic.exportDir(root, nick, row.userName, MomentsLogic.millisOf(row.createTime)))
@@ -570,6 +855,14 @@ object MomentsExport {
         }
         skipped.addAndGet(sk.toLong())
         listMiss.addAndGet(lm.toLong())
+        adSkipped.addAndGet(ad.toLong())
+
+        // R26 图片回填：主循环只在「本次真写 txt」时补图，已导出 txt 的动态在去重处就 continue 了，
+        // 永远走不到拷贝 ⇒ 单独一轮补。⛔ 空间不足已 abort 时不再回填（stop=true）。
+        if (snsIdx != null && !stop) {
+            runCatching { backfillImages(root, snsIdx) }
+                .onFailure { LogX.w("$TAG img backfill THREW ${it.javaClass.simpleName}") }
+        }
 
         val now = System.currentTimeMillis()
         Kv.putString(Keys.MOMENTS_LAST_EXPORT_AT, now.toString())
@@ -582,7 +875,8 @@ object MomentsExport {
         //    但它们各自走了 `bail()` ⇒ 调 `abortRound()` 补上 streak 结算（R20 F-1）。
         //    ⇒ 「绕过 endRound」现在**只剩「不 reset」这一半**，另一半已补齐。
         notifyGate.endRound(clean)
-        return "$TAG export done rows=$rows written=$w skipped=$sk listMiss=$lm err=$er root=$root"
+        return "$TAG export done rows=$rows written=$w skipped=$sk listMiss=$lm " +
+            "adSkipped=$ad err=$er root=$root"
     }
 
     // ------------------------------------------------------------------ 辅助
@@ -875,53 +1169,243 @@ object MomentsExport {
      * 真机上一眼就能确认 `fliterPre` **只砍了一次**（方案 Q5 判据 #1，V1 明确要求）。
      */
     private fun copyImagesForRow(idx: SnsIndex, row: GroupDb.SnsRow, dir: File) {
+        copyRowImages(idx, row, dir, detail = true, st = null)
+    }
+
+    /**
+     * 一条动态的取图实现，主循环与回填轮共用。
+     *
+     * @param detail true = 每个 mediaId 打一行 `img mid` 明细（**只给主循环用**）。
+     *   回填轮传 false —— 它一次要过几百条，明细会把 5000 行环形日志灌满、挤掉真判据。
+     * @param st 非空时按「本轮」累加，供回填轮打聚合日志；全局四态计数两条路径都照常累加。
+     */
+    private fun copyRowImages(
+        idx: SnsIndex,
+        row: GroupDb.SnsRow,
+        dir: File,
+        detail: Boolean,
+        st: ImgRoundStat?,
+    ) {
         val ids = mediaIdsOf(row)
         if (ids.isEmpty()) {
             // 动态级口径：解析不出 mediaId ⇒ 独立计数，不混进按 mediaId 计的四态（V1 P2-1）
             imgNoMedia.incrementAndGet()
-            LogX.i("$TAG img noMediaId snsId=${row.snsId} (protobuf 无媒体/结构断裂)")
+            st?.let { it.noMedia++ }
+            if (detail) LogX.i("$TAG img noMediaId snsId=${row.snsId} (protobuf 无媒体/结构断裂)")
             return
         }
         for ((slot, mid) in ids.withIndex()) {
             val dst = File(dir, MomentsLogic.imageFileName(row.snsId, slot, "jpg"))
+            // ⛔ R26：已存在且**非空**就跳过。必须判 length()>0 ——
+            //    `.tmp` 半成品 / 上次 rename 失败的 0 字节残留都是「存在但为 0 字节」，
+            //    那是上次失败、不是已成功，必须重拷。判据见 [MomentsLogic.imgDone]。
+            val dstExists = dst.exists()
+            if (MomentsLogic.imgDone(dstExists, if (dstExists) dst.length() else 0L)) {
+                imgAlready.incrementAndGet()
+                st?.let { it.already++ }
+                continue
+            }
             val res = runCatching { copyOneFromCache(idx, mid, dst) }.getOrElse {
                 // copyOneFromCache 自己已兜异常；这里只防意料外的运行时异常逃出去
-                LogX.w("$TAG img unexpected ${it.javaClass.simpleName} snsId=${row.snsId} #$slot")
+                if (detail) {
+                    LogX.w("$TAG img unexpected ${it.javaClass.simpleName} snsId=${row.snsId} #$slot")
+                }
                 ImgResult(ImgOutcome.READ_FAIL, null)
             }
-            // ⚠️ 必须**每条都打**（含 NONE）：这是现场判定「只砍一次」的唯一证据。
+            // ⚠️ 主循环必须**每条都打**（含 NONE）：这是现场判定「只砍一次」的唯一证据。
             // 格式定死，勿加字段（真机对账脚本按列取）：
             //   MOMENT img mid snsId=.. raw=.. pre=.. cand0=.. hit=..
-            val pre = MomentsLogic.fliterPre(mid)
-            val cand0 = MomentsLogic.snsNameCandidates(mid).firstOrNull() ?: "NONE"
-            LogX.i(
-                "$TAG img mid snsId=${row.snsId} raw=$mid pre=$pre " +
-                    "cand0=$cand0 hit=${res.hit ?: "NONE"}"
-            )
-            countImg(res.outcome, row.snsId, slot, dst)
+            // R26：加每轮行数上限（IMG_LOG_MAX），超出只计数不打行。
+            if (detail) {
+                if (imgDetailLeft > 0) {
+                    imgDetailLeft--
+                    val pre = MomentsLogic.fliterPre(mid)
+                    val cand0 = MomentsLogic.snsNameCandidates(mid).firstOrNull() ?: "NONE"
+                    LogX.i(
+                        "$TAG img mid snsId=${row.snsId} raw=$mid pre=$pre " +
+                            "cand0=$cand0 hit=${res.hit ?: "NONE"}"
+                    )
+                } else if (imgDetailLeft == 0) {
+                    imgDetailLeft = -1
+                    LogX.i("$TAG img mid detail truncated (>$IMG_LOG_MAX lines this round)")
+                }
+            }
+            countImg(res.outcome, row.snsId, slot, dst, detail, st)
         }
     }
 
+    /** 回填/主循环共用的轮内取图统计（聚合日志用，不参与四态口径） */
+    private class ImgRoundStat {
+        var rows = 0
+        var noMedia = 0
+        var copied = 0
+        var already = 0
+        var miss = 0
+        var readFail = 0
+        var rootMiss = 0
+    }
+
     /** 四态计数 + 一行日志（互斥穷尽：`when` 不给 else 分支外的静默出口） */
-    private fun countImg(outcome: ImgOutcome, snsId: Long, slot: Int, dst: File) {
+    private fun countImg(
+        outcome: ImgOutcome,
+        snsId: Long,
+        slot: Int,
+        dst: File,
+        detail: Boolean,
+        st: ImgRoundStat?,
+    ) {
         when (outcome) {
             ImgOutcome.ROOT_MISS -> {
                 imgRootMiss.incrementAndGet()
-                LogX.w("$TAG img rootMiss snsId=$snsId #$slot")
+                st?.let { it.rootMiss++ }
+                if (detail) LogX.w("$TAG img rootMiss snsId=$snsId #$slot")
             }
             ImgOutcome.FILE_MISS -> {
                 imgFileMiss.incrementAndGet()
-                LogX.i("$TAG img fileMiss snsId=$snsId #$slot")
+                st?.let { it.miss++ }
+                if (detail) LogX.i("$TAG img fileMiss snsId=$snsId #$slot")
             }
             ImgOutcome.READ_FAIL -> {
                 imgReadFail.incrementAndGet()
-                LogX.w("$TAG img readFail snsId=$snsId #$slot dst=${dst.name}")
+                st?.let { it.readFail++ }
+                if (detail) LogX.w("$TAG img readFail snsId=$snsId #$slot dst=${dst.name}")
             }
             ImgOutcome.COPIED -> {
                 imgCopied.incrementAndGet()
-                LogX.i("$TAG img copied snsId=$snsId #$slot dst=${dst.name}")
+                st?.let { it.copied++ }
+                if (detail) LogX.i("$TAG img copied snsId=$snsId #$slot dst=${dst.name}")
             }
         }
+    }
+
+    /**
+     * R26 · 图片**回填轮**：给「txt 已导出但图还缺」的动态补图。
+     *
+     * ## 为什么必须单独一轮
+     * 主循环把「已导出」挡在两处去重上（`cur.first(snsId, exported)` 与 `txt.exists()`），
+     * 两处都直接 `continue` ⇒ `copyImagesForRow` 只在「本次真写 txt 成功」时被调。
+     * 所以**只开开关不做回填 = 已导出的动态永远没图**（真机：7 条 txt 早就在，
+     * `skipped=7`、`copyImagesForRow` 一次都没跑过）。
+     *
+     * ## 与主循环的分工
+     * - 主循环：负责**新**动态，写 txt + 拷图，打 `img mid` 明细；
+     * - 本函数：只负责**补图**，不写 txt，**不打明细**、只打一行聚合。
+     *
+     * ⛔ 刻意不改编主循环的去重语义：那会让「文本去重 = 幂等」（方案 Q6）失效，
+     * 且判断「图齐不齐」需要解 `content` BLOB，扫描阶段（只看文件名）做不到。
+     *
+     * ## 限次 + 跨轮轮转（R27）
+     * 每轮最多 [MAX_BACKFILL_PER_RUN] 条动态（冷启后一次性补几千条会把后台线程占满）。
+     *
+     * ⛔ R26 之前这里是「每轮从最新重扫」，于是 `MAX_BACKFILL_PER_RUN` 之下的行**永远轮不到**
+     * （R26 复核 §8(b) 的队头阻塞：最新 200 条每轮都占满配额，归档每轮徒劳重试）。
+     * R27 起把扫到哪儿**落盘**（[Keys.MOMENTS_FILL_CURSOR]，格式见 [MomentsLogic.FillCursor]）：
+     * - 本轮被配额截断 ⇒ 记住最后一条**已处理**行，下轮从它之后（键集严格更旧）继续；
+     * - 两个源都扫到底 ⇒ 清空游标，回绕到最新（[MomentsLogic.fillCursorAfterRound]）。
+     * 于是「补不完的下一轮继续」这句从空话变成真话，且每轮代价仍有界。
+     *
+     * ⚠️ 游标只有**一份**，主循环不写它（主循环每轮都从最新开始 —— 新动态必须优先）。
+     * 探针 `sub=imgfill` 也走同一份游标：手动补图 = 从上次停的地方接着补，语义一致。
+     *
+     * @return 聚合日志行（探针 `sub=imgfill` 直接把它打出来）
+     */
+    private fun backfillImages(root: String, idx: SnsIndex): String {
+        val db = GroupDb.current() ?: return "$TAG img backfill no db"
+        val st = ImgRoundStat()
+        val nickCache = HashMap<String, String>()
+        val seen = HashSet<Long>()
+        val cur = SnsScanCursor()
+        // R27：从上一轮停下的位置接着扫；没有游标 / 游标是脏值 ⇒ 从最新开始（键集哨兵 MAX_VALUE）
+        val saved = runCatching { MomentsLogic.parseFillCursor(Kv.getString(Keys.MOMENTS_FILL_CURSOR)) }
+            .onFailure { LogX.w("$TAG img backfill cursor read failed ${it.javaClass.simpleName}") }
+            .getOrNull()
+        if (saved != null) cur.seek(fillSrc(saved.src), saved.ct, saved.sid)
+        var filledRows = 0
+        var noTxt = 0
+        // true = 两个源都扫到底（本轮不是被配额截断）⇒ 游标回绕到最新
+        var wrapped = false
+
+        scan@ while (st.rows < MAX_BACKFILL_PER_RUN) {
+            val page: List<GroupDb.SnsRow>? = when (cur.src) {
+                SnsScanCursor.Src.CURRENT ->
+                    runCatching { SnsGuard.listCurrentSns(cur.ct, cur.sid, PAGE) }.getOrNull()
+                SnsScanCursor.Src.ARCHIVE ->
+                    runCatching { db.listSnsArchiveBefore(cur.ct, cur.sid, PAGE) }.getOrNull()
+            }
+            if (page == null || page.isEmpty()) {
+                if (!cur.nextSource()) {
+                    wrapped = true
+                    break
+                }
+                continue
+            }
+            for (row in page) {
+                // ⛔ 配额判定必须在 `advanceTo` **之前**：游标若停在一条没处理的行上，
+                //    下轮键集是严格 `<`，那条行会被**跳过整整一圈**（图永远补不上，且无日志）。
+                if (st.rows >= MAX_BACKFILL_PER_RUN) break@scan
+                // ⚠️ 游标必须无条件推进（去重跳过的也要推，否则死循环 —— 与主循环同一条规矩）
+                cur.advanceTo(row.createTime, row.snsId)
+                if (!seen.add(row.snsId)) continue
+                st.rows++
+                val nick = nickOf(row.userName, nickCache)
+                val dir = File(
+                    MomentsLogic.exportDir(
+                        root, nick, row.userName, MomentsLogic.millisOf(row.createTime)
+                    )
+                )
+                // 没导出过 txt 的交给主循环（它同时会写 txt + 图），这里不重复处理
+                if (!File(dir, MomentsLogic.textFileName(row.snsId)).exists()) {
+                    noTxt++
+                    continue
+                }
+                val before = st.copied
+                copyRowImages(idx, row, dir, detail = false, st = st)
+                if (st.copied > before) filledRows++
+            }
+            if (page.size < PAGE && !cur.nextSource()) {
+                wrapped = true
+                break
+            }
+        }
+
+        // ---- R27：落游标（一轮只写一次，不随行累加） ----
+        // `cur` 此刻的位置 = 本轮最后一条**已处理**行（配额 break 已在 advanceTo 之前挡掉）。
+        val last = MomentsLogic.FillCursor(fillSrcCode(cur.src), cur.ct, cur.sid)
+        val next = MomentsLogic.fillCursorAfterRound(wrapped, last)
+        runCatching {
+            // 空串 = 「清空」，`parseFillCursor` 对此返回 null ⇒ 下轮从最新开始
+            Kv.putString(
+                Keys.MOMENTS_FILL_CURSOR,
+                if (next == null) "" else MomentsLogic.encodeFillCursor(next)
+            )
+        }.onFailure { LogX.w("$TAG img backfill cursor save failed ${it.javaClass.simpleName}") }
+
+        val line = "$TAG img backfill rows=${st.rows} noTxt=$noTxt noMedia=${st.noMedia} " +
+            "withIds=${st.rows - noTxt - st.noMedia} filled=$filledRows " +
+            "copied=${st.copied} already=${st.already} miss=${st.miss} " +
+            "readFail=${st.readFail} rootMiss=${st.rootMiss} " +
+            // 轮转可观测：from=本轮起点（NEW=从最新），next=下轮起点（NEW=已回绕），wrapped=是否扫到底
+            "from=${fillSrcName(saved)}:${saved?.ct ?: "-"} " +
+            "next=${fillSrcName(next)}:${next?.ct ?: "-"} wrapped=$wrapped"
+        LogX.i(line)
+        return line
+    }
+
+    /** 回填游标的源编号 ↔ [SnsScanCursor.Src]（[MomentsLogic] 不许 import 本文件的 enum，故在此转换） */
+    private fun fillSrcCode(src: SnsScanCursor.Src): Int =
+        if (src == SnsScanCursor.Src.ARCHIVE) MomentsLogic.FILL_SRC_ARCHIVE
+        else MomentsLogic.FILL_SRC_CURRENT
+
+    /** 落盘编号 → 源。越界值只可能来自 `parseFillCursor` 已拦掉的脏数据，这里兜 CURRENT */
+    private fun fillSrc(code: Int): SnsScanCursor.Src =
+        if (code == MomentsLogic.FILL_SRC_ARCHIVE) SnsScanCursor.Src.ARCHIVE
+        else SnsScanCursor.Src.CURRENT
+
+    /** 游标源编号的单字符展示（`C` = 当前 SnsInfo，`A` = 归档，`NEW` = 从最新开始） */
+    private fun fillSrcName(c: MomentsLogic.FillCursor?): String = when {
+        c == null -> "NEW"
+        c.src == MomentsLogic.FILL_SRC_ARCHIVE -> "A"
+        else -> "C"
     }
 
     // ⛔ 已删于 R20（A8 收敛）：tryCopyImages() —— 旧 md5 路线已三次真机证伪
@@ -930,9 +1414,9 @@ object MomentsExport {
     //    原 `op=moments sub=imgtry` 探针一并下架；新链路对账请用 `sub=snsprobe`。
 
     /**
-     * **新链路探针**：`sub=snsprobe` 专用，**完全不依赖 [COPY_IMAGES]**。
+     * **新链路探针**：`sub=snsprobe` 专用，**完全不依赖图片开关**（`moments.copy_images`）。
      *
-     * 存在的理由：`COPY_IMAGES` 必须等真机验完才敢开，但「验」本身不能依赖那个开关 ——
+     * 存在的理由：图片开关必须等真机验完才敢开，但「验」本身不能依赖那个开关 ——
      * 否则 `false` 时 [copyImagesForRow] 根本不跑，protobuf 与索引匹配无从验证。
      * 本探针对最近 n 条归档跑一遍**只读**的完整链路，把每步结果打出来：
      *
@@ -946,7 +1430,7 @@ object MomentsExport {
      * 判据：
      * - `ids=0` 且 `noMedia` 接近 `rows` ⇒ **字段号错**（改 `MomentsLogic.PROTO_FIELD_*`）
      * - `ids>0` 但 `hit=NONE` ⇒ mediaId 拿到了但文件名不匹配（看 `raw`/`pre` 与真机文件名对比）
-     * - `hit=<name>` ⇒ **链路通**，可以开 `COPY_IMAGES` 上 M1
+     * - `hit=<name>` ⇒ **链路通**，可以开图片开关（`moments.copy_images`）
      */
     /** 探针专用：content 头部 hex（判字段号用，不参与业务路径） */
     private fun hexHead(b: ByteArray, n: Int): String {
@@ -1299,12 +1783,15 @@ object MomentsExport {
 
     fun stat(): String = runCatching {
         val c = cfg()
-        "$TAG export stat enabled=${c.autoExport} images=$COPY_IMAGES running=$running " +
+        "$TAG export stat enabled=${c.autoExport} images=${c.copyImages} imgHint=$IMG_SOURCE_HINT " +
+            "running=$running " +
             "lastRunAt=$lastRunAt runs=${runs.get()} written=${written.get()} " +
             "skipped=${skipped.get()} listMiss=${listMiss.get()} err=${errs.get()} " +
             "imgRootMiss=${imgRootMiss.get()} imgFileMiss=${imgFileMiss.get()} " +
             "imgReadFail=${imgReadFail.get()} imgCopied=${imgCopied.get()} " +
-            "imgNoMedia=${imgNoMedia.get()} " +
+            "imgAlready=${imgAlready.get()} imgNoMedia=${imgNoMedia.get()} " +
+            // R27：回填游标（NEW / 空 = 下一轮从最新开始）—— 真机看它有没有在往前推
+            "fillCursor=${Kv.getString(Keys.MOMENTS_FILL_CURSOR).ifBlank { "NEW" }} " +
             "list=${c.list.size} root=${c.root}"
     }.getOrElse { "$TAG export stat error=${it.javaClass.simpleName}" }
 
@@ -1313,11 +1800,16 @@ object MomentsExport {
      * - `stat` 状态；`path` 当前路径与可写性/剩余空间
      * - `export` 立刻起一轮（绕过最小间隔；开关只挡自动轮，不挡手动诊断）
      * - `snsprobe` 新链路只读对账（原 `img` / `imgtry` 两个旧 md5 探针已于 R20 删除）
+     * - `imgfill` R26 图片回填（给已导出但缺图的补图，受 `moments.copy_images` 约束）
      * - `scan` 重扫导出目录，报告已导出条数
      */
     fun probe(sub: String, n: Int = 5): String = runCatching {
         when (sub.lowercase()) {
             "stat" -> stat()
+            // ⛔ ⚠️ 别名，不是重复：入口 `op=moments sub=stat` 在 EntryReceiver 里被
+            //    **MomentsAuto** 先截走了（自动刷新那边的 stat 用同名）⇒ 本函数的 stat 走不到。
+            //    R26 新增的 `images=` / `imgHint=` 要能看到，只能用 `sub=estat` 这条。
+            "estat" -> stat()
             "path" -> {
                 val c = cfg()
                 val d = File(c.root)
@@ -1326,8 +1818,17 @@ object MomentsExport {
                     "min=${MomentsLogic.MIN_FREE_BYTES}"
             }
             "export" -> {
-                runAsync()
-                "$TAG export triggered running=$running"
+                // ⛔ 打 `started=` 而不是 `running=`（R26）：后者两种含义混在一起 ——
+                //    刚起成功、以及本来就在跑，都会打成 true，从日志上分不开。
+                //    started=true  ⇒ 这一条广播确实启动了新一轮；
+                //    started=false ⇒ 被单航班挡住（已有轮在跑），要查就得先 `sub=estat` 看上一轮是不是卡住了。
+                val started = runAsync()
+                if (started) {
+                    "$TAG export started=true"
+                } else {
+                    "$TAG export started=false reason=busy (a round is already running; " +
+                        "check estat)"
+                }
             }
             // ⛔ 已删于 R20（A8 收敛）：`img` / `imgtry` 两个旧 md5 路线探针分支
             //    （R15 分桶 0.68% / R16 全盘 find 零结果 / R19 文件名是 20 位数字串不含 md5）。
@@ -1347,11 +1848,30 @@ object MomentsExport {
             "imgurl" -> logImgUrls(MomentsLogic.clampProbeN(n))
             // 真下载（联网）。n 建议小一点（默认 3），别一口气把几十条都下了
             "imgdl" -> downloadMedia(MomentsLogic.clampProbeN(n))
+            // R26：**图片回填**（给「txt 已导出但图缺」的补图）。手动触发，不用等下一轮导出。
+            // ⚠️ 仍受配置开关约束（单闸原则，不做隐藏旁路）；没开就明确告诉你该怎么开。
+            // 与主循环共用 running 单航班 —— 每写这么多个文件查一次空间的那套状态不能并发。
+            "imgfill" -> {
+                val c = cfg()
+                if (!c.copyImages) {
+                    "$TAG img backfill SKIP copy_images=false " +
+                        "（先 kvset ${Keys.MOMENTS_COPY_IMAGES} true）"
+                } else if (!running.compareAndSet(false, true)) {
+                    "$TAG img backfill SKIP a round is running"
+                } else {
+                    try {
+                        imgDetailLeft = 0 // 回填本来就不打明细，这里顺手把状态摆正
+                        backfillImages(c.root, buildSnsIndex())
+                    } finally {
+                        running.set(false)
+                    }
+                }
+            }
             "scan" -> {
                 val ids = scanExportedIds(File(cfg().root))
                 "$TAG scan exported=${ids.size} sample=${ids.take(5)}"
             }
-            else -> "$TAG export subs=stat|path|export|snsidx|imgurl|imgdl|scan"
+            else -> "$TAG export subs=estat|path|export|snsidx|snsprobe|imgfill|imgurl|imgdl|scan"
         }
     }.getOrElse { "$TAG export probe error=${it.javaClass.simpleName}" }
 }

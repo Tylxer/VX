@@ -38,9 +38,6 @@ object MainPage : PanelPage {
     private val C_BAK = 0xFF4B8FF7.toInt()
     private val C_BC = 0xFF8B5CF6.toInt()
 
-    /** 分组项在选择器里的 id 前缀，用来跟好友 wxid 区分开 */
-    private const val GROUP_PREFIX = "g:"
-
     private data class Entry(
         val title: String,
         val color: Int,
@@ -82,9 +79,12 @@ object MainPage : PanelPage {
     /**
      * 所有 `ENTER` 类配置项（名单、群发目标）的点击入口 —— 都推同一个 [PickerPage]。
      *
-     * 群发目标与转发目标是「混合选」：模块分组 + 微信标签 + 好友；其余名单只有好友一段。
-     * 微信标签段来自 [LabelSource]（`ContactLabel` + `rcontact` 两份只读缓存），
-     * [LabelSource.ready] 为 false 时不显示该段（宁可少一段，不显示空段）。
+     * **R24 起统一四 Tab**：好友 / 群聊 / 我的分组 / 微信标签，对所有名单场景开放
+     * （用户明确要求）。四 Tab 的构建只有一份实现 —— [PickerTabs.all]，
+     * 本方法只负责取初始值、写回配置。
+     *
+     * `mixed` 已不再决定「给几段」（四 Tab 恒定），只保留给 hint 文案：
+     * 群发目标的 hint 要说明「会展开成具体的人并去重」，普通名单不需要。
      */
     private fun onEnterSpec(spec: PrefSpec): Boolean {
         val db = GroupDb.current()
@@ -93,29 +93,12 @@ object MainPage : PanelPage {
             return true
         }
         val mixed = spec.key == Keys.BROADCAST_TARGETS
-        val friends = db.allRealFriends()
-
-        val sections = ArrayList<PickerPage.Section>()
-        if (mixed) {
-            val groups = db.listGroups().map {
-                PickerPage.Item(
-                    id = "$GROUP_PREFIX${it.id}",
-                    title = it.name,
-                    subtitle = "分组 · ${db.countMembers(it.id)} 人",
-                )
-            }
-            if (groups.isNotEmpty()) sections.add(PickerPage.Section("我的分组", groups))
-            labelSection()?.let { sections.add(it) }
-        }
-        if (friends.isNotEmpty()) {
-            sections.add(
-                PickerPage.Section(
-                    "好友",
-                    friends.map { PickerPage.Item(it.wxid, it.displayName, it.wxid) }
-                )
-            )
-        }
-        if (sections.isEmpty()) {
+        val tabs = PickerTabs.all(
+            db = db,
+            groups = PickerTabs.allowGroupTab(),
+            labels = PickerTabs.allowGroupTab(),
+        )
+        if (tabs.isEmpty()) {
             toast("好友缓存为空，先去通讯录滚一遍再回来")
             return true
         }
@@ -123,34 +106,26 @@ object MainPage : PanelPage {
         Panel.push(
             PickerPage(
                 title = spec.title,
-                sections = sections,
+                tabs = tabs,
                 initial = Kv.getList(spec.key),
                 hint = if (mixed) "分组、微信标签与好友可混选，发送时会展开成具体的人并去重" else null,
+                // F1：群聊补跑完成后原地刷新，把「群聊」Tab 补出来（不丢勾选/当前 Tab/搜索词）
+                refreshTabs = {
+                    PickerTabs.all(
+                        db = db,
+                        groups = PickerTabs.allowGroupTab(),
+                        labels = PickerTabs.allowGroupTab(),
+                    )
+                },
             ) { ids ->
                 Kv.putList(spec.key, ids)
+                // R24：免打扰名单可能含 g:/t:，作用域判定带 30 秒缓存 → 改完立刻失效，
+                // 否则验收时会看到「名单改了但静音行为晚 30 秒才变」的假阴性
+                runCatching { com.lx.wxgroup.core.NotifyMute.invalidateScope() }
                 LogX.i("PREF ${spec.key} = ${ids.size} 项")
             }
         )
         return true
-    }
-
-    /**
-     * 微信标签段：id 带 `t:` 前缀（与 wxid / 分组 id 区分），展示标签名 + 人数。
-     *
-     * 为空（无标签或缓存还没灌进来）时返回 null，调用方据此不显示段。
-     */
-    private fun labelSection(): PickerPage.Section? {
-        if (!LabelSource.ready()) return null
-        val items = LabelSource.allLabels()
-            .filter { !it.name.isNullOrBlank() }
-            .map {
-                PickerPage.Item(
-                    id = "${ForwardLogic.PREFIX_LABEL}${it.id}",
-                    title = it.name!!,
-                    subtitle = "微信标签 · ${it.memberCount} 人",
-                )
-            }
-        return if (items.isEmpty()) null else PickerPage.Section("微信标签", items)
     }
 
     // ------------------------------------------------------------ 各二级页

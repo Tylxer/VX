@@ -41,13 +41,19 @@ object ActivityResultRelay {
     /**
      * 模块专属 requestCode 区间。
      *
-     * 取 0x5758（"WX"）打头，和微信自己常用的小整数（1/2/100/1000…）拉开距离；
-     * 只需两个值：导出（CREATE_DOCUMENT）与导入（OPEN_DOCUMENT）。
+     * 取 0x5758（"WX"）打头，和微信自己常用的小整数（1/2/100/1000…）拉开距离。
+     *
+     * - [REQ_EXPORT] / [REQ_IMPORT]：备份域的 CREATE_DOCUMENT / OPEN_DOCUMENT；
+     * - [REQ_DIR]（R28）：朋友圈导出目录的 `ACTION_OPEN_DOCUMENT_TREE`。
+     *
+     * ⚠️ [isOurs] 用的是**区间**判断，新增值必须紧接在后面且连续，
+     *    否则区间会漏（漏了的表现是「选完目录没反应」，很难查）。
      */
     const val REQ_EXPORT = 0x575801
     const val REQ_IMPORT = 0x575802
+    const val REQ_DIR = 0x575803
 
-    private fun isOurs(code: Int) = code in REQ_EXPORT..REQ_IMPORT
+    private fun isOurs(code: Int) = code in REQ_EXPORT..REQ_DIR
 
     /** 一次性回调：拿到结果就清空，避免同一个 requestCode 被复用后串号 */
     @Volatile

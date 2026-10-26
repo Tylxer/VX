@@ -55,8 +55,14 @@ object MassSendPage : PanelPage {
 
     override val title = "群发"
 
-    /** 分组项在选择器里的 id 前缀，用来跟好友 wxid 区分开 */
-    private const val GROUP_PREFIX = "g:"
+    /**
+     * 最近一次 `build` 收到的宿主 Context。
+     *
+     * 唯一用途：`onEnterSpec` 以方法引用形式交给 `Rows.prefGroup`（吃不到 ctx），
+     * 而它在「四个数据源全空」时需要 toast 真实原因。只存 Activity Context 引用，
+     * 与模块其它页面持有 `ctx` 的方式一致。
+     */
+    private var lastCtx: Context? = null
 
     private const val FOOTNOTE =
         "全自动后台执行，全程不抢前台；进度只在打开本面板时可见。" +
@@ -108,6 +114,9 @@ object MassSendPage : PanelPage {
         if (specs.isEmpty()) {
             root.addView(Rows.note(ctx, "群发域暂无可配置项"))
         } else {
+            // 兜住 context：`::onEnterSpec` 是方法引用、吃不到 ctx，
+            // 而它在「数据为空」时要 toast 真实原因（见 onEnterSpec 注释）
+            lastCtx = ctx
             root.addView(Rows.prefGroup(ctx, specs, ::onEnterSpec))
         }
 
@@ -183,58 +192,49 @@ object MassSendPage : PanelPage {
     // ------------------------------------------------------------------ 目标选择
 
     /**
-     * 「选择发送目标」行：走 K3 选择器，**混合选**模块分组 + 微信标签 + 好友。
-     * 与转发选择器同一套构建方式（分组 / 标签为空就不显示那段，宁可少一段不显示空段）。
+     * 「选择发送目标」行：走 K3 选择器。
+     *
+     * **R24 起统一四 Tab**（好友 / 群聊 / 我的分组 / 微信标签），与 [MainPage.onEnterSpec]
+     * 共用同一份实现 [PickerTabs.all]。群发是**唯一能展开 `g:` / `t:` 前缀**的场景
+     * （`MassSendLogic.resolveTargets`），所以四个 Tab 在这里本来就是完整的。
      */
     private fun onEnterSpec(spec: PrefSpec): Boolean {
         if (spec.key != Keys.BROADCAST_TARGETS) return false
         val db = GroupDb.current() ?: return false
-        val sections = ArrayList<PickerPage.Section>()
-
-        val groups = runCatching { db.listGroups() }.getOrDefault(emptyList()).map {
-            PickerPage.Item(
-                id = "$GROUP_PREFIX${it.id}",
-                title = it.name,
-                subtitle = "分组 · ${runCatching { db.countMembers(it.id) }.getOrDefault(0)} 人",
-            )
+        val tabs = PickerTabs.all(
+            db = db,
+            groups = PickerTabs.allowGroupTab(),
+            labels = PickerTabs.allowGroupTab(),
+        )
+        if (tabs.isEmpty()) {
+            // ⚠️ 不能直接 return false：`Rows.pref` 对 false 的反应是 toast
+            // 「『选择发送目标』暂未接入」（Rows.kt），会把「好友缓存为空」误导成
+            // 「功能没接线」（R24 复核 S3）。这里先 toast 真实原因，再返回 true
+            // 表示「已处理，别再弹那条通用提示」。
+            lastCtx?.let { UiKit.toast(it, "好友缓存为空，先去通讯录滚一遍再回来") }
+            return true
         }
-        if (groups.isNotEmpty()) sections.add(PickerPage.Section("我的分组", groups))
-
-        labelSection()?.let { sections.add(it) }
-
-        val friends = runCatching { db.allRealFriends() }.getOrDefault(emptyList())
-            .map { PickerPage.Item(it.wxid, it.displayName, it.wxid) }
-        if (friends.isNotEmpty()) sections.add(PickerPage.Section("好友", friends))
-
-        if (sections.isEmpty()) return false
 
         Panel.push(
             PickerPage(
                 title = spec.title,
-                sections = sections,
+                tabs = tabs,
                 initial = Kv.getList(spec.key),
                 hint = "分组、微信标签与好友可混选，发送时会展开成具体的人并去重",
+                // F1：群聊补跑完成后原地刷新，把「群聊」Tab 补出来（不丢勾选/当前 Tab/搜索词）
+                refreshTabs = {
+                    PickerTabs.all(
+                        db = db,
+                        groups = PickerTabs.allowGroupTab(),
+                        labels = PickerTabs.allowGroupTab(),
+                    )
+                },
             ) { ids ->
                 Kv.putList(spec.key, ids)
                 LogX.i("PREF ${spec.key} = ${ids.size} 项")
             }
         )
         return true
-    }
-
-    /** 微信标签段：id 带 `t:` 前缀。无标签 / 缓存没灌进来时返回 null（不显示该段） */
-    private fun labelSection(): PickerPage.Section? {
-        if (!LabelSource.ready()) return null
-        val items = runCatching { LabelSource.allLabels() }.getOrDefault(emptyList())
-            .filter { !it.name.isNullOrBlank() }
-            .map {
-                PickerPage.Item(
-                    id = "${MassSendLogic.PREFIX_LABEL}${it.id}",
-                    title = it.name!!,
-                    subtitle = "微信标签 · ${it.memberCount} 人",
-                )
-            }
-        return if (items.isEmpty()) null else PickerPage.Section("微信标签", items)
     }
 
     private fun buildBuckets(db: GroupDb?): MassSendLogic.Buckets {

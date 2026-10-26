@@ -3,15 +3,20 @@ package com.lx.wxgroup.data
 /**
  * 「防撤回语音后播放失败」的**纯判据**（零 Android / 零 Xposed 依赖 → 可直接跑 JVM 单测）。
  *
- * ## 根因（主会话真机定案，不是猜）
- * 微信撤回语音时做两步：
- * 1. `DELETE FROM voiceinfo WHERE FileName IN (SELECT imgPath FROM message WHERE talker IN (...))`
- *    —— 删掉语音下载记录；
- * 2. `UPDATE message SET type=..., content=... WHERE msgId=?` —— 改写成撤回形态。
+ * ## 根因（DEX 反汇编定案，见 `docs/_r21c_voice_sqlform.md` §1/§2）
+ * 微信撤回语音时做两步（**顺序已实证，别写反**）：
+ * 1. `UPDATE message SET ... WHERE msgId=?`（`j9.va`）—— 改写成撤回形态；
+ * 2. 之后才 `executor.submit` 一个 `deleteLocalFile` runnable，异步执行
+ *    `SQLiteDatabase.delete("voiceinfo", "FileName= ?", [imgPath])` —— 删语音下载记录。
  *
- * 我们的 [com.lx.wxgroup.feature.AntiRevoke] 只拦了第 2 步，第 1 步的 DELETE 没拦：
+ * 我们的 [com.lx.wxgroup.feature.AntiRevoke] 只拦了第 1 步，第 2 步的 DELETE 没拦：
  * `message` 行保住了（气泡还在），但 `voiceinfo` 里那条下载记录没了，播放器按 `imgPath`
  * 去 `voiceinfo` 拿 `Status/TotalLen/NetOffset` 查不到 ⇒ 点了没反应。
+ *
+ * ⚠️ 两个**已证伪**的历史误判（别再写回去）：
+ * - ~~撤回删 voiceinfo 走 `FileName IN (SELECT imgPath FROM message ...)` 子查询~~
+ *   ⇒ 那条子查询属于 `deleteMsgByTalkerSync`，只被「删会话/清空记录」调用，与撤回无关。
+ * - ~~DELETE 先于 UPDATE~~ ⇒ 反汇编里 DELETE 的 runnable 是在 UPDATE 之后才排程的。
  *
  * 本类只回答一个问题：**这一次 voiceinfo 的 DELETE 要不要拦下来**。
  *
@@ -52,7 +57,12 @@ object VoiceGuardLogic {
         RegexOption.IGNORE_CASE,
     )
 
-    /** 子查询（`IN (SELECT ...)`）拿不到具体值，保守放弃 */
+    /**
+     * 子查询形态（`IN (SELECT ...)`）一律放行。
+     * ⚠️ 放行的理由是**「这条路径不该拦」**，不是「读不出值」：唯一用子查询删 voiceinfo 的
+     * 是 `deleteMsgByTalkerSync`（删会话/清空记录），拦它会破坏微信 GC。
+     * 撤回不走子查询（见类注释），所以这条不会误伤撤回场景。
+     */
     private val SUBQUERY = Regex("""\bselect\b""", RegexOption.IGNORE_CASE)
 
     /**
@@ -66,6 +76,54 @@ object VoiceGuardLogic {
         if (s.isNullOrEmpty()) return emptyList()
         return HEX.findAll(s).map { it.value.lowercase() }.toList()
     }
+
+    // ------------------------------------------------------------ 缓存判据（纯函数，可单测）
+
+    /**
+     * 受保护集合的缓存**是否可命中**。
+     *
+     * 命中条件三条同时成立：
+     * 1. `cachedSize > 0` —— ⛔ **空集永不算命中**。空集语义 =「当前什么都没保护」，
+     *    缓存它的唯一作用只是省一次查询（很便宜），而唯一后果是**吃掉紧随其后的
+     *    `record()` 写入** ⇒ 漏拦一条语音（代价最大）。
+     * 2. `now - cachedAt < ttlMs` —— 没过期。
+     * 3. `cachedGen == gen` —— ⛔ **构建之后没有新的 `record()`**。
+     *
+     * ## 为什么必须有第 3 条（`gen` 版本号）
+     * 只有前两条时仍有一个**真实且常见**的漏洞：3 秒内连续撤回两条语音。
+     * ```
+     * t=0.0  撤回 A → record(A)
+     * t=0.1  DELETE(A) → miss ⇒ 建 {A} ⇒ 非空 ⇒ 缓存到 t=3.1
+     * t=1.0  撤回 B → record(B)                 ← 缓存已陈旧
+     * t=1.1  DELETE(B) → 命中 t=0.1 的 {A} ⇒ B 不在里面 ⇒ 放行 ⇒ B 播放失败
+     * ```
+     * 连撤两条是常见动作，且复现的正是本 bug 本身。
+     * ⇒ 用 `gen`（`record()` 时自增）把「缓存构建之后是否有新记录」变成可判条件：
+     * 只要 `record()` 发生过，`gen` 变了，旧缓存立即不可用。
+     *
+     * @param cachedGen 缓存构建时记录的版本号
+     * @param gen       当前版本号
+     */
+    fun cacheUsable(
+        now: Long,
+        cachedAt: Long,
+        cachedSize: Int,
+        ttlMs: Long,
+        cachedGen: Long,
+        gen: Long,
+    ): Boolean = cachedSize > 0 && cachedGen == gen && now - cachedAt < ttlMs
+
+    /**
+     * 一次构建后 `cachedAt` 该记成什么。
+     *
+     * - 非空集 ⇒ 记 `now`（正常缓存 [ttlMs]）；
+     * - **空集 ⇒ 记 `now - ttlMs`**（等价于「立即过期」），这样下一次调用必然 miss 并重新查库。
+     *   ⚠️ 不用常量 `0L` 表示过期：设备刚启动 `uptime < ttlMs` 时 `now - 0` 会意外命中。
+     *   （当前 `cachedSize > 0` 已能挡住空集，本函数是**双保险**：万一有人删掉那条短路，
+     *   空集 stamp 仍恒为「已过期」。）
+     */
+    fun stampAfterBuild(now: Long, builtSize: Int, ttlMs: Long): Long =
+        if (builtSize > 0) now else now - ttlMs
 
     /**
      * 这次 voiceinfo 的 DELETE 要不要拦。
@@ -90,7 +148,10 @@ object VoiceGuardLogic {
         if (whereClause == null) return false
         // 3. 没有受保护标识 ⇒ 没什么可拦
         if (rescuedImgs.isEmpty()) return false
-        // 4. 子查询（FileName IN (SELECT imgPath ...)）拿不到具体值 ⇒ 保守放弃
+        // 4. 子查询形态一律放行。**这不是「拿不到值只好放弃」，是有意的正确性要求**：
+        //    唯一用子查询删 voiceinfo 的是 deleteMsgByTalkerSync（删会话/清空记录），
+        //    拦它会破坏微信的正常 GC（存储只增不减，比播放失败严重得多）。
+        //    撤回走的是单行参数化 FileName= ?，不经过这里。
         if (SUBQUERY.containsMatchIn(whereClause)) return false
         // 5. 只认 FileName/MsgLocalId 的 = / IN；其余一律放行（清理形态）
         if (!EQ_OR_IN.containsMatchIn(whereClause)) return false

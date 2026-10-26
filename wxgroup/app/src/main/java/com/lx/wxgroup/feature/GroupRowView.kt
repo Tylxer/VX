@@ -1,11 +1,16 @@
 package com.lx.wxgroup.feature
 
 import android.content.Context
+import android.graphics.Outline
 import android.graphics.drawable.GradientDrawable
 import android.view.Gravity
 import android.view.View
+import android.view.ViewOutlineProvider
+import android.widget.FrameLayout
+import android.widget.ImageView
 import android.widget.LinearLayout
 import android.widget.TextView
+import com.lx.wxgroup.core.AvatarLoader
 import java.util.Calendar
 
 /**
@@ -38,6 +43,8 @@ object GroupRowView {
         val memberCount: Int = 0,
         /** A4-a：最新消息那个成员的名字（用于取首字和展示） */
         val lastSender: String = "",
+        /** A4-a：最新消息那个成员的 wxid（用于真头像加载，[ConvFilter] 从 snaps 里带出来） */
+        val lastSenderWxid: String = "",
         /** A4-b：最后一条消息的内容 */
         val lastMsg: String = "",
         val timeMs: Long = 0L,
@@ -68,7 +75,7 @@ object GroupRowView {
 
         // ---- 左：头像（A4-a / A4-c）----
         val seed = m.lastSender.ifBlank { m.name }
-        row.addView(avatar(ctx, d, seed, m.lastSender.isBlank()))
+        row.addView(avatar(ctx, d, seed, m.lastSender.isBlank(), m.lastSenderWxid))
 
         // ---- 中：两行文字（weight=1 占满剩余宽度）----
         val center = LinearLayout(ctx).apply {
@@ -165,25 +172,59 @@ object GroupRowView {
     }
 
     /**
-     * 头像占位：首字 + 由名字派生的稳定色。
-     * 真实头像接口打通后只改这里。
+     * 头像：`FrameLayout`（圆形裁剪）叠两层——
+     * - 底层 [ImageView]：真头像（`AvatarLoader` 反射微信 AvatarStorage 取，`CENTER_CROP`）
+     * - 顶层 [TextView]：首字 + 由名字派生的稳定色（**兜底，逻辑原样保留**）
+     *
+     * 首字层默认可见、图片层默认隐藏；`AvatarLoader` 命中真头像后隐藏首字层。
+     * 拿不到真头像时首字层一直可见，配色规则（[colorOf]）一字不改 —— 那是专门修过的
+     * 「同一个名字永远同色」稳定性 bug。
      */
-    private fun avatar(ctx: Context, d: Float, seed: String, neutral: Boolean): View {
+    private fun avatar(ctx: Context, d: Float, seed: String, neutral: Boolean, wxid: String): View {
         val size = (48 * d).toInt()
         val letters = seed.trim().firstOrNull()?.toString() ?: "组"
-        return TextView(ctx).apply {
+
+        // 首字兜底层：首字 + 稳定色块 + 中性灰，逻辑与旧实现逐字一致
+        val lettersView = TextView(ctx).apply {
             text = letters
             textSize = 20f
             setTextColor(0xFFFFFFFF.toInt())
             gravity = Gravity.CENTER
-            layoutParams = LinearLayout.LayoutParams(size, size).apply {
-                rightMargin = (12 * d).toInt()
-            }
+            layoutParams = FrameLayout.LayoutParams(size, size)
             background = GradientDrawable().apply {
                 setColor(if (neutral) 0xFFB0B0B0.toInt() else colorOf(seed))
                 cornerRadius = size / 2f
             }
         }
+
+        // 真头像层：默认 GONE，命中后由 AvatarLoader 回调切 VISIBLE
+        val imageView = ImageView(ctx).apply {
+            scaleType = ImageView.ScaleType.CENTER_CROP
+            visibility = View.GONE
+            layoutParams = FrameLayout.LayoutParams(size, size)
+        }
+
+        val container = FrameLayout(ctx).apply {
+            clipToOutline = true
+            // 用固定 size 而非 view.width/height：布局前的 transient 态宽高可能还是 0
+            outlineProvider = object : ViewOutlineProvider() {
+                override fun getOutline(view: View, outline: Outline) {
+                    outline.setRoundRect(0, 0, size, size, size / 2f)
+                }
+            }
+            layoutParams = LinearLayout.LayoutParams(size, size).apply {
+                rightMargin = (12 * d).toInt()
+            }
+            addView(imageView)
+            addView(lettersView)
+        }
+
+        // 绑定头像：内存缓存（主线程）→ 磁盘解码（后台，tag 校验防错位）→ 拿不到保持首字兜底
+        AvatarLoader.bind(imageView, wxid) {
+            lettersView.visibility = View.GONE
+            imageView.visibility = View.VISIBLE
+        }
+        return container
     }
 
     /** 同一个名字永远同一个颜色（否则每次 getView 颜色都在跳） */

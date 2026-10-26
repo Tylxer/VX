@@ -7,6 +7,7 @@ import android.text.InputType
 import android.view.Gravity
 import android.view.View
 import android.view.ViewGroup
+import android.widget.Button
 import android.widget.EditText
 import android.widget.LinearLayout
 import android.widget.Switch
@@ -322,6 +323,15 @@ object Rows {
                     numbersOnly = false,
                     multiline = false,
                     resetTo = Prefs.DEFAULT_EXPORT_PATH,
+                    // R28：需求 6.4 预留的「用系统文件选择器授权导出目录」入口。
+                    // 授权成功后 ExportDirSaf 已把路径写进 kv，这里再回调一次 onOk
+                    // 只为让行内摘要立刻刷新（写的是同一个值，无副作用）。
+                    extraButton = "用系统文件选择器挑选…" to {
+                        com.lx.wxgroup.feature.ExportDirSaf.launch(ctx) { msg ->
+                            UiKit.toast(ctx, msg)
+                            onOk(Kv.getString(spec.key))
+                        }
+                    },
                     onOk = onOk,
                 )
             }
@@ -338,6 +348,13 @@ object Rows {
         numbersOnly: Boolean,
         multiline: Boolean,
         resetTo: String?,
+        /**
+         * R28：输入框下方额外挂一个按钮（`文案` to `点击动作`）。
+         *
+         * ⚠️ 走自定义 View 而不是 AlertDialog 的按钮位：三个位（确定/取消/恢复默认）
+         * 已被占满，而 AlertDialog 没有第四个标准位。
+         */
+        extraButton: Pair<String, () -> Unit>? = null,
         onOk: (String) -> Unit,
     ) {
         val pad = UiKit.dp(ctx, 20)
@@ -366,6 +383,18 @@ object Rows {
         }
         root.addView(edit)
 
+        // R28：额外按钮（目前只有 PATH 用：调系统文件选择器挑导出目录）
+        val extraBtn = extraButton?.let { (label, _) ->
+            Button(ctx).apply {
+                text = label
+                layoutParams = LinearLayout.LayoutParams(
+                    ViewGroup.LayoutParams.MATCH_PARENT,
+                    ViewGroup.LayoutParams.WRAP_CONTENT
+                ).apply { topMargin = UiKit.dp(ctx, 8) }
+                root.addView(this)
+            }
+        }
+
         val b = AlertDialog.Builder(ctx)
             .setTitle(title)
             .setView(root)
@@ -376,6 +405,12 @@ object Rows {
         b.create().apply {
             // ⛔ R21：不走 Panel 的 dialog 必须单独清 ALT_FOCUSABLE_IM，否则输入框点了不弹键盘
             UiKit.clearAltFocusableIm(this, " Rows.input")
+            // 额外按钮：先把输入框里的手改值丢掉再跳系统选择器 —— 不 dismiss 的话
+            // 系统选择器的回传会被这个还活着的 dialog 盖住。
+            extraBtn?.setOnClickListener {
+                dismiss()
+                extraButton!!.second()
+            }
             setOnShowListener {
                 getButton(AlertDialog.BUTTON_POSITIVE).setOnClickListener {
                     dismiss()

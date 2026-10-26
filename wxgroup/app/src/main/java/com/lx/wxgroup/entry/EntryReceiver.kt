@@ -209,6 +209,64 @@ object EntryReceiver {
                             }
                         }
                     }
+                    // ---- R21c 语音文件备份 / 还原（VoiceBackup）----
+                    //   --es op voicebak --es sub backup  --es sql <imgPath>
+                    //   --es op voicebak --es sub restore --es sql <imgPath>
+                    //   --es op voicebak --sub 空 = 列出已备份的文件
+                    // ⚠️ 必须后台线程：要读文件系统（列目录最坏几百 ms）
+                    "voicebak" -> {
+                        val sub = intent.getStringExtra("sub") ?: "ls"
+                        val img = intent.getStringExtra("sql")
+                        io {
+                            when (sub.lowercase()) {
+                                "backup" -> LogX.i(
+                                    "PROBE voicebak backup img=$img ok=" +
+                                        com.lx.wxgroup.feature.VoiceBackup.backup(34, img)
+                                )
+                                "restore" -> LogX.i(
+                                    "PROBE voicebak restore img=$img ok=" +
+                                        com.lx.wxgroup.feature.VoiceBackup.restore(img)
+                                )
+                                // 一次性验完整条链的三段：源在不在 → 备份在不在 → 还原能不能成。
+                                // 用来在**不依赖撤回动作**的情况下验证路径规则/账号目录推导。
+                                "chain" -> {
+                                    val st = com.lx.wxgroup.feature.VoiceBackup.probeChain(img)
+                                    LogX.i("PROBE voicebak chain img=$img $st")
+                                }
+                                else -> LogX.i(
+                                    "PROBE voicebak " + com.lx.wxgroup.feature.VoiceBackup.stat()
+                                )
+                            }
+                        }
+                    }
+                    // ---- R24 群聊数据源（ChatroomSource）----
+                    //   --es op room --es sub sync     # 立即全表扫 rcontact 补群聊（几百 ms）
+                    //   --es op room --es sub list     # 前 8 个群聊样本
+                    // ⚠️ sync / list 要查微信库，必须丢后台线程（广播主线程会 ANR）
+                    "room" -> {
+                        val sub = intent.getStringExtra("sub") ?: "stat"
+                        when (sub.lowercase()) {
+                            "sync" -> io {
+                                val n = com.lx.wxgroup.core.ChatroomSource.syncBlocking(force = true)
+                                LogX.i("PROBE room sync written=$n")
+                                LogX.i("PROBE " + com.lx.wxgroup.core.ChatroomSource.stat())
+                            }
+                            "list" -> io {
+                                LogX.i("PROBE " + com.lx.wxgroup.core.ChatroomSource.sampleText(8))
+                            }
+                            // 诊断：群名读成空的根因定位（列清单 + 群行原始值）
+                            "schema" -> io {
+                                LogX.i("PROBE " + com.lx.wxgroup.core.ChatroomSource.schemaText())
+                            }
+                            // 诊断：按 wxid 精确查 rcontact（--es w "a@chatroom,b@chatroom"）
+                            "row" -> io {
+                                val w = (intent.getStringExtra("w") ?: "").split(",")
+                                    .map { it.trim() }.filter { it.isNotEmpty() }.toTypedArray()
+                                LogX.i("PROBE " + com.lx.wxgroup.core.ChatroomSource.rowText(*w))
+                            }
+                            else -> LogX.i("PROBE " + com.lx.wxgroup.core.ChatroomSource.stat())
+                        }
+                    }
                     // A15 全量 hook 点取证（临时的，结论固化后随探针一起删除）：
                     // --es sub on|off|flush|tree|win|clear [--es sec 30]
                     "menuhunt" -> {
@@ -287,6 +345,9 @@ object EntryReceiver {
                     "snsg" -> {
                         val sub = intent.getStringExtra("sub") ?: "stat"
                         val n = intent.getIntExtra("n", 20)
+                        // R27 srcfix 的子命令参数。与 op=quiet 同一套约定（sub 只路由、
+                        // sub2 才是功能自己的子命令），所以 `sub=srcfix sub2=rollback`。
+                        val sub2 = intent.getStringExtra(EXTRA_SUB2)
                         io {
                             when (sub) {
                                 "stat" -> LogX.i("SNSG " + com.lx.wxgroup.feature.SnsGuard.stat())
@@ -310,6 +371,10 @@ object EntryReceiver {
                                 }
                                 // 评论表取证（列名 + 最近几行）
                                 "cmts" -> for (l in com.lx.wxgroup.feature.SnsGuard.comments(n)) {
+                                    LogX.i(l)
+                                }
+                                // R27 方案 A：Response-Merge 注入统计
+                                "merge" -> for (l in com.lx.wxgroup.feature.SnsTimelineMerge.stat()) {
                                     LogX.i(l)
                                 }
                                 // **A4 取证（R19）**：扫**当前 SnsInfo** 的 content 抽 mediaId 数字串候选。
@@ -377,19 +442,29 @@ object EntryReceiver {
                                     val id = firstLong(intent, "id")
                                     LogX.i("SNSG " + com.lx.wxgroup.feature.SnsGuard.simulateDelete(id))
                                 }
+                                // ── R27-3 朋友圈时间线来源位修复（srcfix）──
+                                // 微信删动态只清 sourceType 的 bit1（`& -3`），行还在。
+                                // srcstat = 只读：台账行数 / 曾经可见数 / 当前可补候选数
+                                // srcfix  = 执行一轮「快照 + 补位」（写微信库的 sourceType | 2）
+                                // srcfix + sub2=rollback = 按台账 fixed_orig 反向还原
+                                // ⚠️ 明细日志内部限流 50 行，最后一行是聚合结果
+                                "srcstat" -> for (l in com.lx.wxgroup.feature.SnsTimelineSourceFix
+                                    .stat()
+                                ) LogX.i(l)
+                                "srcfix" -> {
+                                    val lines = if (sub2?.lowercase() == "rollback") {
+                                        com.lx.wxgroup.feature.SnsTimelineSourceFix.rollback()
+                                    } else {
+                                        com.lx.wxgroup.feature.SnsTimelineSourceFix.run()
+                                    }
+                                    for (l in lines) LogX.i(l)
+                                }
                                 else -> LogX.i("SNSG unknown sub=$sub")
                             }
                         }
                     }
-                    // R9-P2 朋友圈图片 CDN 落盘验证（tools/_r9_cdn.py 用的临时探针）
-                    // --es sub stat|hook|dk|force|cbon|reqmp|paths|ls|export|imgpath [--es val ..] [--ei n 20]
-                    "cdn" -> {
-                        val sub = intent.getStringExtra("sub") ?: "stat"
-                        val v = intent.getStringExtra("val")
-                        val n = intent.getIntExtra("n", 20)
-                        // ⚠️ 凡是「读目录 / 拷文件」的一律走已有的 io { } 后台线程
-                        io { com.lx.wxgroup.probe.SnsCdnProbe.command(sub, v, n) }
-                    }
+                    // ⛔ op=cdn 已删（2026-10-27）：整条朋友圈图片 CDN 通路判死并整块删除，
+                    //    探针随 `probe/SnsCdnProbe.kt` 一并移除。⛔ 勿按 git 历史恢复，理由见 HookEntry.kt。
                     // 朋友圈动态「[已删除]」标签（SnsTag）
                     // --es sub stat = 状态；hit = 当前界面上打过标的 snsId 清单
                     "snstag" -> {
@@ -483,6 +558,36 @@ object EntryReceiver {
                                     LogX.i(com.lx.wxgroup.feature.MomentsAuto.probe(sub))
                                 else ->
                                     LogX.i(com.lx.wxgroup.feature.MomentsExport.probe(sub, n))
+                            }
+                        }
+                    }
+                    // R25 朋友圈**后台同步**专用探针（定时刷新的底层，完全独立于 UI）
+                    // --es sub stat = 句柄与计数；sync = 立刻投一次（force，绕过 disabled）
+                    // 判据：`sub=stat` 的 `ready=` 必须为 true 且 `disabled=-`；
+                    //       `sub=sync` 返回 `MSYNC OK scene=256 type=214` 才算投递成功。
+                    //       `sub=sync` 返回 `MSYNC OK scene=256 type=214` 才算投递成功。
+                    // ⚠️ 投递成功 ≠ 拉到新动态：朋友圈没新内容时也是 OK。
+                    //    要确认「数据真的回来了」，看导出目录有没有新文件、
+                    //    或 `op=moments sub=scan` 的行数有没有长。
+                    "msync" -> {
+                        val sub = intent.getStringExtra("sub") ?: "stat"
+                        io {
+                            when (sub.lowercase()) {
+                                "sync" -> LogX.i(
+                                    "PROBE " + com.lx.wxgroup.core.MomentsSyncTrigger
+                                        .syncNow(force = true)
+                                )
+                                // 挂临时钩子监听回包，证明「请求真发出去、服务端真回了」
+                                // （`f()=true` 只证明入队成功，不代表网络上真走了一遭）
+                                "watch" -> LogX.i(
+                                    "PROBE " + com.lx.wxgroup.core.MomentsSyncTrigger.watch()
+                                )
+                                "unwatch" -> LogX.i(
+                                    "PROBE " + com.lx.wxgroup.core.MomentsSyncTrigger.stopWatchText()
+                                )
+                                else -> LogX.i(
+                                    "PROBE " + com.lx.wxgroup.core.MomentsSyncTrigger.stat()
+                                )
                             }
                         }
                     }

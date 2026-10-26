@@ -1482,3 +1482,69 @@ R19 计划里写的判据这次真的用上了：
 3. **`AntiRevoke.currentConfigLine()`**：`showHint` 失去全部读取点后，改为在 `adump` 里打印 —— 否则用户报「开关改了没反应」时日志里查不到开关值
 4. **单测 569 全绿**（基线 548，+21，含 4 条角标文案测试）
 
+
+---
+
+## R21d-2/3 轮末合规自审（2026-10-25 21:2x · 角标落点修复 + 交叉复核）
+
+### ① 分包下限
+- 改动面计数：
+  - **修改实现 × 2**：`feature/HintBadge.kt`（`ensure` 分流 / `addBadgeBelowMessageRow` / `relayoutBadgeBelowMessageRow` / `sameRule` / `resolveRowAnchor` / `rowLayoutParams` / `projectNode`）· `data/HintBadgeLogic.kt`（`BadgeNode` + `selectMessageRow` + `alignToEnd`）
+  - **修改测试 × 1**：`test/.../data/HintBadgeLogicTest.kt`（23 → 28 条）
+  - **修改文档 × 3**：`docs/_r21d_badge_chain.md`（§10.1~10.7）· `docs/取证结论.md`（⑬ itemView 结构）· `docs/派发审计台账.md`（两行回填）
+  - **修改接入 × 1**：`entry/EntryReceiver.kt`（`kvset` 分支补 `HintBadge.refresh()`）
+- 独立功能域：**1 个**（防撤回·角标落点）⇒ 实现 lane 下限 **≥1**
+- 实际派：**2 个 Pro lane**（`badge-fix` 实现 + `badge-review2` 交叉复核）⇒ **PASS**
+
+### ② 档位是否显式传 ID
+- `badge-fix` / `badge-review2` 均传 `model="deepseek-v4-pro"` ✅ 显式 ID
+- **实际落地已核实**（不是只看 spawn 参数）：读 `subagents/agent-401bcd21-*.jsonl` 与 `agent-50c46342-*.jsonl` 的
+  `providerData.requestModelId`，两者均为 `custom-local:deepseek-v4-pro-202606`
+- 判定依据：`badge-fix` = **根因推理 + 落点判据设计**；`badge-review2` = **复核反射/布局级改动** ⇒ 均 §四② 第一行 Pro
+- ⚠️ 主会话**没有**自己做 Pro 类活：RelativeLayout 落点算法、`selectMessageRow` / `alignToEnd` 判据、复用路径的
+  `requestLayout` 分析全部由 lane 做；主会话只做「把真机取证结果写进派发 prompt」+ Flash 级接线（补 `refresh()`、跑构建、写文档）
+- **PASS**
+
+### ③ 文件不重叠
+- `badge-fix` 独占：`feature/HintBadge.kt` · `data/HintBadgeLogic.kt` · `HintBadgeLogicTest.kt` · `docs/_r21d_badge_chain.md`
+- `badge-review2` **只读**，独占文件为「无」，明确禁止改任何文件
+- 主会话独占：`entry/EntryReceiver.kt` · `docs/取证结论.md` · `docs/派发审计台账.md` · `docs/SOP审计日志.md`
+- **PASS**
+
+### ④ 设备锁
+- 两个 lane 的 prompt 均写「⛔ 不许碰 adb / 不许装包 / 不许自己跑场景」
+- 主会话本段**未碰设备**（无 adb 调用、无装包）—— 用户未通知装包，符合协作边界
+- 真机验收（判据 7/8 + 判据 5 复验）**留待用户通知后做**
+- **PASS**
+
+### ⑤ 轮次重排
+- 遗留项已结构化记入下方「遗留」，其中真机类 3 条待装包、离线类 0 条（本轮已清）
+- **PASS（记录在案）**
+
+### ⑥ 真机前交叉复核
+- **已完成**：`badge-review2` 结论 **PASS-with-warnings，无 BLOCKER**（7 条判据 ①④⑤⑥ PASS、②③ WARN，另自挖 2 条额外 WARN）
+- 两条 WARN + 一条额外 WARN **已修**（`sameRule` 短路 / 返回值 `Boolean` / `added` 计数前置 + `return ok`）
+- 一条额外 WARN **故意不修**（self↔incoming 单帧反侧），理由已写进 `_r21d_badge_chain.md` §10.7
+- **PASS**
+
+### ⑦ Pro 类活有没有被主会话自己做
+| 类别 | 本轮对应工作 | 谁做的 | 结论 |
+|---|---|---|---|
+| 判据设计 | 「消息行」如何从混淆 id 的子节点里认出来 / 自己发的如何判侧 | **`badge-fix`（Pro）** | ✅ 未由主会话做 |
+| 根因推理 | `bottomSlot` 类型闸门 + `labelParams` 缺分支 ⇒ 落 `(0,0)` | **`badge-fix`（Pro）** | ✅ 未由主会话做 |
+| Hook 链路推导 | 本轮无新增 Hook 链路 | — | ✅ N/A |
+| 复核反射/异步/并发 | 反射投影 + `generateViewId` 注入 + 复用池 `requestLayout` | **`badge-review2`（Pro）** | ✅ 未由主会话做 |
+- 主会话本轮做的全是 Flash 级：补 `HintBadge.refresh()` 接线、跑 gradle、写文档、回填台账、加 5 条护栏单测
+- **PASS**
+
+### 本轮验证记录
+- 单测：`files=31 tests=625 failures=0 errors=0`（**基线 620 时已全绿，本轮再 +5 条护栏**；`HintBadgeLogicTest` 28 条）
+- APK：`3,329,518 B` @ 21:18:35（`app/build/outputs/apk/debug/app-debug.apk`）—— **未装真机**
+- ⚠️ 21:21 重跑 `assembleDebug` 后时间戳**未变**，这是正确行为：之后只改了 test 源码与文档，不进 APK，Gradle 判定输入未变即跳过
+
+### 遗留（下一轮）
+1. **装包后必跑**：`tools/_r21d_badge_pos.py` 验判据 7（角标在内容下方，`by1 >= row.y2 - 30`）/ 判据 8（语音消息落点）
+2. **判据 5 复验**：`kvset antirevoke.show_hint=false` → 2 秒内 `bound` 应归 0（上轮 FAIL，本轮补了 `refresh()`）
+3. **额外 WARN ② 观察**：self↔incoming 复用瞬间的单帧反侧，真机看是否可感知；可感知再引入 `OnLayoutChangeListener`
+4. **问题 3（防撤回语音播放失败）仍未修**：`VoiceGuardLogic.kt` 的 `HEX24`(24→26) + `SUBQUERY` 放行 + 入口未定（`delete` vs `execSQL`）
+5. 更早遗留：`COPY_IMAGES` 仍 `false`；M4/M6/M7 有副作用未授权；M3 需造人工场景

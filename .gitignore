@@ -15,6 +15,11 @@ _*.png
 _*.xml
 _*.db
 _*.sh
+_*.log
+
+# 临时目录 / 合并残留
+.tmp/
+*.orig
 
 # Android / IDE
 local.properties

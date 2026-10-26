@@ -16,11 +16,20 @@ import java.util.concurrent.ConcurrentHashMap
 /**
  * 防撤回语音后的「播放失败」修复 —— 拦 voiceinfo 的 DELETE（需求 6.2 的补丁）。
  *
- * ## 根因（主会话真机定案，见 `docs/_r21c_voice_root.md`）
- * 微信撤回语音时**先** `DELETE FROM voiceinfo WHERE FileName IN (SELECT imgPath FROM message ...)`
- * 删掉语音下载记录，**再** `UPDATE message` 改撤回形态。[AntiRevoke] 只拦了第二步，
- * 第一步的 DELETE 没拦 ⇒ `message` 行还在（气泡在），但 `voiceinfo` 行没了 ⇒ 播放器按
+ * ## 根因（反汇编定案，见 `docs/_r21c_voice_sqlform.md` §1/§2）
+ * 微信撤回语音时**先** `UPDATE message SET type=...,content=... WHERE msgId=?`（`j9.va`）
+ * 改撤回形态，**再排程**（`executor.submit`，异步）`vj0.p` → `onPreDelMessage` →
+ * `em0.v0.f`(deleteRecordFile) → `em0.e1.f`(VoiceStorage) →
+ * `SQLiteDatabase.delete("voiceinfo", "FileName= ?", [imgPath])` 删下载记录。
+ * [AntiRevoke] 只拦了第一步 ⇒ `message` 行还在（气泡在），但 `voiceinfo` 行被删 ⇒ 播放器按
  * `imgPath` 去 `voiceinfo` 拿 `Status/TotalLen/NetOffset` 查不到 ⇒ 点播放没反应。
+ *
+ * ⚠️ 两个**已证伪**的历史误判（别再写回去）：
+ * 1. ~~撤回删 voiceinfo 走子查询 `FileName IN (SELECT imgPath ...)`~~ —— 那条子查询属于
+ *    `MsgInfoStorageLogic.deleteMsgByTalkerSync`（`vj0.a9.j`），只被「删会话/清空记录」的
+ *    34 个 UI 入口调用，**与撤回无任何调用关系**。撤回走的是**单行参数化 `FileName= ?`**。
+ * 2. ~~DELETE 在 UPDATE 之前~~ —— 反汇编地址单调递增：`[532] j9.va`(UPDATE) 之后 `[576-579]`
+ *    才 `new vj0.p` + `executor.submit`。⇒ `AntiRevoke.record()` 已完成，`rescued` 行必已存在。
  *
  * ## 策略：方案 A（伪装成功，不真执行）
  * 命中判据时 `param.result = 1`（同 [AntiRevoke] 拦 update 的思路，最省）。
@@ -34,7 +43,7 @@ import java.util.concurrent.ConcurrentHashMap
  *
  * ## 受保护集合怎么来（时间窗）
  * - `rescued` 表里 `orig_type=34`（语音）且 `at` 在最近 [WINDOW_MS] 内的 msgId；
- * - 这些 msgId 对应 `message.imgPath`（24 位 hex，FileName 匹配用）。
+ * - 这些 msgId 对应 `message.imgPath`（**26 位 hex**，FileName 匹配用）。
  * ⚠️ `GroupDb.Rescued` 没暴露 `at`/`imgPath`，所以这里直读 `rescued` 表的 `msg_id/at`
  * （模块自己的 AOSP 库）+ 反查 message 表拿 `imgPath`。这是对 GroupDb 内部 schema 的
  * 轻耦合，若将来 GroupDb 补了公开 API，本类可换过去。
@@ -51,7 +60,14 @@ object VoiceGuard {
      */
     private const val WINDOW_MS = 60_000L
 
-    /** 受保护集合的缓存刷新间隔（DELETE 低频，缓存几秒既能抗重试风暴又不会太旧） */
+    /**
+     * 受保护集合的缓存 TTL。
+     *
+     * ⚠️ 缓存能存在的前提是 [invalidate] 挂了 [RevokeRescue.record]（gen 版本号）——
+     * **删掉那个失效通知，这个 TTL 就会变成漏拦窗口**。当前保留它的理由是
+     * 微信可能对同一条 DELETE 重试，重复查库没必要；真机若发现缓存引发的漏拦，
+     * 直接把本值改 0（等价于每次重查）即可，判据见 [VoiceGuardLogic.cacheUsable]。
+     */
     private const val CACHE_TTL_MS = 3_000L
 
     /** 伪装返回值：微信预期 delete 返回删掉的行数，返回 1 比 0 更像成功 */
@@ -68,6 +84,25 @@ object VoiceGuard {
 
     @Volatile
     private var cachedImgs: Set<String> = emptySet()
+
+    /** 缓存构建时的记录版本号（见 [invalidate] 与 VoiceGuardLogic.cacheUsable 的 KDoc） */
+    @Volatile
+    private var cachedGen = 0L
+
+    /** 每发生一次 `record()` 自增。缓存构建时快照它，之后不等即失效。 */
+    @Volatile
+    private var gen = 0L
+
+    /**
+     * 通知「台账里多了一条被救语音」⇒ 让受保护集合的缓存立即失效。
+     *
+     * ⛔ **必须由 [RevokeRescue.record] 调用**，否则 3 秒内连续撤回两条时，
+     * 第二条的 DELETE 会命中第一条建下的缓存（不含 B）⇒ 放行 ⇒ B 播放失败。
+     * 详见 [VoiceGuardLogic.cacheUsable] 的 KDoc。
+     */
+    fun invalidate() {
+        gen++
+    }
 
     /** 节流日志：同一 key N 秒内只打一条（重试风暴会反复命中同一条 delete） */
     private val blockedLog = ConcurrentHashMap<String, Long>()
@@ -87,9 +122,14 @@ object VoiceGuard {
             .onFailure { LogX.w("VG refresh failed: ${it.javaClass.simpleName}") }
 
         val ok = mutableListOf<String>()
-        // delete() 内部转调 deleteWithOnConflict（同 update→updateWithOnConflict），
-        // 挂两个是为了兼容「删走 execSQL 之外的 delete 直调」；命中时在 delete 入口就
-        // 置 result 跳过原方法，所以不会双重处理（详情见类注释）。
+        // ⚠️ wcdb 的 `SQLiteDatabase` **没有** `deleteWithOnConflict`（与 AOSP 不同，
+        //    已用 `tools/_r21c_verify_sql.py` 核方法表）。写库相关方法只有：
+        //    delete / deleteDatabase / insert / insertOrThrow / insertWithOnConflict /
+        //    update / updateWithOnConflict / execSQL×3 / rawQuery×2。所以下面那个 hook 返回空集、不会生效，
+        //    日志只会是 `VG installed hooks=delete` —— **这是正常的，不是 hook 没装全**。
+        //    保留它的唯一价值是兼容「若某版本 wcdb 补了这个方法」；delete() 本体是纯 Java
+        //    （拼 'DELETE FROM <t> WHERE <w>' + SQLiteStatement.executeUpdateDelete()），
+        //    param.result 在入口置位即可跳过方法体，所以真正生效的一定是 delete。
         runCatching { XposedBridge.hookAllMethods(cls, "deleteWithOnConflict", deleteGuard) }
             .onSuccess { if (it.isNotEmpty()) ok += "deleteWithOnConflict" }
             .onFailure { LogX.e("VG: hook deleteWithOnConflict failed", it) }
@@ -144,6 +184,19 @@ object VoiceGuard {
 
         // 命中：方案 A —— 伪装成功、不真执行（跳过原 deleteWithOnConflict 方法体）
         param.result = FAKE_ROWS
+
+        // ⛔ R21c：**拦 SQL 只是第一步**。微信随后还会用 `File.delete()` 删掉
+        //    `voice2/<md5桶>/msg_<imgPath>.amr` —— 那条路径不过 SQLite，本 hook 看不到。
+        //
+        // ⚠️ 这里这次 restore **只是「免费早触发」，不是兜底**（别把它当保障）：
+        //    已定案的顺序是 voiceinfo DELETE **在前**、File.delete(磁盘) **在后**，
+        //    所以本 hook 命中那一刻文件**还在** ⇒ shouldRestore(true, true) 恒 false
+        //    ⇒ 直接 no-op。真正的兜底是 `VoiceBackup.scheduleRestore`
+        //    （record() 里排的 +1s 幂等检查，删除链跑完之后才跑）。
+        // ⚠️ 本项目**没有播放路径的 hook**，所以不存在「用户点播放前补一次」这种兜底。
+        runCatching { VoiceBackup.restore(whereArgs?.firstOrNull()) }
+            .onFailure { LogX.w("VG restore on block failed: ${it.javaClass.simpleName}") }
+
         val key = (whereClause ?: "") + "|" + whereArgs?.joinToString(",")
         val now = SystemClock.elapsedRealtime()
         val last = blockedLog[key]
@@ -160,10 +213,18 @@ object VoiceGuard {
 
     private fun protectedSet(): Set<String> {
         val now = SystemClock.elapsedRealtime()
-        if (now - cacheAt < CACHE_TTL_MS) return cachedImgs
+        val g = gen
+        // 三个条件全成立才用缓存（见 VoiceGuardLogic.cacheUsable）：
+        //   ① 非空  ② 构建后无新 record（gen 未变）  ③ 未过期
+        // ⛔ 少了 ② 会漏拦「3 秒内连撤两条」的第二条。
+        if (VoiceGuardLogic.cacheUsable(now, cacheAt, cachedImgs.size, CACHE_TTL_MS, cachedGen, g)) {
+            return cachedImgs
+        }
         val set = buildProtectedSet()
         cachedImgs = set
-        cacheAt = now
+        cachedGen = g
+        // 空集时把 cacheAt 记成「已过期」，下次必然重新查库
+        cacheAt = VoiceGuardLogic.stampAfterBuild(now, set.size, CACHE_TTL_MS)
         return set
     }
 
@@ -193,7 +254,7 @@ object VoiceGuard {
         return out
     }
 
-    /** 这些 msgId 在 message 表里的 imgPath（24 位 hex，FileName 匹配用）。查不到就空。 */
+    /** 这些 msgId 在 message 表里的 imgPath（**26 位 hex**，FileName 匹配用）。查不到就空。 */
     private fun imgPathsOf(msgIds: List<String>): Set<String> {
         if (msgIds.isEmpty()) return emptySet()
         val db = AntiRevoke.wxDb() ?: return emptySet()

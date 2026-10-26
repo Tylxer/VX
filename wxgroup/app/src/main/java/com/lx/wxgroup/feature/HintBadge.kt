@@ -8,6 +8,7 @@ import android.view.View
 import android.view.ViewGroup
 import android.widget.FrameLayout
 import android.widget.LinearLayout
+import android.widget.RelativeLayout
 import android.widget.TextView
 import com.lx.wxgroup.data.GroupDb
 import com.lx.wxgroup.data.HintBadgeLogic
@@ -566,7 +567,13 @@ object HintBadge {
         }
         if (!show) return true
         if (existing != null) {
-            // item 复用到另一条被救消息：原地更新文案，不重复建 View
+            // item 复用到另一条被救消息：原地更新文案，不重复建 View。
+            // ⚠️ RelativeLayout 上锚点/对齐可能跟着复用而变：重新套一遍 BELOW 规则，
+            //    保证角标跟住「新消息行」，而不是停在旧锚点下方。
+            if (target is RelativeLayout) {
+                runCatching { relayoutBadgeBelowMessageRow(target, existing) }
+                    .onFailure { logOnce("HINTBADGE relayout failed: ${it.javaClass.simpleName}") }
+            }
             if (existing.text?.toString() != text) existing.text = text
             return true
         }
@@ -585,41 +592,48 @@ object HintBadge {
         // ⚠️ 但「末尾」的含义随容器方向变：垂直 LinearLayout = 下方（正确）；
         //    横向 LinearLayout = **右端**，不是下方。而微信消息行正是「头像 + 内容」横排，
         //    直接 addView(childCount) 会把角标甩到右边，所以先找纵向子容器当落点。
-        val dest = bottomSlot(target)
-        val lp = labelParams(dest)
+        // ⚠️ 真机根容器 `xi` 是 **RelativeLayout**（不是 LinearLayout），上面的 LinearLayout
+        //    规则一行都不会命中。RelativeLayout 走专有路径：把角标挂到「消息行」的 BELOW 规则上。
+        var ok = true
         runCatching {
-            when {
-                dest is LinearLayout -> dest.addView(tv, dest.childCount, lp)
-                lp == null -> dest.addView(tv)
-                else -> dest.addView(tv, lp)
+            if (target is RelativeLayout) {
+                // ⚠️ 复核额外发现：`resolveRowAnchor` 返回 null（首屏首绑时子节点还没 layout，
+                //    几何全 0）时，这里若仍当成功返回，角标就要等 2 秒后 sweep 才出现。
+                //    返回 false ⇒ apply() 会 post 一帧重试 ⇒ 首枚角标当帧就能贴上。
+                ok = addBadgeBelowMessageRow(target, tv)
+            } else {
+                val dest = bottomSlot(target)
+                val lp = labelParams(dest)
+                when {
+                    dest is LinearLayout -> dest.addView(tv, dest.childCount, lp)
+                    lp == null -> dest.addView(tv)
+                    else -> dest.addView(tv, lp)
+                }
             }
         }.onFailure { e ->
             logOnce("HINTBADGE addView failed: ${e.javaClass.simpleName}")
             runCatching { target.addView(tv) }
+            ok = false
         }
+        // ⚠️ `added` 只在**真的挂上了**才自增：`resolveRowAnchor` 返回 null 时
+        //    `addBadgeBelowMessageRow` 是静默 no-op，若照样自增，验收脚本拿到的
+        //    角标数会比屏幕上实际可见的多 ⇒ 判据「角标数 == 被救消息数」假阳性。
+        if (!ok) return false
         val n = added.incrementAndGet()
         if (logged.get() < LOG_MAX && logged.incrementAndGet() <= LOG_MAX) {
             LogX.i("HINTBADGE badge added #$n host=${target.javaClass.name} text=$text")
         }
-        return true
+        // ⚠️ 必须返回 ok 而不是 true：`apply()` 只在 ensure 返回 false 时 post 一帧重试。
+        //    返回 true ⇒ 首屏首绑（子节点还没 layout、几何全 0）那一枚要等 2s sweep 才补上。
+        return ok
     }
 
     /**
-     * 给角标找「视觉上的下方」落点。
+     * ⚠️ 已弃用（保留仅作非 RelativeLayout 容器的兜底路径）。
      *
-     * ⚠️ 这不是「取最后一个子 View」那么简单：微信消息 item 是
-     * **横向 LinearLayout（头像在左、内容在右）**，往里 append 会跑到右边。
-     * 所以规则按优先级来：
-     *
-     * 1. **横向**容器 ⇒ 不是「下方」语义，先从右往左找纵向子容器钻进去。
-     * 2. **纵向**容器 ⇒ 末尾就是下方，直接返回；但若最后一个 ViewGroup 子项也是纵向
-     *    （`竖[名字, 气泡]` 这种），钻进去贴着气泡画，比退到外层更精确 ——
-     *    否则角标会落在气泡**外面**，中间夹着时间戳就对不上号了。
-     * 3. 非 LinearLayout（FrameLayout / Constraint）⇒ 直接返回，靠 gravity/约束定位。
-     *
-     * 判据里的 `vertical` 读的是 `LinearLayout.getOrientation()`（public，未混淆），
-     * **不**去反射 `mOrientation` 字段（R8 会改名）。取不到方向时按「横向」保守处理 ——
-     * 宁可回退到旧行为，也不要把角标甩到正文右边。
+     * 真机根容器 `xi` 是 RelativeLayout，`bottomSlot` 第一行 `!is LinearLayout` 直接 return，
+     * 整个函数体一行没执行 → 角标落到 (0,0)。RelativeLayout 现在走
+     * [addBadgeBelowMessageRow]（BELOW 消息行 + 水平对齐）。
      */
     private fun bottomSlot(target: ViewGroup, depth: Int = 0): ViewGroup {
         if (target !is LinearLayout) return target
@@ -661,6 +675,10 @@ object HintBadge {
         return target
     }
 
+    /**
+     * ⚠️ 已弃用（保留仅作非 RelativeLayout 容器的兜底路径）。
+     * RelativeLayout 的定位由 [addBadgeBelowMessageRow] 走 BELOW 规则，不再走这里。
+     */
     private fun labelParams(target: ViewGroup): ViewGroup.LayoutParams? {
         val ctx = target.context
         val px = UiKit.dp(ctx, 12)
@@ -711,6 +729,134 @@ object HintBadge {
             LogX.w("HINTBADGE: no explicit LP for ${target.javaClass.name}, use default")
         }
         return null
+    }
+
+    // ------------------------------------------------------------------ RelativeLayout 落点
+
+    /**
+     * RelativeLayout（真机 `xi`）专属：把角标挂到「消息行」的 BELOW 规则上。
+     *
+     * ⚠️ 不能用 `alignParentBottom` —— item 高度 394，消息行 `#bqh` 在 1903~2091，item 底 2091
+     * 与消息行底差 0，但顶部有 `#bxh` 时间戳槽（1740~1860）。角标若贴 item 最底部，会紧贴
+     * **下一条**消息，视觉上分不清属于哪条（用户抱怨的正是这个）。所以锚点必须是「消息行」。
+     *
+     * 锚点选择纯函数 [HintBadgeLogic.selectMessageRow]：取最后一个「高」可见子节点。
+     * 水平对齐纯函数 [HintBadgeLogic.alignToEnd]：消息行内离中线最远的子节点（头像）在哪半边，
+     * 角标就跟到哪半边（自己发的靠右、对方靠左）。
+     *
+     * ⚠️ id 策略：`addRule(BELOW, anchor.getId())`。若 anchor 是 `NO_ID`（-1），AOSP 会把它当
+     * `ALIGN_PARENT_TOP` 处理，角标又回顶部。这里给 anchor `setId(generateViewId())` ——
+     * generateViewId 走 id 空间高位，不会撞微信资源 id；且该 id 只在此 item 内引用，没有跨 item
+     * 依赖，不会污染别的 item（RecyclerView 复用 item 时我们只按运行时结构重新投影，不缓存 id）。
+     */
+    /** 解析结果：锚点行 + 水平对齐（自己发的靠右）。rowView 已确保有非 NO_ID 的 id */
+    private class RowAnchor(val rowView: View, val alignEnd: Boolean)
+
+    /**
+     * 把角标挂到「消息行」的 BELOW 规则上。
+     *
+     * @return true = 已挂上；false = 还没 layout 完、挑不出锚点（调用方应视为「没做到」，
+     *         交给 `apply()` 的 post 重试，而不是当成成功 —— 见 [ensure] 的返回语义）。
+     */
+    private fun addBadgeBelowMessageRow(target: RelativeLayout, tv: TextView): Boolean {
+        val a = resolveRowAnchor(target) ?: return false
+        target.addView(tv, rowLayoutParams(target, a))
+        logOnce("HINTBADGE: badge below row#${a.rowView.id} align=${if (a.alignEnd) "END" else "START"}")
+        return true
+    }
+
+    /**
+     * 复用路径：锚点/对齐可能变了，原地重套 BELOW 规则（不重建 View）。
+     *
+     * ⚠️ **必须短路**（复核 ②）：`setLayoutParams` 无条件触发 `requestLayout()`，
+     * 而本函数被 2 秒一次的 `sweep()` 驱动（`sweep → ensure → 这里`）。
+     * 不复核「新 LP 与旧的是否等价」就会每 2 秒白抛一次布局 pass —— 会话页是滚动热路径，
+     * 能省的布局都要省。等价条件取「同类型 + 同 BELOW 锚点 + 同左右规则 + 同 margin」，
+     * 任一不等才真正重设。
+     */
+    private fun relayoutBadgeBelowMessageRow(target: RelativeLayout, tv: TextView) {
+        val a = resolveRowAnchor(target) ?: return
+        val want = rowLayoutParams(target, a)
+        val cur = tv.layoutParams as? RelativeLayout.LayoutParams
+        if (cur != null && sameRule(cur, want)) return
+        tv.layoutParams = want
+    }
+
+    /** 两个 `RelativeLayout.LayoutParams` 在「我们关心的维度」上是否等价 */
+    private fun sameRule(a: RelativeLayout.LayoutParams, b: RelativeLayout.LayoutParams): Boolean {
+        if (a.width != b.width || a.height != b.height) return false
+        if (a.leftMargin != b.leftMargin || a.rightMargin != b.rightMargin) return false
+        if (a.topMargin != b.topMargin || a.bottomMargin != b.bottomMargin) return false
+        // RELATIVE_BELOW 用的是「锚点 View 的 id」，比较它才等价；光比规则数组会漏掉 id 变化
+        val below = RelativeLayout.BELOW
+        if (a.getRules()[below] != b.getRules()[below]) return false
+        if (a.getRules()[RelativeLayout.ALIGN_PARENT_LEFT] !=
+            b.getRules()[RelativeLayout.ALIGN_PARENT_LEFT]) return false
+        if (a.getRules()[RelativeLayout.ALIGN_PARENT_RIGHT] !=
+            b.getRules()[RelativeLayout.ALIGN_PARENT_RIGHT]) return false
+        return true
+    }
+
+    /**
+     * 投影 item 根的直接子节点 → 纯判据挑锚点 → 取回那个 View 并确保它有非 NO_ID 的 id。
+     * 找不到锚点返回 null（调用方此时不贴/不挪角标）。
+     */
+    private fun resolveRowAnchor(target: RelativeLayout): RowAnchor? {
+        val nodes = ArrayList<HintBadgeLogic.BadgeNode>(target.childCount)
+        for (i in 0 until target.childCount) {
+            val c = runCatching { target.getChildAt(i) }.getOrNull() ?: continue
+            nodes += projectNode(c)
+        }
+        val idx = HintBadgeLogic.selectMessageRow(nodes)
+        if (idx < 0) {
+            logOnce("HINTBADGE: no message-row anchor on ${target.javaClass.name}")
+            return null
+        }
+        val rowView = runCatching { target.getChildAt(idx) }.getOrNull() ?: return null
+        if (rowView.id == View.NO_ID) {
+            runCatching { rowView.id = View.generateViewId() }
+                .onFailure { logOnce("HINTBADGE: setId on anchor failed: ${it.javaClass.simpleName}") }
+        }
+        return RowAnchor(rowView, HintBadgeLogic.alignToEnd(nodes))
+    }
+
+    private fun rowLayoutParams(target: RelativeLayout, a: RowAnchor): RelativeLayout.LayoutParams {
+        val px = UiKit.dp(target.context, 12)
+        val gap = UiKit.dp(target.context, 4)
+        return RelativeLayout.LayoutParams(
+            ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT
+        ).apply {
+            addRule(RelativeLayout.BELOW, a.rowView.id)
+            if (a.alignEnd) addRule(RelativeLayout.ALIGN_PARENT_RIGHT)
+            else addRule(RelativeLayout.ALIGN_PARENT_LEFT)
+            // 角标紧贴消息行下方，不加 topMargin（BELOW 已隔开）；只留左右缩进
+            if (a.alignEnd) rightMargin = px else leftMargin = px
+            bottomMargin = gap
+        }
+    }
+
+    /**
+     * 把真 View 投影成纯判据节点。递归但限深：`selectMessageRow` 只看顶层节点的几何，
+     * `alignToEnd` 只看消息行的**直接子节点**（头像），两层足够，避免对整棵 item 树无界递归。
+     */
+    private fun projectNode(v: View, depth: Int = 0): HintBadgeLogic.BadgeNode {
+        val children = if (v is ViewGroup && depth < 4) {
+            val list = ArrayList<HintBadgeLogic.BadgeNode>(v.childCount)
+            for (i in 0 until v.childCount) {
+                val c = runCatching { v.getChildAt(i) }.getOrNull() ?: continue
+                list += projectNode(c, depth + 1)
+            }
+            list
+        } else emptyList()
+        return HintBadgeLogic.BadgeNode(
+            width = v.width,
+            height = v.height,
+            x = v.x.toInt(),
+            y = v.y.toInt(),
+            visible = v.visibility == View.VISIBLE,
+            isOurBadge = MARK == v.tag,
+            children = children
+        )
     }
 
     /**

@@ -634,7 +634,19 @@ object SnsHuntProbe {
         // 写库是热路径，无条件取栈会明显拖慢微信。
         // catch 模式下调宽 key 长度：不同表的前 60 字符可能撞在一起（update xxx set 之后才有表名差异）
         val keyLen = if (allWrites) 110 else 60
-        val key = "$sig [${if (kw != null) "KW" else "TBL"}] ${detail.take(keyLen)}"
+        // ⚠️ catch 模式必须把 values(tail) 也纳入去重 key。
+        // 成因：`detail` 前 62 字符固定是 `db=<微信库绝对路径> | `，`detail.take(110)` 只够
+        // 到 `SnsInfo | subType=0 localPrivate=0 pravited=0`，**在 sourceType 之前就截断了**
+        // ⇒ `update SnsInfo ... sourceType=2` 与 `sourceType=0` 撞成同一个 key，
+        // 配合下面的 `n == 1` 条件，同一调用点只有第一条能出声。
+        // 2026-10-26 实测后果：清位写 0 的那条 update 被静默吞掉，一度误判成
+        // 「微信清 sourceType 不走 SQL」——结论完全反了。tail 参与 key 后即可逐条区分。
+        val key = if (allWrites) {
+            "$sig [${if (kw != null) "KW" else "TBL"}] " +
+                head.take(80) + "|" + tailStr.take(160).hashCode()
+        } else {
+            "$sig [${if (kw != null) "KW" else "TBL"}] ${detail.take(keyLen)}"
+        }
         val n = counts.merge(key, 1) { a, b -> a + b } ?: 1
         if (n == 1 && printed.get() < maxLines()) {
             printed.incrementAndGet()

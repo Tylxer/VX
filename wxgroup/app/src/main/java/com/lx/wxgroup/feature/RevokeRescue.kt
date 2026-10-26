@@ -97,14 +97,52 @@ object RevokeRescue {
             LogX.i("RRV record msgId=$msgId talker=${talker.take(12)} ok=$ok " +
                 "origType=${orig.type} revoke=${revokeContent?.take(20)} " +
                 "extra=${extra != null} origExtra=${orig.extra != null}")
+            // ⛔ 台账一变就让 VoiceGuard 的受保护集合缓存失效。
+            // 否则 3 秒内连撤两条语音时，第二条的 voiceinfo DELETE 会命中第一条建下的
+            // 缓存（不含第二条）⇒ 放行 ⇒ 第二条被删 ⇒ 播放失败
+            // （详见 VoiceGuardLogic.cacheUsable 的 KDoc）。
+            if (ok) VoiceGuard.invalidate()
+            // ⛔ R21c：**必须在这里备份语音文件**，而且必须在 `record` 这同一次拦截里做。
+            //    撤回链是「UPDATE 被拦 → executor.submit(vj0.p) → File.delete(音频)」，
+            //    此刻文件还在（异步删除还没跑），晚一步就永远拿不到了。
+            //    详见 VoiceBackup 的 KDoc（含 20827 目录递归扫描的实证）。
+            // ⚠️ 放在台账写成功之后：没记账就说明这次撤回没救下来，不必浪费一次拷贝。
+            if (ok && orig.imgPath != null) {
+                // ① 登记「别删这个文件」（拦 File.delete，见 VoiceFileGuard）
+                runCatching { VoiceFileGuard.protect(orig.imgPath) }
+                    .onFailure { LogX.w("RRV voice protect failed: ${it.javaClass.simpleName}") }
+                // ② 同时留一份备份（兜底：万一 File.delete 走的是 native unlink，
+                //    hook 拦不到，还有文件可以搬回来）
+                runCatching { VoiceBackup.backup(orig.type, orig.imgPath) }
+                    .onFailure { LogX.w("RRV voice backup failed: ${it.javaClass.simpleName}") }
+                // ③ 排一个「删除链跑完后」的幂等还原 —— **这一步才是兜底**。
+                //    ①可能拦不住（native unlink），②只是留了个副本；
+                //    真正决定「能不能播放」的是删除动作发生之后文件是否还在原位。
+                //    ⚠️ 必须在 ② 之后：restore 读的是 backup 写出来的文件。
+                //    为什么不能靠 VoiceGuard.onDelete 里那次 restore，见
+                //    VoiceBackup.scheduleRestore 的 KDoc（早触发 ⇒ 恒 no-op）。
+                runCatching { VoiceBackup.scheduleRestore(orig.imgPath) }
+                    .onFailure { LogX.w("RRV voice scheduleRestore failed: ${it.javaClass.simpleName}") }
+            }
             ok
         }.onFailure {
             LogX.w("RRV record failed: ${it.javaClass.simpleName}")
         }.getOrDefault(false)
     }
 
-    /** 库里那一行此刻的样子（撤回被拦下了，所以还是原消息） */
-    private class OrigRow(val type: Int, val content: String?, val extra: String?)
+    /**
+     * 库里那一行此刻的样子（撤回被拦下了，所以还是原消息）。
+     *
+     * @param imgPath 语音消息的音频文件名（26 位 hex）。**必须在备份之前取到** ——
+     *                撤回链里 `vj0.p`(deleteLocalFile) 是异步删磁盘文件的，
+     *                等它跑完就查不到了（也可能查得到但文件已经没了）。
+     */
+    private class OrigRow(
+        val type: Int,
+        val content: String?,
+        val extra: String?,
+        val imgPath: String?,
+    )
 
     private fun queryOriginal(msgId: Long): OrigRow? {
         val db = AntiRevoke.wxDb() ?: return null
@@ -118,7 +156,7 @@ object RevokeRescue {
             val cur = m.invoke(
                 db,
                 AntiRevokeHint.BYPASS +
-                    "select type,content,isSend,lvbuffer,reserved from $TABLE_MESSAGE where msgId=?",
+                    "select type,content,isSend,lvbuffer,reserved,imgPath from $TABLE_MESSAGE where msgId=?",
                 args
             ) ?: return null
             try {
@@ -138,7 +176,15 @@ object RevokeRescue {
                         else -> XposedHelpers.callMethod(cur, "getString", idx)
                     }
                 }
-                OrigRow(type, content, CvCodec.encode(snap))
+                // imgPath 单独取：语音文件的压缩包名，VoiceBackup 要靠它算路径。
+                // 老库没有这一列时 idx<0，返回 null，备份侧会安全跳过。
+                val imgIdx = XposedHelpers.callMethod(cur, "getColumnIndex", "imgPath") as? Int ?: -1
+                val imgPath = if (imgIdx >= 0) {
+                    XposedHelpers.callMethod(cur, "getString", imgIdx) as? String
+                } else {
+                    null
+                }
+                OrigRow(type, content, CvCodec.encode(snap), imgPath)
             } finally {
                 runCatching { XposedHelpers.callMethod(cur, "close") }
             }

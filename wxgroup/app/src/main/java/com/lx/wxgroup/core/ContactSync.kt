@@ -55,6 +55,9 @@ object ContactSync {
         // 不依赖用户打开通讯录。判据/实现见 core/ContactSqlSource.kt。
         runCatching { ContactSqlSource.install(context) }
             .onFailure { LogX.w("SYNC ContactSqlSource install failed: ${it.javaClass.simpleName}") }
+        // R24：群聊数据源。通信录 tab 里扫不到群，必须另走 rcontact（见 ChatroomSource 头注释）
+        runCatching { ChatroomSource.init(context) }
+            .onFailure { LogX.w("SYNC ChatroomSource init failed: ${it.javaClass.simpleName}") }
     }
 
     /** 由 UiProbe 在抓到通讯录列表时回调 */
@@ -192,6 +195,12 @@ object ContactSync {
             )
         }
         if (full) markFullSync()
+
+        // R24：通讯录同步完再补群聊。放在这里而不是 install 时启动：
+        // 此刻库已开、且有 ChatroomSource.shouldRun 自己判「要不要真扫」。
+        // 起独立线程，不拖慢同步收尾（全表扫 rcontact 是几百毫秒级）。
+        runCatching { ChatroomSource.runIfNeeded() }
+            .onFailure { LogX.w("SYNC ChatroomSource trigger failed: ${it.javaClass.simpleName}") }
 
         // 样本：确认字段没读错（备注为空是正常的，大多数人没设备注）
         friends.take(SAMPLE_SIZE).forEachIndexed { i, f ->

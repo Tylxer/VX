@@ -19,7 +19,7 @@ import java.util.Locale
  * ```
  * <导出路径>/昵称(wxid)/yyyy-MM-dd-HHmm/
  *      -3447438253133393222.txt    ← text 文本
- *      <原图>                       ← 图片（命名规则已取证 R15，见 MomentsExport.COPY_IMAGES）
+ *      <原图>                       ← 图片（命名规则已取证 R15，见 Keys.MOMENTS_COPY_IMAGES）
  * ```
  * 昵称在前是为了**人读得懂**，括号里带 wxid 是为了**唯一**（昵称会重名、会改）。
  */
@@ -65,6 +65,32 @@ object MomentsLogic {
 
     /** 导出两轮之间的最小间隔（毫秒） */
     const val EXPORT_MIN_INTERVAL_MS = 10 * 60_000L
+
+    // ------------------------------------------------------------------ sourceType 位定义
+    //
+    // ⛔ 2026-10-27 R28 修正：`bit7(128)` **不是**广告位（旧结论写错了，已订正）。
+    //    字面证据见 `docs/_r28_ad_flag_forensics.md`：
+    //      - `SnsInfo.isAd()` 方法体 = `isSourceExist(32)`（`const/16 v2,#int 32`）；
+    //      - `AdSnsInfo.convertToSnsInfo()` 显式 `addSourceFlag(2)` + `addSourceFlag(32)`；
+    //      - 广告落库 `AdSnsInfoStorageLogic.x.n()` 同样 `|= 32`；
+    //      - 新版 `ImproveSnsInfo.isAd()`（另一份独立实现）也用 32。
+    //    而 128 是「折叠 / 长文本需要点『全文』」位 —— 实测值 130 = 128|2 是**正常的折叠动态**，
+    //    按 128 过滤会把这一类整组误杀。
+
+    /** `bit1(2)`：进时间线（可见）。时间线取数 SQL 一律带 `sourceType & 2 != 0` */
+    const val SOURCE_FLAG_TIMELINE = 2
+
+    /** `bit2(4)`：自己私密 */
+    const val SOURCE_FLAG_PRIVATE = 4
+
+    /** `bit5(32)`：**广告**。`SnsInfo.isAd()` 判的就是这一位 */
+    const val SOURCE_FLAG_AD = 32
+
+    /** `bit7(128)`：折叠（长文本要展开「全文」）。⛔ **不是广告**，别拿它做广告黑名单 */
+    const val SOURCE_FLAG_FOLDED = 128
+
+    /** 这条动态是不是广告（[SOURCE_FLAG_AD]）。纯位运算，单测覆盖 */
+    fun isAd(sourceType: Int): Boolean = sourceType and SOURCE_FLAG_AD != 0
 
     private val DAY_FMT = DateTimeFormatter.ofPattern(DAY_PATTERN, Locale.US)
     private val FULL_FMT = DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm", Locale.US)
@@ -292,6 +318,71 @@ object MomentsLogic {
         val e = ext.lowercase().takeIf { it in IMAGE_EXTS } ?: "jpg"
         return "img_${snsId}_${index}.$e"
     }
+
+    /**
+     * R26：目标图**是否已经拷好**（回填用的短路判据）。
+     *
+     * ⛔ 必须要求 `length > 0`：`.tmp` 半成品、上次 rename 失败的 0 字节残留，
+     * 在磁盘上都是「exists=true」。只看 `exists()` 会把这些**上次失败**的痕迹
+     * 当成已成功 ⇒ 那张图永远补不回来，而且完全没有报错。
+     *
+     * 反过来，判据放宽成 `>= 0` 就等于把 0 字节残留当成功，是这条唯一的错法。
+     */
+    fun imgDone(exists: Boolean, length: Long): Boolean = exists && length > 0L
+
+    // ------------------------------------------------- 图片回填的跨轮游标（R27）
+
+    /**
+     * 回填游标的**源编号**：0 = 当前 SnsInfo（CURRENT），1 = 归档（ARCHIVE）。
+     *
+     * ⚠️ 用 Int 而不是 `SnsScanCursor.Src`：本文件禁止 import 项目内其它类（见文件头），
+     * 引一个 enum 进来单测就加载不动了。
+     */
+    const val FILL_SRC_CURRENT = 0
+    const val FILL_SRC_ARCHIVE = 1
+
+    /**
+     * 回填轮扫到哪儿了 —— **低水位游标**（`MomentsExport.backfillImages` 的跨轮进度记忆）。
+     *
+     * 语义：下一轮从 `(ct, sid)` **之后**（键集严格更旧）继续扫，扫到底再回绕到最新。
+     * 没有它，回填每轮都从最新重扫 ⇒ 最新 `MAX_BACKFILL_PER_RUN` 条
+     * 之后的行**永远轮不到**（R26 复核 §8(b)：队头阻塞）。
+     */
+    data class FillCursor(val src: Int, val ct: Long, val sid: Long)
+
+    /** 落盘格式 `src:ct:sid`，例 `1:1770000000:-3447438253133393222`（人类可读，adb 查库直接看懂） */
+    fun encodeFillCursor(c: FillCursor): String = "${c.src}:${c.ct}:${c.sid}"
+
+    /**
+     * 解析落盘游标。**任何脏值一律返回 null（= 从最新开始）**：不抛异常、不猜、不静默偏移。
+     *
+     * ⚠️ `sid` 必须吃下负号：真机 snsId 是 `-3447438253133393222` 这种有符号 64 位值。
+     * ⚠️ `ct` 必须 > 0：createTime 恒正，0 / 负只可能来自脏数据或截断。
+     */
+    fun parseFillCursor(raw: String?): FillCursor? {
+        val s = raw?.trim().orEmpty()
+        if (s.isEmpty()) return null
+        val parts = s.split(':')
+        if (parts.size != 3) return null
+        val src = parts[0].toIntOrNull() ?: return null
+        if (src != FILL_SRC_CURRENT && src != FILL_SRC_ARCHIVE) return null
+        val ct = parts[1].toLongOrNull() ?: return null
+        if (ct <= 0L) return null
+        val sid = parts[2].toLongOrNull() ?: return null
+        return FillCursor(src, ct, sid)
+    }
+
+    /**
+     * 一轮回填结束后该落盘的游标（环形轮转的**闭合点**）。
+     *
+     * @param exhausted `true` = **两个源都扫到底了**（本轮不是被配额截断）⇒ 回绕，
+     *   返回 `null`（清空游标，下轮从最新开始）。
+     *   ⛔ 不回绕的话，扫到最旧之后每轮都只会拿到空页，回填**永久停摆**且毫无报错。
+     * @param last 本轮最后一条**已处理**行的位置；被配额截断时它就是下轮的起点
+     *   （键集是严格 `<`，所以不会重复处理它，也不会漏掉下一条）。
+     */
+    fun fillCursorAfterRound(exhausted: Boolean, last: FillCursor?): FillCursor? =
+        if (exhausted) null else last
 
     // ------------------------------------------------- SNS 磁盘缓存文件名匹配（R15）
 
@@ -862,4 +953,40 @@ object MomentsLogic {
      */
     fun exportDue(lastRunAt: Long, now: Long, minIntervalMs: Long = EXPORT_MIN_INTERVAL_MS): Boolean =
         lastRunAt <= 0L || now - lastRunAt >= minIntervalMs
+
+    // ------------------------------------------------------------------ 路径迁移
+
+    /**
+     * 这个配置值是不是**旧的私有目录**（需要迁到公共目录）。
+     *
+     * ## 为什么必须判，而不能只改默认值
+     *
+     * `Kv.getString(Keys.MOMENTS_EXPORT_PATH)` 读的是**库里的持久化值**，不是默认值。
+     * 老用户装过旧版本 ⇒ kv 表里存着
+     * `/storage/emulated/0/Android/data/com.tencent.mm/files/WechatXposed/moments`，
+     * 只改 `Prefs.DEFAULT_EXPORT_PATH` 对他们**一点用都没有**：
+     * `ifBlank { DEFAULT }` 只在值为空串时兜底，非空旧值照样原样使用，
+     * 结果导出继续落在用户看不见的目录里，且没有任何报错。
+     *
+     * ## 判定口径
+     *
+     * 只认「命中旧私有根」且**不是用户自己改到别处**：
+     * - 空串 → 不是（那是「没配」，走 `ifBlank` 兜底即可）
+     * - 恰好等于旧默认值 → **是**
+     * - 在旧默认值下面（用户手填了 `.../moments2` 之类）→ **是**
+     * - 任何其他路径（含用户自己选的公共目录、SD 卡路径）→ **不是**，尊重用户选择
+     *
+     * ⚠️ 判据用 `legacy` 前缀而不是硬编码 `Android/data`：
+     * 后者会误伤用户**故意**把导出指到别的 app 的 `Android/data` 下的情况。
+     *
+     * ⚠️ `legacy` **必须由调用方传**（本文件禁止 import 项目内其它类，
+     * 见文件头约定），调用方传 `Prefs.LEGACY_EXPORT_PATH`。
+     */
+    fun isLegacyExportPath(path: String?, legacy: String): Boolean {
+        val p = path?.trim().orEmpty().trimEnd('/')
+        if (p.isEmpty()) return false
+        val l = legacy.trim().trimEnd('/')
+        if (l.isEmpty()) return false
+        return p == l || p.startsWith("$l/")
+    }
 }

@@ -1,5 +1,6 @@
 package com.lx.wxgroup.data
 
+import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
 import org.junit.Test
@@ -157,5 +158,152 @@ class HintBadgeLogicTest {
         // 极端：内容只有 2 个字且第二个是 emoji 前半 —— 去掉代理后只剩 1 个字符，
         // 低于下限 ⇒ 必须 false（不能退化成「1 个字符也算命中」）
         assertFalse(HintBadgeLogic.contentOk("好\uD83D", listOf("好")))
+    }
+
+    // ---------------------------------------------------------------- selectMessageRow / alignToEnd
+
+    private fun node(
+        width: Int, height: Int, x: Int, y: Int,
+        visible: Boolean = true, isBadge: Boolean = false,
+        children: List<HintBadgeLogic.BadgeNode> = emptyList()
+    ) = HintBadgeLogic.BadgeNode(width, height, x, y, visible, isBadge, children)
+
+    // 真机 8.0.48 语音 item（对方消息）根 `xi` 结构（uiautomator，1440×3200）：
+    //   角标(433x65) → 时间戳槽 #bxh(106x120) → 消息行 #bqh(1440x188)
+    //   消息行 #bqh 内部：头像 #bq2(187x187, 靠左 x=22) + 气泡区(601x144, x=209)
+    private fun incomingAvatarRow(x: Int, bubbleW: Int) = node(
+        1440, 188, 0, 206,
+        children = listOf(
+            node(187, 187, x, 0),            // 头像，贴外沿
+            node(bubbleW, 144, 209, 0)       // 气泡区
+        )
+    )
+
+    private val item1 = listOf(
+        node(433, 65, 0, 0, isBadge = true),           // 我们加的角标
+        node(106, 120, 667, 43),                        // 时间戳槽 #bxh
+        incomingAvatarRow(x = 22, bubbleW = 601)        // 消息行 #bqh
+    )
+
+    private val item2 = listOf(
+        incomingAvatarRow(x = 22, bubbleW = 288)        // 窄气泡，无时间戳槽
+    )
+
+    private val itemSelf = listOf(
+        node(106, 120, 0, 0),                           // 时间戳槽
+        node(1440, 188, 0, 206,
+            children = listOf(
+                node(601, 144, 601, 0),                 // 气泡区靠中偏左
+                node(187, 187, 1231, 0)                 // 头像贴右外沿（x=1440-22-187）
+            ))
+    )
+
+    @Test
+    fun selectRowPicksLastTallVisibleChild() {
+        // 消息行(188) 是最高子节点且是最后一个「高」节点 → 选中它，而不是角标(65)/时间戳槽(120)
+        assertEquals(2, HintBadgeLogic.selectMessageRow(item1))
+        assertEquals(0, HintBadgeLogic.selectMessageRow(item2))
+    }
+
+    @Test
+    fun selectRowSkipsGoneAndOwnBadge() {
+        // 角标自己不能当锚点；GONE 的节点跳过。这里只剩一个 GONE 的消息行 → 无候选 → -1
+        val nodes = listOf(
+            node(1440, 188, 0, 206, visible = false),
+            node(433, 65, 0, 0, isBadge = true)
+        )
+        assertEquals(-1, HintBadgeLogic.selectMessageRow(nodes))
+    }
+
+    @Test
+    fun selectRowEmptyGivesMinusOne() {
+        assertEquals(-1, HintBadgeLogic.selectMessageRow(emptyList()))
+    }
+
+    @Test
+    fun selectRowTimestampIsAlsoTallButMessageRowIsLastHigh() {
+        // 阈值 = 188/2 = 94，时间戳槽 120 ≥ 94 也算「高」。但「取**最后一个**高节点」
+        // 保证消息行(索引 2)胜出，而不是时间戳槽。这锁住「同名多高时按最后一个」的语义。
+        assertEquals(2, HintBadgeLogic.selectMessageRow(item1))
+    }
+
+    @Test
+    fun selectRowZeroHeightGivesMinusOne() {
+        // 所有候选都没量完（height ≤ 0）→ 无锚点，调用方不贴角标
+        assertEquals(-1, HintBadgeLogic.selectMessageRow(listOf(node(0, 0, 0, 0))))
+    }
+
+    @Test
+    fun alignToEndFalseForIncoming() {
+        // 对方消息：消息行内头像靠左（中心 115.5 < 中线 720）→ 角标靠左
+        assertFalse(HintBadgeLogic.alignToEnd(item1))
+        assertFalse(HintBadgeLogic.alignToEnd(item2))
+    }
+
+    @Test
+    fun alignToEndTrueForSelf() {
+        // 自己发的消息：消息行内头像靠右（中心 1324.5 > 中线 720）→ 角标靠右
+        assertTrue(HintBadgeLogic.alignToEnd(itemSelf))
+    }
+
+    @Test
+    fun alignToEndFallsBackToLeftWhenNoChildren() {
+        // 消息行没有任何可见子节点（拿不到头像）→ 按对方消息靠左保守处理
+        assertFalse(HintBadgeLogic.alignToEnd(listOf(node(1440, 188, 0, 206))))
+    }
+
+    // -------------------------------------- 复核 WARN 护栏（badge-review2 建议的补测）
+    //
+    // 这 5 条**不是**在测「正确行为」，而是在**把当前行为钉住**：
+    // 一旦微信改了 item 内部节点顺序，或有人动了阈值公式，这些用例会立刻变红，
+    // 提醒「角标锚点可能已经指错对象」——比等真机出鬼再排查便宜得多。
+
+    @Test
+    fun selectRowTimestampAfterMessageRowPicksTimestamp() {
+        // ⚠️ 钉住一条**未承诺的顺序依赖**（复核判据 ③ 的 WARN，故意不修的那条）：
+        //    当前真机结构是「角标 → 时间戳 #bxh(120) → 消息行 #bqh(188)」，消息行排在后
+        //    才被选中（阈值 94，两者都过线，靠的是先后而非几何）。
+        //    假如微信某版把时间戳挪到消息行**之后**，这里选中的就会变成时间戳：
+        //    角标会贴到时间戳下方 —— 正是用户最初抱怨的「看着像给下一条消息打标」。
+        //    ⇒ 本用例断言「选到时间戳」= 把该风险变成会响的警报，而不是假装它不存在。
+        val timestampAfterRow = listOf(
+            incomingAvatarRow(x = 22, bubbleW = 601),      // 消息行 #bqh(188)
+            node(106, 120, 667, 43)                         // 时间戳槽 #bxh(120) 跑到后面
+        )
+        assertEquals(1, HintBadgeLogic.selectMessageRow(timestampAfterRow))
+    }
+
+    @Test
+    fun selectRowOnlyTimestampNoMessageRow() {
+        // 只有时间戳槽、没有消息行（系统提示 / tip 类 item）：
+        // 阈值 = 120/2 = 60，时间戳 120 过线 ⇒ 仍返回它的下标（不会 -1）。
+        // ⇒ 语义是「**矮子里拔高个**」：有可见子节点就一定给锚点，宁可位置不理想也不留空。
+        //    这一类 item 本来就不该有角标（`typeOk` 在更外层已经拦掉），故只钉行为、不改判据。
+        assertEquals(0, HintBadgeLogic.selectMessageRow(listOf(node(106, 120, 667, 43))))
+    }
+
+    @Test
+    fun alignToEndCenteredSingleChildFallsBackLeft() {
+        // 单个子节点**恰好居中**（中心 627+93 == rowCx 720）：恰好不满足 `> rowCx`
+        // ⇒ 落到「靠左」。钉住边界是**严格大于**，不是 `>=`——
+        // 否则居中元素会被判成「自己发的」，把角标甩到右边。
+        val row = node(1440, 188, 0, 206, children = listOf(node(187, 187, 627, 0)))
+        assertFalse(HintBadgeLogic.alignToEnd(listOf(row)))
+    }
+
+    @Test
+    fun alignToEndRightAlignedSingleChild() {
+        // 单个子节点贴右外沿（中心 1231+93 = 1324 > 720）⇒ 自己发的，靠右。
+        val row = node(1440, 188, 0, 206, children = listOf(node(187, 187, 1231, 0)))
+        assertTrue(HintBadgeLogic.alignToEnd(listOf(row)))
+    }
+
+    @Test
+    fun alignToEndSingleFullWidthWrapperFallsBackLeft() {
+        // 子节点是**占满整宽**的包裹层（x=0, w=1440 ⇒ 中心正好 720）：
+        // 这种结构拿不到「头像贴外沿」这个特征（包裹层自己就是中线）
+        // ⇒ 退化为靠左。钉住「满宽包裹层不会被误判成自己发的」。
+        val row = node(1440, 188, 0, 206, children = listOf(node(1440, 188, 0, 0)))
+        assertFalse(HintBadgeLogic.alignToEnd(listOf(row)))
     }
 }

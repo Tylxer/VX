@@ -49,6 +49,16 @@ android {
         abortOnError = false
         checkReleaseBuilds = false
     }
+
+    // 单测进程默认只有 512MB 堆。测试类变多后 worker 会以
+    // 「non-zero exit value 1」整体崩掉（不是断言失败，看不出是哪个测试）。
+    // ⚠️ AGP 的 unit test 任务是 AndroidUnitTest，**不是** org.gradle.api.tasks.Test，
+    //   写 `tasks.withType<Test>` 完全不生效（踩过），必须走 unitTests.all。
+    testOptions {
+        unitTests.all {
+            it.maxHeapSize = "1g"
+        }
+    }
 }
 
 dependencies {

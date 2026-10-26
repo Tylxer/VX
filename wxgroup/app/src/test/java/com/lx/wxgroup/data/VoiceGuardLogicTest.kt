@@ -166,4 +166,88 @@ class VoiceGuardLogicTest {
         assertEquals(emptyList<String>(), VoiceGuardLogic.hexTokensFrom(""))
         assertEquals(emptyList<String>(), VoiceGuardLogic.hexTokensFrom("no hex here"))
     }
+
+    // -------------------------------------------------- 缓存判据（R21c：空集不缓存 + gen 失效）
+
+    @Test
+    fun nonEmptyCacheIsUsableWithinTtl() {
+        // 非空 + gen 未变 + TTL 内 ⇒ 可命中（保留抗重试的正收益）
+        assertTrue(
+            VoiceGuardLogic.cacheUsable(
+                now = 1_000, cachedAt = 0, cachedSize = 3, ttlMs = 3_000,
+                cachedGen = 7, gen = 7
+            )
+        )
+    }
+
+    @Test
+    fun nonEmptyCacheExpiresAfterTtl() {
+        // 边界：TTL 到点就过期（严格小于，不是 <=）
+        assertFalse(
+            VoiceGuardLogic.cacheUsable(
+                now = 3_000, cachedAt = 0, cachedSize = 3, ttlMs = 3_000,
+                cachedGen = 7, gen = 7
+            )
+        )
+    }
+
+    @Test
+    fun emptyCacheIsNeverUsable() {
+        // ⛔ 本判据核心①：空集即使 cachedAt 极新也不算命中。
+        // 回归保护：若有人把 `cachedSize > 0` 删掉，这条立刻红。
+        assertFalse(
+            VoiceGuardLogic.cacheUsable(
+                now = 1, cachedAt = 0, cachedSize = 0, ttlMs = 3_000,
+                cachedGen = 7, gen = 7
+            )
+        )
+        assertFalse(
+            VoiceGuardLogic.cacheUsable(
+                now = 0, cachedAt = 0, cachedSize = 0, ttlMs = 3_000,
+                cachedGen = 7, gen = 7
+            )
+        )
+    }
+
+    @Test
+    fun cacheIsStaleAfterNewRecord() {
+        // ⛔ 本判据核心②（真机 bug 的直接护栏）：3 秒内连撤两条语音。
+        // 缓存建于 gen=7（含 A），随后 record(B) 让 gen→8。
+        // 第二条 DELETE 必须 miss（否则 B 被放行 ⇒ 播放失败）。
+        assertFalse(
+            "record 之后旧缓存必须失效，否则连撤第二条会漏拦",
+            VoiceGuardLogic.cacheUsable(
+                now = 1_100, cachedAt = 100, cachedSize = 1, ttlMs = 3_000,
+                cachedGen = 7, gen = 8
+            )
+        )
+    }
+
+    @Test
+    fun emptyBuildStampsAlreadyExpired() {
+        // ⚠️ 这里断言的是**精确值** now - ttlMs，不能只断言 cacheUsable==false ——
+        //    后者被 cachedSize=0 短路保证，与 stamp 值无关，等于没钉住（复核指出的假绿）。
+        val stamped = VoiceGuardLogic.stampAfterBuild(now = 10_000, builtSize = 0, ttlMs = 3_000)
+        assertEquals(7_000L, stamped)
+    }
+
+    @Test
+    fun stampAfterBuildAvoidsUptimeZeroTrap() {
+        // ⚠️ 不能用常量 0L 表示「过期」：设备刚启动 uptime 很小时 now-0 会意外命中。
+        // 同样断言精确值而非 `stamped < 0`。
+        val stamped = VoiceGuardLogic.stampAfterBuild(now = 100, builtSize = 0, ttlMs = 3_000)
+        assertEquals(-2_900L, stamped)
+    }
+
+    @Test
+    fun nonEmptyBuildStampsNow() {
+        // 非空集合照常缓存：stamp 精确等于 now
+        assertEquals(10_000L, VoiceGuardLogic.stampAfterBuild(now = 10_000, builtSize = 2, ttlMs = 3_000))
+        assertTrue(
+            VoiceGuardLogic.cacheUsable(
+                now = 10_500, cachedAt = 10_000, cachedSize = 2, ttlMs = 3_000,
+                cachedGen = 1, gen = 1
+            )
+        )
+    }
 }

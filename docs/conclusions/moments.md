@@ -183,3 +183,54 @@ UI 导航 点「发现」(900,3060) → 点「朋友圈」(293,435)，实际 Act
 3. **插回去之后微信界面是否真的显示**：INSERT 成功 ≠ 界面出现（时间线还可能依赖 `SnsComment` / 缓存 / 服务端对账）。判据：`snsg sub=restore` 后进朋友圈看这条有没有回来。
 4. 恢复出来的动态**刷新后会不会被服务端再次抹掉**（本地有、服务端已删）。
 
+
+## R27 · 时间线可见性 = `sourceType & 2`（不是 `localFlag`）—— 2026-10-26 定案
+
+> 本轮最重要的认知纠正。此前所有「可见位」判据都建在 `localFlag` 上，**全部作废**。
+
+### 1. 可见性只看 `sourceType`，且发生在 **DB 层**
+- 时间线取数 SQL 一律带 `where (sourceType & 2 != 0)`（`d2.t5/u5/v5/C4/C1/d2/i4`）。
+  调用链：`w5.d -> d2.t5 @0x7c`、`c3.<init> -> d2.t5 @0x10d`；`c3.N`(handleNormalResp) 另查
+  `select snsId from SnsInfo where (sourceType & 2 != 0) limit 10`。
+- `sourceType` 是**客户端落库位字段**，不是服务端下发的字段（`SnsObject` 53 个字段里没有 Source/SourceType）。
+- 位定义：`bit1(2)`=时间线可见 / `bit2(4)`=自己私密 / **`bit5(32)`=广告** / `bit7(128)`=**折叠**
+  / `0`=死来源。
+  字面证据：`SnsInfo.isDeadSource()` = `sourceType==0`，`isSourceExist()` = `sourceType>0`；
+  广告位见下条订正。
+- ⛔ **2026-10-27 R28 订正：广告位是 `bit5(32)`，不是 `bit7(128)`**（本文件此前写 128=广告，
+  **是错的**，已改）。字面证据（`docs/_r28_ad_flag_forensics.md`）：
+  - `SnsInfo.isAd()` 方法体 = `isSourceExist(32)`（字节码 `const/16 v2,#int 32`）；
+  - `AdSnsInfo.convertToSnsInfo()` 显式 `addSourceFlag(2)` + `addSourceFlag(32)` ⇒ 广告落库为 `34`；
+  - 广告落库路径 `AdSnsInfoStorageLogic.x.n()` 同样 `|= 32`；
+  - 新版 `ImproveSnsInfo.isAd()`（另一份独立实现）也用 32，互为佐证。
+  - **128 的真实语义是「折叠 / 长文本需点『全文』」**。实测值 `130 = 128|2` 是**正常的折叠动态**，
+    ⇒ 拿 128 做广告黑名单会把这一类**整组误杀**，且误杀静默（只表现为「少导了几条」）。
+  - 实现：`MomentsLogic.SOURCE_FLAG_AD` / `isAd()`，单测 `MomentsAdFlagTest`（含 130 反向守门）。
+- 赋值点：`i2.onGYNetEnd`(NetSceneSnsClassifyTimeLine) `addSourceFlag(2)` @0x00a7；
+  `l5.o`(SnsInfoStorageLogic.replace) 在 `sourceType==0` 时兜底 addSourceFlag @0x0087；`d2.S7` 清位。
+
+### 2. ⛔ `localFlag` 与时间线可见性**无关**
+- 全 dex `strs "localFlag in"` **0 命中**；`localFlag` 相关 SQL 只有 DDL / `snsLocalflagIndex` / toString 格式串。
+- 唯一 `localFlag IN (0,1,2)` 是 classes7.dex 的 `FinderFeedItem`（**视频号表**），不是 `SnsInfo`。
+- ⇒ `SnsGuard.restoreVisibility` 的 `2 -> 18`（`localFlag |= 16`）是**纯无用功**：
+  好友删除场景根本不触发它（无 DELETE 可拦）；自我删除场景个人页能看到是因为**行没被删**，不是因为这个位。
+  `VISIBLE_BIT=16` 的注释「时间线白名单 localFlag in (16,2064,18,…)」属于**旧版本臆断**，8.0.48 不成立。
+
+### 3. 时间线数据通路（混合模型）
+- **首屏/刷新**：列表由响应内存对象渲染。硬证据：响应分发中枢 `w5.onSceneEnd`（code=0x394640）
+  全方法**无一次 `d2`（SnsInfo 存储层）调用**。`SnsInfo` 只是旁路持久化缓存。
+- **翻页**：走 `d2.t5`，带 `stringSeq` 游标 —— **查表**。
+- 内存层过滤条件不读 `sourceType`：`oh3/p.isDieItem()` 查 `getLocalFlag()<=0`、`isInValid()` 查 `l0()`(snsId)。
+- ⇒ 「刷新后消失」+「冷启后可能还在」可以同时成立，两者走不同路径。
+
+### 4. 好友删动态：服务器**不下发删除标记**
+- 时间线响应体 `q54/zb5` 字段全是 LinkedList/嵌套对象，**没有 deletedIds / tombstone 形态**。
+- 现场：好友删除后零 `SNS delete seen (off)`，本地行与 `localFlag` 均未被改动 ⇒ 靠「少返回」，不靠「多下发一条删除记录」。
+- ⇒ **没有标记可以拦**。要在时间线上保留，只能 (a) merge 本地行进入响应列表，或 (b) 修 DB 的 `sourceType` 位。
+
+### 5. ⛔ 样本有效性教训（本轮栽的坑）
+- 好友 `wxid_xlrbelf6hv0w22`（昵称 verity）名下 **3 条动态清一色 `type=2 src=0`**，
+  其中 2 条**从未被删**，同样不在时间线（`content=337B` 有正常内容，非空动态）。
+- 权限已实地核对：「聊天、朋友圈、微信运动等」+ 不让他看(关) + 不看他(关) ⇒ **排除屏蔽/仅聊天**。
+- ⇒ 他是 `src=0`（死来源），动态**本来就不进时间线**。用他做「防删除」验证 = 样本作废。
+- **规矩**：验证朋友圈可见性必须先用 `snsg sub=dump` 确认目标的 `src & 2 != 0`，再谈删除行为。

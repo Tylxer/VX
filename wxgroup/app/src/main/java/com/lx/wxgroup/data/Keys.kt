@@ -192,11 +192,27 @@ object Keys {
     const val MOMENTS_EXPORT_PATH = "moments.export_path"
     const val MOMENTS_EXPORT_LIST = "moments.export_list"
 
-    /** 朋友圈图片走 CDN 时的批量下载开关 */
-    const val SNS_CDN_IMG = "sns.cdn_img"
+    /**
+     * R28：导出时**排除广告**（`sourceType` 的 `bit5(32)`）。
+     *
+     * ⛔ 判据是位 **32**（`SnsInfo.isAd()`），**不是** 128 ——
+     * 128 是「折叠/全文」位，拿它过滤会误杀正常动态。见 `MomentsLogic.SOURCE_FLAG_AD`。
+     */
+    const val MOMENTS_EXCLUDE_AD = "moments.exclude_ad"
 
-    /** 朋友圈图片落盘时是否改写路径 */
-    const val SNS_CDN_REWRITE_PATH = "sns.cdn_rewrite_path"
+    /**
+     * 导出动态时**同时拷图片**（R26 起由编译期常量 `MomentsExport.COPY_IMAGES` 改成配置键）。
+     *
+     * ⚠️ 名字有讲究：拷的是**微信本地 SNS 缓存**里的图（`cache/<hash32>/sns/…`），
+     * 不是从 CDN 下。所以它的能力边界是「只抓得到本机缓存里还在的图」——
+     * 已删动态、冷启前的图都取不回。UI 文案必须写清楚，别让用户当图片备份用。
+     */
+    const val MOMENTS_COPY_IMAGES = "moments.copy_images"
+
+    // ⛔ 2026-10-27 已删：`sns.cdn_img` / `sns.cdn_rewrite_path` 两个键。
+    //    随整条朋友圈图片 CDN 通路（`SnsCdnImage` 等 4 个源文件）一并物理删除，
+    //    朋友圈图片已改道「SNS 缓存索引直扫」（`MomentsExport.buildSnsIndex`）。
+    //    ⛔ 勿按 git 历史恢复：CDN 通路实测从不触发（判据见下方原注释）。
 
     /**
      * 定时刷新 / 自动导出的**内部状态**（epoch millis 字符串，读不到按 0 = 从没做过）。
@@ -207,6 +223,17 @@ object Keys {
      */
     const val MOMENTS_LAST_REFRESH_AT = "moments.last_refresh_at"
     const val MOMENTS_LAST_EXPORT_AT = "moments.last_export_at"
+
+    /**
+     * 图片**回填轮的低水位游标**（格式 `src:createTime:snsId`，见 `MomentsLogic.parseFillCursor`）。
+     *
+     * 语义：本轮扫到哪儿，下轮从那儿继续往更旧扫，扫到底回绕到最新 —— 让回填真轮转，
+     * 而不是每轮都把配额花在最新那 200 条上（R26 复核 §8(b)）。
+     *
+     * ⚠️ 同 [MOMENTS_LAST_EXPORT_AT]：**刻意不进 `Prefs.ALL`** —— 纯运行状态，
+     * 换机/清空更有意义，也不该被备份带走。
+     */
+    const val MOMENTS_FILL_CURSOR = "moments.fill_cursor"
 
     // —— 群发域 ——
     const val BROADCAST_INTERVAL_S = "broadcast.interval_s"
@@ -220,7 +247,29 @@ object Keys {
 /** 配置项的元数据总表。遍历它就能渲染出全部设置页 */
 object Prefs {
 
+    /**
+     * 朋友圈导出默认目录 = **公共目录**，用户能用系统文件管理器直接打开。
+     *
+     * ⛔ 旧值 `Android/data/com.tencent.mm/files/WechatXposed/moments` 已废弃：
+     *   Android 11+ 起该目录对第三方应用（含系统文件管理器）不可见，
+     *   用户根本进不去 ⇒ 导出等于白导。2026-10-26 真机 M7 定案换成
+     *   `Documents/WXGroup/moments`（与备份 `Documents/WXGroup` 同根，用户只找一处）。
+     *
+     * 已验证可写：设备 Android 16 / 微信 targetSdk=34 下
+     * `MOMENT path ... writable=true`，因为 `/sdcard/Documents` 的 owner 就是微信 uid，
+     * **不需要 SAF 授权**。见 `docs/_r19_M4M6M7_真机验证.md`。
+     *
+     * ⚠️ 旧值仍保留在 [LEGACY_EXPORT_PATH] 用于迁移已有配置，别删。
+     */
     const val DEFAULT_EXPORT_PATH =
+        "/storage/emulated/0/Documents/WXGroup/moments"
+
+    /**
+     * 旧默认值。只在**迁移**时用：老用户的 Kv 里已经持久化了这个字符串，
+     * 光改默认值对他们无效（`getString` 读到的是库里的旧值）。
+     * 见 `MomentsLogic.isLegacyExportPath`。
+     */
+    const val LEGACY_EXPORT_PATH =
         "/storage/emulated/0/Android/data/com.tencent.mm/files/WechatXposed/moments"
 
     val ALL: List<PrefSpec> = listOf(
@@ -303,28 +352,27 @@ object Prefs {
         PrefSpec(Keys.MOMENTS_AUTO_EXPORT, PrefKind.SWITCH, "false", "朋友圈", "自动导出朋友圈动态"),
         PrefSpec(Keys.MOMENTS_EXPORT_PATH, PrefKind.PATH, DEFAULT_EXPORT_PATH, "朋友圈", "路径"),
         PrefSpec(Keys.MOMENTS_EXPORT_LIST, PrefKind.ENTER, "[]", "朋友圈", "设置自动导出名单"),
-        // ⚠️ 下面两项从设置页下架（hidden = true，**定义保留**）。
-        //    两个 key 的「无效」原因**不同，别混写**：
-        //    - sns.cdn_img **有消费点**（SnsCdnImage.kt:102 读它做门控 H1 开门），但整条路已判死：
-        //      真机定案（docs/取证结论.md ⑫.9，2026-10-24）两条判据 ——
-        //        ① picCachePath 字段**存在但恒为空**（hitPicE=7 / hitNoField=0）⇒ 拿不到落盘路径；
-        //        ② 批量下载请求 `ok0.x0#n` **一次都没被调用**（hitN=0）⇒ 批量通路根本没发生。
-        //      ⇒ 打开它只会让微信走一条非默认代码路径，而我们依然拿不到图。
-        //      朋友圈图片已改道「SNS 缓存直读」（MomentsExport.buildSnsIndex），与此开关无关。
-        //    - sns.cdn_rewrite_path **零消费点**：Cfg.rewritePath 只在 refreshCfg() 被写入，
-        //      全类没有任何地方读它（grep 可验），属从未实现的预留。
-        //    ⛔ 为什么 hidden 而不是删定义：旧备份文件里可能带这两个 key，删定义会让
-        //      BackupFlow.knownKeys 当未知 key 丢弃，用户换机时静默丢配置且无任何症状。
+        // R28 广告黑名单。默认**开**：广告不是「好友的动态」，导出它属于噪音。
         PrefSpec(
-            Keys.SNS_CDN_IMG, PrefKind.SWITCH, "false", "朋友圈",
-            "批量下载图片（CDN 通路已判死：拿不到落盘路径）",
-            hidden = true
+            Keys.MOMENTS_EXCLUDE_AD, PrefKind.SWITCH, "true", "朋友圈",
+            "排除广告（按 sourceType 的广告位判定）"
         ),
+        // R26：图片导出。默认关（真机只验到「链路通」，见 MomentsExport 的 KDoc）。
+        // ⚠️ 摘要必须写明「只导缓存里已有的图」——否则用户会以为能当图片备份用。
         PrefSpec(
-            Keys.SNS_CDN_REWRITE_PATH, PrefKind.SWITCH, "false", "朋友圈",
-            "改写落盘路径（未实现：全类零读取点）",
-            hidden = true
+            Keys.MOMENTS_COPY_IMAGES, PrefKind.SWITCH, "false", "朋友圈",
+            "导出图片（仅微信本地缓存里已有的图；历史/已删动态的图取不回）"
         ),
+        // ⛔ 2026-10-27 已删：这里原本登记着 `sns.cdn_img` / `sns.cdn_rewrite_path` 两项
+        //    （hidden = true）。随整条 CDN 通路一并物理删除，判死判据保留备查：
+        //      - sns.cdn_img：真机定案（docs/取证结论.md ⑫.9，2026-10-24）两条 ——
+        //        ① 出参 picCachePath 字段**存在但恒为空**（hitPicE=7 / hitNoField=0）⇒ 拿不到落盘路径；
+        //        ② 批量下载请求 `ok0.x0#n` **一次都没被调用**（hitN=0）⇒ 通路根本没发生。
+        //      - sns.cdn_rewrite_path：零消费点（只在 refreshCfg() 被写入，全类无读取），从未实现的预留。
+        //    ⚠️ 删除定义会让旧备份里的这两个 key 被 BackupMerge 当「未登记 key」丢弃
+        //       （`BackupMerge.kt:165`，并计入 settingsDropped 提示）。已确认这是**容错丢弃、不拒绝导入**，
+        //        且这两个开关在通路删除后无论真假都无任何效果 ⇒ 丢弃零损失。
+        //    ⛔ 勿按 git 历史恢复。
 
         // 群发域
         PrefSpec(

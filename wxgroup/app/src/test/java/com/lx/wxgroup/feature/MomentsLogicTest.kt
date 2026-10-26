@@ -1,5 +1,6 @@
 package com.lx.wxgroup.feature
 
+import com.lx.wxgroup.data.Prefs
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNull
@@ -361,6 +362,65 @@ class MomentsLogicTest {
         assertTrue(MomentsLogic.exportDue(now - MomentsLogic.EXPORT_MIN_INTERVAL_MS - 1, now))
     }
 
+    // ------------------------------------------------------------ 旧私有目录迁移
+    //
+    // 背景：默认值从 `Android/data/com.tencent.mm/files/WechatXposed/moments` 换成
+    // `Documents/WXGroup/moments`（2026-10-26 M7 真机，前者用户根本打不开）。
+    // ⚠️ 只改默认值**救不了老用户** —— 他们 kv 表里已持久化旧值，`ifBlank` 只兜空串。
+    // 所以要有 isLegacyExportPath 判定 + 写回。
+
+    @Test
+    fun legacyExportPathDetected() {
+        assertTrue("恰好等于旧默认值必须命中", MomentsLogic.isLegacyExportPath(Prefs.LEGACY_EXPORT_PATH, Prefs.LEGACY_EXPORT_PATH))
+        // 用户手填了旧目录下面的子目录，一样在用户看不见的地方，必须一起迁
+        assertTrue(
+            MomentsLogic.isLegacyExportPath(Prefs.LEGACY_EXPORT_PATH + "/sub", Prefs.LEGACY_EXPORT_PATH)
+        )
+        // 末尾多个斜杠不该影响判定（用户手敲很容易带）
+        assertTrue(MomentsLogic.isLegacyExportPath(Prefs.LEGACY_EXPORT_PATH + "/", Prefs.LEGACY_EXPORT_PATH))
+    }
+
+    @Test
+    fun legacyExportPathNotTriggeredForUserChoice() {
+        // 空串 = 没配，走 ifBlank 兜底，不该当迁移
+        assertFalse(MomentsLogic.isLegacyExportPath("", Prefs.LEGACY_EXPORT_PATH))
+        assertFalse(MomentsLogic.isLegacyExportPath(null, Prefs.LEGACY_EXPORT_PATH))
+        assertFalse(MomentsLogic.isLegacyExportPath("   ", Prefs.LEGACY_EXPORT_PATH))
+
+        // 新的公共目录：已经是目标值，再判成 legacy 就会反复写库
+        assertFalse(MomentsLogic.isLegacyExportPath(Prefs.DEFAULT_EXPORT_PATH, Prefs.LEGACY_EXPORT_PATH))
+
+        // 用户自己选的别处（SD 卡 / 别的目录）必须尊重
+        assertFalse(MomentsLogic.isLegacyExportPath("/storage/emulated/0/MyMoments", Prefs.LEGACY_EXPORT_PATH))
+        assertFalse(MomentsLogic.isLegacyExportPath("/storage/1234-5678/moments", Prefs.LEGACY_EXPORT_PATH))
+
+        // ⚠️ 前缀判定不能宽到「任何 Android/data」——
+        //    用户可能故意把导出指到**别的 app** 的 Android/data 下，那不是我们要管的
+        assertFalse(
+            MomentsLogic.isLegacyExportPath(
+                "/storage/emulated/0/Android/data/com.other.app/files/moments",
+                Prefs.LEGACY_EXPORT_PATH,
+            )
+        )
+        // 仅「旧根的兄弟目录」不算：`.../WechatXposed/moments2` 以 `moments` 为前缀，
+        // 但不是旧根的子路径。这条专门防 `startsWith` 少写斜杠。
+        assertFalse(
+            MomentsLogic.isLegacyExportPath(Prefs.LEGACY_EXPORT_PATH + "2", Prefs.LEGACY_EXPORT_PATH)
+        )
+    }
+
+    @Test
+    fun defaultExportPathIsPublicDir() {
+        // 默认值必须落在公共 Documents 下 —— 用户能用系统文件管理器打开
+        assertTrue(
+            Prefs.DEFAULT_EXPORT_PATH.startsWith("/storage/emulated/0/Documents/")
+        )
+        // 且不能再指回私有 Android/data（否则 M7 的结论白测）
+        assertFalse(Prefs.DEFAULT_EXPORT_PATH.contains("/Android/data/"))
+        // 新旧默认值必须真的不同，否则迁移是空操作、单测会假绿
+        assertFalse(Prefs.DEFAULT_EXPORT_PATH == Prefs.LEGACY_EXPORT_PATH)
+    }
+
     // ------------------------------------------------------------ 图片原图留存（6.4）
     //
     // ⛔ 已删于 R20（A8 收敛）：原 md5sOf* / imageCandidates* / pickExisting* 共 8 条 @Test。
@@ -393,6 +453,28 @@ class MomentsLogicTest {
         assertEquals("jpg", MomentsLogic.extOf("/a/b/c.json"))
         // 带 query 的 url 不是路径，重复点也要能处理
         assertEquals("jpg", MomentsLogic.extOf("http://x/a.jpg?q=1"))
+    }
+
+    /**
+     * R26 回填短路判据：**0 字节残留不算「已拷好」**。
+     *
+     * 这条防的是一类静默失败：`.tmp` 半成品 / rename 失败的 0 字节文件在磁盘上
+     * `exists()` 为真，如果只看 exists()，那张图会被永远当成已完成、再也不会重拷，
+     * 而且没有任何报错。
+     */
+    @Test
+    fun imgDoneRequiresNonEmptyFile() {
+        // 不存在 ⇒ 当然要拷
+        assertFalse(MomentsLogic.imgDone(false, 0L))
+        // 存在但 0 字节 ⇒ 上次失败的残留，必须重拷（这条是唯一容易写错的地方）
+        assertFalse(MomentsLogic.imgDone(true, 0L))
+        // 存在且非空 ⇒ 已完成，跳过
+        assertTrue(MomentsLogic.imgDone(true, 1L))
+        assertTrue(MomentsLogic.imgDone(true, 292_214L))
+        // 负数长度（异常文件系统）一律当没拷好
+        assertFalse(MomentsLogic.imgDone(true, -1L))
+        // exists=false 时长度再大也不算完成
+        assertFalse(MomentsLogic.imgDone(false, 999L))
     }
 
     @Test

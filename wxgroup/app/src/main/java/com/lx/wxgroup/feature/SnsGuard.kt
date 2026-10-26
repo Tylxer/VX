@@ -1,6 +1,8 @@
 package com.lx.wxgroup.feature
 
 import android.content.ContentValues
+import android.os.Handler
+import android.os.HandlerThread
 import android.os.SystemClock
 import com.lx.wxgroup.data.GroupDb
 import com.lx.wxgroup.data.Keys
@@ -56,6 +58,16 @@ object SnsGuard {
 
     private const val CFG_TTL_MS = 3000L
 
+    /**
+     * 两次「update 后补位」之间的最小间隔。
+     *
+     * 实测一轮首屏同步会连写多条 `sourceType=0`（4 条、间隔 10ms），而
+     * [SnsTimelineSourceFix.reFixAfterClear] 扫的是整张台账 ⇒ 补一次就把这一轮
+     * 全部覆盖，重复触发纯属浪费（每次 7 块 count + 7 块 UPDATE SQL）。
+     */
+    private const val UPDATE_FIX_QUIET_MS = 350L
+    private const val UPDATE_FIX_MAX_WAIT_MS = 2000L
+
     private data class Config(
         val enabled: Boolean,
         val debugLog: Boolean,
@@ -103,13 +115,28 @@ object SnsGuard {
         runCatching { XposedBridge.hookAllMethods(cls, "execSQL", sqlGuard) }
             .onSuccess { if (it.isNotEmpty()) ok += "execSQL" }
             .onFailure { LogX.e("SNS: hook execSQL failed", it) }
+        // ✅ R27：微信清 `sourceType` 的真实通道是 `update("SnsInfo", {...sourceType=0})`，
+        //   不是 `execSQL`。不挂这条，[onExecSqlAfter] 永远是空挂
+        //   （详见 `docs/_r27_clear_api_forensics.md`）。
+        runCatching { XposedBridge.hookAllMethods(cls, "updateWithOnConflict", snsUpdateGuard) }
+            .onSuccess { if (it.isNotEmpty()) ok += "updateWithOnConflict" }
+            .onFailure { LogX.e("SNS: hook updateWithOnConflict failed", it) }
+        // ✅ R27 方案 A（Response-Merge）：联网时时间线吃响应对象、不读库，
+        //   只补 DB 的 sourceType 不够，还得把本地行注入回 `c3.N` 的响应列表
+        //   （见 `docs/_r27_clear_api_forensics.md` §11.4 的联网/断网对照实验）。
+        runCatching { SnsTimelineMerge.install(lpparam) }
+            .onFailure { LogX.e("SNS: merge install failed", it) }
         // ✅ R20：**句柄捕获钩子**（拿到即自我卸载，见 [installCapture]）。
         //   它不是常驻钩子，跟下面「常驻的两个」不是一回事，别按同一把尺子衡量。
         runCatching { installCapture(cls) }
             .onFailure { LogX.w("SNS: capture hook failed: ${it.javaClass.simpleName}") }
-        // ⚠️ **常驻**的只有 delete 和 execSQL 两个。update / insert / query 一律不挂：
+        // ⚠️ **常驻**的只有 delete / execSQL / updateWithOnConflict 三个。insert / query 一律不挂：
         // 那是微信所有表（message / rcontact …）的写路径，挂上去等于给每次写库都加一层开销，
         // 而我们要的信息（原 localFlag）用 `| VISIBLE_BIT` 兜底已经够了。
+        //
+        // ⛔ updateWithOnConflict 是 2026-10-26 R27 才加的**唯一例外**：真机取证证明
+        //    清 `sourceType` 走的是它、而不是 execSQL（见 [snsUpdateGuard] 的三道闸）。
+        //    不加这一条，方案 B 的补位永远等不到触发。
         //
         // ⛔ 唯一例外是上面的 [installCapture]（`rawQuery`）：需求 6.4 的导出要扫
         // **当前** SnsInfo（防撤回 = 在动态还看得见时留图，见 [listCurrentSns]），
@@ -149,6 +176,182 @@ object SnsGuard {
         override fun beforeHookedMethod(param: MethodHookParam) {
             runCatching { onExecSql(param) }
                 .onFailure { LogX.w("SNS execSQL hook err: ${it.javaClass.simpleName}") }
+        }
+
+        /**
+         * ⚠️ **必须挂在 after**：微信清 `sourceType` 的 bit1 是
+         * `UPDATE SnsInfo SET sourceType = sourceType & -3 ...`，在 before 里补位会被
+         * 同一条 SQL 立刻清掉（顺序反过来）。
+         */
+        override fun afterHookedMethod(param: MethodHookParam) {
+            runCatching { onExecSqlAfter(param) }
+                .onFailure { LogX.w("SNS execSQL after hook err: ${it.javaClass.simpleName}") }
+        }
+    }
+
+    /**
+     * `execSQL` 执行**之后**：如果这条 SQL 是微信在「批量清时间线来源位」，
+     * 立刻把台账里「曾经可见」的行补回去（方案 B，见 `docs/_r27_srcfix_design.md`）。
+     *
+     * 为什么不能省：真机实测清位每轮 sync 都跑一次（`updateFilterTimeLine`），
+     * 一次性补位活不过一轮。补位必须跟在清位后面走。
+     *
+     * 代价：这条 SQL 只在朋友圈同步时出现，字符串匹配在 `& -3` 那步就短路返回，
+     * 平时零成本（不做反射、不碰库）。
+     */
+    private fun onExecSqlAfter(param: XC_MethodHook.MethodHookParam) {
+        val sql = param.args?.firstOrNull() as? String ?: return
+        if (!SnsTimelineSrcLogic.isSourceClearSql(sql)) {
+            // 微信换写法时这里会打出真实 SQL —— 否则补位静默失效，只能靠猜。
+            // ⚠️ 必须排除我们自己补位/回滚写的 SQL，否则每次 sync 都被自己刷一条噪音。
+            if (SnsTimelineSrcLogic.looksLikeSourceWrite(sql) &&
+                !SnsTimelineSrcLogic.isOwnFixSql(sql)
+            ) {
+                SnsTimelineSourceFix.noteUnmatchedSourceWrite(sql)
+            }
+            return
+        }
+        if (bypass.get() == true) return
+        val db = param.thisObject ?: return
+        val t0 = android.os.SystemClock.elapsedRealtime()
+        val fixed = SnsTimelineSourceFix.reFixAfterClear(db)
+        val cost = android.os.SystemClock.elapsedRealtime() - t0
+        // fixed=-1 = 上一轮还在跑（重入保护），不算异常，但要让排查的人看见
+        LogX.i("SNS srcguard re-fix after clear fixed=$fixed cost=${cost}ms")
+    }
+
+
+    /**
+     * 微信清时间线可见位（`sourceType` bit1）的**真实通道**。
+     *
+     * ⚠️ 2026-10-26 R27 真机取证（`docs/_r27_clear_api_forensics.md`）：微信落库是
+     * 「服务器对象整行 upsert」，清位表现为
+     * `update("SnsInfo", ContentValues{... sourceType=0 ...})` → `updateWithOnConflict`，
+     * **每轮首屏同步都会跑**（实测 4 条、间隔 10ms），`execSQL` 一次都不出现。
+     * ⇒ 原来挂在 `execSQL` 上的 [onExecSqlAfter] 一直是空挂，必须补这一条。
+     *
+     * 挂 `updateWithOnConflict` 而不是 `update`：后者内部必走前者，挂前者不会漏。
+     *
+     * 代价控制三闸：`updateWithOnConflict` 是**全表**热路径（微信所有表的 update 都经过），
+     * ① 第一句就是零反射的字符串比较，非 `SnsInfo` 立刻返回；
+     * ② 命中后看 values 里 `sourceType` 是否为 0（正常行写 2/10，只有清位写 0）；
+     * ③ 命中后**不立刻补**，而是等这一批写完（静默 350ms）在 [FixWorker] 里统一补一次
+     * —— 立刻补会被同批后面的写 0 覆盖（真机实测一轮清 3 条只补回 1 条）。
+     */
+    private val snsUpdateGuard = object : XC_MethodHook() {
+        override fun afterHookedMethod(param: MethodHookParam) {
+            runCatching { onSnsUpdateAfter(param) }
+                .onFailure { LogX.w("SNS update hook err: ${it.javaClass.simpleName}") }
+        }
+    }
+
+    /**
+     * 最近一次「写 0」命中的时刻（`elapsedRealtime`）。
+     * 补位不在这里立刻跑，而是等这一批写完（静默 [UPDATE_FIX_QUIET_MS]）后统一跑，
+     * 否则先补的那条会被同批后续的写 0 覆盖（2026-10-26 00:18 真机实测：
+     * 一轮写 3 条，只补回 1 条，另两条被节流挡掉后保持 0）。
+     */
+    private val lastUpdateZeroAt = java.util.concurrent.atomic.AtomicLong(0L)
+
+    /** 是否已排了一个待执行的补位任务（合并同一批连写） */
+    private val fixScheduled = java.util.concurrent.atomic.AtomicBoolean(false)
+
+    /** 补位专用单线程：`object` 的初始化是线程安全的，懒加载且全局唯一 */
+    private object FixWorker {
+        val handler: Handler = Handler(HandlerThread("sns-srcfix").apply { start() }.looper)
+    }
+
+    /**
+     * 读 `ContentValues.sourceType`，返回 `null` 表示取不到。
+     *
+     * ⚠️ 必须走反射、不能 `as? android.content.ContentValues`：微信用的是 wcdb 自己
+     * copy 的一份 `com.tencent.wcdb.ContentValues`（不是 AOSP 那个类的子类）。
+     * 直接强转在真机上会恒为 null ⇒ 整个钩子静默失效，而日志上什么异常都没有。
+     * Method 缓存按 class 存，避免每条 update 都 getMethod。
+     */
+    private fun sourceTypeOf(values: Any): Int? {
+        val c = values.javaClass
+        if (cvCls !== c) {
+            cvGetInteger = runCatching { c.getMethod("getAsInteger", String::class.java) }.getOrNull()
+            cvCls = c
+        }
+        val m = cvGetInteger ?: return null
+        return runCatching { m.invoke(values, "sourceType") as? Int }.getOrNull()
+    }
+
+    @Volatile
+    private var cvCls: Class<*>? = null
+
+    @Volatile
+    private var cvGetInteger: Method? = null
+
+    /** 「取不到 sourceType」的告警只打一次，避免刷屏 */
+    private val cvWarned = java.util.concurrent.atomic.AtomicBoolean(false)
+
+    private fun onSnsUpdateAfter(param: XC_MethodHook.MethodHookParam) {
+        val a = param.args ?: return
+        if (a.size < 2) return
+        // ① 零反射短路：微信所有表的 update 都走这里，这句必须是第一个判断
+        if ((a[0] as? String) != "SnsInfo") return
+        // ② 只有「服务器认为这条不可见」才需要补；正常行微信写的是 2 或 10
+        val values = a[1] ?: return
+        val st = sourceTypeOf(values)
+        if (st == null) {
+            // ⛔ 绝不允许静默失效：取不到值说明 ContentValues 形态变了，
+            // 补位会从此永久不触发，而功能表面上"正常"（只是不生效）。
+            if (cvWarned.compareAndSet(false, true)) {
+                LogX.w("SNS update hook: no sourceType on ${values.javaClass.name} (re-fix disabled)")
+            }
+            return
+        }
+        if (st != 0) return
+        if (bypass.get() == true) return
+        // ③ 不立刻补：只记时刻 + 排一个「静默后统一补」的任务。
+        //    立刻补会被同一批里后面的写 0 覆盖（真机实测 fixed=1 而实际有 3 条被清）。
+        lastUpdateZeroAt.set(SystemClock.elapsedRealtime())
+        if (!fixScheduled.compareAndSet(false, true)) return
+        val db = param.thisObject ?: run {
+            fixScheduled.set(false)
+            return
+        }
+        // ⛔ 排程失败必须回滚单航班标记：否则 fixScheduled 永久为 true，
+        //    补位从此彻底静默失效（正是本轮要防的失效模式）。
+        runCatching {
+            FixWorker.handler.postDelayed({ runDeferredFix(db, 0L) }, UPDATE_FIX_QUIET_MS)
+        }.onFailure {
+            fixScheduled.set(false)
+            LogX.w("SNS srcguard schedule failed: ${it.javaClass.simpleName}")
+        }
+    }
+
+    /**
+     * 等这一批写 0 静默 [UPDATE_FIX_QUIET_MS] 后，跑一次 [SnsTimelineSourceFix.reFixAfterClear]。
+     *
+     * 三层保护：
+     * 1. **静默判定**：每 [UPDATE_FIX_QUIET_MS] 复查一次 `lastUpdateZeroAt`，还在写就继续等，
+     *    最长等 [UPDATE_FIX_MAX_WAIT_MS]（防止有持续写入把补位无限推迟）。
+     * 2. **补位后自检**：补位期间若又有写 0（`lastUpdateZeroAt` 晚于补位开始时刻），再排一轮。
+     * 3. **单航班**：`fixScheduled` 保证同一时刻只有一个补位任务在跑/在排队。
+     */
+    private fun runDeferredFix(db: Any, waited: Long) {
+        val quiet = SystemClock.elapsedRealtime() - lastUpdateZeroAt.get()
+        if (quiet < UPDATE_FIX_QUIET_MS && waited < UPDATE_FIX_MAX_WAIT_MS) {
+            FixWorker.handler.postDelayed(
+                { runDeferredFix(db, waited + UPDATE_FIX_QUIET_MS) },
+                UPDATE_FIX_QUIET_MS
+            )
+            return
+        }
+        val startedAt = SystemClock.elapsedRealtime()
+        val fixed = runCatching { SnsTimelineSourceFix.reFixAfterClear(db) }
+            .onFailure { LogX.e("SNS srcguard re-fix failed", it) }
+            .getOrDefault(0)
+        val cost = SystemClock.elapsedRealtime() - startedAt
+        LogX.i("SNS srcguard re-fix after burst fixed=$fixed waited=${waited}ms cost=${cost}ms")
+        fixScheduled.set(false)
+        // 补位期间又发生了写 0 ⇒ 再补一轮（真机上一批可能跨 100ms 以上）
+        if (lastUpdateZeroAt.get() > startedAt && fixScheduled.compareAndSet(false, true)) {
+            FixWorker.handler.postDelayed({ runDeferredFix(db, 0L) }, UPDATE_FIX_QUIET_MS)
         }
     }
 
@@ -284,8 +487,13 @@ object SnsGuard {
     private var pathWarned = false
 
     /**
-     * 时间线查询 `localFlag in (16,2064,18,2066,24,2072,…)` 里**每个值都置了 bit4(16)**。
-     * 微信删动态时先清掉这一位（实测落成 2），拦完 DELETE 必须置回去，否则界面不显示。
+     * bit4(16)：**只用于「拦下删除后把行补回可见」**（[restoreVisibility]），
+     * ⛔ **不再用于查询筛选** —— 理由见 [`listCurrentSns`] 的 KDoc 与
+     * `docs/_r26_bit16_rootcause.md`。
+     *
+     * 8.0.48 实测：新落库的动态是 `localFlag=2`、**不含** bit16，而它们在朋友圈界面里正常显示。
+     * 旧结论「时间线白名单里每个值都置 bit4 ⇒ bit4 = 可见位」把「删除会清这一位」
+     * 偷换成了「可见必须置这一位」，第一步从未在 8.0.48 上验证过。
      */
     private const val VISIBLE_BIT = 16
 
@@ -371,6 +579,14 @@ object SnsGuard {
 
     /** 微信库句柄是否已捕获（=「扫当前 SnsInfo」这条路现在能不能走） */
     fun snsReady(): Boolean = snsDb != null
+
+    /**
+     * 只读暴露微信朋友圈库句柄，给 [SnsTimelineSourceFix]（R27 srcfix）复用。
+     *
+     * ⚠️ 仍然只在 `execSQL` / `rawQuery` 捕获钩子里被赋值（见 [installCapture]），
+     *  **本轮没有新增任何常驻钩子**。调用方必须容忍 null（= 这次启动微信还没碰过朋友圈库）。
+     */
+    internal fun snsDbHandle(): Any? = snsDb
 
     // ------------------------------------------------------------------ 归档
 
@@ -501,11 +717,24 @@ object SnsGuard {
      * 里放的正是**当前可见**动态的图：R19 实测归档那 7 个 mediaId 在 72 个缓存文件里
      * **0 命中** —— 扫归档时 `imgCopied` 恒为 0 是数据源选错了，不是取图链路坏了。
      *
-     * ## 可见性过滤
-     * 只取 `(localFlag & 16) != 0` 的行。时间线查询的白名单
-     * `localFlag in (16,2064,18,2066,24,2072,…)` 里**每个值都置了 bit4(16)**，
-     * 所以按位判是白名单的等价超集；`localFlag=2`（微信删动态第一步清掉可见位）
-     * 的行会被排除 —— 那不是「当前可见」。
+     * ## 可见性过滤 —— ⛔ R26 起**故意不加**
+     * 旧实现按 `(localFlag & 16) != 0` 筛，依据是「时间线白名单 `localFlag in (16,2064,18,…)`
+     * 里每个值都置了 bit4」。2026-10-26 真机证伪：
+     * - 最新 50 行 `localFlag` 分布 `{2:45, 4098:2, 5122:3}` —— **含 bit16 的行数为 0**；
+     * - 而同一时刻朋友圈界面正常显示「8 分钟前」的新动态；
+     * - 导出因此**永远只扫到 7 条旧动态**（`flag=50`=32|16|2，最新一条 2026-10-16），
+     *   新动态一条都进不来 —— 图片导出也就无从验证（图只在「新动态进主循环」或
+     *   「旧动态的图还在缓存」时才拷得到，两头都不成立）。
+     *
+     * ⇒ 现在**只按键集分页取，不按 flag 筛**。取舍理由：
+     * 这是防撤回的主数据源，**漏采 = 动态被删后永久找不回来**，比多带脏数据严重一个量级；
+     * 而多导出的 txt 是加法、可逆（`renderText` 会打出 `来源=sourceType`，事后可筛）。
+     * 广告/推荐位的 `sourceType` 映射尚未定死（实测出现过 0/2/6/8/10/130），
+     * **不做黑名单**：定不死就黑名单，只会再次误杀真动态。
+     * 详见 `docs/_r26_bit16_rootcause.md`。
+     *
+     * ⚠️ [VISIBLE_BIT] 仍然保留给「拦下删除后补回可见位」（[restoreVisibility]），
+     * 那条路径的语义是「微信自己清过这一位，我们照原样补回去」，与查询筛选无关。
      *
      * ## ⚠️ 返回的是**半行**，只取导出需要的 7 列
      * `attrBuf` / `postBuf` / `head` / `stringSeq` / `subType` / `serverExtFlag` **不读**
@@ -532,8 +761,7 @@ object SnsGuard {
         //    列名（schema）对不上会让 SQLite 直接报错（被 runCatching 兜住并**告警**），
         //    不会像 `select *` 那样静默取错列。
         val sql = "select snsId,userName,createTime,type,sourceType,localFlag,content " +
-            "from $TABLE where (localFlag & $VISIBLE_BIT) != 0 " +
-            "and (createTime < ? or (createTime = ? and snsId < ?)) " +
+            "from $TABLE where (createTime < ? or (createTime = ? and snsId < ?)) " +
             "order by createTime desc, snsId desc limit $lim"
         val args: Any = if (m.parameterTypes[1] == Array<String>::class.java) {
             arrayOf(createTime.toString(), createTime.toString(), snsId.toString())

@@ -483,6 +483,10 @@ object ConvFilter {
             emptySet()
         }
         membersVersion++
+        // R24：分组/标签成员变了，免打扰的「作用域」快照也得跟着失效，
+        // 否则名单里存 g:/t: 时，改完成员要等 30 秒（SCOPE_TTL_MS）才按新成员判定。
+        // 全部 10 个成员写库入口都收敛到本方法，所以在这里一处就够。
+        runCatching { com.lx.wxgroup.core.NotifyMute.invalidateScope() }
         refresh()
     }
 
@@ -1127,6 +1131,7 @@ object ConvFilter {
             var timeMs = 0L
             var unread = 0
             var sender = ""
+            var senderWxid = ""
             var msg = ""
 
             for (i in snaps.indices) {
@@ -1137,6 +1142,7 @@ object ConvFilter {
                     val item = runCatching { wrapped.getItem(i) }.getOrNull()
                     msg = ConvReader.digest(item)
                     sender = nameOf(db, snaps[i].wxid)
+                    senderWxid = snaps[i].wxid
                 }
                 unread += ConvReader.unread(runCatching { wrapped.getItem(i) }.getOrNull())
             }
@@ -1154,6 +1160,7 @@ object ConvFilter {
                 pinned = g.pinned,
                 memberCount = wx.size,
                 lastSender = sender,
+                lastSenderWxid = senderWxid,
                 lastMsg = msg,
                 timeMs = timeMs,
                 unread = unread,

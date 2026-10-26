@@ -13,6 +13,7 @@ import android.os.SystemClock
 import android.view.View
 import android.view.ViewGroup
 import com.lx.wxgroup.core.HostContext
+import com.lx.wxgroup.core.MomentsSyncTrigger
 import com.lx.wxgroup.data.Keys
 import com.lx.wxgroup.data.Kv
 import com.lx.wxgroup.util.LogX
@@ -30,9 +31,13 @@ import java.util.Collections
  * 需求 6.4「朋友圈」——**定时刷新** + **自动加载**的 hook 侧。
  *
  * ## 两部分各自解决什么
- * - **定时刷新**：周期性把朋友圈时间线拉到前台，让微信真的去服务端拉一次动态。
+ * - **定时刷新**（R25 起改为**纯后台**）：周期性投递微信自己的 `NetSceneSnsSync`
+ *   （见 [MomentsSyncTrigger]），让微信去服务端拉一次动态。
  *   目的是「在对方删除前留存」——删动态在本地是物理 DELETE（见 [SnsGuard]），
  *   本地库里有这一行，删除才会被拦下并归档；拉得越勤，漏删窗口越小。
+ *
+ *   ⚠️ 旧实现是 `startActivity` 把时间线拉到前台：既要求用户先手动进过一次朋友圈
+ *   （否则拿不到 Activity 类），又会抢走用户正在用的界面。R25 起不再碰 UI。
  * - **自动加载**：用户滚到时间线底部时，替他把列表再往下滚一段（真机实证：
  *   时间线是 ImproveRecyclerView，微信剥了公有的 fling(int,int)，改用
  *   smoothScrollBy/scrollBy，见 [triggerLoadMore]），让微信自己的
@@ -112,16 +117,19 @@ object MomentsAuto {
 
     private val tickScheduled = java.util.concurrent.atomic.AtomicBoolean(false)
 
-    /** 时间线 Activity 的**具体类**（用户进过一次朋友圈后捕获） */
+    /**
+     * 时间线 Activity 的**具体类**（用户进过一次朋友圈后在 lifecycle 回调里捕获）。
+     *
+     * ⚠️ R25 起它**只服务于自动滚动加载**（判断"用户正在看朋友圈"这个会话边界），
+     * 不再是定时刷新的前提 —— 定时刷新已改走 [MomentsSyncTrigger] 的后台 NetScene，
+     * 用户从来没打开过朋友圈也照样刷新。
+     */
     @Volatile
     private var timelineCls: Class<out Activity>? = null
 
+    /** 用户当前是否正在朋友圈界面（用于重置自动加载的会话计数） */
     @Volatile
     private var timelineActive = false
-
-    /** 自动拉起失败过就整体禁用（多半是 Activity 不能直接启动，反复试只会反复撩前台） */
-    @Volatile
-    private var launchDisabled = false
 
     @Volatile
     private var unknownWarned = false
@@ -165,7 +173,8 @@ object MomentsAuto {
 
     // 自诊断计数
     private val ticks = java.util.concurrent.atomic.AtomicLong(0)
-    private val launches = java.util.concurrent.atomic.AtomicLong(0)
+    /** R25：后台同步投递成功的次数（原 launches，语义已变） */
+    private val refreshes = java.util.concurrent.atomic.AtomicLong(0)
     private val binds = java.util.concurrent.atomic.AtomicLong(0)
     private val snsBinds = java.util.concurrent.atomic.AtomicLong(0)
     private val loads = java.util.concurrent.atomic.AtomicLong(0)
@@ -186,6 +195,11 @@ object MomentsAuto {
         runCatching { refresh() }
             .onFailure { LogX.w("$TAG refresh failed: ${it.javaClass.simpleName}") }
 
+        // R25：定时刷新改走后台 NetScene —— 必须在 install 里备好句柄，
+        // 否则微信开始干活之后才想起来拿 ClassLoader 会错过时机。
+        val syncOk = MomentsSyncTrigger.install(lpparam.classLoader)
+        if (!syncOk) LogX.w("$TAG: background sync handles unresolved (见 op=msync sub=stat)")
+
         var hooked = 0
         // ① 基类上声明的实现（子类不覆写时走这条）
         runCatching { XposedHelpers.findClass(ADAPTER_CLASS, lpparam.classLoader) }
@@ -198,7 +212,8 @@ object MomentsAuto {
         ensureTick(FIRST_TICK_MS)
 
         LogX.i(
-            "$TAG installed hooks=$hooked refresh=${config.autoRefresh} " +
+            "$TAG installed hooks=$hooked bgSync=$syncOk " +
+                "refresh=${config.autoRefresh} " +
                 "load=${config.autoLoad} interval=${config.intervalH}h"
         )
     }
@@ -267,7 +282,17 @@ object MomentsAuto {
     private fun onTick() {
         ticks.incrementAndGet()
         val c = cfg()
-        if (!c.autoRefresh) return
+        // R25：两个开关**任一**开启都要跑后台同步。
+        //
+        // 原来只有 autoRefresh 一条路，autoLoad 单独开着时整条后台链路是死的
+        // —— 而用户视角里「定时刷新」和「自动加载」都是「模块帮我把朋友圈拉进来」，
+        //    看不出也不该关心底下分了两个开关。既然拉新的能力已经后台化，
+        //    让 autoLoad 也能触发它才对得上「两个功能都在后台定时执行」。
+        //
+        // ⚠️ 两者共享同一个 `lastRefreshAt` 节拍（同一份 interval），不会叠加成双倍频率：
+        //    autoLoad 在这里**不额外多跑一次**，它只是让「什么情况下允许跑」放宽。
+        //    autoLoad 真正独立的部分仍在原有分支：用户打开朋友圈时帮他继续往下滚。
+        if (!c.autoRefresh && !c.autoLoad) return
         val now = System.currentTimeMillis()
         // Kv 读一次就够（60s 一拍），但开关刚被 kvset 改过时要立刻看到
         if (now - lastRefreshAtRead > CFG_TTL_MS) {
@@ -280,48 +305,47 @@ object MomentsAuto {
     }
 
     /**
-     * 到点刷新：把时间线 Activity 显式拉起来。
+     * 到点刷新 —— **后台投递 NetSceneSnsSync，不拉任何界面**。
      *
-     * ⚠️ 全限定名是运行时捕获的（[timelineCls]），这里不拼字符串猜包名。
-     * ⚠️ 整个包 runCatching：startActivity 抛出来会把微信搞崩。
+     * ## R25 改造（这是本轮的核心行为变更）
      *
-     * @param force 手动探针（`op=moments sub=refresh`）传 true：绕过 [launchDisabled]，
-     *   否则自动拉起失败过一次之后，手动诊断入口也被自己挡死，真机上没法再验证。
-     *   ⚠️ force 只绕过闸门，不重置 launchDisabled——自动轮依然被禁着，防止反复撩前台。
+     * 旧实现：`startActivity` 把 [TIMELINE_ACT] 拉到前台。三个副作用：
+     * 1. [timelineCls] 只能靠 lifecycle 捕获 ⇒ 用户**没手动进过朋友圈就永远不刷新**；
+     * 2. 一到点就把朋友圈顶到前台，**抢走用户正在用的界面**；
+     * 3. `FLAG_ACTIVITY_NEW_TASK` 起 Activity 属于「系统看不懂意图」的操作，
+     *    失败一次就得整体 self-disable。
+     *
+     * 新实现：走 [MomentsSyncTrigger] 直接投递微信自己的同步 NetScene
+     * （`x2(256)` → `modelbase/p1.f()`）。全程无 UI、不需要用户进过朋友圈、
+     * 也不需要知道 Activity 类名。
+     *
+     * ⚠️ **Rolling back 的判据**：如果某次微信升级让反射链失效，
+     * 日志会长这样 —— `MSYNC FAIL NoSuchMethodException: y70.k1.n()`，
+     * 自动轮随即停住（不会刷屏），`op=msync sub=stat` 可见。
+     * 是否退化回「拉 Activity」由人工决策，不要自动退化：
+     * 抢前台的代价远大于「这一轮没刷成」。
+     *
+     * @param force 手动探针（`op=moments sub=refresh`）传 true：
+     *   绕过 [MomentsSyncTrigger] 的 disabled 闸门进行诊断。
+     *   ⚠️ force 只绕过闸门，失败仍会写回 disabled —— 自动轮依然被拦。
      */
-    private fun doRefresh(now: Long, force: Boolean = false) {
-        val ctx = HostContext.app()
-        val cls = timelineCls
-        if (ctx == null || cls == null) {
-            if (!unknownWarned) {
-                unknownWarned = true
-                LogX.w("$TAG refresh due but timeline class unknown (先手动进一次朋友圈)")
-            }
-            return
+    private fun doRefresh(now: Long, force: Boolean = false): Boolean {
+        val r = MomentsSyncTrigger.syncNow(force = force)
+        val okr = MomentsSyncTrigger.syncOk(r)
+        if (okr) {
+            refreshes.incrementAndGet()
+            Kv.putString(Keys.MOMENTS_LAST_REFRESH_AT, now.toString())
+            lastRefreshAt = now
+            lastRefreshAtRead = now
+            LogX.i("$TAG refresh bg-sent $r")
+            // R25：同步刚投递成功 = 最可能有新动态的时刻，把导出那一轮提前，
+            // 别让用户等到下一个 10 分钟的 exportDue 窗口。内部自带节流与开关判断。
+            runCatching { MomentsExport.pokeExport() }
+                .onFailure { LogX.w("$TAG poke export failed: ${it.javaClass.simpleName}") }
+        } else {
+            LogX.w("$TAG refresh bg-send failed: $r")
         }
-        if (launchDisabled && !force) return
-        val ok = runCatching {
-            val i = Intent().setClassName(ctx, cls.name)
-            i.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_REORDER_TO_FRONT)
-            ctx.startActivity(i)
-            true
-        }.getOrElse {
-            LogX.w("$TAG launch err: ${it.javaClass.simpleName}: ${it.message?.take(80)}")
-            false
-        }
-        if (!ok) {
-            launchDisabled = true
-            LogX.w("$TAG auto-launch disabled (手动入口: op=moments sub=refresh)")
-            return
-        }
-        launches.incrementAndGet()
-        Kv.putString(Keys.MOMENTS_LAST_REFRESH_AT, now.toString())
-        lastRefreshAt = now
-        lastRefreshAtRead = now
-        LogX.i(
-            "$TAG refresh launched act=${cls.simpleName} active=$timelineActive " +
-                "env(chg=${charging()},wifi=${wifi()})"
-        )
+        return okr
     }
 
     // ------------------------------------------------------------------ 时间线 Activity 捕获
@@ -647,8 +671,13 @@ object MomentsAuto {
         val c = cfg()
         "MOMENT stat refresh=${c.autoRefresh} load=${c.autoLoad} interval=${c.intervalH}h " +
             "lastAt=$lastRefreshAt env(chg=${charging()},wifi=${wifi()}) ticks=${ticks.get()} " +
-            "launches=${launches.get()} launchDisabled=$launchDisabled " +
+            // R25：refreshes = 后台 NetScene 投递成功次数（原来叫 launches，统计的是拉 Activity）。
+            // ⚠️ 投递成功 ≠ 服务端回来新数据：朋友圈本来没新内容时这一样会 OK。
+            //   判断"到底拉没拉到东西"要看 SnsMicroMsg.db 有没有新行，别只看计数长没长。
+            "refreshes=${refreshes.get()} bgSync=[${MomentsSyncTrigger.stat()}] " +
             "timeline=${timelineCls?.simpleName ?: "-"} active=$timelineActive " +
+            // ⚠️ timeline 仍在这里，但它现在**只是自动滚动加载用的辅助信息**，
+            // 不再是定时刷新的前提 —— 用户没进过朋友圈也照样刷新。
             "binds=${binds.get()} snsBinds=${snsBinds.get()} loads=${loads.get()} " +
             "grows=${grows.get()} lastSize=$lastSize " +
             "rv=${lastRv?.get()?.javaClass?.simpleName ?: "-"}"
@@ -668,10 +697,14 @@ object MomentsAuto {
         when (sub.lowercase()) {
             "stat" -> stat()
             "env" -> "MOMENT env charging=${charging()} wifi=${wifi()} ctx=${HostContext.app() != null}"
-            "act" -> "MOMENT act timeline=${timelineCls?.name ?: "(未捕获，先手动进一次朋友圈)"} active=$timelineActive"
+            // ⚠️ R25 起这里不再是「没手动进过朋友圈就刷不了」，只是说明
+            //    "用户正在看朋友圈时才会起作用的自动滚动加载"目前没被激活过。
+            "act" -> "MOMENT act timeline=${timelineCls?.name ?: "(未捕获；不影响后台刷新)"} " +
+                "active=$timelineActive bgSyncReady=${MomentsSyncTrigger.ready()}"
             "refresh" -> {
-                doRefresh(System.currentTimeMillis(), force = true)
-                "MOMENT refresh forced launches=${launches.get()} disabled=$launchDisabled"
+                val done = doRefresh(System.currentTimeMillis(), force = true)
+                "MOMENT refresh forced ok=$done " +
+                    "refreshes=${refreshes.get()} bgSync=[${MomentsSyncTrigger.stat()}]"
             }
             "load" -> forceLoad()
             "rvmethods" -> rvMethods()

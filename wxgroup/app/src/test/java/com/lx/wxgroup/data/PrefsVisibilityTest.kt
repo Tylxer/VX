@@ -30,10 +30,8 @@ class PrefsVisibilityTest {
     private val expectedHidden = setOf(
         Keys.REDPACKET_ALLOW,
         Keys.REDPACKET_EXCLUDE,
-        // 朋友圈 CDN 批量下载两项：CDN 通路未打通（⑫.9：picCachePath 恒空、ok0.x0#n 从未触发），
-        // 且 sns.cdn_rewrite_path 在 SnsCdnImage.kt 里零消费点 ⇒ 改了没有任何效果。
-        Keys.SNS_CDN_IMG,
-        Keys.SNS_CDN_REWRITE_PATH,
+        // ⛔ 2026-10-27 移除：朋友圈 CDN 批量下载两项（sns.cdn_img / sns.cdn_rewrite_path）
+        //    随整条 CDN 通路物理删除（判死判据见 Keys.kt 与 HookEntry.kt 的「勿恢复」注释）。
     )
 
     // ------------------------------------------------------------ 三方约束

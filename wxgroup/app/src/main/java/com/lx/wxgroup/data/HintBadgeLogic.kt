@@ -74,4 +74,87 @@ object HintBadgeLogic {
         val last = s[s.length - 1]
         return if (Character.isHighSurrogate(last)) s.substring(0, s.length - 1) else s
     }
+
+    // ---------------------------------------------------------------- 角标锚点（纯判据）
+
+    /**
+     * item 根容器里一个「候选子节点」的最小视图模型。
+     *
+     * 只带选锚点所需的信息，零 Android 依赖。由 [HintBadge] 从真 View 上投影：
+     * `width/height` 是已 layout 的像素尺寸（≤0 表示「还没量完」），`x/y` 是相对**父节点**
+     * 左上角的像素坐标，`isOurBadge` 标记我们自己加的角标（tag == MARK），
+     * `children` 是它的直接子节点（只投影一层，够判据用）。
+     */
+    data class BadgeNode(
+        val width: Int,
+        val height: Int,
+        val x: Int,
+        val y: Int,
+        val visible: Boolean,
+        val isOurBadge: Boolean,
+        val children: List<BadgeNode> = emptyList()
+    )
+
+    /**
+     * 从 item 根的子节点里挑「消息行」的下标，角标就画在它**下方**。
+     *
+     * 规则（按优先级，命中即返回，绝不再往下钻）：
+     *
+     * 1. 跳过 `GONE` 和我们自己加的角标（角标不能把自己当锚点）。
+     * 2. **最后一个「高」可见子节点** —— 消息行是 item 的主内容，纵向占大头。
+     *    「高」= `height >= 0.5 * maxVisibleHeight`，容忍自研 VM 与外发场景里
+     *    「时间戳槽被收起 / 复用成一条细线」等情形。
+     * 3. 若没有任何高子节点（数据异常），退回最后一个可见的非角标子节点。
+     * 4. 全空才返回 -1（调用方此时不贴角标）。
+     *
+     * ⚠️ 为什么是「最后一个高子节点」而不是「childCount-1」：真机实测 item 根是
+     * `RelativeLayout`（`com.tencent.mm.ui.chatting.viewitems.xi`），消息行 `#bqh` 恰好是
+     * 最后一个子节点，但「最后一个」这个位置是**未承诺的**——RecyclerView 复用 + 微信内部
+     * 增删节点都可能改变它。用「最后一个**高**子节点」既覆盖当前结构，又不赌位置。
+     */
+    fun selectMessageRow(nodes: List<BadgeNode>): Int {
+        var maxH = 0
+        for (n in nodes) {
+            if (n.visible && !n.isOurBadge && n.height > maxH) maxH = n.height
+        }
+        if (maxH <= 0) return -1
+        val threshold = maxH / 2
+        var lastHigh = -1
+        var lastVisible = -1
+        for (i in nodes.indices) {
+            val n = nodes[i]
+            if (!n.visible || n.isOurBadge) continue
+            lastVisible = i
+            if (n.height >= threshold) lastHigh = i
+        }
+        return if (lastHigh >= 0) lastHigh else lastVisible
+    }
+
+    /**
+     * 角标相对 item 根的水平对齐：自己发的消息靠右（`alignParentRight`），对方发的靠左。
+     *
+     * 判断依据（从 View 结构推，不赌资源 id、不赌头像节点数）：微信 item 根 `xi` 的消息行
+     * `#bqh` 内部是「头像 + 气泡」横排，**头像永远贴外沿**——对方消息头像在左、气泡靠中偏右；
+     * 自己发的头像在右、气泡靠中偏左。因此头像（离消息行水平中线**最远**的那个子节点）在哪
+     * 半边，角标就跟到哪半边。拿不到头像（无子节点）时按对方消息（靠左）保守处理。
+     */
+    fun alignToEnd(nodes: List<BadgeNode>): Boolean {
+        val rowIdx = selectMessageRow(nodes)
+        if (rowIdx < 0) return false
+        val row = nodes[rowIdx]
+        val rowCx = row.width / 2
+        var avatar: BadgeNode? = null
+        var avatarDist = -1
+        for (c in row.children) {
+            if (!c.visible || c.isOurBadge) continue
+            if (c.width <= 0 || c.height <= 0) continue
+            val d = Math.abs(c.x + c.width / 2 - rowCx)
+            if (d > avatarDist) {
+                avatarDist = d
+                avatar = c
+            }
+        }
+        val a = avatar ?: return false
+        return a.x + a.width / 2 > rowCx
+    }
 }

@@ -38,7 +38,7 @@ class GroupDb private constructor(context: Context) :
 
     companion object {
         const val DB_NAME = "wxgroup.db"
-        private const val DB_VERSION = 8
+        private const val DB_VERSION = 9
 
         private const val T_GROUP = "groups"
         private const val T_MEMBER = "group_member"
@@ -48,6 +48,7 @@ class GroupDb private constructor(context: Context) :
         private const val T_SEEN = "group_seen"
         private const val T_RESCUED = "rescued"
         private const val T_SNS = "sns_archive"
+        private const val T_SRC = "sns_visible_src"
 
         @Volatile
         private var instance: GroupDb? = null
@@ -99,6 +100,7 @@ class GroupDb private constructor(context: Context) :
         createRescuedTable(db)
         createSnsTable(db)
         createSeenTable(db)
+        createSrcTable(db)
     }
 
     override fun onUpgrade(db: SQLiteDatabase, oldVersion: Int, newVersion: Int) {
@@ -160,6 +162,11 @@ class GroupDb private constructor(context: Context) :
         }
         if (oldVersion < 8) {
             createSeenTable(db)
+        }
+        if (oldVersion < 9) {
+            // R27：朋友圈「曾经可见」台账。纯新增表，老库直接补建即可（CREATE IF NOT EXISTS，
+            // 重复执行无害）。**没有** ALTER 老表 ⇒ 不存在丢列/重建风险。
+            createSrcTable(db)
         }
     }
 
@@ -223,6 +230,34 @@ class GroupDb private constructor(context: Context) :
             """.trimIndent()
         )
         db.execSQL("CREATE INDEX IF NOT EXISTS idx_sns_time ON $T_SNS(create_time)")
+    }
+
+    /**
+     * 朋友圈「曾经时间线可见」台账（[com.lx.wxgroup.feature.SnsTimelineSourceFix]）。
+     *
+     * 为什么需要它：好友删动态时微信只把 `SnsInfo.sourceType` 的 bit1 清掉（`& -3`），
+     * 行还在、`content`/`localFlag` 全不变。要区分「被清成 0」与「本来就不是 2」，
+     * 唯一可信的信号是「这行**曾经** `& 2 != 0`」—— 那就得跨轮、跨重启记下来。
+     *
+     * 列语义：
+     * - `source_type`：**最近一次**亲眼见到它可见时的值（不是当前库里的值，当前值要现查微信库）
+     * - `first_seen` / `last_seen`：首次 / 最近一次见到可见的毫秒时间戳
+     * - `fixed_orig`：最近一次补位**之前**的原值（回滚用）；null = 没补过 / 已回滚
+     *
+     * ⚠️ 这是**模块自己的库**（AOSP SQLite），写它不触发挂在微信库上的任何钩子。
+     */
+    private fun createSrcTable(db: SQLiteDatabase) {
+        db.execSQL(
+            """
+            CREATE TABLE IF NOT EXISTS $T_SRC (
+                sns_id      INTEGER NOT NULL PRIMARY KEY,
+                source_type INTEGER NOT NULL DEFAULT 0,
+                first_seen  INTEGER NOT NULL DEFAULT 0,
+                last_seen   INTEGER NOT NULL DEFAULT 0,
+                fixed_orig  INTEGER
+            )
+            """.trimIndent()
+        )
     }
 
     // ---------------------------------------------------------------- 防撤回：被救下的消息
@@ -480,6 +515,171 @@ class GroupDb private constructor(context: Context) :
     fun deleteSnsArchive(snsId: Long) {
         writableDatabase.delete(T_SNS, "sns_id=?", arrayOf(snsId.toString()))
     }
+
+    // ---------------------------------------------------------------- 朋友圈「曾经可见」台账
+
+    /**
+     * 台账一行（[T_SRC]）。`source_type` 是**最近一次见到可见时**的值，
+     * 不是库里当前的值 —— 后者每次都要现查微信库，别混。
+     */
+    data class VisibleSrc(
+        val snsId: Long,
+        val sourceType: Int,
+        val firstSeen: Long,
+        val lastSeen: Long,
+        /** 最近一次补位前的原值；null = 没补过 / 已回滚 */
+        val fixedOrig: Int?,
+    )
+
+    /**
+     * 批量登记「见过它可见」。
+     *
+     * 语义与 `recordRescued` 的「首条为准」不同，这里要**更新** `source_type` / `last_seen`：
+     * 台账答的是「它最近一次可见时是什么值」，用旧值会让补位回滚写出过期数值。
+     * 但 `first_seen` **不覆盖**（它答的是「第一次见到它的时间」，覆盖等于丢失历史）。
+     *
+     * 主键是 `sns_id` ⇒ 先 `CONFLICT_IGNORE` 插入，插不进（已存在）再 update 一次。
+     * 走单事务：一轮快照几千行，逐条提交会产生几千次 journal。
+     *
+     * @return 新增（此前不在台账里）的行数
+     */
+    fun upsertVisibleSrc(rows: Collection<Pair<Long, Int>>, now: Long = System.currentTimeMillis()): Int {
+        if (rows.isEmpty()) return 0
+        return runCatching {
+            writableDatabase.run {
+                beginTransaction()
+                try {
+                    val values = ContentValues()
+                    var added = 0
+                    for ((snsId, src) in rows) {
+                        if (snsId == 0L) continue
+                        values.clear()
+                        values.put("sns_id", snsId)
+                        values.put("source_type", src)
+                        values.put("first_seen", now)
+                        values.put("last_seen", now)
+                        if (insertWithOnConflict(T_SRC, null, values, SQLiteDatabase.CONFLICT_IGNORE) > 0) {
+                            added++
+                        } else {
+                            values.clear()
+                            values.put("source_type", src)
+                            values.put("last_seen", now)
+                            update(T_SRC, values, "sns_id=?", arrayOf(snsId.toString()))
+                        }
+                    }
+                    setTransactionSuccessful()
+                    added
+                } finally {
+                    endTransaction()
+                }
+            }
+        }.onFailure { LogX.w("GroupDb upsertVisibleSrc failed: ${it.javaClass.simpleName}") }
+            .getOrDefault(0)
+    }
+
+    /**
+     * 台账全量（`last_seen DESC` = 最近还看得见的排前面）。
+     *
+     * ⚠️ 有 `LIMIT`：台账会随「见过多少条可见动态」线性增长，探针不该把它一把拖出来。
+     * 默认 5000 与 `listRescued` 同一个量级口径。
+     */
+    fun listVisibleSrc(limit: Int = 5000): List<VisibleSrc> {
+        val out = ArrayList<VisibleSrc>()
+        readableDatabase.query(
+            T_SRC, null, null, null, null, null, "last_seen DESC, sns_id DESC", limit.toString()
+        ).use { c ->
+            while (c.moveToNext()) {
+                val origIdx = c.getColumnIndexOrThrow("fixed_orig")
+                out.add(
+                    VisibleSrc(
+                        snsId = c.getLong(c.getColumnIndexOrThrow("sns_id")),
+                        sourceType = c.getInt(c.getColumnIndexOrThrow("source_type")),
+                        firstSeen = c.getLong(c.getColumnIndexOrThrow("first_seen")),
+                        lastSeen = c.getLong(c.getColumnIndexOrThrow("last_seen")),
+                        fixedOrig = if (c.isNull(origIdx)) null else c.getInt(origIdx),
+                    )
+                )
+            }
+        }
+        return out
+    }
+
+    fun visibleSrc(snsId: Long): VisibleSrc? {
+        if (snsId == 0L) return null
+        readableDatabase.query(
+            T_SRC, null, "sns_id=?", arrayOf(snsId.toString()), null, null, null
+        ).use { c ->
+            if (!c.moveToFirst()) return null
+            val origIdx = c.getColumnIndexOrThrow("fixed_orig")
+            return VisibleSrc(
+                snsId = c.getLong(c.getColumnIndexOrThrow("sns_id")),
+                sourceType = c.getInt(c.getColumnIndexOrThrow("source_type")),
+                firstSeen = c.getLong(c.getColumnIndexOrThrow("first_seen")),
+                lastSeen = c.getLong(c.getColumnIndexOrThrow("last_seen")),
+                fixedOrig = if (c.isNull(origIdx)) null else c.getInt(origIdx),
+            )
+        }
+    }
+
+    /** 记下本次补位前的原值（回滚依据）。只在真的写成功了才调 */
+    fun markSrcFixed(snsId: Long, orig: Int) {
+        val values = ContentValues().apply { put("fixed_orig", orig) }
+        runCatching { writableDatabase.update(T_SRC, values, "sns_id=?", arrayOf(snsId.toString())) }
+            .onFailure { LogX.w("GroupDb markSrcFixed failed: ${it.javaClass.simpleName}") }
+    }
+
+    /**
+     * 回滚成功后把 `fixed_orig` 清空。
+     *
+     * 必须清：不清的话下一轮 `srcstat/fix` 会把「已经回滚过的行」当成「补过位的行」，
+     * 反复出现在回滚清单里。
+     */
+    fun clearSrcFixed(snsId: Long) {
+        val values = ContentValues().apply { putNull("fixed_orig") }
+        runCatching { writableDatabase.update(T_SRC, values, "sns_id=?", arrayOf(snsId.toString())) }
+            .onFailure { LogX.w("GroupDb clearSrcFixed failed: ${it.javaClass.simpleName}") }
+    }
+
+    fun countVisibleSrc(): Int = runCatching {
+        readableDatabase.rawQuery("SELECT COUNT(*) FROM $T_SRC", null).use { c ->
+            if (c.moveToFirst()) c.getInt(0) else 0
+        }
+    }.onFailure { 0 }.getOrDefault(0)
+
+    /** 台账里「曾经可见」（`source_type & 2 != 0`）的行数 */
+    fun countEverVisibleSrc(): Int = runCatching {
+        readableDatabase.rawQuery(
+            "SELECT COUNT(*) FROM $T_SRC WHERE (source_type & 2) != 0", null
+        ).use { c -> if (c.moveToFirst()) c.getInt(0) else 0 }
+    }.onFailure { 0 }.getOrDefault(0)
+
+    /** 台账里「补过位且还没回滚」的行数（`fixed_orig IS NOT NULL`） */
+    fun countSrcFixed(): Int = runCatching {
+        readableDatabase.rawQuery(
+            "SELECT COUNT(*) FROM $T_SRC WHERE fixed_orig IS NOT NULL", null
+        ).use { c -> if (c.moveToFirst()) c.getInt(0) else 0 }
+    }.onFailure { 0 }.getOrDefault(0)
+
+    /**
+     * 「被微信清过位、我们补回来过」的 snsId（`fixed_orig IS NOT NULL`，最近补的在前）。
+     *
+     * 这是方案 A（Response-Merge）的**注入候选集**：这些条目服务端已经不返回，
+     * 但本地行与 `attrBuf` 都还在，正好补回时间线响应列表。
+     *
+     * @param limit 上限，防止台账变大后每轮同步都拖一大把 id 出来
+     */
+    fun listSrcFixedIds(limit: Int = 200): List<Long> = runCatching {
+        val out = ArrayList<Long>()
+        readableDatabase.rawQuery(
+            "SELECT sns_id FROM $T_SRC WHERE fixed_orig IS NOT NULL ORDER BY last_seen DESC LIMIT ?",
+            arrayOf(limit.toString()),
+        ).use { c ->
+            val i = c.getColumnIndexOrThrow("sns_id")
+            while (c.moveToNext()) out.add(c.getLong(i))
+        }
+        out
+    }.onFailure { LogX.w("GroupDb listSrcFixedIds failed: ${it.javaClass.simpleName}") }
+        .getOrDefault(emptyList())
 
     /**
      * 已自动设过免打扰的群。
@@ -981,6 +1181,27 @@ class GroupDb private constructor(context: Context) :
 
     fun allFriends(): List<Friend> = queryFriends(null, null)
 
+    /**
+     * 群聊（`wxid_type = CHATROOM = 2`），给 R24 的「群聊」Tab 用。
+     *
+     * ⚠️ 这些行**不是 `ContactSync` 扫出来的** —— 通讯录 tab 里没有群聊，
+     * 由 [com.lx.wxgroup.core.ChatroomSource] 直接扫 `rcontact` 的 `@chatroom` 补进来。
+     * 所以这里为空时先怀疑 ChatroomSource 没跑成功，不要怀疑「用户没群」。
+     *
+     * R29-4：源表里大量群 `remark`/`nickname` 都是空串，而 queryFriends 的
+     * `ORDER BY remark, nickname` 让空串排最前 → 一进 Tab 满屏数字群号。
+     * 这里在 **Kotlin 侧**把「无名群」稳定地沉到末尾（判据见 [ChatroomSortLogic]），
+     * ⛔ 不动 queryFriends 的共享 ORDER BY —— 它被好友列表 / findByDisplayName 共用。
+     */
+    fun allChatrooms(): List<Friend> = ChatroomSortLogic.sortNamedFirst(
+        queryFriends(
+            selection = "wxid_type=?",
+            args = arrayOf(WxidType.CHATROOM.toString()),
+        ),
+        remarkOf = { it.remark },
+        nicknameOf = { it.nickname },
+    )
+
     fun findFriend(wxid: String): Friend? =
         queryFriends("wxid=?", arrayOf(wxid)).firstOrNull()
 
@@ -1056,6 +1277,27 @@ class GroupDb private constructor(context: Context) :
             return if (cursor.moveToFirst()) cursor.getInt(0) else 0
         }
     }
+
+    /**
+     * 诊断用：执行一条只读 SQL 并把每行拼成字符串。
+     *
+     * ⚠️ 仅供探针（`op=room sub=list`）使用，**不要**用它承载业务读取 ——
+     * 返回的是已格式化的字符串，类型信息全丢了。
+     * 存在的理由：排查「DB 里存的到底是什么」时，走 [queryFriends] → `Friend`
+     * 会经过列映射，一旦怀疑映射有问题就需要看到**原始列值**才能定性。
+     */
+    fun debugRawRows(sql: String, maxRows: Int = 20): List<String> = runCatching {
+        readableDatabase.rawQuery(sql, null).use { cursor ->
+            val cols = cursor.columnNames
+            val out = ArrayList<String>(maxRows)
+            while (out.size < maxRows && cursor.moveToNext()) {
+                out += cols.joinToString(" ") { c ->
+                    "$c=${runCatching { cursor.getString(cursor.getColumnIndex(c)) }.getOrNull() ?: "null"}"
+                }
+            }
+            out
+        }
+    }.getOrDefault(emptyList())
 
     private fun nextSortOrder(): Int {
         readableDatabase.rawQuery("SELECT MAX(sort_order) FROM $T_GROUP", null).use { cursor ->

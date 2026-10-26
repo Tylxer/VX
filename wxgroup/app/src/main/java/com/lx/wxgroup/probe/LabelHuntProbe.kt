@@ -11,6 +11,7 @@ import de.robv.android.xposed.XposedBridge
 import de.robv.android.xposed.XposedHelpers
 import de.robv.android.xposed.callbacks.XC_LoadPackage
 import org.xmlpull.v1.XmlPullParser as XP
+import java.io.File
 import java.util.Collections
 import java.util.WeakHashMap
 
@@ -244,9 +245,30 @@ object LabelHuntProbe {
              */
             "sql" -> runSql(sql)
 
+            /**
+             * 只读列目录 / 查文件存在性（**绝不写、绝不删**）。
+             * `--es table <相对 dataDir 的路径>`，如 `MicroMsg/<hash>/voice2`。
+             * 空则列 dataDir 根。
+             *
+             * 用途：语音防撤回要判断「voiceinfo 记录还在」是否等于「磁盘音频文件还在」——
+             * `vj0.p` 名字就叫 deleteLocalFile，可能同时删文件，那条路径不过 SQLite，hook 拦不到。
+             */
+            "file" -> listFiles(table, n)
+
+            /**
+             * 全目录递归找文件名含关键字的文件（**只读，绝不写**）。
+             * `--es table <相对 dataDir 的根>`（如 `MicroMsg/<hash>/voice2`）
+             * `--es sql <关键字>`（如 imgPath）`--ei n <最多列几个>`
+             *
+             * 为什么必须递归：`voice2` 是**两级**两字符 hex 桶（`voice2/01/70/`），
+             * 文件名 `msg_<imgPath>.amr`。桶的计算规则没定案 —— 与其猜桶，
+             * 不如全树扫一遍。树不大（256 个一级桶），扫一次几百 ms 可接受。
+             */
+            "find" -> findFiles(table, sql, n)
+
             else -> own(
                 "$TAG unknown sub=$sub " +
-                    "(names|of|stat|on|off|dbs|tables|info|rows|sql|" +
+                    "(names|of|stat|on|off|dbs|tables|info|rows|sql|file|find|" +
                     "mutetables|mute1|mute2|mutediff|muteclear|muteprefs)"
             )
         }
@@ -477,9 +499,141 @@ object LabelHuntProbe {
         }
     }
 
-    // ------------------------------------------------------- 免打扰锚点取证（MUTE）
+    // ------------------------------------------------------- 只读文件探针（FILE）
 
-    /** 免打扰 dump 时 `rowid` 的别名列（有它才能稳定对齐两次快照的同一行） */
+    /** 单次最多列多少项（防止语音目录几万文件把日志刷满） */
+    private const val MAX_FILE_ENTRIES = 200
+
+    /**
+     * `sub=find` 的访问节点上限。
+     *
+     * `voice2` 有 256 个一级桶 × N 个二级桶，全扫约几千个目录 —— 给到 20 万足够，
+     * 又能防手滑 `--es table .` 把整个 dataDir 扫穿。
+     */
+    private const val MAX_FIND_VISIT = 200_000
+
+    /**
+     * 列目录 / 查文件存在性。**纯只读，绝不写、绝不删。**
+     *
+     * `--es table <相对宿主 dataDir 的路径>`，如 `MicroMsg/<hash>/voice2`；空 = dataDir 根。
+     * `--ei n <最近多少个>` 只列按 mtime 倒序的前 n 个（默认 [MAX_FILE_ENTRIES]）。
+     *
+     * ⚠️ 只读宿主 dataDir，不跟 `..` 越界（[File.getCanonicalPath] 前缀校验）。
+     */
+    private fun listFiles(sub: String?, n: Int) {
+        val dir = dataDir()
+        if (dir == null) {
+            own("$TAG file: 拿不到宿主 dataDir")
+            return
+        }
+        val root = File(dir)
+        val target = if (sub.isNullOrBlank()) root else File(root, sub)
+        val cap = n.coerceIn(1, MAX_FILE_ENTRIES)
+
+        val canonRoot = runCatching { root.canonicalPath }.getOrNull()
+        val canonTarget = runCatching { target.canonicalPath }.getOrNull()
+        if (canonRoot == null || canonTarget == null) {
+            own("$TAG file: canonicalPath 失败 $target")
+            return
+        }
+        // ⛔ 防 `--es table ../../` 越界读别的应用：必须在 dataDir 之内
+        if (canonTarget != canonRoot && !canonTarget.startsWith(canonRoot + File.separator)) {
+            own("$TAG file refused: 路径越出 dataDir ($canonTarget)")
+            return
+        }
+
+        if (!target.exists()) {
+            own("$TAG file $sub: **不存在** (NotExist)")
+            return
+        }
+        if (target.isFile) {
+            own("$TAG file ${target.name} size=${target.length()}B mtime=${target.lastModified()} 存在=YES")
+            return
+        }
+
+        val all = target.listFiles()
+        if (all == null) {
+            own("$TAG file $sub: listFiles 返回 null（无权限？）")
+            return
+        }
+        // 按 mtime 倒序：最新的语音在最前面
+        val sorted = all.sortedByDescending { it.lastModified() }
+        own("$TAG file $sub: exists=YES total=${all.size} 列前 ${minOf(cap, all.size)} 个（mtime 倒序）")
+        for (f in sorted.take(cap)) {
+            own(
+                "$TAG   ${if (f.isDirectory) "d" else "f"} ${f.name} " +
+                    "size=${f.length()}B mtime=${f.lastModified()}"
+            )
+        }
+    }
+
+    /**
+     * 递归找人文件名含 [needle] 的文件。**纯只读。**
+     *
+     * ⚠️ 只读宿主 dataDir，越界一律拒绝（同 [listFiles]）。
+     * ⚠️ 设 [MAX_FIND_VISIT] 访问上限，防在超大目录里卡住微信主线程 —— 本命令走 io{} 但仍要自律。
+     */
+    private fun findFiles(sub: String?, needle: String?, n: Int) {
+        if (needle.isNullOrBlank()) {
+            own("$TAG find: --es sql <关键字> 不能为空（如 imgPath）")
+            return
+        }
+        val dir = dataDir()
+        if (dir == null) {
+            own("$TAG find: 拿不到宿主 dataDir")
+            return
+        }
+        val root = File(dir)
+        val target = if (sub.isNullOrBlank()) root else File(root, sub)
+        val cap = n.coerceIn(1, MAX_FILE_ENTRIES)
+
+        val canonRoot = runCatching { root.canonicalPath }.getOrNull() ?: return
+        val canonTarget = runCatching { target.canonicalPath }.getOrNull()
+        if (canonTarget == null) {
+            own("$TAG find: canonicalPath 失败 $target")
+            return
+        }
+        if (canonTarget != canonRoot && !canonTarget.startsWith(canonRoot + File.separator)) {
+            own("$TAG find refused: 路径越出 dataDir ($canonTarget)")
+            return
+        }
+        if (!target.isDirectory) {
+            own("$TAG find $sub: 不是目录 / 不存在")
+            return
+        }
+
+        val hits = ArrayList<File>()
+        var visited = 0
+        var dirs = 0
+        // 手写栈替代递归：微信目录层级浅，但用栈能顺便数「访问了多少节点」
+        val stack = ArrayDeque<File>()
+        stack.addLast(target)
+        while (stack.isNotEmpty() && visited < MAX_FIND_VISIT) {
+            val d = stack.removeLast()
+            val kids = d.listFiles() ?: continue
+            for (f in kids) {
+                visited++
+                if (f.isDirectory) {
+                    dirs++
+                    stack.addLast(f)
+                } else if (f.name.contains(needle, ignoreCase = true)) {
+                    hits.add(f)
+                }
+                if (visited >= MAX_FIND_VISIT) break
+            }
+        }
+
+        own(
+            "$TAG find '$needle' under $sub: hits=${hits.size} " +
+                "visited=$visited dirs=$dirs" +
+                if (visited >= MAX_FIND_VISIT) " ⚠️ 已达访问上限 ${MAX_FIND_VISIT}，可能没扫完" else ""
+        )
+        for (f in hits.sortedByDescending { it.lastModified() }.take(cap)) {
+            own("$TAG   HIT ${f.absolutePath} size=${f.length()}B mtime=${f.lastModified()}")
+        }
+    }
+
+    // ------------------------------------------------------- 免打扰锚点取证（MUTE）
     private const val LOCATOR_COL = "__rid"
 
     /** 每个库最多看多少张表（微信主库表数在几百量级，够用） */

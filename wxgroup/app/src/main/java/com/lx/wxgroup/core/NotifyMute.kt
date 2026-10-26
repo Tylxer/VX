@@ -11,6 +11,8 @@ import de.robv.android.xposed.XposedHelpers
 import de.robv.android.xposed.callbacks.XC_LoadPackage
 import com.lx.wxgroup.data.Keys
 import com.lx.wxgroup.data.Kv
+import com.lx.wxgroup.feature.LabelSource
+import com.lx.wxgroup.feature.ListResolver
 import com.lx.wxgroup.util.LogX
 import java.util.Calendar
 import java.util.Locale
@@ -285,12 +287,111 @@ object NotifyMute {
     /**
      * 作用域：**排除名单优先**（命中直接不生效），再看允许名单。
      * 允许名单为空 = 对所有会话生效。talker 拿不到时按不在作用域处理（宁可漏判）。
+     *
+     * ## R24：支持 `g:` / `t:` 前缀
+     *
+     * K3 选择器现在四个 Tab 全开，名单里可能存 `g:3`（分组）或 `t:12`（标签）。
+     * 直接拿 talker 去比 `g:3` 永不命中 ⇒ 用户勾了分组会**静默失效**。
+     * 所以先把名单经 [ListResolver.expand] 展开成具体 wxid 再比。
+     *
+     * ⚠️ 「允许名单为空」只认**配置为空**，不认「展开后为空」：
+     * 用户把允许名单设成一个空分组时，正确行为是「谁都不在范围内」；
+     * 若退回成「允许所有人」，免打扰会把**全部**通知静音 —— 这是方向相反的失效。
+     * 该三态语义由 [ListResolver.inScope] 统一实现，别在这里另写一份判空逻辑。
      */
-    private fun inScope(talker: String?): Boolean {
-        if (talker.isNullOrBlank()) return false
-        if (talker in Kv.getList(Keys.CHAT_MUTE_AT_EXCLUDE)) return false
+    private fun inScope(talker: String?): Boolean = ListResolver.inScope(
+        talker = talker,
+        allowRaw = Kv.getList(Keys.CHAT_MUTE_AT_ALLOW),
+        excludeRaw = Kv.getList(Keys.CHAT_MUTE_AT_EXCLUDE),
+        groups = scopeBuckets().groups,
+        labels = scopeBuckets().labels,
+    )
+
+    // ---------------------------------------------------- 作用域用的分组/标签快照
+
+    /**
+     * 作用域展开用的 buckets 缓存。
+     *
+     * 为什么必须缓存：`inScope` 跑在**通知回调**里（`onNotify` 的 hook 帧上），
+     * 每条微信通知都会走一次。分组有几十个、成员上千时，每次通知都查
+     * `group_member` 表会让通知延迟可见 —— 而免打扰是「能容忍配置晚 3 秒生效，
+     * 不能容忍通知卡顿」的功能。
+     *
+     * 缓存策略照抄项目里已有的做法（`MomentsExport.Config` 的 `cfgAt` + TTL）：
+     * - TTL 30 秒：用户刚改完分组就收到消息，最多 30 秒后才按新成员判定；
+     * - 用户改名单 / 成员时 [invalidateScope] 主动失效，所以正常路径是立即生效的。
+     *
+     * ⚠️ 快照只在**首次需要时**才查库。若用户从没用过分组/标签（名单里全是裸 wxid），
+     * [needBuckets] 直接返回 false，一次库都不查。
+     */
+    private data class ScopeBuckets(
+        val groups: Map<String, List<String>> = emptyMap(),
+        val labels: Map<String, List<String>> = emptyMap(),
+    )
+
+    private val scopeLock = Any()
+    private var scopeCache: ScopeBuckets = ScopeBuckets()
+    private var scopeAt = 0L
+
+    private const val SCOPE_TTL_MS = 30_000L
+
+    private fun scopeBuckets(): ScopeBuckets {
         val allow = Kv.getList(Keys.CHAT_MUTE_AT_ALLOW)
-        return allow.isEmpty() || talker in allow
+        val exclude = Kv.getList(Keys.CHAT_MUTE_AT_EXCLUDE)
+        // 名单里一个前缀都没有 ⇒ 展开必然等于原样，不用查库也不用缓存
+        if (!needBuckets(allow) && !needBuckets(exclude)) return ScopeBuckets()
+        synchronized(scopeLock) {
+            val now = android.os.SystemClock.elapsedRealtime()
+            if (scopeAt != 0L && now - scopeAt < SCOPE_TTL_MS) return scopeCache
+            val fresh = loadBuckets()
+            scopeCache = fresh
+            scopeAt = now
+            return fresh
+        }
+    }
+
+    /** 名单里有没有 `g:` / `t:` 条目 —— 没有就不值得为它查库 */
+    private fun needBuckets(list: List<String>): Boolean = list.any {
+        val s = it.trim()
+        s.startsWith(ListResolver.PREFIX_GROUP) || s.startsWith(ListResolver.PREFIX_LABEL)
+    }
+
+    private fun loadBuckets(): ScopeBuckets = runCatching {
+        val db = com.lx.wxgroup.data.GroupDb.current() ?: return@runCatching ScopeBuckets()
+        val g = LinkedHashMap<String, List<String>>()
+        for (group in db.listGroups()) {
+            runCatching { g[group.id.toString()] = db.memberWxids(group.id).toList() }
+        }
+        val l = runCatching { LabelSource.membersByLabelId() }.getOrDefault(emptyMap())
+        ScopeBuckets(groups = g, labels = l)
+    }.onFailure { LogX.w("K9 scope buckets failed: ${it.javaClass.simpleName}") }
+        .getOrDefault(ScopeBuckets())
+
+    /**
+     * 名单 / 分组成员变了就调它。
+     *
+     * 两件事，缺一不可：
+     * 1. **立刻失效**（`scopeAt = 0`）—— 否则改完配置要等 30 秒 TTL 才生效，
+     *    验收时会看到「名单改了但行为没变」的假阴性；
+     * 2. **后台预热** —— 若只失效不预热，下一次 @ 通知会在 **hook 帧上**同步跑
+     *    `listGroups()` + 逐组 `memberWxids()`（几十次 SQLite 查询），把通知卡住
+     *    （R24 复核 S4）。在此处提前把快照建好，通知路径就只读内存。
+     *
+     * 预热失败不影响正确性：`scopeBuckets()` 发现 `scopeAt == 0` 会自己补一次同步加载。
+     */
+    fun invalidateScope() {
+        synchronized(scopeLock) { scopeAt = 0L }
+        runCatching {
+            Thread({
+                runCatching {
+                    val fresh = loadBuckets()
+                    synchronized(scopeLock) {
+                        scopeCache = fresh
+                        scopeAt = android.os.SystemClock.elapsedRealtime()
+                    }
+                }.onFailure { LogX.w("K9 scope warm-up failed: ${it.javaClass.simpleName}") }
+            }, "wxg-scope-warm").apply { isDaemon = true }.start()
+        }.onFailure { LogX.w("K9 scope warm-up thread failed: ${it.javaClass.simpleName}") }
     }
 
     /**

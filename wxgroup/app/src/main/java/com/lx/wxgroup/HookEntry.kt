@@ -28,9 +28,9 @@ import com.lx.wxgroup.feature.ForceForward
 import com.lx.wxgroup.feature.GroupBar
 import com.lx.wxgroup.feature.HintBadge
 import com.lx.wxgroup.feature.ScrollDock
-import com.lx.wxgroup.feature.SnsCdnImage
 import com.lx.wxgroup.feature.SnsGuard
 import com.lx.wxgroup.feature.SnsTag
+import com.lx.wxgroup.feature.VoiceFileGuard
 import com.lx.wxgroup.feature.VoiceGuard
 import com.lx.wxgroup.feature.MomentsAuto
 import com.lx.wxgroup.feature.MomentsExport
@@ -219,6 +219,16 @@ class HookEntry : IXposedHookLoadPackage {
             VoiceGuard.install(lpparam)
         }.onFailure { LogX.e("VoiceGuard install failed", it) }
 
+        // ---- 防撤回·语音文件防删（R21c 真机定的根因，最后一块补丁）----
+        // 前两个 hook（UPDATE message / DELETE voiceinfo）都拦住之后，真机仍然**播放失败**。
+        // 递归扫 voice2/ 的 20827 个目录证实：微信还会 `File.delete()` 掉
+        // `voice2/<md5桶>/msg_<imgPath>.amr` —— 那一步不过 SQLite，VoiceGuard 看不到。
+        // 这里拦 Java 层的 File.delete（纯字符串判据，高频路径安全），
+        // 同时 RevokeRescue.record 里还会留一份备份兜底。
+        runCatching {
+            VoiceFileGuard.install()
+        }.onFailure { LogX.e("VoiceFileGuard install failed", it) }
+
         // ---- 防撤回·朋友圈动态防删除（6.2 第二项）：拦住 DELETE FROM SnsInfo 并归档整行 ----
         // ⚠️ 朋友圈是**独立的库** SnsMicroMsg.db，不是 EnMicroMsg.db。
         // 删动态是物理 DELETE 整行（不是改标记），所以策略是「拦 + 归档」而不是「拦 + 改写」。
@@ -306,15 +316,11 @@ class HookEntry : IXposedHookLoadPackage {
             MomentsAuto.install(lpparam)
         }.onFailure { LogX.e("MomentsAuto install failed", it) }
 
-        // ---- 6.4 朋友圈：图片 CDN 批量下载（默认关；只在 WiFi 下放行）----
-        // 思路：hook dk.a() 强制返回 true 打开微信自己的批量图片下载通路，再在
-        // onC2CDownloadCompleted 里读出参 picCachePath，把文件拷到外部可读目录。
-        // 我们自己**不发 HTTP、不解 aeskey** —— 让微信自己下、自己解。
-        // ⚠️ 开关默认关：开门后走的是微信非默认代码路径（流量/风控/崩溃三个面），
-        // 必须先过真机 I-0~I-4 才允许默认开。实现见 feature/SnsCdnImage.kt 类注释。
-        runCatching {
-            SnsCdnImage.install(lpparam)
-        }.onFailure { LogX.e("SnsCdnImage install failed", it) }
+        // ⛔ 2026-10-27 已整块删除：6.4「朋友圈图片 CDN 批量下载」通路
+        //    （`SnsCdnImage` / `SnsCdnCheckLogic` / `SnsCdnBreaker` / `SnsCdnProbe` + 两个单测）。
+        //    判死理由：批量下载开门点 `dk.a()` 下游 `ok0.x0#n` **零调用**，出参 `picCachePath` 恒空，
+        //    整条路从不触发；朋友圈图片已改道「SNS 缓存索引直扫」（见 `docs/_r26_img_export_真机验证.md`）。
+        //    ⛔ 勿按 git 历史恢复：开门后走的是微信非默认代码路径（流量/风控/崩溃三个面），且通路实测无效。
 
         // ---- 6.4 朋友圈：自动导出（sns_archive → 文本文件；图片规则未取证，只留探针）----
         // 没有任何 hook：后台 5 分钟一拍，导出间隔 10 分钟，单航班后台线程。
