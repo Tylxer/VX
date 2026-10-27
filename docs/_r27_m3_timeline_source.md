@@ -308,7 +308,7 @@ v1 曾写：「若刷新会重查表，这条 `flag=2` 的行理应在时间线�
 
 **结论：`sourceType & 2` 过滤发生在 DB 查询层（`d2.t5` 等），不在 improve 内存模型层。** 因此：
 
-- **内存层不会按 sourceType 再过滤**：improve 内存模型 `oh3/p`（= `ImproveSnsInfo`）的 `isDieItem()` 查 `getLocalFlag()<=0`、`isInValid()` 查 `l0()`(=snsId) —— **都不读 sourceType**（`_r27_disasm.py` 实测）。
+- **内存层不会按 sourceType 再过滤**：improve 内存模型 `oh3/p`（= `ImproveSnsInfo`）的 `isDieItem()` 查 `getLocalFlag() & 32`（⛔ 2026-10-28 订正：既有的 `<=0` / `& 2` 两种写法**都错**，见 `docs/_r30_62_album_gate.md` §2）、`isInValid()` 查 `l0()`(=snsId) —— **都不读 sourceType**（`_r27_disasm.py` 实测）。
 - ⇒ **Response-Merge（把保留 SnsObject merge 进内存响应列表）在当次刷新里不会被「同一处 sourceType 逻辑」再滤一次** —— 它只过 `localFlag`/`snsId` 校验（保留行两者都合法）。
 - ⚠️ **但 merge 只救「当次内存列表」**：冷启/DB 重建路径（`d2.t5`）仍按 `sourceType & 2` 过滤，被 merge 的 src=0 行**冷启后照样消失**。
 - ⇒ **结论**：Response-Merge 与 SourceFlag-Fix **不是二选一，是互补**：

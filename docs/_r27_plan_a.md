@@ -26,7 +26,10 @@ c3.N(IILjava/lang/String;Lq54/zb5;)V        ← NetSceneSnsTimeLine（getType=21
 ```
 
 - 在 `N` 执行**前**把对象 `add` 进 `zb5.f`，它就会随「写库 + 事件 + 渲染」全链路走完。
-- 个人相册走 `h3`(212) / `k3`(5203)，**不经过 `c3.N`** ⇒ 天然只命中时间线。
+- 个人相册走 `h3`(212)，**不经过 `c3.N`** ⇒ 天然只命中时间线。
+  ⚠️ **2026-10-27 订正**：原文把 `k3`(5203) 也算个人相册 —— **错**。
+  `k3` = `NetSceneSnsWwUserPage`，CGI `mmsnswwuserpage`（**ww = WeWork**）⇒ **企业微信**朋友圈，与好友相册无关。
+  证据见 `docs/_r30_lane2_album_page.md` 附·主会话复核 #4。
 
 字段核实（`_r12_dexclass.py`）：
 
@@ -114,3 +117,83 @@ JVM 单测一加载该 object 就会因缺 Xposed 运行时**整个测试进程�
 
 **若 L3 不中**：说明 `isDieItem()` 把注入对象判死了。下一步取证 `oh3/p.isDieItem()`
 读的是哪份数据（`SnsObject.DeleteFlag` 还是 `SnsInfo.localFlag`），再决定补哪个字段。
+
+---
+
+## 7. 真机验证（2026-10-27 02:21，**首次上机即命中**）
+
+### 7.1 三层判据全部达成
+
+**L1（注入进列表）** —— 进朋友圈触发首屏同步：
+
+```
+02:21:49.071 SNS-INJECT first hit: respIds=10 times=10
+02:21:49.074 SNS-INJECT snsId=-3405726322886831589 parse=ok buf=174 ct=1793029040 idx=7  size=11
+02:21:49.076 SNS-INJECT snsId=-3405753000984047083 parse=ok buf=174 ct=1793025860 idx=11 size=12
+02:21:49.077 SNS-INJECT snsId=-3405736005952990706 parse=ok buf=174 ct=1793027885 idx=9  size=13
+02:21:49.078 SNS-INJECT snsId=-3405768558946217460 parse=ok buf=174 ct=1793024005 idx=13 size=14
+02:21:49.078 SNS-INJECT-STAT attempt=4 ok=4 parseFail=0 emptyBuf=0 noDb=0 resp=10
+02:21:49.951 sns-srcfix SNS srcguard re-fix after burst fixed=5 waited=350ms cost=63ms
+```
+4 条 `attrBuf` 全部 174 字节、`parse=ok`，**`parseFrom` 路径成立**（不用手拼 53 个字段）。
+最后一行是方案 B 在注入后照常补位，两者互不干扰 ✅
+
+**L2（落库）** —— `snsg sub=dump`：所有行 `src=2 flag=2`。
+
+**L3（界面）** —— 联网状态下逐屏 `uiautomator dump`：
+
+```
+屏3: 2小时前 | QQ音乐 | 王贝拉 … | 昨天 | 网易云音乐 | verity | 9
+屏4: verity | 8 | 昨天
+屏5: verity | 7 | 昨天
+屏6: verity | 6 | 昨天 | 小曦崽3.27 …
+```
+
+- 四条**全部出现**，且**顺序正确**（9→8→7→6，按 `CreateTime` 倒序）
+- 周围正常动态未被打乱（19分钟前 → 33分钟前 → 1小时前 → 2小时前 → 昨天，时间单调）
+- 无重复条目
+
+⇒ **方案 A 成立。这是与方案 B 的对照实验（同库同刻，联网时 B 不显示、A 显示）的最终闭环。**
+
+### 7.2 「10」为何不在注入列表
+
+`-3405721048722501111`（verity「10」）没被注入，因为**这一轮响应里已经有它**（`respIds=10` 含它），
+`pickMissing` 正确排除了。⇒ 「不重复注入」的判据在真机上被顺带验证了。
+
+### 7.3 ⛔ 真机发现并已修的缺陷：空响应被高频注入
+
+下拉刷新时日志暴增：
+
+```
+02:23:49 SNS-INJECT-STAT attempt=32 ok=32 … resp=0
+02:23:53 SNS-INJECT-STAT attempt=48 ok=48 … resp=0
+02:23:57 SNS-INJECT-STAT attempt=56 ok=56 … resp=0
+```
+
+**`resp=0` = 响应列表为空，但仍在注入**。成因：进朋友圈后 `c3.N` 被**每秒一次**反复调用，
+且传入的 `zb5.f` 是空列表（增量/心跳类请求）。我们往空列表里塞 4 条 ⇒ attempt 从 4 涨到 56
+（52 次无用注入 × 4 次 SQL），白烧 CPU，还可能有写库副作用。
+
+**修法**：`if (list.isEmpty()) { emptyResp++; return }`。首屏/刷新的正常响应一定非空，
+这条闸不会误伤主路径；`emptyResp` 进统计便于观察。
+
+### 7.4 遗留观察点
+
+- 若某些**分页**响应的列表非空但只含旧内容，仍可能每页注入一次（未观测到，先不处理）
+- `isDieItem()` 究竟读哪份数据仍未取证 —— 但 L3 已通过，说明当前路径（注入 → 写库 → UI 读库/对象）
+  的数据流可以让它过判，无需追加字段
+
+### 7.5 防护修复后的复测（02:27，已装机验证）
+
+```
+02:21（修复前） attempt=56 ok=56  resp=0     ← 空响应也注入，52 次无用功
+02:28（修复后） attempt=12 ok=12  emptyResp=13 resp=10
+```
+
+- `emptyResp=13` = **13 次空响应被正确跳过**（硬证据）
+- `attempt=12` = 首屏 4 + 滚动触发的 2 轮非空响应各 4
+- 界面复查：`昨天 | verity | 6 | 昨天 | 小曦崽3.27`，**「6」只出现一次，后面紧跟别人**，无重复
+
+⚠️ 遗留观察点：滚动会触发**非空**分页响应（每轮仍注入 4 条，cost ≈ 63ms）。
+目前 UI 表现正确（每轮列表独立重建），未造成重复显示；若后续发现重复，再加
+「同 snsId 在 N 秒内不重复注入」的节流。

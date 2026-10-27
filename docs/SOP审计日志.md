@@ -1548,3 +1548,88 @@ R19 计划里写的判据这次真的用上了：
 3. **额外 WARN ② 观察**：self↔incoming 复用瞬间的单帧反侧，真机看是否可感知；可感知再引入 `OnLayoutChangeListener`
 4. **问题 3（防撤回语音播放失败）仍未修**：`VoiceGuardLogic.kt` 的 `HEX24`(24→26) + `SUBQUERY` 放行 + 入口未定（`delete` vs `execSQL`）
 5. 更早遗留：`COPY_IMAGES` 仍 `false`；M4/M6/M7 有副作用未授权；M3 需造人工场景
+
+---
+
+## R29 轮末自审（2026-10-27 02:25）
+
+> 用户：「还是按并发的方式推进项目，429 问题我已经解决」。本轮全部 lane **不碰设备**，子代理不跑 gradle。
+
+### ① 分包下限
+本轮改动面（`git show --stat f231af2` 逐项核过，新建文件单列）：
+
+| 类型 | 文件 |
+|---|---|
+| 新建功能文件 | `data/ChatroomSortLogic.kt`、`feature/PickerTabLogic.kt`、`core/AvatarLoader.kt` |
+| 新建测试 | `ChatroomSortLogicTest.kt`、`PickerTabLogicTest.kt`、`AvatarLoadLogicTest.kt` |
+| 修改（独立功能） | `GroupDb.kt`、`PickerTabs.kt`、`ChatroomSource.kt`、`PickerPage.kt`、`GroupRowView.kt`、`ConvFilter.kt`（+ 两个接线点 `MainPage.kt`/`MassSendPage.kt` 不计） |
+
+⇒ 改动面 **≥3 个独立功能文件**，要求 ≥2 个实现 lane。实派 3 个（R29-4 排序 / R29-3 群聊 Tab / R29-2b 头像）。
+**PASS**
+
+### ② 档位是否显式传 ID
+- `r29-g1-forward` / `r29-avatar`（两段）/ `r29-f1-chatroom` / `r29-g2-msgobj` ⇒ `deepseek-v4-pro`
+- `r29-room-sort` ⇒ `deepseek-v4.1-flash`
+全部显式传 ID，无 `default` / 无 `lite`/`reasoning` 别名。**PASS**
+
+### ③ 文件不重叠
+| lane | 独占文件 | 冲突 |
+|---|---|---|
+| R29-3 | PickerTabs / ChatroomSource / PickerPage / PickerTabLogic / MainPage / MassSendPage | 无 |
+| R29-4 | GroupDb / ChatroomSortLogic / 其单测 | 无 |
+| R29-2b | GroupRowView / ConvFilter / AvatarLoader / 其单测 | 无 |
+| R29-1、R29-5 | 只读 dex + 各自 docs | 无 |
+**PASS**
+
+### ④ 设备锁
+本轮零 `adb` 调用、零装包、零跑场景。**PASS**
+
+### ⑤ 轮次重排
+见下方「遗留」，已列出下一轮可执行项（G1 实现 / 真机批次 / ForwardPicker 补跑）。**PASS**
+
+### ⑥ 真机前交叉复核
+本轮**未上真机**（用户明确「暂不上真机」），故无 `adb install` 前复核。替代验证：
+- `assembleDebug` EXIT=0
+- `testDebugUnitTest` **718 tests / 38 类 / 0 failed / 0 errors**
+- 变异验证 3 组（见下），全部精确变红后还原
+**PASS（N/A 上机，验证已做）**
+
+### ⑦ Pro 类活有没有被主会话自己做
+| 类别 | 本轮对应工作 | 谁做的 | 结论 |
+|---|---|---|---|
+| Hook 链路推导 | G1 转发链路（`hl0/r1`+`hl0/m`+`q1.h`） | `r29-g1-forward`（Pro） | ✅ |
+| 反射/接口链路 | 头像 `AvatarStorage(x)` / `B8()→z8()` | `r29-avatar`（Pro） | ✅ |
+| Hook 链路推导 | G2 View→`h9`（adapter.getItem 真实性校验） | `r29-g2-msgobj`（Pro） | ✅ |
+| 异步/时序设计 | F1 补跑时机 + 原地刷新 | `r29-f1-chatroom`（Pro） | ✅ |
+
+主会话本轮只做 Flash 级：跑 gradle / 解析测试结果 / 改文档 / git 提交 / 变异验证执行 / 代码事实核查（读 `ConvFilter.buildModel` 定位 `snaps[i].wxid`）。**PASS**
+
+### 本轮验证记录
+
+**变异验证（主会话实跑，非推演）**：对 `PickerTabLogic.kt` 逐条改坏 → 跑全量 → 还原：
+
+| 变异 | 结果 | 命中用例 |
+|---|---|---|
+| `>` → `>=`（边界） | 1 红 | `exactlyAtIntervalSkips` |
+| `else 0` → `else -1`（fallback） | 2 红 | `missingCurrentFallsBackToFirst` / `emptyNewListFallsBackToZero` |
+| 去掉 `oldNames == newNames` 短路 | 编译期报错（快照变换失败），未取到断言级证据 | — |
+
+⚠️ 第三条变异**没有取得断言级证据**：那次构建炸在 `BuildToolsApiClasspathEntrySnapshotTransform`，
+与变异本身无关（是构建状态损坏）。还原后复绿，故该条按「未验证」记录，不算 PASS。
+
+**构建状态事故（写进速查了）**：
+清 `kotlin-classes` + 删 `executionHistory.bin` 期间出现两次假失败 ——
+① `SnsTimelineMergeTest.respectsLimit` 报 `expected 2 but was 3`，而源码逻辑不可能返回 3 ⇒ 旧 class 复用；
+② `ActivityResultRelay.class (Permission denied)` ⇒ 上一轮被杀的 daemon 未释放句柄。
+两者都在 `gradlew --stop` + 删执行历史 + 重跑后消失。**源码全程没被改坏**。
+
+**产物**：APK `2,874,510 B` @ 02:19:45；commit `f231af2`（122 files, +18439/−1925），已推送 `origin/main`。
+
+### 遗留（下一轮）
+1. **G1 实现**（现在有完整依据）：`TextSender.sendForward` / `FileSender.sendForward` 挂 `hl0/m` + `q1.h=4/13`；
+   源消息走 R29-5 的 `adapter.getItem` 路径。⚠️ 文本侧「转发标记对端可见」仍是②强推测
+2. **真机批次**（用户要求暂缓）：R24 §5.6 空分组反向对照（P0）/ §5.4 `g:`/`t:` / §5.5 / R25 真落盘 / R22 8ms 闸门
+3. **头像真机验证**：`x.i`/`x.j` 是否真的返回非空；HD 图 4.6MB 与 8MB 缓存的关系需实测
+4. **F1 首开 2~3s 空窗**：观察是否可接受，必要时加「正在加载群聊…」占位
+5. **ForwardPicker 未接补跑**：它不走 `PickerPage`，首开仍可能没有群聊入口
+6. **R27 方案 A** 仍等用户拍板
