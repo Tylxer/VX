@@ -180,6 +180,44 @@ object ContactSqlSource {
     fun ready(): Boolean = mainDb != null
 
     /**
+     * 只读诊断：把 wxid 翻成「昵称 / 备注 / 微信号」。
+     *
+     * 存在的理由：日志和数据库里全是 wxid，`sourceType` 取证时知道「被删动态属于
+     * `wxid_xlrbelf6hv0w22`」毫无用处 —— 必须知道这是**谁**，才能进对相册页去验证。
+     * 探针：`op=who --es val "wxid_a,wxid_b"`（逗号分隔，最多 30 个）。
+     *
+     * ⚠️ 同 [doSupplement]：用 `select *` 按列名取，避免列名跨版本对不上导致整条查询抛异常。
+     */
+    fun who(rawIds: List<String>): List<String> {
+        val ids = rawIds.map { it.trim() }.filter { it.isNotEmpty() }.take(30)
+        if (ids.isEmpty()) return listOf("WHO 用法: --es val \"wxid_a,wxid_b\"")
+        val db = mainDb ?: return listOf("WHO no main db (还没拿到微信主库)")
+        val m = rawQueryMethod(db) ?: return listOf("WHO no rawQuery on ${db.javaClass.name}")
+        val csv = ids.joinToString(",") { "'${it.replace("'", "''")}'" }
+        val cur = runCatching { m.invoke(db, "select * from $TABLE where username in ($csv)", null) }
+            .onFailure {
+                LogX.w("WHO query failed ${it.javaClass.simpleName}: ${(it.cause ?: it).message?.take(80)}")
+            }
+            .getOrNull() ?: return listOf("WHO query failed")
+        val out = ArrayList<String>()
+        try {
+            if (columnIndexOf(cur, "username") < 0) return listOf("WHO schema mismatch: no 'username' column")
+            var guard = 0
+            while (guard++ < 200 && XposedHelpers.callMethod(cur, "moveToNext") as? Boolean == true) {
+                val wxid = cText(cur, "username") ?: continue
+                out += "WHO $wxid nick=${cText(cur, "nickname")?.trim().orEmpty()} " +
+                    "remark=${cText(cur, "conRemark")?.trim().orEmpty()} " +
+                    "alias=${cText(cur, "alias")?.trim().orEmpty()}"
+            }
+        } finally {
+            runCatching { XposedHelpers.callMethod(cur, "close") }
+        }
+        val got = out.map { it.split(" ")[1] }
+        for (miss in ids) if (miss !in got) out += "WHO $miss (rcontact 里没有这行)"
+        return out
+    }
+
+    /**
      * 兜底触发：句柄已捕获但还没补成功时，再试一次。
      * 由 [ContactSync.doSync] 在用户打开通讯录时调用（低频，不会刷屏）。
      */

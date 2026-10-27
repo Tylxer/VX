@@ -93,6 +93,20 @@ object Keys {
     const val CHAT_MUTE_AT_EXCLUDE = "chat.mute_at_exclude"
 
     /**
+     * 收到图片消息时**自动把原图下载下来**（不用手点「查看原图」）。
+     *
+     * 判定「是否已有原图」用 `ImgInfo.t == 1`（微信自己的 `AutoGetBigImgLogic` 用的
+     * 就是这一个字段），已有时直接跳过 —— 不重复建下载任务。
+     */
+    const val CHAT_AUTO_HD_IMG = "chat.auto_hd_img"
+
+    /** 自动加载原图的**允许名单**（空 = 所有会话都生效） */
+    const val CHAT_AUTO_HD_ALLOW = "chat.auto_hd_allow"
+
+    /** 自动加载原图的**排除名单**（排除优先于允许） */
+    const val CHAT_AUTO_HD_EXCLUDE = "chat.auto_hd_exclude"
+
+    /**
      * 自己的昵称 / 群昵称，用于判断「这条消息是不是 @了我」。
      *
      * 微信把 @ 渲染进通知正文（如 `verity: @V 3`），要认出 `@V` 里的 V 是不是自己，
@@ -292,6 +306,12 @@ object Prefs {
         PrefSpec(Keys.CHAT_MUTE_AT_ENABLED, PrefKind.SWITCH, "false", "聊天", "开启防止被@"),
         PrefSpec(Keys.CHAT_MUTE_AT_ALLOW, PrefKind.ENTER, "[]", "聊天", "设置允许名单"),
         PrefSpec(Keys.CHAT_MUTE_AT_EXCLUDE, PrefKind.ENTER, "[]", "聊天", "设置排除名单"),
+        PrefSpec(
+            Keys.CHAT_AUTO_HD_IMG, PrefKind.SWITCH, "false", "聊天",
+            "自动加载原图（收到图片就后台下原图，不用手点「查看原图」）"
+        ),
+        PrefSpec(Keys.CHAT_AUTO_HD_ALLOW, PrefKind.ENTER, "[]", "聊天", "原图：设置允许名单"),
+        PrefSpec(Keys.CHAT_AUTO_HD_EXCLUDE, PrefKind.ENTER, "[]", "聊天", "原图：设置排除名单"),
         // 判断「@我」用。留空则只认 @所有人（见 Keys.CHAT_AT_ALIASES 的注释）
         PrefSpec(Keys.CHAT_AT_ALIASES, PrefKind.TEXT, "", "聊天", "我的昵称（判断@我）"),
         PrefSpec(Keys.CHAT_DND_ENABLED, PrefKind.SWITCH, "false", "聊天", "免打扰"),

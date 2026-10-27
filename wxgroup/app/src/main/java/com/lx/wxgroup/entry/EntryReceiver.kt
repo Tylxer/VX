@@ -357,6 +357,35 @@ object EntryReceiver {
                                 "dump" -> for (l in com.lx.wxgroup.feature.SnsGuard.dump(n)) {
                                     LogX.i(l)
                                 }
+                                // R30 §6.2 取证：全表 sourceType 分布 + 候选谓词计数 + 是否多行
+                                // ⛔ 调试：直接改一行的 sourceType（"snsId:值"），只写显式指定的那一行
+                                "setsrc" -> {
+                                    val p = intent.getStringExtra("val").orEmpty().split(":")
+                                    val id = p.getOrNull(0)?.trim()?.toLongOrNull()
+                                    val v = p.getOrNull(1)?.trim()?.toIntOrNull()
+                                    if (id == null || v == null) {
+                                        LogX.w("SNS setsrc bad val (want '<snsId>:<value>')")
+                                    } else {
+                                        for (l in com.lx.wxgroup.feature.SnsGuard.setSrc(id, v)) LogX.i(l)
+                                    }
+                                }
+                                // --es sub srcmap [--es val "wxid_xxx"]：不带 val = 全表分布，带 val = 按作者查
+                                "srcmap" -> for (l in com.lx.wxgroup.feature.SnsGuard.srcMap(
+                                    intent.getStringExtra("val").orEmpty()
+                                )) {
+                                    LogX.i(l)
+                                }
+                                // R30 §6.2 取证：旁听 rawQuery，把含 SnsInfo 的真 SQL 打出来
+                                // `--es sub sqlspy --es sub2 on|off`，不带 sub2 只报状态
+                                "sqlspy" -> LogX.i(
+                                    if (sub2 == null) {
+                                        com.lx.wxgroup.feature.SnsSqlSpy.state()
+                                    } else {
+                                        com.lx.wxgroup.feature.SnsSqlSpy.enable(
+                                            sub2.equals("on", true),
+                                        )
+                                    },
+                                )
                                 "one" -> {
                                     val id = firstLong(intent, "id")
                                     for (l in com.lx.wxgroup.feature.SnsGuard.one(id)) LogX.i(l)
@@ -448,14 +477,114 @@ object EntryReceiver {
                                 // srcfix  = 执行一轮「快照 + 补位」（写微信库的 sourceType | 2）
                                 // srcfix + sub2=rollback = 按台账 fixed_orig 反向还原
                                 // ⚠️ 明细日志内部限流 50 行，最后一行是聚合结果
-                                "srcstat" -> for (l in com.lx.wxgroup.feature.SnsTimelineSourceFix
-                                    .stat()
-                                ) LogX.i(l)
+                                "srcstat" -> {
+                                    for (l in com.lx.wxgroup.feature.SnsTimelineSourceFix.stat()) LogX.i(l)
+                                    // R30 §6.2：写库瞬间补相册位的命中数（>0 才说明新路径活着）
+                                    LogX.i(com.lx.wxgroup.feature.SnsTimelineSourceFix.albumPatchStat())
+                                }
                                 "srcfix" -> {
-                                    val lines = if (sub2?.lowercase() == "rollback") {
-                                        com.lx.wxgroup.feature.SnsTimelineSourceFix.rollback()
-                                    } else {
-                                        com.lx.wxgroup.feature.SnsTimelineSourceFix.run()
+                                    val lines = when (sub2?.lowercase()) {
+                                        // ⛔ 只读：只批量 probe 台账里的行并打统计，**不写库、不写台账**。
+                                        //    必须显式列出 —— 缺了它 `sub2=stat` 会掉进最后的
+                                        //    `else -> run()`，而 `run()` 第一步就是 `snapshot()`
+                                        //    写可见台账、之后还会补位写微信库。R31 整晚我把它当
+                                        //    只读统计反复跑，等于反复重放「快照 + 补位」，
+                                        //    229 条 held 里有一部分就是这么来的。
+                                        "stat" ->
+                                            com.lx.wxgroup.feature.SnsTimelineSourceFix.stat()
+                                        "rollback" ->
+                                            com.lx.wxgroup.feature.SnsTimelineSourceFix.rollback()
+                                        // R30 §6.2：只给「被删又救回」的行补相册位(bit3)
+                                        "album" ->
+                                            com.lx.wxgroup.feature.SnsTimelineSourceFix.fixAlbum()
+                                        // R30 §6.2 补丁：把历史漏登记的救回行手动塞进窄台账
+                                        // （只登记不写库；--es val "id1,id2"）
+                                        "hold" -> {
+                                            val raw = intent.getStringExtra("val").orEmpty()
+                                            val ids = raw.split(',', ' ', '\n')
+                                                .mapNotNull { it.trim().toLongOrNull() }
+                                            for (l in com.lx.wxgroup.feature.SnsTimelineSourceFix
+                                                .hold(ids)
+                                            ) LogX.i(l)
+                                            emptyList<String>()
+                                        }
+                                        // 2026-10-28 事故善后：清掉「误登记」的 fixed_orig。
+                                        // 判据 `fixed_orig & 8 != 0`（合法补位的原值必然缺 bit8）。
+                                        // 不清的话正常动态会一直显示 `[删除已拦截]`。
+                                        "clean" -> {
+                                            val gdb = com.lx.wxgroup.data.GroupDb.current()
+                                            if (gdb == null) {
+                                                LogX.i("SNS clean: no module db")
+                                            } else {
+                                                val bad = gdb.countSrcFixedWithAlbumBit()
+                                                val n = gdb.cleanSrcFixedWithAlbumBit()
+                                                com.lx.wxgroup.feature.SnsTimelineSourceFix
+                                                    .invalidateAlbumIds()
+                                                com.lx.wxgroup.feature.SnsTag.invalidateIds()
+                                                LogX.i(
+                                                    "SNS clean bad=$bad cleared=$n " +
+                                                        "remaining=${gdb.countSrcFixed()}"
+                                                )
+                                            }
+                                            emptyList<String>()
+                                        }
+                                        // 只读诊断：拿微信自己那条 SQL 放大 limit 复现返回顺序，
+                                        // 看已删动态是否被 `limit 11` 挤出窗口（--ei n 放大到多少，默认 40）
+                                        "rank" -> {
+                                            val n = intent.getIntExtra("n", 40)
+                                            for (l in com.lx.wxgroup.feature.SnsGuard.rankSql(n)) {
+                                                LogX.i(l)
+                                            }
+                                            emptyList<String>()
+                                        }
+                                        // 只读诊断：打 sns.db 全部表结构（表名/行数/列名）
+                                        "sch" -> {
+                                            for (l in com.lx.wxgroup.feature
+                                                .SnsTimelineSourceFix.schema()) {
+                                                LogX.i(l)
+                                            }
+                                            emptyList<String>()
+                                        }
+                                        // 只读诊断：扫 sns.db 所有表，看一组 snsId 在哪些表里有行
+                                        // （正文不在 SnsInfo ⇒ 找承载正文的表；--es val "id1,id2"）
+                                        "tbl" -> {
+                                            val raw = intent.getStringExtra("val").orEmpty()
+                                            val ids = raw.split(',', ' ', '\n')
+                                                .mapNotNull { it.trim().toLongOrNull() }
+                                            for (l in com.lx.wxgroup.feature
+                                                .SnsTimelineSourceFix.scanTables(ids)) {
+                                                LogX.i(l)
+                                            }
+                                            emptyList<String>()
+                                        }
+                                        // 只读诊断：打一行的**全部列**（对比两条同构动态的差异；
+                                        // --es val "<snsId>"）
+                                        "cols" -> {
+                                            val id = intent.getStringExtra("val").orEmpty()
+                                                .trim().toLongOrNull()
+                                            if (id == null) {
+                                                LogX.i("SNSCOL bad val (--es val <snsId>)")
+                                            } else {
+                                                for (l in com.lx.wxgroup.feature
+                                                    .SnsTimelineSourceFix.dumpAllCols(id)) {
+                                                    LogX.i(l)
+                                                }
+                                            }
+                                            emptyList<String>()
+                                        }
+                                        // 只读诊断：一次打全 snsId 的 sourceType / localFlag
+                                        // （§6.2「补了位还是不显示」定位用；--es val "id1,id2"）
+                                        "dump" -> {
+                                            val raw = intent.getStringExtra("val").orEmpty()
+                                            val ids = raw.split(',', ' ', '\n')
+                                                .mapNotNull { it.trim().toLongOrNull() }
+                                            for (l in com.lx.wxgroup.feature.SnsTimelineSourceFix
+                                                .dumpRows(ids)
+                                            ) LogX.i(l)
+                                            emptyList<String>()
+                                        }
+                                        else ->
+                                            com.lx.wxgroup.feature.SnsTimelineSourceFix.run()
                                     }
                                     for (l in lines) LogX.i(l)
                                 }
@@ -732,6 +861,31 @@ object EntryReceiver {
                             val known = com.lx.wxgroup.data.Prefs.spec(k) != null
                             LogX.i("PROBE kv $k = ${com.lx.wxgroup.data.Kv.getString(k)}${if (known) "" else " (未登记)"}")
                         }
+                    }
+                    // wxid -> 昵称/备注（只读，取证里全是 wxid，必须翻成人能认的名字）
+                    // --es op who --es val "wxid_a,wxid_b"
+                    "who" -> {
+                        val v = intent.getStringExtra("val").orEmpty()
+                        io {
+                            for (l in com.lx.wxgroup.core.ContactSqlSource.who(v.split(","))) {
+                                LogX.i(l)
+                            }
+                        }
+                    }
+                    // ⭐ 通用只读 SQL 探针：--es op sql --es q "select …" [--ei n 60]
+                    // 取样（sns.db）为例。加它是为了不再「一个取证维度 = 一次编译装包装重启」。
+                    "sql" -> {
+                        val q = intent.getStringExtra("q").orEmpty()
+                        val n = intent.getIntExtra("n", 60)
+                        io {
+                            for (l in com.lx.wxgroup.feature.SnsGuard.runReadOnlySql(q, n)) {
+                                LogX.i(l)
+                            }
+                        }
+                    }
+                    // 自动加载原图：--es op hdimg --es sub stat
+                    "hdimg" -> {
+                        LogX.i(com.lx.wxgroup.feature.AutoHdImg.stat())
                     }
                     // A13 探针 convtop / A7 探针 marktest 已用完，随 ConvTopProbe 一起删除：
                     // 结论已固化在 ConvLayout 与 MarkRead 的注释里。

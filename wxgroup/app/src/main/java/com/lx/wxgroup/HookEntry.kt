@@ -23,13 +23,17 @@ import com.lx.wxgroup.entry.EntryReceiver
 import com.lx.wxgroup.feature.ConvFilter
 import com.lx.wxgroup.feature.AntiRevoke
 import com.lx.wxgroup.feature.AntiRevokeHint
+import com.lx.wxgroup.feature.AutoHdImg
 import com.lx.wxgroup.feature.ConvMenuInject
 import com.lx.wxgroup.feature.ForceForward
 import com.lx.wxgroup.feature.GroupBar
 import com.lx.wxgroup.feature.HintBadge
 import com.lx.wxgroup.feature.ScrollDock
+import com.lx.wxgroup.feature.SnsAlbumMerge
 import com.lx.wxgroup.feature.SnsGuard
+import com.lx.wxgroup.feature.SnsSqlSpy
 import com.lx.wxgroup.feature.SnsTag
+import com.lx.wxgroup.feature.SnsTimelineSourceFix
 import com.lx.wxgroup.feature.VoiceFileGuard
 import com.lx.wxgroup.feature.VoiceGuard
 import com.lx.wxgroup.feature.MomentsAuto
@@ -244,6 +248,45 @@ class HookEntry : IXposedHookLoadPackage {
         runCatching {
             SnsTag.install(lpparam)
         }.onFailure { LogX.e("SnsTag install failed", it) }
+
+        // ---- R30 §6.2 取证：SQL 旁听（默认关闭，`op=snsg sub=sqlspy sub2=on` 才记）----
+        // 目的：让微信自己把相册 `getUserMediaSql` 的 **真 SQL** 说出来。
+        // 静态反汇编读出的 `sourceType in (64)` 与真机数据矛盾（最新 50 行无一条等于 64，
+        // 且 10/130 组合值普遍存在 ⇒ 位掩码语义），不再靠猜。
+        runCatching {
+            SnsSqlSpy.install(lpparam.classLoader)
+        }.onFailure { LogX.e("SnsSqlSpy install failed", it) }
+
+        // ---- R30 §6.2/6.3：好友个人相册页也显示被删动态 ----
+        // ⛔ **暂不启用**（2026-10-27 21:2x）。原因：取证发现相册 UI 是**读库渲染**
+        //    （`qg3/i` 的 `d:List` 元素是 `SnsInfo` 存储实体），SQL 由
+        //    `SnsInfoStorage.getUserMediaSql` 生成：
+        //      `select *,rowid from SnsInfo WHERE <d2.x> AND type in (1, 15)`
+        //    其中 `d2.x` 是运行时按 `d2.E` 排除清单拼出的 sourceType 条件。
+        //    ⇒ 若该条件实际拦住的正是 `sourceType=0`，那**方案 B（补 sourceType=2）已经够**，
+        //      再往 `h3.N` 注入等于「先写库、再从库里读回来」，纯属绕路且会重复写行。
+        //    必须先在真机确认「进相册首屏到底有没有那 4 条已补位的动态」，再决定是否打开。
+        //    静态追 `d2.x` 的拼接链成本已超过收益（`<clinit>` 859 units + `Q0` 多层分发）。
+        // runCatching {
+        //     SnsAlbumMerge.install(lpparam)   // 响应注入方案：相册是读库渲染，注入 jc5.f 对 UI 无增量
+        // }.onFailure { LogX.e("SnsAlbumMerge install failed", it) }
+
+        // ⭐ R30 §6.2 改用「写库补相册位」：h3.N 的 after（写库后、读库前）把被删动态
+        //    的 sourceType 补上 bit3(8)，让它们满足相册 SQL 的 `sourceType in (…)` 白名单。
+        //    只补 `fixed_orig` 窄台账里的十几条，绝不扫全表（17.6 万条正常 src=2 会被误补）。
+        runCatching {
+            SnsTimelineSourceFix.installAlbumTrigger(lpparam)
+        }.onFailure { LogX.e("SnsTimelineSourceFix.installAlbumTrigger failed", it) }
+        // ⭐ 补位守不住：微信同步会把 10 打回 2 ⇒ 必须在同步结束（x2.onGYNetEnd）后再补一次
+        runCatching {
+            SnsTimelineSourceFix.installAlbumSyncTrigger(lpparam)
+        }.onFailure { LogX.e("SnsTimelineSourceFix.installAlbumSyncTrigger failed", it) }
+
+        // ---- 聊天·自动加载原图（默认关闭：chat.auto_hd_img）----
+        // 借微信自己下压缩图那一脚（t1 构造，downloadType=1）起跳，再调下载服务下原图（=0）。
+        runCatching {
+            AutoHdImg.install(lpparam)
+        }.onFailure { LogX.e("AutoHdImg install failed", it) }
 
         // ---- 防撤回·「已阻止撤回」角标（6.2 显示撤回提示的新实现，R21d 方案 1）----
         // 落点：会话页 adapter 的 onBindViewHolder（q3，super=androidx RecyclerView.Adapter）。

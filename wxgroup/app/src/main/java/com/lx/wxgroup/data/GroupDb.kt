@@ -512,6 +512,32 @@ class GroupDb private constructor(context: Context) :
         return out
     }
 
+    /**
+     * R30 §6.1「已删动态」标记用的**并集清单**。
+     *
+     * 微信有两条**互斥**的删除路径（2026-10-27 真机实测：两个集合**交集为 ∅**）：
+     * - 物理 `DELETE FROM SnsInfo` ⇒ 被 `SnsGuard` 拦下并写进 [T_SNS]（实测 8 条）；
+     * - `UPDATE SnsInfo SET sourceType=0` ⇒ 被 `SnsTimelineSourceFix` 补位，`fixed_orig` 留痕（实测 4 条）。
+     *
+     * ⇒ 只查任一边都会漏标，这里用 `UNION` 一次取全（12 条）。
+     *
+     * ⚠️ **不加 LIMIT**：`UNION` 没有 `ORDER BY` 时 LIMIT 取的是「任意 N 行」，
+     * 会让早期被删的动态**静默漏标**（与 [snsArchivedIds] 同一理由）。这里只读一个
+     * INTEGER 列，全量扫的代价远小于漏标。
+     */
+    fun snsTagIds(): Set<Long> = runCatching {
+        val out = HashSet<Long>(256)
+        readableDatabase.rawQuery(
+            "SELECT sns_id FROM $T_SNS UNION SELECT sns_id FROM $T_SRC WHERE fixed_orig IS NOT NULL",
+            null,
+        ).use { c ->
+            val i = c.getColumnIndexOrThrow("sns_id")
+            while (c.moveToNext()) out.add(c.getLong(i))
+        }
+        out
+    }.onFailure { LogX.w("GroupDb snsTagIds failed: ${it.javaClass.simpleName}") }
+        .getOrDefault(emptySet())
+
     fun deleteSnsArchive(snsId: Long) {
         writableDatabase.delete(T_SNS, "sns_id=?", arrayOf(snsId.toString()))
     }
@@ -639,6 +665,41 @@ class GroupDb private constructor(context: Context) :
         runCatching { writableDatabase.update(T_SRC, values, "sns_id=?", arrayOf(snsId.toString())) }
             .onFailure { LogX.w("GroupDb clearSrcFixed failed: ${it.javaClass.simpleName}") }
     }
+
+    /**
+     * 清洗「误登记」的 `fixed_orig`（2026-10-28 事故善后）。
+     *
+     * ## 为什么可以用 `fixed_orig & 8` 当判据
+     * `fixed_orig` 的**合法语义**只有一个：`fixAlbum` 真的执行了 `UPDATE sourceType = src|8`
+     * 时记下的「补位前原值」。既然原值都需要补 bit8，那它**必然不含 bit8**
+     * （含了就不需要补，走的是 already 分支、不记账）。
+     *
+     * ⇒ `(fixed_orig & 8) != 0` 的行在合法流程下**不存在**，只可能来自
+     *   2026-10-27 晚那次「already 分支也 markSrcFixed」的错误改动。
+     *
+     * ## 为什么必须清
+     * `fixed_orig IS NOT NULL` 同时是「已删除」判据（见 [snsTagIds]）。被误登记的正常动态
+     * 会被 SnsTag 当成已删，在时间线/好友主页上被标 `[删除已拦截]`（真机报障原样）。
+     *
+     * @return 清掉的行数；-1 = 写库失败
+     */
+    fun cleanSrcFixedWithAlbumBit(): Int = runCatching {
+        writableDatabase.update(
+            T_SRC,
+            ContentValues().apply { putNull("fixed_orig") },
+            "fixed_orig IS NOT NULL AND (fixed_orig & 8) != 0",
+            null
+        )
+    }.onFailure { LogX.w("GroupDb cleanSrcFixedWithAlbumBit failed: ${it.javaClass.simpleName}") }
+        .getOrDefault(-1)
+
+    /** 诊断用：当前有多少行 `fixed_orig` 含 bit8（= 待清洗的误登记） */
+    fun countSrcFixedWithAlbumBit(): Int = runCatching {
+        readableDatabase.rawQuery(
+            "SELECT COUNT(*) FROM $T_SRC WHERE fixed_orig IS NOT NULL AND (fixed_orig & 8) != 0",
+            null
+        ).use { c -> if (c.moveToFirst()) c.getInt(0) else 0 }
+    }.onFailure { 0 }.getOrDefault(0)
 
     fun countVisibleSrc(): Int = runCatching {
         readableDatabase.rawQuery("SELECT COUNT(*) FROM $T_SRC", null).use { c ->
