@@ -8,7 +8,9 @@ package com.lx.wxgroup.feature
  * 只执行 `UPDATE SnsInfo SET sourceType = sourceType & -3`（`-3 = ~2`，只清 bit1）——
  * 行、`content`、`localFlag` 全都不动，但这一行从此不进时间线。
  *
- * ⇒ 修复 = 把 bit1 补回去（`sourceType | 2`）。
+ * ⇒ 修复 = 把 bit1 补回去。**R30（2026-10-27）追加 bit3（相册位）**，见 [ALBUM_BIT]：
+ * 只补 bit1 的动态进得了时间线、**进不了好友相册页**，两处门槛不同（真机 SQL 已证）。
+ * 故实际写回值是 `sourceType | 10`（[FIX_BITS]）。
  *
  * ## 唯一可信判据：「这行曾经 bit1=1」
  * 光看「现在是 0」绝不能补：`src=0`（死来源）和 `src=4`（自己发的私密）**本来就不是 0 的
@@ -28,6 +30,26 @@ object SnsTimelineSrcLogic {
 
     /** 自己发的私密位（bit2，`src=4`）。**永远不补** */
     const val PRIVATE_BIT = 4
+
+    /**
+     * 相册可见位（bit3，`src=8`）。
+     *
+     * ⭐ **2026-10-27 R30 真机定案**（`op=snsg sub=sqlspy` 抓到微信自己的取数 SQL）：
+     * 好友个人相册页的 WHERE 是
+     * `SnsInfo.userName="…" AND (sourceType in (8,264,10,266,12,268,14,270,…,222,478))`，
+     * 那 64 个候选值**全部含 bit3**，且只组合自 bit1/2/3(4,8)/bit4(16)/bit6(64)/bit7(128) 与 +256。
+     *
+     * ⇒ 只补 bit1 的动态进得了时间线，**进不了相册**（这正是 R30 §6.2 的病根）。
+     */
+    const val ALBUM_BIT = 8
+
+    /**
+     * 补位时**一起置**的位：时间线(bit1) + 相册(bit3) = `10`。
+     *
+     * `10` 同时满足两个门槛：`& 2 != 0`（时间线）且在相册白名单里（含 bit3）。
+     * 其它位原样保留 ⇒ 对既有行为是纯增量。
+     */
+    const val FIX_BITS = TIMELINE_BIT or ALBUM_BIT
 
     /** 单页扫描行数（键集分页，与 `SnsGuard.listCurrentSns` 同量级） */
     const val PAGE_SIZE = 100
@@ -80,9 +102,9 @@ object SnsTimelineSrcLogic {
             (s.contains("update") || s.contains(" set "))
     }
 
-    /** 我们自己补位、回滚写的 SQL（`sourceType = sourceType | 2`）—— 采样时要排除，否则日志被自己刷满 */
+    /** 我们自己补位、回滚写的 SQL（`sourceType = sourceType | 10`）—— 采样时要排除，否则日志被自己刷满 */
     private val OWN_FIX_SQL_RE =
-        Regex("""sourcetype\s*=\s*\(?\s*sourcetype\s*\|\s*\(?\s*2\b""")
+        Regex("""sourcetype\s*=\s*\(?\s*sourcetype\s*\|\s*\(?\s*(?:10|2)\b""")
 
     fun isOwnFixSql(sql: String?): Boolean {
         if (sql.isNullOrBlank()) return false
@@ -104,6 +126,9 @@ object SnsTimelineSrcLogic {
     /** 私密位是否在（`src=4` / `6` 等） */
     fun isPrivate(sourceType: Int): Boolean = (sourceType and PRIVATE_BIT) != 0
 
+    /** 这一行现在会不会出现在好友个人相册页（相册白名单全部含 bit3） */
+    fun isAlbumVisible(sourceType: Int): Boolean = (sourceType and ALBUM_BIT) != 0
+
     /**
      * 补位判据（**两条硬约束的落地点**）。
      *
@@ -114,20 +139,33 @@ object SnsTimelineSrcLogic {
     fun shouldFix(current: Int, everVisible: Boolean): Boolean =
         everVisible && !isTimelineVisible(current) && !isPrivate(current)
 
+    /**
+     * **相册位**补位判据：只问 bit3，不问 bit1。
+     *
+     * ⛔⛔ **只能对被删台账那个窄集合调用**（[callers] 见 `SnsTimelineSourceFix.fixAlbum`，
+     * 入参是 `fixed_orig IS NOT NULL` 的十几条）。**绝不能**喂给广谱的「曾经可见」台账：
+     * 真机 `SnsInfo` 里有 **17.6 万条 `sourceType=2`** 的**正常**动态（只有时间线位、
+     * 无相册位 —— 微信本来就不让它们进个人相册）。2026-10-27 误把这条判据接到广谱路径上，
+     * 一夜之间给几百条正常动态补了 bit8，它们全部涌进好友相册、`[删除已拦截]` 也跟着乱标。
+     * **教训：判据本身没有对错，是调用点决定它是修复还是破坏。**
+     */
+    fun shouldFixAlbum(current: Int, everVisible: Boolean): Boolean =
+        everVisible && !isAlbumVisible(current) && !isPrivate(current)
+
     /** 补位要写的目标值（幂等：已可见时等于原值，写不出变化） */
-    fun fixTarget(current: Int): Int = current or TIMELINE_BIT
+    fun fixTarget(current: Int): Int = current or FIX_BITS
 
     /**
      * 回滚要写的目标值。
      *
      * 优先还原台账里记下的**补位前原值**（`fixed_orig`）；没有记录（老台账 / 手工清过）时
-     * 退化为「只清 bit1」—— 与微信自己的 `& -3` 语义一致，绝不动其它位。
+     * 退化为「清掉补位时置过的位」（[FIX_BITS] = bit1 + bit3）—— 绝不动其它位。
      *
      * ⚠️ `orig` 若自己带 bit1（理论上不该有，补位前必然是 0），说明台账被写脏了，
      * 此时**不信 orig**：照它写回去等于没回滚。
      */
     fun rollbackTarget(current: Int, orig: Int?): Int =
-        if (orig != null && !isTimelineVisible(orig)) orig else current and TIMELINE_BIT.inv()
+        if (orig != null && !isTimelineVisible(orig)) orig else current and FIX_BITS.inv()
 
     /**
      * 台账里这条记录的「曾经可见」判定（快照写入时用，读台账时也用它复核）。

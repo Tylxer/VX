@@ -1,6 +1,5 @@
 package com.lx.wxgroup.feature
 
-import android.graphics.Color
 import android.os.Handler
 import android.os.Looper
 import android.os.SystemClock
@@ -12,7 +11,6 @@ import android.widget.TextView
 import com.lx.wxgroup.data.GroupDb
 import com.lx.wxgroup.data.Keys
 import com.lx.wxgroup.data.Kv
-import com.lx.wxgroup.ui.UiKit
 import com.lx.wxgroup.util.LogX
 import de.robv.android.xposed.XC_MethodHook
 import de.robv.android.xposed.XposedBridge
@@ -65,7 +63,6 @@ object SnsTag {
 
     /** 我们加的标记 View 的 tag，用来识别/摘除 */
     private const val MARK = "wxgroup.sns.deleted.tag"
-    private const val LABEL = "[已删除]"
 
     /** 微信的 RecyclerView 适配器基类：**没有混淆**，可以直接按名字找 */
     private const val ADAPTER_CLASS = "com.tencent.mm.view.recyclerview.WxRecyclerAdapter"
@@ -93,9 +90,6 @@ object SnsTag {
     private val sweepScheduled = AtomicBoolean(false)
 
     @Volatile private var dbWarned = false
-    @Volatile private var lpWarned = false
-    @Volatile private var andWarned = false
-    @Volatile private var hostWarned = false
 
     /** 自诊断：静默失效全靠这几个数定位（binds>0 才说明钩子活着） */
     @Volatile private var binds = 0      // 所有 adapter 的回调次数（钩子存活）
@@ -105,8 +99,6 @@ object SnsTag {
     @Volatile private var missed = 0
     @Volatile private var lastMiss = ""
 
-    private val added = AtomicInteger(0)
-    private val logged = AtomicInteger(0)
     private val miscLogged = AtomicInteger(0)
     private val errLogged = AtomicInteger(0)
 
@@ -212,17 +204,15 @@ object SnsTag {
     }
 
     /**
-     * 开关语义：标签的**数据源**是 `sns_archive`，而 `sns_archive` 只由 SnsGuard
-     * （受 [Keys.ANTIREVOKE_SNS] 控制）写入 → 防删除没开就不会有新归档，两个都开才生效。
+     * 开关语义。
+     *
+     * ⭐ R30 拍板（2026-10-27 02:41）：**灰色小字 + 同一个开关**，复用 [Keys.ANTIREVOKE_SNS]，
+     * 不新增 Key。所以这里只看防删除开关，**不再要求** `antirevoke.sns_deleted_tag`。
+     * （那个 Key 保留在设置里不删，避免设置项突然消失；但已不参与判定。）
      */
     fun refresh() {
         val guard = Kv.getBool(Keys.ANTIREVOKE_SNS)
-        val tag = Kv.getBool(Keys.ANTIREVOKE_SNS_DELETED_TAG)
-        enabled = guard && tag
-        if (tag && !guard && !andWarned) {
-            andWarned = true
-            LogX.w("SNS_TAG: tag switch on but ANTIREVOKE_SNS off -> no data source")
-        }
+        enabled = guard
         cfgAt = SystemClock.elapsedRealtime()
         setAt = 0L // 顺手让「已删清单」也重读
         // 验证用的强制集合只能由探针设置，开关一变就清掉，绝不能让它在正常运行里残留
@@ -276,8 +266,9 @@ object SnsTag {
         val pos = param.args?.getOrNull(1) as? Int ?: return
         snsBinds++
         if (!on()) {
-            // 开关关着时不再解析，但要记得把可能残留的标签摘掉
-            runCatching { itemViewOf(holder)?.let { ensure(it, false) } }
+            // 开关关着时不再解析，但要记得把可能残留的时间标记剥掉
+            // （snsId 未知 → 传 0L ⇒ isTagged 恒 false ⇒ 只还原）
+            runCatching { itemViewOf(holder)?.let { SnsDeletedTag.apply(it, 0L, emptySet()) } }
             return
         }
 
@@ -290,13 +281,15 @@ object SnsTag {
             return
         }
 
-        // 解析不出「这是哪条动态」时，必须**顺手清掉这个 View 上的旧标签**：
-        // item 是复用的，留着旧绑定会让标签跟着错位到别的动态上
+        // 解析不出「这是哪条动态」时，必须**顺手清掉这个 View 上的旧标记**：
+        // item 是复用的，留着旧绑定会让标记跟着错位到别的动态上。
+        // ⚠️ 不能靠 realTimeUpdate 自愈——它只重写「几分钟前」这类实时文案，
+        //   老动态的「昨天 / 3月5日」根本不会被重写，残留标记会永久串味。
         val info = resolve(adapter, pos, itemView)
         if (info == null) {
             missed++
             bound.remove(itemView)
-            runCatching { ensure(itemView, false) }
+            runCatching { SnsDeletedTag.apply(itemView, 0L, emptySet()) }
             return
         }
         resolved++
@@ -569,12 +562,15 @@ object SnsTag {
         val snap = snapshot()
         if (snap.isEmpty()) return
         val del = if (on()) deleted() else emptySet()
+        // 呈现改为时间文案追加（不再 ensure 加绿色 TextView）。开关关着时按空清单处理
+        // = 全还原。forceSet 是验证探针，正常恒空：Set.plus 空集合原样返回 del，零分配。
+        val tagged = if (on()) del + forceSet else emptySet()
         for ((v, id) in snap) {
             if (!v.isAttachedToWindow) {
                 synchronized(bound) { bound.remove(v) }
                 continue
             }
-            ensure(v, if (on()) isDeleted(id, del) else false)
+            SnsDeletedTag.apply(v, id, tagged)
         }
     }
 
@@ -590,13 +586,24 @@ object SnsTag {
         return out
     }
 
+    /**
+     * 让「已删清单」缓存失效，下一拍重读。
+     *
+     * 存在的理由：台账被**外部**改动时（`op=snsg sub=srcfix sub2=clean` 清洗误登记的
+     * `fixed_orig`、`setsrc` 定向改值）本类毫不知情，只靠 5 秒 TTL 兜底会让用户
+     * 「清完还挂着标记」看几秒。探针里显式调一次，验收判据才能立刻变。
+     */
+    fun invalidateIds() {
+        setAt = 0L
+    }
+
     /** 已救下（= 被删过）的动态清单 */
     private fun deleted(): Set<Long> {
         val now = SystemClock.elapsedRealtime()
         if (setAt != 0L && now - setAt < SET_TTL_MS) return delSet
 
         // 首屏必须同步拿一次，否则进朋友圈第一屏一个标签都没有。
-        // ⚠️ 只查 sns_id 一列（GroupDb.snsArchivedIds），绝不读 content/attrBuf/postBuf
+        // ⚠️ 只查 sns_id 一列（GroupDb.snsTagIds），绝不读 content/attrBuf/postBuf
         // 三个 BLOB —— 那会把十几 MB 读进主线程，滚动时必然掉帧。
         if (!firstLoad) {
             val s = loadIds()
@@ -632,7 +639,10 @@ object SnsTag {
             }
             return delSet
         }
-        return runCatching { db.snsArchivedIds() }
+        // ⚠️ 数据源换成并集 snsTagIds()（实测 12 条 vs 原 snsArchivedIds 8 条）：
+        // 微信删动态有两条**互斥**路径（物理 DELETE 归档 vs UPDATE sourceType=0 补位），
+        // 两集合交集为 ∅，只查任一边都会漏标。详见 GroupDb.snsTagIds 的 KDoc。
+        return runCatching { db.snsTagIds() }
             .onFailure { LogX.w("SNS_TAG ids failed: ${it.javaClass.simpleName}") }
             .getOrDefault(delSet)
     }
@@ -649,121 +659,17 @@ object SnsTag {
 
     private fun isDeleted(id: Long, del: Set<Long>): Boolean = id in del || id in forceSet
 
+    /**
+     * 呈现：不再往 itemView 末尾 addView 绿色 `[已删除]` TextView（用户拍板：同一条
+     * 动态不能同时出现两个标记），统一改成在时间文案后面追加灰色 `[删除已拦截]`。
+     * 具体动作在 [SnsDeletedTag.apply]；这里只负责判定 + 命中计数。
+     */
     private fun apply(host: View, id: Long) {
-        val show = isDeleted(id, deleted())
-        if (show) hits++
-        if (!ensure(host, show)) {
-            host.post { runCatching { ensure(host, show) } }
-        }
-    }
-
-    /**
-     * 幂等：状态一致就什么都不做，绝不重复创建 TextView。
-     * @return true = 已按目标状态处理过；false = 因为还没 attach / host 不是容器等原因没动
-     */
-    private fun ensure(host: View, show: Boolean): Boolean {
-        val target = host as? ViewGroup
-        if (target == null) {
-            if (!hostWarned) {
-                hostWarned = true
-                LogX.w("SNS_TAG: host not ViewGroup: ${host.javaClass.name}")
-            }
-            return false
-        }
-        if (!target.isAttachedToWindow) return false
-        // ⚠️ 防御：往 RecyclerView 里直接 addView 会绕开 LayoutManager 的 child 管理，
-        // 实测会把微信搞崩（进程重启）。host 选错时宁可什么都不做。
-        if (isRv(target)) {
-            logOnce("SNS_TAG: refuse to label Rv, host=${target.javaClass.name}")
-            return true
-        }
-        var has = false
-        for (i in target.childCount - 1 downTo 0) {
-            val c = runCatching { target.getChildAt(i) }.getOrNull() ?: continue
-            if (MARK == c.tag) { // ⚠️ 用 equals 不用 ===：不依赖常量池驻留
-                if (show) has = true else target.removeViewAt(i)
-            }
-        }
-        if (!show || has) return true
-        val tv = TextView(target.context).apply {
-            text = LABEL
-            setTextColor(Color.parseColor("#E64340"))
-            textSize = 12f
-            tag = MARK
-            // 给个 id：部分 ConstraintLayout 版本对 NO_ID 子 View 的约束解析不稳
-            id = View.generateViewId()
-            isClickable = false // 别吃掉 item 的点击
-            isFocusable = false
-            importantForAccessibility = View.IMPORTANT_FOR_ACCESSIBILITY_NO
-            setPadding(UiKit.dp(target.context, 6), 0, 0, UiKit.dp(target.context, 2))
-        }
-        // ⚠️ 绝不能 addView(v, null)：null LP 会走到 generateLayoutParams(null)，
-        // 自定义 ViewGroup 上可能 NPE，AOSP 的 setLayoutParams(null) 也会抛 IAE。
-        // 拿不到合适的 LP 时宁可走单参版（让宿主 generateDefaultLayoutParams() 决定）。
-        //
-        // ⚠️ 位置必须插到 **index 0**（垂直 LinearLayout 时 = 顶部）。
-        // 默认 addView 是追加到末尾 → 标签跑到底部，视觉上紧贴**下一条**动态，
-        // 看着像给别人打的标（实测踩过）。
-        val lp = labelParams(target)
-        runCatching {
-            when {
-                target is LinearLayout -> target.addView(tv, 0, lp)
-                lp == null -> target.addView(tv, 0)
-                else -> target.addView(tv, lp) // FrameLayout/ConstraintLayout 靠 gravity/约束定位
-            }
-        }.onFailure { e ->
-            logOnce("SNS_TAG addView failed: ${e.javaClass.simpleName}")
-            runCatching { target.addView(tv) }
-        }
-        val n = added.incrementAndGet()
-        if (logged.get() < LOG_MAX && logged.incrementAndGet() <= LOG_MAX) {
-            LogX.i("SNS_TAG label added #$n host=${target.javaClass.name}")
-        }
-        return true
-    }
-
-    /**
-     * 显式 LayoutParams。LinearLayout / FrameLayout / ConstraintLayout 各有各的写法，
-     * 其余容器退回不带 LP（让宿主 `generateDefaultLayoutParams()` 决定）。
-     */
-    private fun labelParams(target: ViewGroup): ViewGroup.LayoutParams? {
-        val ctx = target.context
-        val px = UiKit.dp(ctx, 12)
-        val top = UiKit.dp(ctx, 4)
-        when (target) {
-            is LinearLayout -> return LinearLayout.LayoutParams(
-                ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT
-            ).apply { leftMargin = px; topMargin = top }
-            is FrameLayout -> return FrameLayout.LayoutParams(
-                ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT,
-                android.view.Gravity.END or android.view.Gravity.TOP
-            ).apply { rightMargin = px; topMargin = top }
-        }
-        // ConstraintLayout：模块编译期没有这个依赖 → 只能反射造 LP 并设约束
-        // （不管的话默认 LP 会把标签甩到左上角压住头像）
-        if (target.javaClass.name.contains("ConstraintLayout")) {
-            runCatching {
-                val cls = Class.forName(
-                    "androidx.constraintlayout.widget.ConstraintLayout\$LayoutParams",
-                    false, target.javaClass.classLoader
-                )
-                val w = ViewGroup.LayoutParams.WRAP_CONTENT
-                val lp = cls.getConstructor(
-                    Int::class.javaPrimitiveType, Int::class.javaPrimitiveType
-                ).newInstance(w, w) as ViewGroup.LayoutParams
-                // PARENT_ID == 0（不是 -1！-1 是 UNSET，等于没约束 → 标签甩到左上角）
-                XposedHelpers.setIntField(lp, "topToTop", 0)
-                XposedHelpers.setIntField(lp, "endToEnd", 0)
-                XposedHelpers.setIntField(lp, "leftMargin", px)
-                XposedHelpers.setIntField(lp, "topMargin", top)
-                return lp
-            }.onFailure { logOnce("SNS_TAG: constraint LP failed: ${it.javaClass.simpleName}") }
-        }
-        if (!lpWarned) {
-            lpWarned = true
-            LogX.w("SNS_TAG: no explicit LP for ${target.javaClass.name}, use default")
-        }
-        return null
+        val del = deleted()
+        if (isDeleted(id, del)) hits++
+        // del + forceSet：验证探针设的 forceSet 也要走时间标记。正常运行时 forceSet
+        // 恒空，Set.plus 空集合原样返回 del，零分配。
+        SnsDeletedTag.apply(host, id, del + forceSet)
     }
 
     // ------------------------------------------------------------------ 真机验证入口
@@ -773,7 +679,8 @@ object SnsTag {
         val snap = snapshot()
         forceSet = snap.mapTo(HashSet()) { it.second }
         cfgAt = SystemClock.elapsedRealtime() // 别让 on() 立刻 refresh 把 forceSet 清掉
-        for ((v, _) in snap) runCatching { ensure(v, true) }
+        // 探针必须和被测对象走同一条路：apply()（时间标记），否则验的不是新呈现
+        for ((v, id) in snap) runCatching { apply(v, id) }
         return "SNS_TAG markVisible n=${forceSet.size}"
     }
 
@@ -796,7 +703,7 @@ object SnsTag {
         forceSet = setOf(id)
         setAt = 0L
         cfgAt = SystemClock.elapsedRealtime()
-        for ((v, vId) in snapshot()) runCatching { ensure(v, isDeleted(vId, delSet)) }
+        for ((v, vId) in snapshot()) runCatching { apply(v, vId) }
         return "SNS_TAG fake u=$raw s=$id"
     }
 
@@ -826,11 +733,12 @@ object SnsTag {
      * ② `snsBinds>0` —— 朋友圈限定生效吗（binds 大而 snsBinds=0 = 类名前缀写错）
      * ③ `resolved≈snsBinds` —— 解析通吗（差得多就看 lastMiss）
      * ④ `hits>0` —— 清单/符号对吗（解析全通但 hits=0 = 归档里的 id 与解析出的 id 位模式对不上）
-     * ⑤ `added>0` —— 真的贴上去了吗（hits 有值但 added=0 = host 不是 ViewGroup / 没 attach）
+     * ⑤ `missedTime>0` —— hits 有值但界面上标记没出现时，看这个：>0 说明反射取不到
+     *    时间控件（getPublishTimeText()/字段 o 漂移），不是判定错
      */
     fun stat(): String = "SNS_TAG stat enabled=${on()} " +
         "guard=${Kv.getBool(Keys.ANTIREVOKE_SNS)} tag=${Kv.getBool(Keys.ANTIREVOKE_SNS_DELETED_TAG)} " +
         "deleted=${delSet.size} bound=${synchronized(bound) { bound.size }} " +
-        "added=${added.get()} binds=$binds sns=$snsBinds resolved=$resolved " +
-        "missed=$missed hits=$hits lastMiss=$lastMiss"
+        "binds=$binds sns=$snsBinds resolved=$resolved " +
+        "missed=$missed hits=$hits missedTime=${SnsDeletedTag.missedTimeCount()} lastMiss=$lastMiss"
 }

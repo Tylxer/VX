@@ -90,6 +90,19 @@ class SnsTimelineSrcLogicTest {
     }
 
     @Test
+    fun albumFixIsScopedToLedgerNotToAllRows() {
+        // ⛔ 2026-10-27 真机事故：一度把 `shouldFix` 改成「缺 bit8 也补」，
+        // 而库里有 17.6 万条正常的 sourceType=2 —— 一夜之间给几百条正常动态补了相册位，
+        // 它们全部涌进好友个人相册。⇒ **时间线补位判据只认 bit1**，与相册位彻底解耦。
+        assertFalse(SnsTimelineSrcLogic.shouldFix(current = 2, everVisible = true))
+        // 相册位补位是**独立的窄口径**判据，只对「被删又救回」台账调用：
+        assertTrue(SnsTimelineSrcLogic.shouldFixAlbum(current = 2, everVisible = true))
+        assertFalse(SnsTimelineSrcLogic.shouldFixAlbum(current = 10, everVisible = true)) // 幂等
+        assertFalse(SnsTimelineSrcLogic.shouldFixAlbum(current = 6, everVisible = true)) // 私密位不接手
+        assertFalse(SnsTimelineSrcLogic.shouldFixAlbum(current = 2, everVisible = false))
+    }
+
+    @Test
     fun fixesAdRowThatLostTimelineBit() {
         // 130(128|2) 被清成 128：台账里有 130 ⇒ 应当补回 130（维持用户原本看得见的状态）
         assertTrue(SnsTimelineSrcLogic.shouldFix(current = 128, everVisible = true))
@@ -98,13 +111,32 @@ class SnsTimelineSrcLogicTest {
     // ------------------------------------------------------------------ 目标值
 
     @Test
-    fun fixTargetOnlySetsTimelineBit() {
-        assertEquals(2, SnsTimelineSrcLogic.fixTarget(0))
-        assertEquals(130, SnsTimelineSrcLogic.fixTarget(128))
+    fun fixTargetSetsTimelineAndAlbumBits() {
+        // R30：补位 = bit1(时间线) + bit3(相册) ⇒ 0 -> 10
+        assertEquals(10, SnsTimelineSrcLogic.fixTarget(0))
         // 幂等
-        assertEquals(2, SnsTimelineSrcLogic.fixTarget(2))
-        // 只追加 bit1，其它位一个都不动（广告位 128 必须留着）
-        assertEquals(130, SnsTimelineSrcLogic.fixTarget(128))
+        assertEquals(10, SnsTimelineSrcLogic.fixTarget(10))
+        // 微信只清 bit1 的情形：8(相册) -> 10
+        assertEquals(10, SnsTimelineSrcLogic.fixTarget(8))
+        // 其它位一个都不动（折叠位 128 必须留着）
+        assertEquals(138, SnsTimelineSrcLogic.fixTarget(128))
+        // 私密位在时 shouldFix 已先挡掉，这里只验证不误清
+        assertEquals(14, SnsTimelineSrcLogic.fixTarget(4))
+    }
+
+    @Test
+    fun fixTargetValueIsInAlbumWhitelist() {
+        // 真机抓到的相册白名单片段（含 10 / 14 / 12 / 138 / 12+256 等）
+        val albumWhitelist = setOf(8, 10, 12, 14, 24, 26, 28, 30, 72, 74, 76, 78, 136, 138, 266, 264, 268, 270)
+        for (cur in listOf(0, 2, 8, 10, 16, 64, 128, 130, 256)) {
+            val fixed = SnsTimelineSrcLogic.fixTarget(cur)
+            assertTrue(
+                "fixTarget($cur)=$fixed 不在相册白名单里",
+                fixed in albumWhitelist,
+            )
+            // 同时必须仍然通过时间线门槛
+            assertTrue("fixTarget($cur)=$fixed 丢了时间线位", (fixed and 2) != 0)
+        }
     }
 
     // ------------------------------------------------------------------ 回滚

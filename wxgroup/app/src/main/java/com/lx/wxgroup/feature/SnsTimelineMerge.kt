@@ -26,8 +26,11 @@ import java.util.concurrent.atomic.AtomicInteger
  *   └─ IEvent.d() 发布 → UI 渲染
  * ```
  * 在 `N` 执行**前**把对象 `add` 进 `zb5.f`，它就会随「写库 + 事件 + 渲染」全链路走完。
- * `c3` = `NetSceneSnsTimeLine`（getType=211），个人相册走 `h3`(212) / `k3`(5203)，
+ * `c3` = `NetSceneSnsTimeLine`（getType=211），个人相册走 `h3`(212)，
  * **根本不经过 `c3.N`**，所以天然只命中时间线、不会误伤相册。
+ * ⚠️ 2026-10-27 订正：原文写的 `k3`(5203) **不是**个人相册 —— 它是
+ *   `NetSceneSnsWwUserPage`（CGI `mmsnswwuserpage`，ww=WeWork）⇒ 企业微信朋友圈。
+ *   好友相册通路取证见 `docs/_r30_lane2_album_page.md`。
  *
  * ## ⭐ 对象不用手拼：`attrBuf` 就是 SnsObject 的序列化
  * 微信自己在 `l5.f` / `l5.e`（读）里就是 `new SnsObject().parseFrom(attrBuf)`，
@@ -61,6 +64,9 @@ object SnsTimelineMerge {
     private val parseFail = AtomicInteger(0)
     private val emptyBuf = AtomicInteger(0)
     private val noDb = AtomicInteger(0)
+
+    /** 空响应被跳过的次数（真机上 `c3.N` 会被每秒调用，正常现象） */
+    private val emptyResp = AtomicInteger(0)
 
     /** 首次命中 `c3.N` 时打一条日志（区分「钩子没触发」与「无需注入」） */
     private val firstHit = java.util.concurrent.atomic.AtomicBoolean(false)
@@ -124,6 +130,14 @@ object SnsTimelineMerge {
             respIds.add(runCatching { XposedHelpers.getLongField(o, "Id") }.getOrDefault(0L))
             times.add(runCatching { XposedHelpers.getIntField(o, "CreateTime") }.getOrDefault(0))
         }
+        // ⛔ 空响应不注入。真机实测：进朋友圈后 `c3.N` 会被**每秒一次**地反复调用，
+        //    且传入的 `zb5.f` 是空列表（增量/心跳类请求）。往空列表里塞 4 条会让
+        //    attempt 从 4 涨到 56（52 次无用注入 × 4 次 SQL），白烧 CPU 还可能被写库。
+        //    首屏/刷新的正常响应一定非空，所以这条闸不会误伤主路径。
+        if (list.isEmpty()) {
+            emptyResp.incrementAndGet()
+            return
+        }
         // ⛔ 反静默失效：首次命中必须留下痕迹，否则「钩子没触发」和「触发了但无需注入」无法区分
         if (firstHit.compareAndSet(false, true)) {
             LogX.i("$TAG first hit: respIds=${respIds.size} times=${times.size}")
@@ -174,7 +188,8 @@ object SnsTimelineMerge {
         }
         LogX.i(
             "$TAG-STAT attempt=${attempt.get()} ok=${ok.get()} parseFail=${parseFail.get()} " +
-                "emptyBuf=${emptyBuf.get()} noDb=${noDb.get()} resp=${respIds.size}"
+                "emptyBuf=${emptyBuf.get()} emptyResp=${emptyResp.get()} noDb=${noDb.get()} " +
+                "resp=${respIds.size}"
         )
     }
 
@@ -220,6 +235,7 @@ object SnsTimelineMerge {
     /** 探针：注入统计（`op=snsa sub=stat`） */
     fun stat(): List<String> = listOf(
         "$TAG-STAT attempt=${attempt.get()} ok=${ok.get()} parseFail=${parseFail.get()} " +
-            "emptyBuf=${emptyBuf.get()} noDb=${noDb.get()} switch=${enabled()}"
+            "emptyBuf=${emptyBuf.get()} emptyResp=${emptyResp.get()} noDb=${noDb.get()} " +
+            "switch=${enabled()}"
     )
 }

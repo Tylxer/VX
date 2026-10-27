@@ -288,6 +288,24 @@ object SnsGuard {
     /** 「取不到 sourceType」的告警只打一次，避免刷屏 */
     private val cvWarned = java.util.concurrent.atomic.AtomicBoolean(false)
 
+    /**
+     * 从 `updateWithOnConflict` 的参数里抠 snsId。
+     *
+     * 签名是 `(table, values, whereClause, whereArgs, conflictAlgorithm)`，但 wcdb 有多个
+     * 重载，所以不赌下标：**只认「某个参数是长度 1 的数组、且唯一元素能 parseLong」**。
+     * 抠不出返回 0（= 哨兵，调用方直接放弃补位，绝不去猜一个 id 来改库）。
+     */
+    private fun snsIdOf(a: Array<Any?>): Long {
+        for (i in 2 until a.size) {
+            val arr = a[i] as? Array<*> ?: continue
+            if (arr.size != 1) continue
+            val s = arr[0]?.toString() ?: continue
+            val v = s.toLongOrNull() ?: continue
+            if (v != 0L) return v
+        }
+        return 0L
+    }
+
     private fun onSnsUpdateAfter(param: XC_MethodHook.MethodHookParam) {
         val a = param.args ?: return
         if (a.size < 2) return
@@ -304,7 +322,32 @@ object SnsGuard {
             }
             return
         }
-        if (st != 0) return
+        if (st != 0) {
+            // ⭐ R30 §6.2：微信**不是**只写 0 才覆盖我们。好友个人主页同步时它按服务端值
+            //    整行 upsert，把补好的 `10`（时间线|相册）打回 `2`（只有时间线位）——
+            //    `st != 0` 的老闸门会直接放过这种写，于是「进好友朋友圈，已删动态闪一下
+            //    就没了」（首屏吃旧内存数据看得见，刷新一读库就没了）。
+            // ⇒ 缺 bit8 且 snsId 在**窄台账**里时，必须在这里**同步**补回去。
+            //    ⛔ 判据必须窄：全库 17.6 万行正常动态就是 `sourceType=2`，广谱即事故。
+            if ((st and SnsTimelineSrcLogic.ALBUM_BIT) == 0 && bypass.get() != true) {
+                val id = snsIdOf(a)
+                if (id != 0L && SnsTimelineSourceFix.isAlbumTarget(id)) {
+                    val db = param.thisObject
+                    if (db != null) {
+                        bypass.set(true)   // 补位自己那次 update 不许再进本钩子
+                        try {
+                            SnsTimelineSourceFix.patchAlbumBit(db, id, st)
+                        } catch (t: Throwable) {
+                            LogX.w("SNS albumpatch err: ${t.javaClass.simpleName}")
+                        } finally {
+                            bypass.set(false)
+                        }
+                    }
+                }
+            }
+            return
+        }
+        // ⛔ 我们自己的写库（补位 / 伪装）不许再触发补位
         if (bypass.get() == true) return
         // ③ 不立刻补：只记时刻 + 排一个「静默后统一补」的任务。
         //    立刻补会被同一批里后面的写 0 覆盖（真机实测 fixed=1 而实际有 3 条被清）。
@@ -932,6 +975,145 @@ object SnsGuard {
         }
     }
 
+    /**
+     * `op=snsg sub=srcmap` —— **只读**，一行都不写。R30 §6.2 取证专用。
+     *
+     * 回答的是「相册谓词到底是什么」这个被判死的问题：
+     * - `dist`：**全表** `sourceType` 分布（上一轮只看到`createTime desc` 的最新 50 行，
+     *   覆盖不到历史行，无法证明 64 在库里根本不存在）
+     * - `pred`：把几种候选谓词各数一遍，直接比大小
+     *   （`in(64)` 若真为相册谓词，它必然是最大的那个；实测最新 50 行 0 条等于 64）
+     * - `dup`：同一 `snsId` 是否**多行**（多行 ⇒ 「给相册多插一行 64」可行；单行 ⇒ 只能改值）
+     * - `tagged`：被我们标记的那批动态**当前**在库里的 `sourceType`/`type`
+     */
+    fun srcMap(user: String = ""): List<String> {
+        val db = snsDb ?: return listOf("SRCMAP no sns db yet (先让微信刷一次朋友圈)")
+        val m = rawQueryMethod(db) ?: return listOf("SRCMAP no rawQuery on ${db.javaClass.name}")
+        return runCatching {
+            val out = ArrayList<String>(48)
+            // ⭐ 按作者查：验证「相册只收 type ∈ {1,15}」—— 看该用户**正常可见**的动态 type 是什么
+            //    （若他的可见动态也全是 type=2，说明微信确实按 type 收，与个人相册无关）
+            if (user.isNotBlank()) {
+                val u = user.trim()
+                out += "SRCMAP user=$u dist (type -> 行数):"
+                out += rows(
+                    db, m,
+                    "select type, count(*) from $TABLE where userName='$u' group by type order by 2 desc limit 20",
+                )
+                out += "SRCMAP user=$u 可见(type∈1/15) 行数=" +
+                    scalar(
+                        db, m,
+                        "select count(*) from $TABLE where userName='$u' and type in (1,15)",
+                    )
+                out += "SRCMAP user=$u 明细 (snsId src type head localFlag):"
+                out += rows(
+                    db, m,
+                    "select snsId, sourceType, type, head, localFlag from $TABLE " +
+                        "where userName='$u' order by head desc limit 40",
+                )
+                return@runCatching out
+            }
+            out += "SRCMAP total=" + scalar(db, m, "select count(*) from $TABLE")
+            out += "SRCMAP dist (sourceType -> 行数):"
+            out += rows(db, m, "select sourceType, count(*) from $TABLE group by sourceType order by 2 desc limit 30")
+            out += "SRCMAP pred: in64=" + scalar(db, m, "select count(*) from $TABLE where sourceType in (64)") +
+                " and64=" + scalar(db, m, "select count(*) from $TABLE where (sourceType & 64) != 0") +
+                " and8=" + scalar(db, m, "select count(*) from $TABLE where (sourceType & 8) != 0") +
+                " and2=" + scalar(db, m, "select count(*) from $TABLE where (sourceType & 2) != 0") +
+                " t1_15=" + scalar(db, m, "select count(*) from $TABLE where type in (1,15)")
+            out += "SRCMAP dup (同 snsId 多行):"
+            out += rows(
+                db, m,
+                "select snsId, count(*) from $TABLE group by snsId having count(*) > 1 limit 8",
+            )
+            val ids = runCatching { GroupDb.current()?.snsTagIds() }.getOrNull().orEmpty()
+            if (ids.isEmpty()) {
+                out += "SRCMAP tagged: (空 —— 台账没有已删动态，先复现一条)"
+            } else {
+                val csv = ids.take(30).joinToString(",")
+                val alive = scalar(db, m, "select count(*) from $TABLE where snsId in ($csv)")
+                out += "SRCMAP tagged n=${ids.size} 库里有行=$alive 无行(物理删除)=${ids.size - (alive.toLongOrNull() ?: 0)}"
+                // ⭐ 相册按 userName 过滤 —— 看不到被删动态时，先看它到底属于谁
+                out += "SRCMAP tagged (snsId userName src type head localFlag):"
+                out += rows(
+                    db, m,
+                    "select snsId, userName, sourceType, type, head, localFlag from $TABLE " +
+                        "where snsId in ($csv) order by head desc",
+                )
+                out += "SRCMAP album-ok (含 bit8 且 type 在相册白名单):" +
+                    scalar(
+                        db, m,
+                        "select count(*) from $TABLE where snsId in ($csv) and (sourceType & 8) != 0",
+                    )
+            }
+            out
+        }.getOrElse { e -> listOf("SRCMAP err ${e.javaClass.simpleName}: ${(e.cause ?: e).message?.take(100)}") }
+    }
+
+    /**
+     * ⛔ **调试专用**：直接改一行的 `sourceType`（`op=snsg sub=setsrc --es val "<snsId>:<值>"`）。
+     *
+     * 存在的理由：一条「当天发、当天删」的动态，在「发布 → 被删」之间**没被任何一轮快照
+     * 记进台账**（`sns_visible_src`），于是补位判据永远轮不到它 —— 真机实测过一次
+     * （`snsId=-3404957496863878648`，`src=0`，`run()` 报 `new=0 fixed=0`）。
+     * 台账缺口只能靠事后定向补，不能靠等（它已经不可能再变回可见）。
+     *
+     * ⚠️ 只写**显式指定**的那一行，不扫表 —— 广谱扫表在几分钟内就能污染几十万行
+     * （00:20 事故的教训）。
+     */
+    fun setSrc(snsId: Long, value: Int): List<String> {
+        if (snsId == 0L) return listOf("SNS setsrc bad snsId")
+        val db = snsDb ?: return listOf("SNS setsrc no sns db")
+        val m = rawQueryMethod(db) ?: return listOf("SNS setsrc no rawQuery")
+        val before = scalar(db, m, "select sourceType from $TABLE where snsId=$snsId")
+        return runCatching {
+            // ⛔ 别自己按签名找：wcdb 的 `execSQL` 重载参数是 `(String, Object[])` 而不是
+            //    单参 `String`，照单参找会落空（真机实测报 "no execSQL"）。交给 Xposed 按实参匹配。
+            XposedHelpers.callMethod(
+                db, "execSQL",
+                "update $TABLE set sourceType=$value where snsId=$snsId",
+            )
+            val after = scalar(db, m, "select sourceType from $TABLE where snsId=$snsId")
+            // 顺手把它记进台账，否则下次同步又会被清掉且没人管
+            runCatching { GroupDb.current()?.upsertVisibleSrc(listOf(snsId to value)) }
+            // ⭐ 带相册位（bit8）的行还要进**窄台账**：微信下一次同步会按服务端值把它打回 2，
+            //    只有窄台账里的行才会在**写库瞬间**被 [SnsTimelineSourceFix.patchAlbumBit]
+            //    补回来（否则就是「点进去闪一下又消失」）。
+            if (SnsTimelineSrcLogic.isAlbumVisible(value)) {
+                val orig = before.toIntOrNull() ?: value
+                runCatching { GroupDb.current()?.markSrcFixed(snsId, orig) }
+                SnsTimelineSourceFix.invalidateAlbumIds()
+            }
+            listOf("SNS setsrc snsId=$snsId $before -> $after (台账已补登)")
+        }.getOrElse { e ->
+            listOf("SNS setsrc err ${e.javaClass.simpleName}: ${(e.cause ?: e).message?.take(80)}")
+        }
+    }
+
+    /** 跑一条单值 SQL，取第一行第一列（拿不到就给 `?`，绝不抛） */
+    private fun scalar(db: Any, m: Method, sql: String): String =
+        runCatching { rows(db, m, sql).firstOrNull() ?: "?" }.getOrDefault("?")
+
+    /** 跑一条 SQL，每行用空格拼起来；`getString` 对整数列同样可用 */
+    private fun rows(db: Any, m: Method, sql: String): List<String> {
+        val out = ArrayList<String>(16)
+        val cur = m.invoke(db, sql, null) ?: return listOf("?null cursor")
+        try {
+            val n = XposedHelpers.callMethod(cur, "getColumnCount") as? Int ?: 0
+            while (XposedHelpers.callMethod(cur, "moveToNext") as? Boolean == true) {
+                val sb = StringBuilder(32)
+                for (i in 0 until n) {
+                    if (i > 0) sb.append(' ')
+                    sb.append(XposedHelpers.callMethod(cur, "getString", i) ?: "null")
+                }
+                out += sb.toString()
+            }
+        } finally {
+            runCatching { XposedHelpers.callMethod(cur, "close") }
+        }
+        return out
+    }
+
     /** 微信库里现在还有多少条 SnsInfo（验证「拦下来后行还在」） */
     fun dump(limit: Int = 5): List<String> {
         // ⚠️ limit 来自广播 --ei n，拼进 SQL 字符串，入口钳位防全表拖库
@@ -967,6 +1149,182 @@ object SnsGuard {
             out
         }.getOrElse { listOf("err ${it.javaClass.simpleName}: ${(it.cause ?: it).message?.take(80)}") }
     }
+
+    /**
+     * **6.2 取证探针（R31c）**：判断「已删动态是不是被好友主页的 `limit 11` 挤出窗口」。
+     *
+     * 做法：拿 [SnsSqlSpy.lastUserSql]（微信**自己**查该用户朋友圈的那句 SQL 原文），
+     * 只把 `limit N` 放大成 `limit expand`，其余字节不动地执行一遍。
+     * **返回顺序就是微信的取数顺序** ⇒ 这 5 条在序列里排第几，一目了然。
+     *
+     * ⛔ 不手拼 WHERE：那句里 sourceType 白名单有 32 个常量、type 白名单 40+ 个，
+     *    抄错一个就得到相反结论（这个课题上已经栽过两次）。
+     */
+    fun rankSql(expand: Int = 40): List<String> {
+        val raw = SnsSqlSpy.lastUserSql ?: return listOf(
+            "SRCRANK 还没抓到微信的 userName SQL：" +
+                "① op=snsg sub=sqlspy sub2=on ② 进出一次好友主页 ③ 重跑本探针"
+        )
+        val n = MomentsLogic.clampProbeN(expand)
+        val sql = Regex("(?i)\\blimit\\s+\\d+").replace(raw, "limit $n")
+        val db = snsDb ?: return listOf("SRCRANK no sns db yet")
+        val m = rawQueryMethod(db) ?: return listOf("SRCRANK no rawQuery on ${db.javaClass.name}")
+        return runCatching {
+            // ⚠️ 不用 rows()：那个 helper 在按列名/参数重载上有坑（`srcmap` 的按作者查询
+            //    一直是空结果，根因是 `SnsInfo` 的 DB 列名是 `user_name` 不是 `userName`）。
+            //    这里自己走 cursor，跟 `dumpRows` 同一套已验证的调用方式。
+            val cur = m.invoke(db, sql, null) ?: return listOf("SRCRANK null cursor")
+            val ids = ArrayList<String>(n)
+            try {
+                while (XposedHelpers.callMethod(cur, "moveToNext") as? Boolean == true) {
+                    ids += (XposedHelpers.callMethod(cur, "getString", 0) as? String).orEmpty()
+                }
+            } finally {
+                runCatching { XposedHelpers.callMethod(cur, "close") }
+            }
+            val tagged = runCatching { GroupDb.current()?.snsTagIds() }.getOrNull().orEmpty()
+            val out = ArrayList<String>(ids.size + 6)
+            out += "SRCRANK expand=$n got=${ids.size} tagged=${tagged.size}"
+            // 微信页面实际只吃前 WINDOW 条；边界画出来，「第 12 条起」就是被窗口挤掉的部分
+            val win = if (n >= WINDOW) WINDOW else n
+            ids.forEachIndexed { i, id ->
+                val num = id.toLongOrNull()
+                val inTag = num != null && num in tagged
+                if (i < win || inTag) {
+                    out += "SRCRANK #" + (i + 1).toString().padStart(2) +
+                        (if (i < win) " IN  " else " OUT ") + "snsId=$id" +
+                        (if (inTag) " [已删台账]" else "")
+                }
+            }
+            if (ids.size > win) out += "SRCRANK … 窗口外还有 ${ids.size - win} 条"
+            out
+        }.getOrElse {
+            listOf("SRCRANK err ${it.javaClass.simpleName}: ${(it.cause ?: it).message?.take(100)}")
+        }
+    }
+
+    /** 允许**带参数**的 pragma（列举型，纯读） */
+    private val PRAGMA_WITH_ARG = setOf(
+        "table_info", "table_xinfo", "table_list", "table_exists",
+        "database_list", "foreign_key_list", "index_list", "index_info", "index_xinfo",
+        "collation_list", "function_list", "module_list", "pragma_list", "compile_options",
+    )
+
+    /** 只允许**无参数**形式的 pragma（读当前值）。带参数多半是写，例如 `journal_mode(WAL)` */
+    private val PRAGMA_NO_ARG = setOf(
+        "page_size", "page_count", "freelist_count", "encoding", "schema_version",
+        "user_version", "journal_mode", "auto_vacuum", "foreign_keys", "integrity_check",
+    )
+
+    /**
+     * `pragma` 是否只读。**注意分两类**：
+     * - `pragma journal_mode` = 读；`pragma journal_mode(WAL)` = **写**。同名前缀不同语义，
+     *   只按名字白名单放行会漏掉后者 ⇒ 必须看有没有括号。
+     * - `pragma foo=bar` 是赋值，一律拒。
+     */
+    private fun pragmaReadOnly(low: String): Boolean {
+        val body = low.removePrefix("pragma").trim()
+        if (body.contains('=')) return false
+        return if (body.contains('(')) {
+            body.substringBefore('(').trim() in PRAGMA_WITH_ARG
+        } else {
+            body in PRAGMA_NO_ARG
+        }
+    }
+
+    /**
+     * **通用只读 SQL 探针（R31d）**：`op=sql --es q "select …"`，查 `sns.db`。
+     *
+     * ## 为什么要有它
+     * 6.2 排查时为 4 个取证维度（窗口排名 / 逐列对比 / 表清单 / 表结构）写了 4 个专用探针，
+     * 结果**装了 4 次包、重启了 4 次微信**，每次还要用户重新进页面配合。
+     * 这 4 件事本质都是「跑一条 SQL 看结果」——专用探针是把通用能力拆碎了重复付款。
+     * ⇒ 通用入口一次投入，之后取证**零编译、零重启**。
+     *
+     * ## 安全（R31e 收口，第二视角审核发现三个口子）
+     * 白名单只放 **`select`**，另加**只读 pragma 白名单**。三条理由：
+     * 1. ⛔ `with` 必须去掉：`WITH x AS (SELECT 1) DELETE FROM SnsInfo` 以 `with` 开头，
+     *    原判据放行；而 `rawQuery` **不校验语句类型**（不像 `execSQL` 有反向限制），
+     *    `SQLiteCursor` 填窗口时会真的 step 它 ⇒ 等于任意写库。同理 `WITH…UPDATE/INSERT`。
+     * 2. ⛔ `pragma` 不能整体放行：`pragma user_version=9` / `journal_mode=` / `auto_vacuum=`
+     *    都改库头或持久状态。只放列举型（`table_info`/`table_list`/`database_list`/
+     *    `foreign_key_list`/`index_list`/`index_info`），取值型 `pragma foo` 也放（无副作用）。
+     * 3. 内部 `;` 一律拒：`rawQuery` 只编译第一条、尾部静默丢弃 —— 它现在无害，
+     *    但「静默丢弃」本身是判据陷阱，fail-closed 更省心。
+     *
+     * ⚠️ 这个接收器是 **exported** 的（Manifest `RECEIVER_EXPORTED`），设备上任何 app
+     * 都能发这条广播 ⇒ 上面不仅是「防自己手滑」，同时是**防第三方借模块写微信库的安全边界**。
+     * 改判据时按安全边界对待，别当普通参数校验。
+     */
+    fun runReadOnlySql(sql: String, maxRows: Int = 60): List<String> {
+        val s = sql.trim().trimEnd(';')
+        val low = s.lowercase()
+        val okPrefix = low.startsWith("select") || (low.startsWith("pragma") && pragmaReadOnly(low))
+        if (!okPrefix) {
+            return listOf(
+                "SQLX 拒绝：只允许 select / 只读 pragma（收到 `${s.take(32)}`）"
+            )
+        }
+        if (s.contains(';')) {
+            return listOf("SQLX 拒绝：不允许多语句（内部含 `;`）")
+        }
+        val db = snsDb ?: return listOf("SQLX no sns db yet（先让微信刷一次朋友圈）")
+        val m = rawQueryMethod(db) ?: return listOf("SQLX no rawQuery on ${db.javaClass.name}")
+        val cap = MomentsLogic.clampProbeN(maxRows)
+        return runCatching {
+            val cur = m.invoke(db, s, null) ?: return listOf("SQLX null cursor")
+            try {
+                val nc = XposedHelpers.callMethod(cur, "getColumnCount") as? Int ?: 0
+                val names = (0 until nc).map { i ->
+                    (runCatching {
+                        XposedHelpers.callMethod(cur, "getColumnName", i) as? String
+                    }.getOrNull()) ?: "#$i"
+                }
+                val out = ArrayList<String>(16)
+                out += "SQLX cols=${names.joinToString(",")}"
+                var n = 0
+                while (XposedHelpers.callMethod(cur, "moveToNext") as? Boolean == true) {
+                    if (n >= cap) break
+                    val sb = StringBuilder(64)
+                    for (i in 0 until nc) {
+                        if (i > 0) sb.append(" | ")
+                        sb.append(cellOf(cur, i))
+                    }
+                    out += "SQLX r${n + 1} $sb"
+                    n++
+                }
+                out += "SQLX rows=$n"
+                out
+            } finally {
+                runCatching { XposedHelpers.callMethod(cur, "close") }
+            }
+        }.getOrElse {
+            val c = (it as? java.lang.reflect.InvocationTargetException)?.targetException ?: it
+            listOf("SQLX err ${c.javaClass.simpleName}: ${c.message?.take(120)}")
+        }
+    }
+
+    /**
+     * 取一格的值。BLOB 用 `getType` 识别后只报字节数。
+     *
+     * ⛔ `Cursor.getString()` 对 BLOB 列返回 **null** —— 那是**取值失败**，不是「列是空的」。
+     * 本轮就因此误判过「attrBuf 全为 null ⇒ 正文永久丢失」，实际两条都是 174 字节。
+     */
+    private fun cellOf(cur: Any, i: Int): String {
+        val ty = runCatching { XposedHelpers.callMethod(cur, "getType", i) as? Int }.getOrNull()
+        if (ty == 4) { // FIELD_TYPE_BLOB
+            val b = runCatching {
+                XposedHelpers.callMethod(cur, "getBlob", i) as? ByteArray
+            }.getOrNull()
+            return "<blob ${b?.size ?: -1}B>"
+        }
+        return runCatching {
+            XposedHelpers.callMethod(cur, "getString", i) as? String
+        }.getOrNull() ?: "<null>"
+    }
+
+    /** 好友主页那条 SQL 的 `limit`（微信写死 11，见 `_r30_62_album_gate.md`） */
+    private const val WINDOW = 11
 
     /**
      * **A4 取证探针（R19）**：扫**当前** `SnsInfo`（不是归档表！）的 `content`，
