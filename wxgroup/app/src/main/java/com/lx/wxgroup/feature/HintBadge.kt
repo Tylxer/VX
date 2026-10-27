@@ -66,6 +66,17 @@ object HintBadge {
     /** 我们加的标记 View 的 tag，用来识别/摘除 */
     private const val MARK = "wxgroup.badge.hint"
 
+    /**
+     * 角标文字色 —— **微信系统灰条的同款灰**（R30 用户要求）。
+     *
+     * 原来是 `#E64340`（微信危险红），在群里一屏几十条消息时红字比正文还跳，
+     * 看着像报错。改成微信自己画系统提示（「撤回了一条消息」「以下为新消息」）
+     * 用的那档灰 —— 与周围气泡同色系，只靠「小一号 + 在气泡下方」区别于正文。
+     *
+     * ⚠️ 不要改成 `#7F7F7F` 以下：深色模式（微信夜间是深灰底）会看不清。
+     */
+    private const val COLOR_HINT = "#999999"
+
     /** 聊天列表 RecyclerView.Adapter 基类（q0 不覆写 onBindViewHolder ⇒ 活钩） */
     private const val ADAPTER_CLASS = "com.tencent.mm.pluginsdk.ui.tools.q3"
 
@@ -104,15 +115,20 @@ object HintBadge {
     @Volatile private var hits = 0       // msgId 命中 rescued 集（含 fake）
     @Volatile private var missed = 0     // 解析/取 View 失败
     @Volatile private var verifyFail = 0 // 文本对账失败（真被救但内容对不上）
+    @Volatile private var talkerMismatch = 0 // 会话核对失败（别的会话的同号消息）
     @Volatile private var masked = 0     // 类型闸门抑制（restore_view 伪装态）
     @Volatile private var lastMiss = ""
+
+    /** 文本对账失败的**全量现场**只打前 [VERIFY_LOG_MAX] 条 —— 打满会刷屏，但对不上账时它是唯一线索 */
+    private val verifyLogged = AtomicInteger(0)
+    private const val VERIFY_LOG_MAX = 8
 
     private val added = AtomicInteger(0)
     private val logged = AtomicInteger(0)
     private val miscLogged = AtomicInteger(0)
     private val errLogged = AtomicInteger(0)
 
-    private class Hit(val origType: Int, val origContent: String?)
+    private class Hit(val origType: Int, val origContent: String?, val talker: String)
 
     private fun logOnce(msg: String) {
         if (miscLogged.get() < LOG_MAX && miscLogged.incrementAndGet() <= LOG_MAX) LogX.i(msg)
@@ -305,6 +321,36 @@ object HintBadge {
         hits++ // 命中 rescued（或 fake），在闸门之前自增（诊断用）
 
         if (rescued != null) {
+            // ⭐⭐ 会话核对（2026-10-28 用户报障「正常聊天下也出现」）。
+            //
+            // 台账是**跨会话**的：`GroupDb.listRescued()` 只按 at 倒序取 5000 条，
+            // 完全不看 talker；而 `rescued` 表是**跨版本累积**的（真机已积到 208 条）。
+            // msgId 只在「同一份 message 库、同一次安装」内保证唯一 —— 一旦用户
+            // 恢复过聊天记录 / 换过机 / 从备份导入，不同会话的 msgId 就会重叠。
+            // 重叠时本类只拿到一个 Long 去查台账，**结构上无从区分**，于是另一会话里
+            // 同号的消息被贴上别人那条的「已阻止撤回 · xxx」。
+            //
+            // ⇒ 用 `h9.getTalker()` 与台账 talker 对齐。两侧任一为空就跳过校验：
+            //   反射拿不到不是用户的错，不能因此整片不贴（宁可漏判，不可错贴方向相反）。
+            val curTalker = talkerOf(h9)
+            if (!curTalker.isNullOrBlank() && rescued.talker.isNotBlank() &&
+                curTalker != rescued.talker
+            ) {
+                talkerMismatch++
+                lastMiss = "talker(${curTalker.take(10)}!=${rescued.talker.take(10)})"
+                // 限流打现场：这条日志是「正常消息被错贴角标」唯一的直接证据，
+                // 不打就只剩一个计数器，无法区分「msgId 碰撞」与「台账记错会话」。
+                if (talkerMismatch <= 8) {
+                    LogX.w(
+                        "HINTBADGE talkerMismatch id=$msgId " +
+                            "cur=${curTalker.take(24)} led=${rescued.talker.take(24)} " +
+                            "orig=${rescued.origContent?.take(16)}"
+                    )
+                }
+                bound.remove(itemView)
+                runCatching { ensure(itemView, false, "") }
+                return
+            }
             // 类型闸门：伪装态（restore_view）没有「原文气泡」，抑制角标
             if (!HintBadgeLogic.typeOk(h9Type, rescued.origType)) {
                 masked++
@@ -315,10 +361,29 @@ object HintBadge {
             }
             // 文本对账：只对文本消息，宁可 missed 不打错
             if (rescued.origType == HintTextLogic.TYPE_TEXT) {
-                val texts = textsOf(itemView)
+                // ⭐⭐ 01:4x 第二次根因修正：**不要用气泡文本对账**。
+                // 两个独立的坑：① 气泡是 `NeatTextView extends View`，`v is TextView` 恒 false；
+                // ② 微信群消息的 `content` **自带 `wxid_xxx:\n` 前缀**（真机现场
+                //    `orig=[wxid_0mnuc8zqglzt21:\n现在节目效果…]`），而气泡上显示的正文**不含前缀**
+                //    ⇒ 即使取到气泡文本，probe（orig 开头）也永远匹配不上；折叠态还会再截一刀。
+                // 正解：直接拿 `h9.getContent()` 与台账原文比 —— 两者同口径、都是完整原文。
+                val content = runCatching {
+                    XposedHelpers.callMethod(h9, "getContent") as? String
+                }.getOrNull()
+                val texts = if (content != null) listOf(content) else textsOf(itemView)
                 if (!HintBadgeLogic.contentOk(rescued.origContent, texts)) {
                     verifyFail++
                     lastMiss = "verify(texts=[${texts.take(3).joinToString("|") { it.take(10) }}])"
+                    // ⭐ 前 N 次失败打全量现场：只看 lastMiss 永远猜不出是「取错 View」
+                    // 还是「原文与气泡文本不同构」，必须看到 orig 与 texts 的原文。
+                    if (verifyLogged.get() < VERIFY_LOG_MAX && verifyLogged.incrementAndGet() <= VERIFY_LOG_MAX) {
+                        LogX.w(
+                            "HINTBADGE verify#${verifyLogged.get()} id=$msgId " +
+                                "orig=[${rescued.origContent?.take(40)}] " +
+                                "view=${itemView.javaClass.name} tv=${texts.size} " +
+                                "texts=[${texts.take(8).joinToString(" | ") { it.take(24) }}]"
+                        )
+                    }
                     bound.remove(itemView)
                     runCatching { ensure(itemView, false, "") }
                     return
@@ -426,6 +491,18 @@ object HintBadge {
         return runCatching { m.invoke(h9) as? Int }.getOrNull()
     }
 
+    /**
+     * `h9.getTalker()`（未混淆，与 getMsgId/getType 同一声明类 `k74/f0`）。
+     *
+     * 群聊返回群 id（`xxx@chatroom`）、私聊返回对方 wxid，与台账
+     * `rescued.talker` 同口径（[RevokeRescue.record] 记的就是库里 message.talker 列）。
+     * 拿不到返回 null ⇒ 调用方跳过核对。
+     */
+    private fun talkerOf(h9: Any): String? {
+        val m = runCatching { h9.javaClass.getMethod("getTalker") }.getOrNull() ?: return null
+        return runCatching { m.invoke(h9) as? String }.getOrNull()
+    }
+
     // ------------------------------------------------------------------ 台账缓存
 
     /** 被救消息台账（内存缓存，TTL + 首屏同步 + 后台刷新，绝不每次 bind 查库） */
@@ -466,7 +543,7 @@ object HintBadge {
             return hitMap
         }
         return runCatching {
-            db.listRescued().associate { it.msgId to Hit(it.origType, it.origContent) }
+            db.listRescued().associate { it.msgId to Hit(it.origType, it.origContent, it.talker) }
         }.onFailure { LogX.w("HINTBADGE listRescued failed: ${it.javaClass.simpleName}") }
             .getOrDefault(hitMap)
     }
@@ -579,7 +656,7 @@ object HintBadge {
         }
         val tv = TextView(target.context).apply {
             this.text = text
-            setTextColor(Color.parseColor("#E64340"))
+            setTextColor(Color.parseColor(COLOR_HINT))
             textSize = 12f
             tag = MARK
             id = View.generateViewId()
@@ -863,14 +940,28 @@ object HintBadge {
      * item 子树里的可见文字（跳过我们自己加的角标），用来做文本对账。
      * ⚠️ 上限放宽到 20 条 / 深度 8（同 SnsTag：正文 TextView 常埋在内容区之后）。
      */
-    private fun textsOf(root: View, max: Int = 20): List<String> {
+    /**
+     * ⭐ **01:3x 真机根因（DEX 坐实）**：聊天气泡**不是 `TextView`**。
+     *
+     * `com.tencent.mm.ui.widget.MMNeat7extView` → `com.tencent.neattextview.textview.view.NeatTextView`
+     * → **`android.view.View`**（`NeatTextView.<init>` 三条构造首条指令全是
+     * `invoke-direct Landroid/view/View;-><init>`）。它**自己 onDraw 画文本**，没有 `getText()`。
+     *
+     * ⇒ 原来的 `if (v is TextView)` 在气泡上**恒为 false**，收集到的全是分隔条与按钮文案
+     * （真机现场：`[没有更多消息了 | 以下为新消息 | near | 查看全文 | {source} | 设为群待办]`）。
+     * ⛔ 所以「放宽深度/条数上限」对这个问题**完全无效** —— 类型判断在气泡节点就短路了。
+     */
+    private fun textsOf(root: View, max: Int = 48): List<String> {
         val out = ArrayList<String>(max)
         fun walk(v: View, d: Int) {
-            if (out.size >= max || d > 8) return
+            if (out.size >= max || d > 14) return
             if (MARK == v.tag) return
             if (v is TextView) {
                 val t = v.text?.toString()?.trim()
                 if (!t.isNullOrEmpty()) out.add(t)
+            } else if (v.javaClass.name.contains("Neat")) {
+                // 气泡（MMNeat7extView / NeatTextView）：只能靠字段或包装 View 取文本
+                neatTextOf(v)?.let { if (it.isNotEmpty()) out.add(it) }
             }
             if (v is ViewGroup) {
                 for (i in 0 until v.childCount) {
@@ -880,6 +971,34 @@ object HintBadge {
         }
         walk(root, 0)
         return out
+    }
+
+    /**
+     * 从气泡（`NeatTextView` 系）取正文。三条路依次试，全失败返回 null（绝不抛）。
+     *
+     * 1. `getWrappedTextView()` —— 它返回一个真的 `TextView`，最稳；
+     * 2. 字段 `x` / `z`（`CharSequence`）—— `NeatTextView.onDraw` 读的就是 `x`（正文）与 `z`（hint 等）；
+     * 3. `getText()` —— 若将来版本补了这个 getter。
+     */
+    private fun neatTextOf(v: View): String? {
+        runCatching {
+            val w = XposedHelpers.callMethod(v, "getWrappedTextView")
+            if (w is TextView) {
+                val t = w.text?.toString()?.trim()
+                if (!t.isNullOrEmpty()) return t
+            }
+        }
+        for (f in listOf("x", "z")) {
+            runCatching {
+                val t = (XposedHelpers.getObjectField(v, f) as? CharSequence)?.toString()?.trim()
+                if (!t.isNullOrEmpty()) return t
+            }
+        }
+        runCatching {
+            val t = (XposedHelpers.callMethod(v, "getText") as? CharSequence)?.toString()?.trim()
+            if (!t.isNullOrEmpty()) return t
+        }
+        return null
     }
 
     // ------------------------------------------------------------------ 真机验证入口
@@ -942,5 +1061,6 @@ object HintBadge {
         "msg=${Kv.getBool(Keys.ANTIREVOKE_MSG)} hint=${Kv.getBool(Keys.ANTIREVOKE_SHOW_HINT)} " +
         "rescued=${hitMap.size} bound=${synchronized(bound) { bound.size }} " +
         "added=${added.get()} binds=$binds chat=$chatBinds resolved=$resolved " +
-        "hits=$hits missed=$missed verifyFail=$verifyFail masked=$masked lastMiss=$lastMiss"
+        "hits=$hits missed=$missed verifyFail=$verifyFail masked=$masked lastMiss=$lastMiss" +
+        " talkerMismatch=$talkerMismatch"
 }

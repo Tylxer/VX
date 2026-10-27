@@ -96,6 +96,9 @@ object RevokeRescue {
             ) ?: false
             LogX.i("RRV record msgId=$msgId talker=${talker.take(12)} ok=$ok " +
                 "origType=${orig.type} revoke=${revokeContent?.take(20)} " +
+                // ⚠️ imgPath 必打：图片/视频**没有** imgPath 时 protectMedia 是空操作，
+                //    而「被撤回的图片打不开」正是靠这一行区分「没救到文件」和「救到了还打不开」
+                "imgPath=${orig.imgPath} " +
                 "extra=${extra != null} origExtra=${orig.extra != null}")
             // ⛔ 台账一变就让 VoiceGuard 的受保护集合缓存失效。
             // 否则 3 秒内连撤两条语音时，第二条的 voiceinfo DELETE 会命中第一条建下的
@@ -108,21 +111,32 @@ object RevokeRescue {
             //    详见 VoiceBackup 的 KDoc（含 20827 目录递归扫描的实证）。
             // ⚠️ 放在台账写成功之后：没记账就说明这次撤回没救下来，不必浪费一次拷贝。
             if (ok && orig.imgPath != null) {
-                // ① 登记「别删这个文件」（拦 File.delete，见 VoiceFileGuard）
-                runCatching { VoiceFileGuard.protect(orig.imgPath) }
-                    .onFailure { LogX.w("RRV voice protect failed: ${it.javaClass.simpleName}") }
-                // ② 同时留一份备份（兜底：万一 File.delete 走的是 native unlink，
-                //    hook 拦不到，还有文件可以搬回来）
-                runCatching { VoiceBackup.backup(orig.type, orig.imgPath) }
-                    .onFailure { LogX.w("RRV voice backup failed: ${it.javaClass.simpleName}") }
-                // ③ 排一个「删除链跑完后」的幂等还原 —— **这一步才是兜底**。
-                //    ①可能拦不住（native unlink），②只是留了个副本；
-                //    真正决定「能不能播放」的是删除动作发生之后文件是否还在原位。
-                //    ⚠️ 必须在 ② 之后：restore 读的是 backup 写出来的文件。
-                //    为什么不能靠 VoiceGuard.onDelete 里那次 restore，见
-                //    VoiceBackup.scheduleRestore 的 KDoc（早触发 ⇒ 恒 no-op）。
-                runCatching { VoiceBackup.scheduleRestore(orig.imgPath) }
-                    .onFailure { LogX.w("RRV voice scheduleRestore failed: ${it.javaClass.simpleName}") }
+                val isVoice = orig.type == HintTextLogic.TYPE_VOICE
+                // ⭐ R30：图片 / 视频**与语音同构**。撤回时微信一样会删磁盘文件
+                //    （`image2/<桶>/<imgPath>`、`<imgPath>hd`），行和索引都还在、
+                //    文件没了 ⇒ 用户点开直接失败（报障：「被撤回的图片无法打开」）。
+                //    这里只「拦删除」，不做 md5 分桶、不算路径 —— 判据是文件名含 imgPath。
+                if (orig.type == HintTextLogic.TYPE_IMAGE || orig.type == HintTextLogic.TYPE_VIDEO) {
+                    runCatching { VoiceFileGuard.protectMedia(orig.imgPath) }
+                        .onFailure { LogX.w("RRV media protect failed: ${it.javaClass.simpleName}") }
+                }
+                if (isVoice) {
+                    // ① 登记「别删这个文件」（拦 File.delete，见 VoiceFileGuard）
+                    runCatching { VoiceFileGuard.protect(orig.imgPath) }
+                        .onFailure { LogX.w("RRV voice protect failed: ${it.javaClass.simpleName}") }
+                    // ② 同时留一份备份（兜底：万一 File.delete 走的是 native unlink，
+                    //    hook 拦不到，还有文件可以搬回来）
+                    runCatching { VoiceBackup.backup(orig.type, orig.imgPath) }
+                        .onFailure { LogX.w("RRV voice backup failed: ${it.javaClass.simpleName}") }
+                    // ③ 排一个「删除链跑完后」的幂等还原 —— **这一步才是兜底**。
+                    //    ①可能拦不住（native unlink），②只是留了个副本；
+                    //    真正决定「能不能播放」的是删除动作发生之后文件是否还在原位。
+                    //    ⚠️ 必须在 ② 之后：restore 读的是 backup 写出来的文件。
+                    //    为什么不能靠 VoiceGuard.onDelete 里那次 restore，见
+                    //    VoiceBackup.scheduleRestore 的 KDoc（早触发 ⇒ 恒 no-op）。
+                    runCatching { VoiceBackup.scheduleRestore(orig.imgPath) }
+                        .onFailure { LogX.w("RRV voice scheduleRestore failed: ${it.javaClass.simpleName}") }
+                }
             }
             ok
         }.onFailure {

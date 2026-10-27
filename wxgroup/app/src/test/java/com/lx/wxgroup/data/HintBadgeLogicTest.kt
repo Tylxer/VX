@@ -80,6 +80,27 @@ class HintBadgeLogicTest {
     }
 
     @Test
+    fun contentOkBubbleKeepsNewline() {
+        // ⭐ R30 真机根因：气泡 TextView **保留**换行，只有台账侧被折平。
+        // 修复前 probe="第一行 第二行"、text="第一行\n第二行" ⇒ contains=false ⇒
+        // 凡带换行的文字消息一律漏画「已阻止撤回」角标。
+        assertTrue(HintBadgeLogic.contentOk("第一行\n第二行", listOf("第一行\n第二行")))
+    }
+
+    @Test
+    fun contentOkBubbleHasMultipleSpaces() {
+        // 同上：连续空格 / 制表符，两侧必须同构折平
+        assertTrue(HintBadgeLogic.contentOk("甲  乙", listOf("甲  乙")))
+        assertTrue(HintBadgeLogic.contentOk("甲\t乙", listOf("甲\t乙")))
+    }
+
+    @Test
+    fun contentOkStillRejectsDifferentContent() {
+        // 折平不能把「不同内容」洗成「相同内容」
+        assertFalse(HintBadgeLogic.contentOk("第一行\n第二行", listOf("第一行\n第三行")))
+    }
+
+    @Test
     fun contentOkIsStrict() {
         assertFalse(HintBadgeLogic.contentOk(null, listOf("你好")))          // 拿不到内容
         assertFalse(HintBadgeLogic.contentOk("", listOf("你好")))            // 空内容

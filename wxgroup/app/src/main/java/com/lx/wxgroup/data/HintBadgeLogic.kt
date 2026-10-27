@@ -58,15 +58,26 @@ object HintBadgeLogic {
      * ⚠️ **emoji 截断**：`take(12)` 按 UTF-16 码元切，可能正好切断一个代理对
      * （emoji 占 2 个码元）。半截代理与任何字符串都匹配不上 ⇒ 假阴性 ⇒ 角标漏画。
      * 所以切完要把末尾的孤立高位代理去掉（宁可 probe 短 1 位，也不能让它变废）。
+     *
+     * ⚠️ **两侧必须同构折平**（R30 修）：`flat` 把 `\s+` 折成单空格，而 `texts`
+     * 是气泡 TextView 的**原始**文本（换行/连续空格都还在）。若原文里有换行，
+     * probe 变成 `"你好 世界"`、气泡里是 `"你好\n世界"` ⇒ `contains` 恒 false ⇒
+     * **凡是带换行的文字消息一律漏画角标**。所以 text 侧也要走同一个 [WS] 折平。
      */
     fun contentOk(origContent: String?, texts: List<String>): Boolean {
-        val flat = origContent?.replace(Regex("\\s+"), " ")?.trim().orEmpty()
+        val flat = origContent?.replace(WS, " ")?.trim().orEmpty()
         if (flat.length < 2) return false
         if (texts.isEmpty()) return false
         val probe = dropLoneHighSurrogate(if (flat.length > PROBE_LEN) flat.take(PROBE_LEN) else flat)
         if (probe.length < 2) return false
-        return texts.any { it.length >= 2 && it.contains(probe) }
+        return texts.any { raw ->
+            val n = raw.replace(WS, " ").trim()
+            n.length >= 2 && n.contains(probe)
+        }
     }
+
+    /** 空白折平：换行 / 制表符 / 连续空格 → 单空格。**比对两侧必须用同一个** */
+    private val WS = Regex("\\s+")
 
     /** 末尾若是孤立的高位代理（被 `take` 切断的 emoji 前半），去掉它 */
     private fun dropLoneHighSurrogate(s: String): String {

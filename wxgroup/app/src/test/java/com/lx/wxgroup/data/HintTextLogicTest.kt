@@ -214,6 +214,40 @@ class HintTextLogicTest {
      * ⚠️ 摘要为空时必须退化成纯前缀，**不能**输出 `已阻止撤回 · ` ——
      * 末尾悬空的分隔符在界面上看着像渲染失败。
      */
+    /**
+     * ⭐ R30 用户报障：「角标里面显示的昵称不要 wxid」。
+     *
+     * 群聊消息的 `content` 自带发送者前缀 `wxid_xxx:\n`（真机现场
+     * `orig=[wxid_0mnuc8zqglzt21:\n现在节目效果…]`），原先直接当正文显示。
+     * 角标不需要昵称（气泡上方本来就有），所以整段前缀剥掉。
+     */
+    @Test
+    fun badgeStripsGroupSenderPrefix() {
+        val content = "wxid_0mnuc8zqglzt21:\n现在节目效果是真的好"
+        val s = HintTextLogic.badgeText(HintTextLogic.TYPE_TEXT, content)
+        assertEquals("已阻止撤回 · 现在节目效果是真的好", s)
+        assertFalse("不该出现 wxid：$s", s.contains("wxid"))
+
+        // 语音的 content 也是 `wxid:duration:flag`，时长解析不受前缀影响
+        assertEquals(
+            "已阻止撤回 · 语音 30秒",
+            HintTextLogic.badgeText(HintTextLogic.TYPE_VOICE, "wxid_abc:30000:0"),
+        )
+    }
+
+    /**
+     * ⛔ 剥前缀的判据必须收紧到 `wxid_` 字面量：
+     * 用户真的发了 `abc: 你好` 时不能被当成前缀切掉。
+     */
+    @Test
+    fun stripSenderOnlyMatchesWxidPrefix() {
+        assertEquals("abc: 你好", HintTextLogic.stripSender("abc: 你好"))
+        assertEquals("你好", HintTextLogic.stripSender("wxid_abc_123:\n你好"))
+        // 中间出现的 wxid 不动（只剥开头一处）
+        assertEquals("看 wxid_abc: 这个", HintTextLogic.stripSender("看 wxid_abc: 这个"))
+        assertEquals("", HintTextLogic.stripSender(null))
+    }
+
     @Test
     fun badgeEmptySummaryDegrades() {
         assertEquals("已阻止撤回", HintTextLogic.badgeText(HintTextLogic.TYPE_SYSTEM, null))

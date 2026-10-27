@@ -147,6 +147,29 @@ object HintTextLogic {
 
 
     /**
+     * 群消息 `content` 的发送者前缀：`wxid_xxxxxxxx:\n正文`。
+     *
+     * ⛔ **必须剥掉**（R30 用户报障：「里面显示的昵称不要 wxid」）。
+     * 微信在**群聊**里给每条消息的 `content` 都加了发送者 wxid 前缀（私聊没有），
+     * 时间线角标直接把它当正文显示，用户看到的就是
+     * `已阻止撤回 · wxid_0mnuc8zqglzt21: 现在节目效果…`。
+     *
+     * 角标**不需要**这个前缀：气泡上方本来就有群昵称，「是谁撤的」是冗余信息
+     * （见 [badgeText] 的 KDoc）。所以这里直接**不显示昵称**，而不是换成真名 ——
+     * 换名要查联系人库（热路径上还要处理未保存到通讯录的人），收益为负。
+     *
+     * 判据刻意收紧到 `wxid_` 字面量 + 紧跟冒号：正文自己以 `abc:` 开头（用户真发了
+     * 这几个字）时不会被误剥。
+     */
+    private val SENDER_PREFIX_RE = Regex("""^\s*wxid_[0-9A-Za-z_\-]+:\s*""")
+
+    /** 剥掉群消息的 `wxid_xxx:` 前缀（只剥开头一处；没有前缀原样返回） */
+    fun stripSender(content: String?): String {
+        if (content.isNullOrEmpty()) return ""
+        return content.replaceFirst(SENDER_PREFIX_RE, "")
+    }
+
+    /**
      * 由 `origType` + `origContent` 折一句可读摘要。
      *
      * 返回「显示串」：有实际内容就返回内容（文本/时长/文件名/被引用原文）；
@@ -170,9 +193,12 @@ object HintTextLogic {
     // ------------------------------------------------------------------ 文本
 
     private fun textSummary(content: String?): String {
-        if (content.isNullOrBlank()) return ""
+        // ⚠️ 先剥群消息的 `wxid_xxx:` 前缀再折平：否则 group 消息的角标正文会以
+        //    `wxid_0mnuc8zqglzt21: ` 开头（R30 用户直接报障「昵称不要 wxid」）
+        val body = stripSender(content)
+        if (body.isBlank()) return ""
         // 提示行是单行：换行 / 制表符 / 连续空格全折成单个空格
-        val flat = content.replace(Regex("\\s+"), " ").trim()
+        val flat = body.replace(Regex("\\s+"), " ").trim()
         return truncate(flat)
     }
 

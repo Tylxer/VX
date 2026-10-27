@@ -83,6 +83,82 @@ object VoiceFileGuard {
     var blockedCount = 0
         private set
 
+    /** 其中因「图片/视频」被拦的次数（R30 新增，用于区分语音/媒体两条路径） */
+    @Volatile
+    var blockedMediaCount = 0
+        private set
+
+    // ------------------------------------------------------------------ 图片 / 视频
+    //
+    // ⛔ 为什么图片也要拦（R30 用户报障：「被撤回的图片无法打开」）
+    //
+    // 撤回语音的教训是「拦 SQL ≠ 拦住删除」：语音还走 `File.delete(voice2/.../*.amr)`。
+    // 图片是**完全同构**的第二例 —— 撤回时微信同样会删 `image2/<桶>/` 下的
+    // `thumb_<imgPath>` / `<imgPath>` / `<imgPath>hd`。行还在（type=3、imgPath 还在）、
+    // 索引也在，唯独文件没了 ⇒ 点开看大图直接失败。
+    //
+    // ⚠️ 与语音的差别：**不需要算 md5 分桶**。我们不是去「找文件」，而是在删除发生时
+    //    判断「这个文件名里是否含某个刚被撤回的 imgPath」—— 微信的图片文件名本来就含它。
+    //    这就把 O(1) 路径计算这个最容易算错的部分整个绕开了。
+    //
+    // ⚠️ 代价：图片 TTL 取得比语音长（[PROTECT_MEDIA_MS]），因为用户点开大图往往比
+    //    点语音晚。再长就不行 —— 那会把微信的空间清理永久堵住。
+
+    /** 图片 / 视频的 imgPath → 放行截止时刻 */
+    private val protectedMedia = ConcurrentHashMap<String, Long>()
+
+    /** 保护窗口（图片/视频）。比语音长 10 倍：用户常过几分钟才回头看那张图 */
+    private const val PROTECT_MEDIA_MS = 600_000L
+
+    /** 短于此长度的 token 一律不收：`contains` 判据太短会误伤无关文件 */
+    private const val MIN_TOKEN = 16
+
+    /**
+     * 是否有活着的媒体保护项 —— `File.delete` 是高频路径，靠它把新增开销压到零。
+     * （绝大多数时候微信根本没撤回图片，这里恒 false，连 `file.path` 都不取。）
+     */
+    @Volatile
+    private var hasMedia = false
+
+    /** 把某个图片/视频的 imgPath 加入保护名单 */
+    fun protectMedia(token: String?, ttlMs: Long = PROTECT_MEDIA_MS) {
+        val t = token?.trim().orEmpty()
+        if (t.length < MIN_TOKEN) return
+        if (!t.all { it in '0'..'9' || it in 'a'..'f' || it in 'A'..'F' }) return
+        val now = SystemClock.elapsedRealtime()
+        protectedMedia[t] = now + ttlMs
+        if (protectedMedia.size > 256) {
+            protectedMedia.entries.removeIf { it.value < now }
+        }
+        hasMedia = true
+        LogX.i("VFG protectMedia img=${t.take(10)}..(${t.length}) ttl=${ttlMs}ms pool=${protectedMedia.size}")
+    }
+
+    /**
+     * 这个路径是不是某个「刚被撤回的图片/视频」的文件。
+     *
+     * 判据：路径含 `/image2/` 或 `/video2/` 或 `/video/`，且文件名含某个未过期的 token。
+     * 纯字符串 + map 遍历（池子只有个位数），无 IO。
+     */
+    private fun mediaHit(path: String, now: Long): String? {
+        if (!hasMedia) return null
+        if (path.indexOf("/image2/") < 0 && path.indexOf("/video2/") < 0 &&
+            path.indexOf("/video/") < 0
+        ) {
+            return null
+        }
+        val slash = path.lastIndexOf('/')
+        val name = if (slash >= 0) path.substring(slash + 1) else path
+        var alive = false
+        for ((token, until) in protectedMedia) {
+            if (until < now) continue
+            alive = true
+            if (name.contains(token)) return token
+        }
+        if (!alive) hasMedia = false
+        return null
+    }
+
     /**
      * 开关缓存。
      *
@@ -147,8 +223,8 @@ object VoiceFileGuard {
     fun stat(): String {
         val now = SystemClock.elapsedRealtime()
         val live = protected.entries.count { it.value >= now }
-        return "stat: enabled=${on()} blocked=$blockedCount " +
-            "protected(pool=${protected.size} live=$live)"
+        return "stat: enabled=${on()} blocked=$blockedCount media=$blockedMediaCount " +
+            "protected(pool=${protected.size} live=$live) mediaPool=${protectedMedia.size}"
     }
 
     /** 安装 hook。**必须在微信进程起来时调用一次**（[HookEntry] 已挂）。 */
@@ -182,22 +258,42 @@ object VoiceFileGuard {
             val self = param.thisObject as? File ?: return
             // File.getName() 是纯字段拼接，比 getAbsolutePath 便宜得多
             val name = runCatching { self.name }.getOrNull() ?: return
-            if (!name.startsWith(NAME_PREFIX) || !name.endsWith(EXT)) return
 
+            if (name.startsWith(NAME_PREFIX) && name.endsWith(EXT)) {
+                val path = runCatching { self.path }.getOrNull() ?: return
+                val now = SystemClock.elapsedRealtime()
+                if (!shouldBlock(path, now)) return
+                // ⛔ 开关关着就绝不拦（见 enabled 的 KDoc）
+                if (!on()) return
+
+                // 命中：伪装成功、不真删
+                param.result = true
+                blockedCount++
+                val img = name.substring(NAME_PREFIX.length, name.length - EXT.length)
+                val last = logAt[img]
+                if (last == null || now - last > LOG_TTL_MS) {
+                    logAt[img] = now
+                    LogX.i("VFG blocked file delete img=$img path=${path.takeLast(24)}")
+                }
+                return
+            }
+
+            // ---- 图片 / 视频（R30）：判据是「文件名含刚被撤回的 imgPath」 ----
+            // ⛔ `hasMedia` 必须先判：没有待保护的媒体时这一步**零开销**返回，
+            //    否则每次 File.delete 都要取一次 path（微信到处在删缓存文件）。
+            if (!hasMedia) return
             val path = runCatching { self.path }.getOrNull() ?: return
             val now = SystemClock.elapsedRealtime()
-            if (!shouldBlock(path, now)) return
-            // ⛔ 开关关着就绝不拦（见 enabled 的 KDoc）
+            val token = mediaHit(path, now) ?: return
             if (!on()) return
 
-            // 命中：伪装成功、不真删
             param.result = true
-            blockedCount++
-            val img = name.substring(NAME_PREFIX.length, name.length - EXT.length)
-            val last = logAt[img]
+            blockedMediaCount++
+            val key = "m:$token"
+            val last = logAt[key]
             if (last == null || now - last > LOG_TTL_MS) {
-                logAt[img] = now
-                LogX.i("VFG blocked file delete img=$img path=${path.takeLast(24)}")
+                logAt[key] = now
+                LogX.i("VFG blocked MEDIA delete img=${token.take(10)}.. name=$name")
             }
         }
     }
