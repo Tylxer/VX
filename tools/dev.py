@@ -10,6 +10,22 @@
   python tools/dev.py q <正则> [n]
       只拉日志并过滤（不编译）。例：python tools/dev.py q 'SNS_TAG' 30
 
+  python tools/dev.py probe <op> [sub] [sub2] [--val V] [--q SQL] [--grep P] [--n 40] [--wait 3] [--clear]
+      一条命令跑完一次探针：清日志 → 发广播 → 等 → 拉日志 → 过滤。
+      例：python tools/dev.py probe snsg srcfix cols --val -3405721048722501111 --grep SNSCOL
+      例：python tools/dev.py probe snsg srcfix rank --grep SRCRANK --clear
+      例：python tools/dev.py probe sql --q "select snsId,type from SnsInfo limit 5" --grep SQLX
+      ⭐ 取证默认走这个；只有「要改代码加新探针」才需要编译装包。
+
+      ⛔ 值会自动包单引号（设备 sh 会二次解析，不包就 syntax error）。
+      ⛔ `op=sql` 用 `--q`，不是 `--val`（模块读的是 extra `q`）。
+      ⛔ 微信在后台时 AMS 照样回 `Broadcast completed` 但**不投递**。本命令比对
+         日志文件大小，没增长就报错并拒绝打印旧日志 —— 别对着过期数据下结论。
+      ⛔ **写库探针**（`op=snsg sub=srcfix` 的 `album/hold/clean`、`snstag fake/mark`、
+         `kvset`、`setsrc`）：`srcfix` 的 `sub2` 一旦拼错会掉进 `else -> run()`
+         （`SnsTimelineSourceFix.run()`，含 snapshot 写台账 + 补位写库）。
+         只想要状态就用 `--grep` 类只读探针，别用 `srcfix stat`。
+
   python tools/dev.py ui <文本片段> [包含上下文的额外关键字]
       uiautomator 文本断言，替代截图（截图是最贵的单项 token 开销）。
       输出命中的节点 text + bounds，按 y 排序 —— 位置关系可量化，
@@ -47,9 +63,48 @@ def sh(*args, quiet=True):
     return out
 
 
+def _sq(v):
+    """设备端 `sh` 会**二次解析** adb 发过去的参数。
+
+    ⛔ 不包单引号时：`select count(*)` → `/system/bin/sh: syntax error: unexpected '('`
+    （广播压根没发出去）；`... where a='x'` 里那对单引号会把后面的 `-p 包名` 一起吞掉，
+    实测 `pkg=adb_keys`。两种都是**静默**失败的假阴性。
+    内部单引号按 POSIX 写法转成 `'\\''`。
+    """
+    s = str(v)
+    if s == "":
+        return "''"
+    return "'" + s.replace("'", "'\\''") + "'"
+
+
+# 这些开关后面紧跟的**值**需要转义；开关本身不转义
+_VALUE_FLAGS = ("--es", "--esn", "--esa", "--ei", "--el", "--ef")
+
+
 def bc(*extras, quiet=True):
-    return sh("shell", "am", "broadcast", "-a", PKG + ".action.PROBE", *extras,
+    args = []
+    want_val = False
+    for e in extras:
+        if want_val:
+            args.append(_sq(e))
+            want_val = False
+            continue
+        args.append(e)
+        if e in _VALUE_FLAGS:
+            want_val = True
+    return sh("shell", "am", "broadcast", "-a", PKG + ".action.PROBE", *args,
               "-p", HOST, quiet=quiet)
+
+
+def dbg_size():
+    """日志文件字节数。用来判「探针到底执行了没有」—— 比 `Broadcast completed` 可靠得多。
+
+    `am broadcast` 的 completed 只证明 AMS 收下了广播；微信在后台时它**不投递**，
+    旧实现会安安静静打印几分钟前的旧日志，让人对着过期数据下结论。
+    """
+    r = sh("shell", "stat", "-c", "%s", DBG)
+    m = re.search(r"(\d+)", r)
+    return int(m.group(1)) if m else -1
 
 
 def restart():
@@ -119,8 +174,11 @@ def show(txt, pat, n):
             continue
         seen.add(k)
         out.append(l)
+    # ⚠️ 行宽上限 240 → 1600：抓 SQL 时 240 会在 `sourceType in (...)` 中间截断，
+    #    而 SQL 的**后半段**（createTime 窗口 / LIMIT）恰恰是判据所在。
+    #    截断一度让人误以为「条件已经看全了」，白跑一轮。
     for l in out[-n:]:
-        print(l[:240])
+        print(l[:1600])
     print("--- 共 %d 行（去重后），显示最后 %d 行 ---" % (len(out), min(n, len(out))))
 
 
@@ -158,12 +216,84 @@ def cmd_ui(text, extra=None):
     print("--- 命中 %d 个 ---" % len(nodes))
 
 
+def cmd_probe(a):
+    """一条命令跑一次探针：可选清日志 → 发广播 → 等 → 拉日志 → 过滤。
+
+    存在理由：手工拼 `adb shell am broadcast --es op … -p com.tencent.mm` 再单独
+    `dev.py q` 是本轮最大的重复劳动（半小时拼了几十次），而且踩过三个坑：
+      · `kvset` 的参数名是 `key`/`val`，不是 `k`/`v`（栽过两次）
+      · `--el` 只收 signed long，无符号 id 会静默丢弃
+      · 值里含空格/负数时被 shell 二次解析
+    ⇒ 这里把参数形状固定成一种写法，探针名和参数跟着代码走，不再靠记忆。
+    """
+    kv, pos, i = {}, [], 0
+    while i < len(a):
+        x = a[i]
+        if x in ("--val", "--grep", "--n", "--wait", "--q"):
+            if i + 1 >= len(a):
+                print("%s 缺值" % x)
+                return
+            kv[x[2:]] = a[i + 1]
+            i += 2
+            continue
+        if x == "--clear":
+            kv["clear"] = "1"
+            i += 1
+            continue
+        pos.append(x)
+        i += 1
+    if not pos:
+        print("用法：dev.py probe <op> [sub] [sub2] "
+              "[--val V] [--q SQL] [--grep P] [--n 40] [--wait 3] [--clear]")
+        return
+    # 先清日志再发：LogX 有 5000 行上限，不清的话新探针输出可能被旧行挤掉
+    if kv.get("clear"):
+        bc("--es", "op", "logclear")
+        time.sleep(0.4)
+    ex = ["--es", "op", pos[0]]
+    if len(pos) > 1:
+        ex += ["--es", "sub", pos[1]]
+    if len(pos) > 2:
+        ex += ["--es", "sub2", pos[2]]
+    if "val" in kv:
+        ex += ["--es", "val", kv["val"]]
+    # ⛔ `op=sql` 读的是 extra **`q`**，不是 `val`（EntryReceiver.kt）。
+    #    只发 val 会让模块收到空 q，返回「只允许 select/pragma/with（收到 ''）」。
+    if "q" in kv:
+        ex += ["--es", "q", kv["q"]]
+    # 行数上限也要真的传给模块，否则 --n 只截本地显示
+    if "n" in kv:
+        ex += ["--ei", "n", kv["n"]]
+
+    before = dbg_size()
+    r = bc(*ex)
+    # 广播未投递是静默的（后台不投递 / 包名错），必须显式判
+    if "Broadcast completed" not in r:
+        print("!! 广播未投递（微信在后台? 先 am start）:\n%s" % r.strip()[:300])
+        return
+    time.sleep(float(kv.get("wait", "3")))
+    # ⛔ 第二道闸：`Broadcast completed` 只证明 AMS 收下了广播，证不了模块执行了。
+    #    微信在后台时 AMS 照收不误（result=0），模块一次都不跑。旧实现此时会
+    #    安安静静打印几分钟前的旧日志 —— 这是比「判据写错」更阴的陷阱：
+    #    数据是真的，只是属于上一次。
+    after = dbg_size()
+    if before >= 0 and after == before:
+        print("!! 探针**没有输出**（日志文件大小未变 %dB）：微信多半在后台，"
+              "或模块未重载。先 am start -n com.tencent.mm/.ui.LauncherUI 再试。\n"
+              "!! 下面**不会**打印旧日志，免得你对着过期数据下结论。" % before)
+        return
+    show(pull_dbg(), kv.get("grep") or "", int(kv.get("n", "40")))
+
+
 def main():
     a = sys.argv[1:]
     if not a:
         print(__doc__)
         return
     cmd = a[0]
+    if cmd == "probe":
+        cmd_probe(a[1:])
+        return
     if cmd == "restart":
         restart()
         print("微信已重启（LogX 计数归零）")
