@@ -21,8 +21,6 @@ import de.robv.android.xposed.callbacks.XC_LoadPackage
 import com.lx.wxgroup.core.HostContext
 import com.lx.wxgroup.data.Group
 import com.lx.wxgroup.data.GroupDb
-import com.lx.wxgroup.data.Keys
-import com.lx.wxgroup.data.Kv
 import com.lx.wxgroup.data.PrefKeys
 import com.lx.wxgroup.ui.AvatarCompose
 import com.lx.wxgroup.ui.UiKit
@@ -380,13 +378,20 @@ object GroupBar {
         val db = GroupDb.current() ?: return
 
         // A1/A2/A6 落地后，分组行归 ConvFilter 管（adapter 内插行，能跟会话按时间混排），
-        // 这里的 header 横条是旧机制 —— 两套并存会出现两份分组行，所以默认让位。
-        // 关掉「启用分组行」开关则退回旧行为，等于留了一条可回退的路。
-        val mode = if (runCatching { Kv.getBool(Keys.CHAT_GROUP_ROW_ENABLED) }.getOrDefault(true)) {
-            MODE_NONE
-        } else {
-            db.getPref(PrefKeys.BAR_MODE, MODE_LIST)
-        }
+        // 这里的 header 横条是旧机制 —— 两套并存会出现两份分组行，所以一律让位。
+        //
+        // 注意：本分支已废弃（DEPRECATED），保留仅为可回退。
+        // 历史上这里曾是「开关 OFF ⇒ 退回旧机制读 BAR_MODE（默认 MODE_LIST）」，
+        // 语义与用户直觉相反：关「启用分组行」本意是不要分组栏，结果反而把
+        // GroupBar 这条旧横条打开了（真机表现为 BAR pinFold -> collapse 常驻）。
+        // 现改为任何开关状态下都走 MODE_NONE，GroupBar 不再注入任何 UI；
+        // 分组行由 ConvFilter 全权负责（它自己会读 CHAT_GROUP_ROW_ENABLED 决定是否插行）。
+        //
+        // 由此 `syncPinFold` / `applyFold` / `FOLDED_H` 一整套变成死代码（MODE_NONE
+        // 下有两道 guard 拦住：build() 的布局回调里 `bar.mode == MODE_LIST` 判定，
+        // 以及 syncPinFold 自身首行的 mode 判定），但刻意保留不删，方便日后回退。
+        // 若要恢复旧机制，把下面改回读 PrefKeys.BAR_MODE 即可。
+        val mode = MODE_NONE
         val bar = build(ctx, db, list, parent, mode)
 
         // cr0 = 微信会话行的资源 id，行背景采样和滚动锚点都靠它（两种模式都要）
