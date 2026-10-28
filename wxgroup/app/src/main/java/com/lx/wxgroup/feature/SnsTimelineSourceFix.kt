@@ -219,8 +219,10 @@ object SnsTimelineSourceFix {
                 //
                 //    **`fixAlbum` 的输入是整个「曾经可见」台账（held=229），其中绝大多数是
                 //    正常动态**（正常动态 sourceType 天生就是 10，天然"已经带 bit8"）。
-                //    而 `fixed_orig` 同时是「已删除」的判据
-                //    （[GroupDb.snsTagIds] = `T_SNS ∪ T_SRC WHERE fixed_orig IS NOT NULL`）。
+                //    而 `fixed_orig` 曾被当成「已删除」的判据（R31h 之前
+                //    `GroupDb.snsTagIds` 是 `T_SNS ∪ T_SRC WHERE fixed_orig IS NOT NULL`）。
+                //    R31h 已把判据收窄成只认 `T_SNS`，但**污染数据仍在库里**（3447 条），
+                //    需 [GroupDb.cleanSrcFixedWithAlbumBit] 清洗 —— 判据修好不等于数据修好。
                 //
                 //    ⇒ 一句话：**把「可见」写成了「已删除」**。真机数据铁证：
                 //      `02:17 albumfix held=229 fixed=0 already=229` 之后
@@ -326,7 +328,8 @@ object SnsTimelineSourceFix {
             // ⚠️ 记 **0** 而不是当前 `p.src`（2026-10-28 改）。
             //
             // `fixed_orig` 现在被两支同时读：① 补位目标表（`isAlbumTarget`）；
-            // ② 「已删除」判据（`GroupDb.snsTagIds` 的 `fixed_orig IS NOT NULL`）。
+            // ② 补位台账并集（`GroupDb.snsLedgerIds` 的 `fixed_orig IS NOT NULL`，
+            //    目前只有停用中的 SnsAlbumMerge 用；「已删」判据 R31h 已收窄，见 GroupDb.snsTagIds）。
             // 而 [GroupDb.cleanSrcFixedWithAlbumBit] 的清洗判据是 `(fixed_orig & 8) != 0`
             // —— 因为**合法补位**记的原值必然缺 bit8。若这里记 `p.src`（人工登记时通常
             // 已经是正常的 10，含 bit8），这条会被下一次清洗误判成"误登记"而清掉。

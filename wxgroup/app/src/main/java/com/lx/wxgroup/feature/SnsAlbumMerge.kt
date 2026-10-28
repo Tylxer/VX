@@ -41,7 +41,7 @@ object SnsAlbumMerge {
     /**
      * 一轮同步最多注入几条。
      *
-     * ⚠️ 候选来源 `GroupDb.snsTagIds()` 返回的是 `Set<Long>`（HashSet），`.toList()` 后
+     * ⚠️ 候选来源 `GroupDb.snsLedgerIds()` 返回的是 `Set<Long>`（HashSet），`.toList()` 后
      * 顺序不确定；`pickForAlbum` 的 limit 截断会按这个随机顺序先到先得。所以这里必须
      * **远大于**预期台账规模，否则「同一批候选、每轮注入不同子集」会漂移。当前预期
      * 台账 12 条 < 32，取 32 兜底不触发截断；台账若再涨，优先调大这里而不是去给集合排序。
@@ -151,13 +151,15 @@ object SnsAlbumMerge {
             respIds.add(runCatching { XposedHelpers.getLongField(o, "Id") }.getOrDefault(0L))
             times.add(runCatching { XposedHelpers.getIntField(o, "CreateTime") }.getOrDefault(0))
         }
-        // ② 候选 = 台账并集（归档 ∪ src 补位），这一轮响应没有的
+        // ② 候选 = 补位台账并集（归档 ∪ src 补位），这一轮响应没有的
+        //    ⚠️ 用 snsLedgerIds() **不是** snsTagIds()：后者已收窄成「只认物理删除」的
+        //       已删判据（R31h 事故后拆分），拿它当候选会让注入范围缩到个位数。
         val gdb = GroupDb.current() ?: run {
             noDb.incrementAndGet()
             LogX.w("$TAG no module db")
             return
         }
-        val missing = SnsAlbumMergeLogic.pickForAlbum(gdb.snsTagIds().toList(), respIds, MAX_PER_ROUND)
+        val missing = SnsAlbumMergeLogic.pickForAlbum(gdb.snsLedgerIds().toList(), respIds, MAX_PER_ROUND)
         if (missing.isEmpty()) return
         // ③ attrBuf 在微信自己的 SnsInfo 行里（好友删除不删行）
         val db = SnsGuard.snsDbHandle() ?: run {

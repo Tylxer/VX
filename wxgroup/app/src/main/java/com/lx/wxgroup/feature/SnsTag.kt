@@ -639,9 +639,10 @@ object SnsTag {
             }
             return delSet
         }
-        // ⚠️ 数据源换成并集 snsTagIds()（实测 12 条 vs 原 snsArchivedIds 8 条）：
-        // 微信删动态有两条**互斥**路径（物理 DELETE 归档 vs UPDATE sourceType=0 补位），
-        // 两集合交集为 ∅，只查任一边都会漏标。详见 GroupDb.snsTagIds 的 KDoc。
+        // ⛔ 数据源 = [GroupDb.snsTagIds]，**只认物理删除归档 T_SNS**。
+        //    R30 这里曾用「归档 ∪ src 补位」的并集，理由是两条删除路径互斥、只查一边会漏标。
+        //    但补位台账 `fixed_orig` 会随每条可见动态写入且永不清理（R31 已涨到 3447 条），
+        //    拿它当已删判据 ⇒ 正常动态全被插上灰标。事故详情见 GroupDb.snsTagIds 的 KDoc。
         return runCatching { db.snsTagIds() }
             .onFailure { LogX.w("SNS_TAG ids failed: ${it.javaClass.simpleName}") }
             .getOrDefault(delSet)

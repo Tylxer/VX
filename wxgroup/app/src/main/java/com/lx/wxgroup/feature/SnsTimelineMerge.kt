@@ -63,6 +63,18 @@ object SnsTimelineMerge {
     private val ok = AtomicInteger(0)
     private val parseFail = AtomicInteger(0)
     private val emptyBuf = AtomicInteger(0)
+
+    /** `CreateTime <= 0` 被拒的条数（R31h 复核补：ct=0 会被 insertIndexDesc 静默沉底） */
+    private val badCt = AtomicInteger(0)
+
+    /**
+     * 归档轮转游标（R31h 复核 Q2：防饥饿）。
+     *
+     * 归档条数 > [MAX_PER_ROUND] 时，若永远从 `create_time DESC` 的第 1 条切，
+     * 第 13 条起永远注入不到。这里记住上轮结束位置，每轮接着取。
+     */
+    @Volatile
+    private var archiveCursor = 0
     private val noDb = AtomicInteger(0)
 
     /** 空响应被跳过的次数（真机上 `c3.N` 会被每秒调用，正常现象） */
@@ -142,24 +154,48 @@ object SnsTimelineMerge {
         if (firstHit.compareAndSet(false, true)) {
             LogX.i("$TAG first hit: respIds=${respIds.size} times=${times.size}")
         }
-        // ② 候选 = 台账里被清过位、我们补回来的，且这一轮响应没有的
+        // ② 候选 = **物理删除归档**（SnsGuard 拦下的 DELETE）里、这一轮响应没有的
+        //
+        // ⛔⛔ 绝不能用 listSrcFixedIds（补位台账 `fixed_orig`）：台账装的是「补过位的
+        //     可见动态」，每条正常动态都在里面，而时间线是**分页**的（一页 10 条）——
+        //     200 条台账里必然有 190 条不在当前页，「不在响应里」被判成「被删」。
+        //     R31h 真机铁证：`attempt=24 ok=24 emptyBuf=0` ⇒ 注入的 24 条全能从微信
+        //     SnsInfo 读回 attrBuf，**没有一条是删掉的**，全是重复的正常动态。
         val gdb = GroupDb.current() ?: run {
             noDb.incrementAndGet()
             LogX.w("$TAG no module db")
             return
         }
-        val missing = SnsTimelineMergeLogic.pickMissing(gdb.listSrcFixedIds(200), respIds, MAX_PER_ROUND)
-        if (missing.isEmpty()) return
-        // ③ attrBuf 在微信自己的 SnsInfo 行里（好友删除不删行，只是 sourceType=0）
-        val db = SnsGuard.snsDbHandle() ?: run {
-            noDb.incrementAndGet()
-            LogX.w("$TAG no sns db handle (skipped ${missing.size})")
-            return
+        // ⛔ R31h 复核 Q2：不能永远从 `create_time DESC` 的第 1 条切 12 条 ——
+        //    归档超过 12 条时，第 13 条起**永远轮不到**（饥饿），且没有任何日志提示被截断。
+        //    这里做**轮转游标**：每轮从上轮结束处接着取，取到尾再回头。
+        val all = gdb.listArchiveIds(500)
+        val rotated = if (all.size <= MAX_PER_ROUND) {
+            all
+        } else {
+            val s = archiveCursor % all.size
+            buildList(all.size) {
+                addAll(all.subList(s, all.size))
+                addAll(all.subList(0, s))
+            }
         }
+        val missing = SnsTimelineMergeLogic.pickMissing(rotated, respIds, MAX_PER_ROUND)
+        if (missing.isEmpty()) return
+        if (all.size > MAX_PER_ROUND) {
+            archiveCursor = (archiveCursor + missing.size) % all.size
+        }
+        // ③ attrBuf 两个来源：微信自己的 SnsInfo 行（行还在）→ 我们的归档（行已被物理删）
+        val db = SnsGuard.snsDbHandle()
         val cls = objCls ?: return
         for (id in missing) {
             attempt.incrementAndGet()
-            val buf = readAttrBuf(db, id)
+            var buf = db?.let { readAttrBuf(it, id) }
+            var src = "snsinfo"
+            if (buf == null || buf.isEmpty()) {
+                // 物理删除的场景：行已经没了，只能吃我们拦下 DELETE 时存的快照
+                buf = gdb.snsArchivedAttrBuf(id)
+                src = "archive"
+            }
             if (buf == null || buf.isEmpty()) {
                 emptyBuf.incrementAndGet()
                 LogX.w("$TAG-FAIL snsId=$id reason=empty-buf size=${list.size}")
@@ -168,14 +204,27 @@ object SnsTimelineMerge {
             val o = parse(cls, buf)
             if (o == null) {
                 parseFail.incrementAndGet()
-                LogX.w("$TAG-FAIL snsId=$id reason=parse-ex size=${list.size}")
+                LogX.w("$TAG-FAIL snsId=$id reason=parse-ex src=$src size=${list.size}")
                 continue
             }
             // l5.f 的做法：Id 为空时用 DB 的 snsId 兜底
-            if (XposedHelpers.getLongField(o, "Id") == 0L) {
-                XposedHelpers.setLongField(o, "Id", id)
+            //
+            // ⛔ R31h 复核：这两个字段**必须各自 runCatching**（与本文件 125 行的纪律一致）。
+            //    裸调用在字段漂移/缺失时抛异常 → 冒泡到 mergeGuard 被整包吞掉 ⇒
+            //    **本轮剩余 id 全部跳过，且 STAT 日志不会执行**，现场只剩一行
+            //    `SNS-INJECT before err`，排查时会被误判成「钩子没触发」。
+            val curId = runCatching { XposedHelpers.getLongField(o, "Id") }.getOrDefault(0L)
+            if (curId == 0L) {
+                runCatching { XposedHelpers.setLongField(o, "Id", id) }
             }
-            val ct = XposedHelpers.getIntField(o, "CreateTime")
+            val ct = runCatching { XposedHelpers.getIntField(o, "CreateTime") }.getOrDefault(0)
+            // ct<=0 不能交给 insertIndexDesc：times[i] >= 0 恒真 ⇒ 静默沉到列表最底部。
+            // 与其插到错误位置，不如放弃这一条并留痕（有 ct 的条目照常注入）。
+            if (ct <= 0) {
+                badCt.incrementAndGet()
+                LogX.w("$TAG-FAIL snsId=$id reason=bad-ct src=$src size=${list.size}")
+                continue
+            }
             val idx = SnsTimelineMergeLogic.insertIndexDesc(times, ct)
             val added = runCatching { list.add(idx, o); true }.getOrDefault(false)
             if (!added) {
@@ -184,12 +233,12 @@ object SnsTimelineMerge {
             }
             times.add(idx, ct)
             ok.incrementAndGet()
-            LogX.i("$TAG snsId=$id parse=ok buf=${buf.size} ct=$ct idx=$idx size=${list.size}")
+            LogX.i("$TAG snsId=$id parse=ok src=$src buf=${buf.size} ct=$ct idx=$idx size=${list.size}")
         }
         LogX.i(
             "$TAG-STAT attempt=${attempt.get()} ok=${ok.get()} parseFail=${parseFail.get()} " +
-                "emptyBuf=${emptyBuf.get()} emptyResp=${emptyResp.get()} noDb=${noDb.get()} " +
-                "resp=${respIds.size}"
+                "emptyBuf=${emptyBuf.get()} badCt=${badCt.get()} emptyResp=${emptyResp.get()} " +
+                "noDb=${noDb.get()} resp=${respIds.size}"
         )
     }
 

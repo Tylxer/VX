@@ -17,7 +17,7 @@ import org.junit.Test
  * 这些都只在真机进某个好友相册 + 逐屏看才能发现 ⇒ 在 JVM 里先锁死。
  *
  * ## 数据来源
- * - `pickForAlbum` 输入口径：`GroupDb.snsTagIds()` 的并集（归档 ∪ src 补位），
+ * - `pickForAlbum` 输入口径：`GroupDb.snsLedgerIds()` 的并集（归档 ∪ src 补位），
  *   响应列表已有的要排除（与时间线 `pickMissing` 同语义）。
  * - `insertIndexDesc` 的降序假设：`jc5.f` 是相册响应列表，按 `CreateTime` 倒序
  *   （新的在前），dex 取证见 `docs/_r30_lane2_album_page.md` §4。

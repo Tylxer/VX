@@ -30,7 +30,9 @@ object SnsDeletedTagLogic {
      * - 过滤 `snsId = 0`：无效项（`oh3/p.isInValid()` 判 die），本就不该出现在界面上；
      * - 去重：台账 `sns_visible_src` 里同一 snsId 可能有多行。
      *
-     * @param ids 台账候选（`GroupDb.listSrcFixedIds()` 的返回，已按 `last_seen DESC` 排序）
+     * @param ids 已删判据候选。**必须是 `GroupDb.snsTagIds()`**（只含物理删除归档 `T_SNS`）；
+     *   ⛔ 曾经传 `GroupDb.listSrcFixedIds()`（补位台账），那是「补过位的可见动态」，
+     *   会把正常动态全部打上 `[删除已拦截]` —— R31h 真实事故。
      */
     fun taggedIds(ids: List<Long>): Set<Long> {
         val out = HashSet<Long>(ids.size)

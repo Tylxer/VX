@@ -513,20 +513,94 @@ class GroupDb private constructor(context: Context) :
     }
 
     /**
-     * R30 §6.1「已删动态」标记用的**并集清单**。
+     * 「已删动态」判据 —— **只认物理删除归档 [T_SNS]**（R31h 方案 A 收窄）。
      *
-     * 微信有两条**互斥**的删除路径（2026-10-27 真机实测：两个集合**交集为 ∅**）：
-     * - 物理 `DELETE FROM SnsInfo` ⇒ 被 `SnsGuard` 拦下并写进 [T_SNS]（实测 8 条）；
-     * - `UPDATE SnsInfo SET sourceType=0` ⇒ 被 `SnsTimelineSourceFix` 补位，`fixed_orig` 留痕（实测 4 条）。
+     * ⛔⛔ **这里有一起真实事故，改回并集前必读。**
+     * R30 时这里写的是 `T_SNS ∪ (T_SRC WHERE fixed_orig IS NOT NULL)`，理由是「微信删动态有两条
+     * 互斥路径，只查一边会漏标」。当时 `fixed_orig` 只有 4 条，所以「补过位」≈「被删过」碰巧成立。
+     * 但 R31 把补位范围扩到全量可见动态后，`fixed_orig` 涨到 **3447 条**，而它**只写不删**：
+     * ⇒ 3447 条**正常动态**全部被判成「已删除」，正常朋友圈被插上「已阻止删除」灰标，误伤真实用户。
      *
-     * ⇒ 只查任一边都会漏标，这里用 `UNION` 一次取全（12 条）。
+     * 根因不是 SQL 写错，而是 **`fixed_orig` 这一个字段背了两个语义**：
+     * ① 补位台账（「这条我动过 sourceType」，每条可见动态都会写，量级 = 全部动态）；
+     * ② 已删判据（「这条被删了」，应该只有个位数）。
+     * 只要两者共用一个字段，下游任何一处「顺手记一笔」都会污染判据。
      *
-     * ⚠️ **不加 LIMIT**：`UNION` 没有 `ORDER BY` 时 LIMIT 取的是「任意 N 行」，
-     * 会让早期被删的动态**静默漏标**（与 [snsArchivedIds] 同一理由）。这里只读一个
-     * INTEGER 列，全量扫的代价远小于漏标。
+     * ⇒ 现在拆成两个方法，语义分开：
+     * - **本方法 [snsTagIds]**：已删判据，只查 [T_SNS]（`SnsGuard` 拦住的物理 DELETE）。
+     * - **[snsLedgerIds]**：补位台账并集，只给「按台账回捞动态」这类用途（`SnsAlbumMerge`）。
+     *
+     * ⚠️ 代价（已知并接受）：走 `UPDATE sourceType=0` 那条路径被删的动态不再有灰标。
+     * 想补回来必须按 R31h 方案 B 做 —— 给 [T_SRC] 加一列记录「该 snsId 在不在最近一次
+     * 服务端回包里」，只有**不在**的才算真删，**绝不能再拿 `fixed_orig` 当判据**。
      */
     fun snsTagIds(): Set<Long> = runCatching {
-        val out = HashSet<Long>(256)
+        val out = HashSet<Long>(64)
+        readableDatabase.query(
+            T_SNS, arrayOf("sns_id"), null, null, null, null, null,
+        ).use { c ->
+            val i = c.getColumnIndexOrThrow("sns_id")
+            while (c.moveToNext()) out.add(c.getLong(i))
+        }
+        out
+    }.onFailure { LogX.w("GroupDb snsTagIds failed: ${it.javaClass.simpleName}") }
+        .getOrDefault(emptySet())
+
+    /**
+     * 朋友圈时间线注入的候选 snsId（新的在前）。
+     *
+     * ⛔ **只能用这个，绝不能用 [listSrcFixedIds]。** R31h 真机铁证：
+     * 用补位台账当候选时 `SNS-INJECT-STAT attempt=24 ok=24 emptyBuf=0` ——
+     * 24 条全部能从微信 `SnsInfo` 里读回 attrBuf，说明它们**全是还好好存在的正常动态**，
+     * 没有一条被删。根因：时间线**分页**（一页 10 条），台账 200 条里必然有 190 条
+     * 不在当前页 ⇒ 「不在响应里」被判成「被删」⇒ 每轮往列表底部重复注入 12 条。
+     *
+     * 本方法只取 [T_SNS]（`SnsGuard` 拦下的物理 `DELETE`），那才是真被删的。
+     */
+    fun listArchiveIds(limit: Int = 200): List<Long> = runCatching {
+        val out = ArrayList<Long>(limit.coerceAtMost(256))
+        readableDatabase.query(
+            T_SNS, arrayOf("sns_id"), null, null, null, null, "create_time DESC", limit.toString()
+        ).use { c ->
+            val i = c.getColumnIndexOrThrow("sns_id")
+            while (c.moveToNext()) out.add(c.getLong(i))
+        }
+        out
+    }.onFailure { LogX.w("GroupDb listArchiveIds failed: ${it.javaClass.simpleName}") }
+        .getOrDefault(emptyList())
+
+    /**
+     * 按 snsId 读归档的 `attr_buf`（时间线注入用）。
+     *
+     * 为什么不复用 [snsArchived]：那个读整行，`content` / `post_buf` 一起出来（动辄几十 KB），
+     * 而注入每轮最多 12 条、跑在 worker 上，只需要这一个 BLOB。
+     *
+     * ⚠️ **BLOB 必须 `getType()==4` + `getBlob`**：`getString` 读 BLOB 返回 null，
+     * 本项目为此误判过两次（以为「正文永久丢失」，其实是取值方式错）。
+     */
+    fun snsArchivedAttrBuf(snsId: Long): ByteArray? = runCatching {
+        readableDatabase.query(
+            T_SNS, arrayOf("attr_buf"), "sns_id=?", arrayOf(snsId.toString()),
+            null, null, null, "1",
+        ).use { c -> if (c.moveToFirst() && c.getType(0) == 4) c.getBlob(0) else null }
+    }.onFailure { LogX.w("GroupDb snsArchivedAttrBuf failed: ${it.javaClass.simpleName}") }
+        .getOrNull()
+
+    /**
+     * 补位台账的**并集清单**（[T_SNS] ∪ `T_SRC WHERE fixed_orig IS NOT NULL`）。
+     *
+     * ⛔ **绝不能拿它当「已删除」判据**（见 [snsTagIds] 的事故说明）——它包含**所有补过位
+     * 的正常动态**，量级是全部可见动态。
+     *
+     * 唯一合法用途：按台账把「微信本地已经不返回、但我们有记录」的动态回捞出来（相册注入）。
+     * 目前只有 `SnsAlbumMerge`（**默认停用**）用它。
+     *
+     * ⚠️ **不加 LIMIT**：`UNION` 没有 `ORDER BY` 时 LIMIT 取的是「任意 N 行」，
+     * 会让早期记录**静默漏掉**（与 [snsArchivedIds] 同一理由）。这里只读一个
+     * INTEGER 列，全量扫的代价远小于漏。
+     */
+    fun snsLedgerIds(): Set<Long> = runCatching {
+        val out = HashSet<Long>(4096)
         readableDatabase.rawQuery(
             "SELECT sns_id FROM $T_SNS UNION SELECT sns_id FROM $T_SRC WHERE fixed_orig IS NOT NULL",
             null,
@@ -535,7 +609,7 @@ class GroupDb private constructor(context: Context) :
             while (c.moveToNext()) out.add(c.getLong(i))
         }
         out
-    }.onFailure { LogX.w("GroupDb snsTagIds failed: ${it.javaClass.simpleName}") }
+    }.onFailure { LogX.w("GroupDb snsLedgerIds failed: ${it.javaClass.simpleName}") }
         .getOrDefault(emptySet())
 
     fun deleteSnsArchive(snsId: Long) {
@@ -678,8 +752,10 @@ class GroupDb private constructor(context: Context) :
      *   2026-10-27 晚那次「already 分支也 markSrcFixed」的错误改动。
      *
      * ## 为什么必须清
-     * `fixed_orig IS NOT NULL` 同时是「已删除」判据（见 [snsTagIds]）。被误登记的正常动态
-     * 会被 SnsTag 当成已删，在时间线/好友主页上被标 `[删除已拦截]`（真机报障原样）。
+     * `fixed_orig IS NOT NULL` 在 R31h 之前同时是「已删除」判据（当时见 [snsTagIds]，现已收窄）。
+     * 被误登记的正常动态会被 SnsTag 当成已删，在时间线/好友主页上被标 `[删除已拦截]`（真机报障原样）。
+     * ⚠️ 判据收窄后误标已止血，但**台账里的污染行仍在**（计入 [snsLedgerIds]，会虚增注入候选），
+     * 所以清洗仍必须保留、且事后要复跑一次。
      *
      * @return 清掉的行数；-1 = 写库失败
      */
@@ -724,8 +800,18 @@ class GroupDb private constructor(context: Context) :
     /**
      * 「被微信清过位、我们补回来过」的 snsId（`fixed_orig IS NOT NULL`，最近补的在前）。
      *
-     * 这是方案 A（Response-Merge）的**注入候选集**：这些条目服务端已经不返回，
-     * 但本地行与 `attrBuf` 都还在，正好补回时间线响应列表。
+     * ## 合法用途只有两个，都跟「补位」本身有关
+     * ① `SnsTimelineSourceFix` 自己的补位目标表；
+     * ② 人工 `setsrc` 复核。
+     *
+     * ## ⛔ 绝不能当「已删除」或「注入候选」用（R31h 事故）
+     * 老 KDoc 曾写「这些条目服务端已经不返回」—— **这句是错的，且代价很大**：
+     * 时间线是**分页**的，台账 200 条里绝大部分只是「不在当前这一页」，
+     * 拿它当「被删/缺失」判据会做两件坏事：
+     * - 灰标：把正常动态标成「已阻止删除」（用户真实报障）；
+     * - 注入：把正常动态重复塞回时间线底部（`attempt=24 ok=24 emptyBuf=0` 铁证）。
+     *
+     * ⇒ 已删判据用 [snsTagIds]，注入候选用 [listArchiveIds]，两者都只认 [T_SNS]。
      *
      * @param limit 上限，防止台账变大后每轮同步都拖一大把 id 出来
      */

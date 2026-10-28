@@ -23,7 +23,7 @@ object SnsAlbumMergeLogic {
      * 与时间线 [SnsTimelineMergeLogic.pickMissing] 同语义：
      * 排除 `snsId=0`（无效项）、排除响应已有的、去重、限条数。
      *
-     * @param ledgerIds 台账候选（相册版来源是 `GroupDb.snsTagIds()` 的并集，
+     * @param ledgerIds 台账候选（相册版来源是 `GroupDb.snsLedgerIds()` 的并集，
      *   本身是 `Set<Long>`，调用方转成 `List` 传入；顺序不影响最终渲染位，
      *   注入位置由 [insertIndexDesc] 按 CreateTime 独立决定）
      * @param respIds 响应列表里已有的 snsId
