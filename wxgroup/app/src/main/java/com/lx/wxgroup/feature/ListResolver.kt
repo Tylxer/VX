@@ -108,6 +108,19 @@ object ListResolver {
      * ⚠️ 第 2 条只认「配置为空」，**不认「展开后为空」**。用户把允许名单设成一个
      * 空分组时，正确行为是「谁都不在范围内」而不是「所有人都允许」——
      * 后者会把「只想对某个群生效」变成「对全部会话生效」。
+     *
+     * ## ⛔ 调用方必读：`talker == null` 时**不能直接信这个返回值**（R34 复核 P2②）
+     *
+     * 本函数对空 talker 一律 `return false`（宁可漏判，与 NotifyMute 同口径）。
+     * 这在**允许名单模式**下是对的；但在**纯排除模式**（`allowRaw` 为空、`excludeRaw` 非空）下
+     * 会把语义整个反过来 —— 用户配的是「排除这几个、其余都下」，而「查不到 talker」这个
+     * **取数失败**会被当成「命中排除」⇒ 变成「谁都不下」，且日志里只剩 skipScope 在涨。
+     *
+     * ⇒ **这个判断不能下沉到本函数**（下沉就要改 NotifyMute 的既有口径）。
+     *   调用方自己在调 [inScope] 之前分一下模式：
+     *   `talker.isNullOrBlank() && allowRaw.isEmpty()` ⇒ **放行**（纯排除模式的语义是默认生效），
+     *   并打 warn 表明这是降级；其余情况照旧交给 [inScope]。
+     *   参考实现见 `AutoHdImg.fire` 的名单分支。
      */
     fun inScope(
         talker: String?,

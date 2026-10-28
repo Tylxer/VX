@@ -124,13 +124,28 @@ object VoiceFileGuard {
         //    `THUMBNAIL_DIRPATH://th_0c947a1dd158f52fcca431bb84954d5b`。
         //    旧实现要求「整个字符串全是 hex」，于是这条在**第一道判据**就 return 了 ——
         //    连日志都没打（真机 `grep VFG` = 0 行正是证据），文件照删，点开必然失败。
-        //    现在由 MediaGuardLogic 取最长 hex 段（≥32 位，见其类注释：16 位会误收数字串）。
+        //    现在由 MediaGuardLogic 取**优先 32 位**的 hex 段（见其类注释：16 位会误收数字串，
+        //    只设下界则会被更长的 hex 顶掉）。
         val t = MediaGuardLogic.hexToken(token)
         if (t == null) {
             // ⛔ 不能静默 return：上一次「一行日志都没有」害得排查了半天。
             //    取不到 token = 这张图**完全没被保护**，必须留下痕迹。
-            LogX.w("VFG protectMedia SKIP no-token raw=${token?.take(40)}")
+            //    ⚠️ 这条也是「视频（type=43）imgPath 真实形态」的取证口 ——
+            //       `RevokeRescue` 的 `RRV record` 行同时打了 `origType=` 与 `imgPath=`，
+            //       两条日志能对上，不必再改 RevokeRescue 传类型进来。
+            LogX.w("VFG protectMedia SKIP no-token raw=${token?.take(48)}")
             return
+        }
+        // ⛔ 取到的不是 32 位 md5 ⇒ `contains` 几乎必然永不命中 ⇒ 这张图**实际没被保护**，
+        //    而 `protectedMedia` 里又有值、`hasMedia` 又为 true —— 表现得一切正常。
+        //    这正是「静默失效」最难查的一种（既不是 SKIP、也不是 blocked、没有任何一行日志），
+        //    所以必须在这里把长度和 raw 值一起打出来（R34 复核 P2①）。
+        //    ⚠️ 仍然照样入池：万一真机上真的存在更长形态的合法 token，退回旧行为总比直接丢强。
+        if (!MediaGuardLogic.isMd5(t)) {
+            LogX.w(
+                "VFG protectMedia token len=${t.length} != ${MediaGuardLogic.MD5_LEN} " +
+                    "tok=${t.take(16)} raw=${token?.take(48)}",
+            )
         }
         val now = SystemClock.elapsedRealtime()
         protectedMedia[t] = now + ttlMs
@@ -148,7 +163,8 @@ object VoiceFileGuard {
      * 这个路径是不是某个「刚被撤回的图片/视频」的文件。
      *
      * 判据全部下移到 [MediaGuardLogic.mediaHit]（纯逻辑，有单测覆盖）：
-     * 路径在 `/image2/` `/video2/` `/video/` 下，且文件名含某个未过期的 32 位 token。
+     * 路径在 `/image2/` `/video2/` `/video/` 下，且文件名含某个未过期的 token
+     * （期望是 32 位 md5，见 [MediaGuardLogic.MD5_LEN]）。
      */
     private fun mediaHit(path: String, now: Long): String? =
         MediaGuardLogic.mediaHit(path, protectedMedia, now)

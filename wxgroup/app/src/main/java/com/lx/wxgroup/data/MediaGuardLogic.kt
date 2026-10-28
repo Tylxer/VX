@@ -20,11 +20,42 @@ package com.lx.wxgroup.data
  * 真机实测（R31g）：图片 `imgPath` = `THUMBNAIL_DIRPATH://th_<32 位 md5>`，
  * 最长 hex 段恒为 32 位。所以下限放到 32 —— 既不会误收数字串，也仍兼容
  * `xxx://th_<md5>` / `/image2/ab/cd/<md5>` / 纯 `<md5>` 三种形态。
+ *
+ * ## ⛔ 为什么光有下限还不够（R34 复核）
+ *
+ * 只设下限 ⇒ 「最长段」会被串里更长的 hex 顶掉（sha1 40 / aes key 64），
+ * 取回来的不是 md5，`contains` 永不命中且**零日志**。所以 [hexToken] 改成
+ * **优先取长度恰好 32 的段**，并且调用方必须拿 `token.length` 与 [MD5_LEN]
+ * 比一次、不等就告警（见 [MD5_LEN] 的 KDoc）。
+ *
+ * ## ⚠️ 32 位只对「图片」实锤
+ *
+ * 视频（type=43）的 `imgPath` 形态**没有真机证据**（`docs/_r29_g2_msg_object.md` §视频路径
+ * 明写「属强推测，真机需验」）。同一个 `message.imgPath` 列，语音是 26 位
+ * （`VoiceBackupLogic.isValidImgPath`）、图片是 32 位 ⇒ **长度随消息类型变是已证实的事实**。
+ * 视频现在复用图片口径，靠 `VoiceFileGuard.protectMedia` 的 warn 把 raw 值打出来取证。
  */
 object MediaGuardLogic {
 
     /** 媒体 token 最短长度：md5 定长 32。低于此值一律不收（见类注释） */
     const val MIN_TOKEN = 32
+
+    /**
+     * 期望的 token 长度（md5）。**取到的不是这个长度就是形态异常**。
+     *
+     * ⛔ 为什么必须单独定义一个「期望值」而不是只靠 [MIN_TOKEN] 下界（R34 复核发现）：
+     * [hexToken] 取的是**最长** hex 段，而只设下界 ⇒ 串里一旦混进更长的 hex
+     * （sha1 40 位、aes key 64 位、长整型十六进制），最长段就会被它顶掉，
+     * 拿回来的根本不是文件名里那个 md5 ⇒ `contains` **永不命中** ⇒ 文件照删，
+     * 而且日志里什么都没有（既不是 SKIP、也不是 blocked）—— 静默失效换了入口。
+     *
+     * 所以调用方（[com.lx.wxgroup.feature.VoiceFileGuard.protectMedia]）必须拿
+     * `token.length` 与 [MD5_LEN] 比一次，不等就打 warn 带 raw 值。
+     */
+    const val MD5_LEN = 32
+
+    /** [hexToken] 返回的那一段是不是「正常形态」（= md5）。供调用方决定要不要告警 */
+    fun isMd5(token: String?): Boolean = token != null && token.length == MD5_LEN
 
     /** 媒体文件所在目录片段（含两侧分隔符，防 `myimage2` 这类误命中） */
     private val MEDIA_DIRS = arrayOf("/image2/", "/video2/", "/video/")
@@ -33,7 +64,14 @@ object MediaGuardLogic {
         c in '0'..'9' || c in 'a'..'f' || c in 'A'..'F'
 
     /**
-     * 从任意形态的 imgPath 里取出最长的十六进制段（统一**小写**返回）。
+     * 从任意形态的 imgPath 里取出用作保护 token 的十六进制段（统一**小写**返回）。
+     *
+     * ⛔ **不是单纯取「最长段」**（R34 复核修正）：
+     * 最长段会被串里更长的 hex（sha1 / aes key / 长整型）顶掉，取回来的就不是文件名里
+     * 那个 md5 ⇒ `contains` 永不命中 ⇒ 静默失效。所以分两级取：
+     * 1. **优先**取第一个长度**恰好 = [MD5_LEN]** 的段（真机图片恒为此形态）；
+     * 2. 没有 32 位段，才退回「最长且 ≥ [minLen] 的段」—— 此时长度多半 ≠ 32，
+     *    调用方应按 [MD5_LEN] 比一次并告警（见 [isMd5]）。
      *
      * 返回 null 的情形：整串没有连续 hex 段，或最长段短于 [minLen]。
      * 大小写都认（真机是小写，防大写变体）—— 必须小写归一，否则
@@ -42,19 +80,23 @@ object MediaGuardLogic {
     fun hexToken(raw: String?, minLen: Int = MIN_TOKEN): String? {
         val s = raw?.trim().orEmpty()
         if (s.length < minLen) return null
-        var best = ""
+        var best = ""    // 最长段（兜底用）
+        var exact = ""   // 第一个长度恰好 = MD5_LEN 的段（优先用）
         var i = 0
         while (i < s.length) {
             if (isHex(s[i])) {
                 var j = i
                 while (j < s.length && isHex(s[j])) j++
                 if (j - i > best.length) best = s.substring(i, j)
+                // 只认第一个 md5 长度的段：真机一串里只有一个 md5，多了也不该换
+                if (exact.isEmpty() && j - i == MD5_LEN && MD5_LEN >= minLen) exact = s.substring(i, j)
                 i = j
             } else {
                 i++
             }
         }
-        return if (best.length >= minLen) best.lowercase() else null
+        val picked = if (exact.isNotEmpty()) exact else best
+        return if (picked.length >= minLen) picked.lowercase() else null
     }
 
     /** 路径是否落在图片/视频目录下 */

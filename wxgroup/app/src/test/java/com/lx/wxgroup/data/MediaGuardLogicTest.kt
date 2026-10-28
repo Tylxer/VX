@@ -55,6 +55,51 @@ class MediaGuardLogicTest {
         assertEquals(md5A, MediaGuardLogic.hexToken(md5A.uppercase()))
     }
 
+    /**
+     * ⛔ 修复核心（R34 P2①）：串里混进**更长的 hex**（sha1 40 / aes key 64）时，
+     * 必须取 md5 那个 32 位段，而不是「最长段」。
+     *
+     * 取最长段 ⇒ 拿回来 64 位 ⇒ `contains` 对真实文件名永不命中 ⇒ 文件照删且**零日志**
+     * （既不是 SKIP 也不是 blocked）—— 这正是本次要消灭的静默失效。
+     */
+    @Test
+    fun hexTokenPrefersMd5OverLongerHexSegment() {
+        val sha1 = "a".repeat(40)
+        val key64 = "b".repeat(64)
+        // 长段在 md5 之后
+        assertEquals(md5A, MediaGuardLogic.hexToken("THUMBNAIL_DIRPATH://th_${md5A}_$key64"))
+        // 长段在 md5 之前（「最长段」实现取到的是它）
+        assertEquals(md5A, MediaGuardLogic.hexToken("/image2/ab/cd/${key64}/${md5A}"))
+        assertEquals(md5A, MediaGuardLogic.hexToken("$sha1/$md5A"))
+        // 真机形态 + 尾巴上挂一段更长的 hex
+        assertEquals(md5A, MediaGuardLogic.hexToken("/image2/ab/cd/${md5A}hd?k=$key64"))
+    }
+
+    /** 没有 32 位段时才退回「最长 ≥32 段」—— 固化这条兜底，别让它变成隐式行为 */
+    @Test
+    fun hexTokenFallsBackToOverLongSegmentWhenNoMd5() {
+        val sha1 = "a".repeat(40)
+        val got = MediaGuardLogic.hexToken("THUMBNAIL_DIRPATH://th_$sha1")
+        assertEquals(sha1, got)
+        // 兜底拿到的不是 md5 ⇒ 调用方必须据此告警（见 VoiceFileGuard.protectMedia）
+        assertFalse(MediaGuardLogic.isMd5(got))
+        assertTrue(MediaGuardLogic.isMd5(md5A))
+    }
+
+    /**
+     * ⛔ 下界必须顶到 21 以上：项目自己记录过 `msgSvrId` 是 **19 位**
+     * （`docs/_r21c_voice_root.md` 的 `6139184963485905836`），这类纯数字串一旦被当成
+     * token，`contains` 就会误拦无关文件（比漏保护严重得多）。
+     *
+     * 只放 18 位样本（老用例那样）锁不住 —— 那会把 19 位 msgSvrId 放过去。
+     */
+    @Test
+    fun hexTokenRejectsNineteenDigitMsgSvrId() {
+        assertNull(MediaGuardLogic.hexToken("6139184963485905836"))          // 19 位
+        assertNull(MediaGuardLogic.hexToken("/image2/ab/cd/6139184963485905836"))
+        assertNull(MediaGuardLogic.hexToken("20251028000123456789"))         // 20 位
+    }
+
     // ---------------------------------------------------------------- inMediaDir
 
     @Test
@@ -98,6 +143,32 @@ class MediaGuardLogicTest {
         assertNull(MediaGuardLogic.mediaHit(null, mapOf(md5A to now + 1000), now))
     }
 
+    /**
+     * ⛔ 判据必须作用在**文件名**上，不是整条路径。
+     *
+     * 用整路径 `contains` 时：桶目录（2 位 hex）无所谓，但一旦 token 出现在**目录段**
+     * （比如微信把某张图放在以 md5 命名的子目录里），就会把该目录下**所有文件**都拦住。
+     * 老用例全是「token 只在文件名里」，两种实现都绿 —— 这条专门补上区分度。
+     */
+    @Test
+    fun mediaHitIgnoresTokenAppearingOnlyInDirectoryPart() {
+        val pool = mapOf(md5A to now + 1000)
+        // token 只出现在目录段，文件名里没有 ⇒ 不该命中
+        assertNull(MediaGuardLogic.mediaHit("/sdcard/MicroMsg/x/image2/$md5A/other.jpg", pool, now))
+        assertNull(MediaGuardLogic.mediaHit("/sdcard/MicroMsg/x/image2/$md5A/th_$md5B", pool, now))
+        // 反证：同一个 token 出现在文件名里就该命中
+        assertEquals(md5A, MediaGuardLogic.mediaHit("/sdcard/MicroMsg/x/image2/$md5A/$md5A", pool, now))
+    }
+
+    /** 「到期那一刻」仍算存活：与 [MediaGuardLogic.anyAlive] 的 `>=` 口径必须一致 */
+    @Test
+    fun mediaHitTreatsExpiryAtNowAsAlive() {
+        val dir = "/sdcard/MicroMsg/x/image2/ab/cd/"
+        assertEquals(md5A, MediaGuardLogic.mediaHit("$dir$md5A", mapOf(md5A to now), now))
+        // 差 1 毫秒就过期
+        assertNull(MediaGuardLogic.mediaHit("$dir$md5A", mapOf(md5A to now - 1), now))
+    }
+
     /** 多张同时受保护时，各命中各的（不能因为池里有别人就放行） */
     @Test
     fun mediaHitMatchesEachTokenIndependently() {
@@ -115,5 +186,9 @@ class MediaGuardLogicTest {
         assertFalse(MediaGuardLogic.anyAlive(mapOf(md5A to now - 1), now))
         assertTrue(MediaGuardLogic.anyAlive(mapOf(md5A to now + 1), now))
         assertTrue(MediaGuardLogic.anyAlive(mapOf(md5A to now - 1, md5B to now + 1), now))
+        // ⛔ `until == now` 边界：`>=` 与 `>` 两种实现在这里才分得开。
+        //    必须与 mediaHit 的「until < now 才过期」同口径，否则会出现
+        //    「anyAlive 说活着、mediaHit 却不命中」⇒ hasMedia 永不复位。
+        assertTrue(MediaGuardLogic.anyAlive(mapOf(md5A to now), now))
     }
 }

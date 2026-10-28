@@ -113,6 +113,13 @@ object AutoHdImg {
      */
     private val missSeen = java.util.concurrent.ConcurrentHashMap.newKeySet<String>()
 
+    /**
+     * 「参数解析出来的 id 与实例字段对不上」的形状（每种 sig 只打一条）。
+     * ⛔ 存在的唯一理由：那是「微信又换了 t1 构造形态」的唯一信号 —— 不记下来，
+     *    下次真机出现「下载下错图 / svc.c 恒 false」时没有任何线索可查。
+     */
+    private val mismatchSeen = java.util.concurrent.ConcurrentHashMap.newKeySet<String>()
+
     /** 拿不到 msgId 的累计次数（探针用） */
     private val noMsgId = AtomicInteger(0)
 
@@ -191,14 +198,32 @@ object AutoHdImg {
             }
             // ⛔ R31h 真机（2026-10-28）：撤回后点开时微信建的是 `(0, msgId)` 形态 —— 第一参
             //    localId 为 0，说明「第一参=localId、第二参=msgId」并非所有构造都成立。
-            //    `t1` 的实例字段在构造结束时必然已赋值（dex dump：`h/i/j`=localId、`q`=msgId）
-            //    ⇒ 参数解析落空就改用字段兜底。
+            //    `t1` 的实例字段在构造结束时必然已赋值（dex dump：`h/i/j`=localId、`q`=msgId）。
             //    ⚠️ 原来的 `if (msgId == 0L) return` 是**静默丢弃**：真机上有一条被撤回的图片
             //    到达时压根没 fire，日志里连一行都没有 —— 无头案的教科书案例。
             val fldLocal = instLong(param.thisObject, "h").let { if (it > 0) it else 0L }
             val fldMsg = instLong(param.thisObject, "q").let { if (it > 0) it else 0L }
-            val localId = if (argLocal > 0) argLocal else fldLocal
-            val msgId = if (argMsg > 0) argMsg else fldMsg
+            // ⛔ R34 复核 P2③：**字段优先，参数兜底**。
+            //    字段语义（`h/i/j`=localId、`q`=msgId）是 dex dump 直接取证确认的；
+            //    而「第一参=localId、第二参=msgId」这个**参数位置语义已经被真机推翻过一次**
+            //    （撤回后点开时微信建的是 `(0, msgId)`）。既然一个是取证、一个是假设，
+            //    就该让取证的那个说了算 —— 否则参数顺序一旦相反，两个参数都 > 0 ⇒
+            //    字段兜底永远不启用 ⇒ 拿着互换的 id 去下，静默下错。
+            val localId = if (fldLocal > 0) fldLocal else argLocal
+            val msgId = if (fldMsg > 0) fldMsg else argMsg
+            // ⚠️ 两者都拿到却对不上 ⇒ 说明当前形态下「参数位置」的语义与假设不符。
+            //    这本身不致命（已按字段取值），但它是「微信又换构造形态了」的唯一信号，
+            //    必须留痕。按 sig 去重（最多 12 条）防刷屏 —— t1 构造在热路径上。
+            if ((fldLocal > 0 && argLocal > 0 && fldLocal != argLocal) ||
+                (fldMsg > 0 && argMsg > 0 && fldMsg != argMsg)
+            ) {
+                if (mismatchSeen.size < 12 && mismatchSeen.add("${args.size}:$type")) {
+                    LogX.w(
+                        "$TAG id arg/fld mismatch n=${args.size} type=$type " +
+                            "args=$argLocal/$argMsg fld=$fldLocal/$fldMsg -> use fld",
+                    )
+                }
+            }
             // 档位分布取证：每种 (参数个数, 首个Int) 只打一条，最多 12 条。零装包成本，
             // 下次真机就能看清微信各场景传的档位 —— 不再靠猜常量。
             if (type != TYPE_THUMB) skipOther.incrementAndGet()
@@ -232,7 +257,15 @@ object AutoHdImg {
                             .onFailure {
                                 fail.incrementAndGet()
                                 lastErr = it.javaClass.simpleName
-                                LogX.w("$TAG fire err ${it.javaClass.simpleName}: ${it.message}")
+                                // ⛔ R34 复核 P2④：失败必须把 msgId 从 `done` 里摘掉。
+                                //    `done.add` 发生在 fire **之前**，不摘的话这一次失败
+                                //    （网络抖动 / 反射漂移 / svc.c 拒收）就会让这张图在
+                                //    **本次微信进程内永远不再自动下载** —— 微信后续重试、
+                                //    用户再点开时建 t1 都只会落进 skipDup。
+                                //    ⇒ 摘掉让它可被重试；真正的判重仍由 `ImgInfo.t==1`
+                                //    和 `done` 的「同一时刻去重」两头兜住，不会递归。
+                                synchronized(done) { done.remove(msgId) }
+                                LogX.w("$TAG fire err ${it.javaClass.simpleName}: ${it.message} (retryable)")
                             }
                     } finally {
                         selfFiring.set(false)
@@ -300,8 +333,21 @@ object AutoHdImg {
             val (groups, labels) = buckets(allowRaw, excludeRaw)
             val talker = talkerOf(msgId, cl)
             lastTalker = talker.orEmpty()
-            // ⚠️ 判定口径与 NotifyMute 完全一致（排除优先 / 允许空 = 全部生效 / 空分组不退化）
-            if (!ListResolver.inScope(
+            // ⛔ R34 复核 P2②：talker 拿不到时**不能一律拒绝**。
+            //    `ListResolver.inScope` 对空 talker 返回 false（宁可漏判，与 NotifyMute 同口径），
+            //    但那在**纯排除模式**下会把语义整个反过来：用户配的是「排除这几个、其余都下」，
+            //    talkerOf 一失败（R31g 真机已见 `talker:NullPointerException`）就变成
+            //    「谁都不下」，且日志里只有 skipScope 在涨 —— 静默全挡。
+            //    ⇒ 纯排除模式（allowRaw 为空）下拿不到 talker 就**放行**，语义才是「默认生效」。
+            // ⛔ 但**允许名单模式必须保持拦截**：那边 talker 为空放行 = 「只想对某群生效」
+            //    退化成「对全部会话生效」，是另一个方向的语义反转。
+            val talkerUnknown = talker.isNullOrBlank()
+            if (talkerUnknown && allowRaw.isEmpty()) {
+                LogX.w(
+                    "$TAG talker unknown -> pass (exclude-only) msgId=$msgId " +
+                        "exclude=${excludeRaw.size} err=$lastErr",
+                )
+            } else if (!ListResolver.inScope(
                     talker = talker,
                     allowRaw = allowRaw,
                     excludeRaw = excludeRaw,
@@ -309,7 +355,14 @@ object AutoHdImg {
                     labels = labels,
                 )
             ) {
+                // ⚠️ 判定口径与 NotifyMute 完全一致（排除优先 / 允许空 = 全部生效 / 空分组不退化）
                 skipScope.incrementAndGet()
+                // ⛔ 同 P2④，但**只针对「没判出来」而不是「判出来不在范围」**：
+                //    allow 模式下 talker 取不到，我们并不知道这条到底在不在范围里
+                //    （是一次取数失败，不是一个判定结果）—— 不留它永久占位。
+                //    真被判定为「不在名单里」的那些（talker 拿到了）**照旧占位**，
+                //    否则每条不在范围内的消息都会被反复做名单展开。
+                if (talkerUnknown) synchronized(done) { done.remove(msgId) }
                 return
             }
         }
@@ -326,7 +379,10 @@ object AutoHdImg {
         } else {
             fail.incrementAndGet()
             lastErr = "svc.c returned $r"
-            LogX.w("$TAG svc.c rejected msgId=$msgId -> $r")
+            // ⛔ 同 P2④：`svc.c` 返回非 true 也是一次失败（不抛异常，走不到外层 onFailure），
+            //    同样要把 msgId 摘出 `done`，否则这一次拒收会永久挡住后续重试。
+            synchronized(done) { done.remove(msgId) }
+            LogX.w("$TAG svc.c rejected msgId=$msgId -> $r (retryable)")
         }
     }
 
