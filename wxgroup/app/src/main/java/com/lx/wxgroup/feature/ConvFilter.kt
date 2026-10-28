@@ -893,6 +893,9 @@ object ConvFilter {
         /** 折叠态扫描的节流时间戳（布局回调可能密集） */
         var pinScanMs = 0L
 
+        /** 上次真正传给 ConvLayout.build 的折叠态：只在变化时打一条日志，避免刷屏 */
+        var pinApplied: Boolean? = null
+
         /** 上次 rebuild 的快照时间指纹：区分「仅 timeMs 变」与「完全没变」 */
         private var lastTimeFp = 0L
 
@@ -979,7 +982,18 @@ object ConvFilter {
             // ⚠️ 指纹**必须带上 showUnread**：只改这个开关时会话数/分组都没变，
             // 少了它会被下面的「指纹相同直接返回」短路掉，表现为改了开关列表纹丝不动。
             // 这 6 项是「配置指纹」，不含会话顺序/时间（那些用 orderChanged + timeFingerprint 单独判）。
-            val configStamp = "$n|$enabled|$filterId|$showUnread|${cachedMembers.hashCode()}|${groups.hashCode()}"
+            // ⚠️ 折叠态**必须**进指纹（R31 真机踩过）：折叠/展开时会话顺序、条数、分组全没变，
+            // 少了它就会被下面的「指纹相同直接返回」短路掉，日志明明打了
+            // `pinFold(view) folded=true -> rebuild`，置顶分组行却纹丝不动。
+            val configStamp = PinFoldLogic.configStamp(
+                n = n,
+                enabled = enabled,
+                filterId = filterId,
+                showUnread = showUnread,
+                membersHash = cachedMembers.hashCode(),
+                groupsHash = groups.hashCode(),
+                pinFolded = pinFoldedByView,
+            )
 
             // ★ R1 修复：每次都读最新快照。旧代码只在「条数变化」时才读
             // （`if (snaps.size != n) snaps = readSnaps(n)`），但收新消息导致
@@ -1057,9 +1071,14 @@ object ConvFilter {
                         // R31：置顶分组行要跟着微信「折叠置顶聊天」一起收放。
                         // 判据优先用「扫已布局文字」（最接近用户看到的事实），
                         // 扫不到（还没布局过 / 微信换了文案）再退回数据层判据。
+                        val pf = pinFoldedByView ?: PinFoldLogic.detectPinFolded(snaps)
+                        if (pf != pinApplied) {
+                            pinApplied = pf
+                            LogX.i("K7 pinFold apply folded=$pf src=${if (pinFoldedByView != null) "view" else "data"}")
+                        }
                         ConvLayout.build(
                             snaps, specs, members, enabled = true,
-                            pinFolded = pinFoldedByView ?: PinFoldLogic.detectPinFolded(snaps),
+                            pinFolded = pf,
                         )
                     }
                 }

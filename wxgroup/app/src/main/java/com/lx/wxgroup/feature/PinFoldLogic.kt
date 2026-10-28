@@ -49,4 +49,23 @@ object PinFoldLogic {
      * 折叠态（true）⇒ 收进「N个置顶聊天」，不插入；展开 / 判不出（false / null）⇒ 插入。
      */
     fun shouldInsertPinned(pinFolded: Boolean?): Boolean = pinFolded != true
+
+    /**
+     * `GroupedAdapter` 的「配置指纹」。
+     *
+     * ⚠️ 存在理由（R31 真机踩坑）：指纹相同 ⇒ rebuild 直接短路返回、**一行都不重算**。
+     * 折叠/展开时会话条数、顺序、分组、筛选态全都没变，只有 [pinFolded] 变了；
+     * 少了这一项，日志会打 `pinFold(view) folded=true -> rebuild`，而列表纹丝不动。
+     *
+     * @param pinFolded `null` 表示「还没扫到」，与 true/false 必须是**三个不同**的串
+     */
+    fun configStamp(
+        n: Int,
+        enabled: Boolean,
+        filterId: Long,
+        showUnread: Boolean,
+        membersHash: Int,
+        groupsHash: Int,
+        pinFolded: Boolean?,
+    ): String = "$n|$enabled|$filterId|$showUnread|$membersHash|$groupsHash|$pinFolded"
 }

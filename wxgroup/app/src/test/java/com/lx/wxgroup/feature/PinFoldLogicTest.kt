@@ -1,7 +1,9 @@
 package com.lx.wxgroup.feature
 
 import com.lx.wxgroup.data.ConvLayout
+import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
+import org.junit.Assert.assertNotEquals
 import org.junit.Assert.assertTrue
 import org.junit.Test
 
@@ -112,5 +114,42 @@ class PinFoldLogicTest {
                 PinFoldLogic.detectPinFolded(listOf(conv(""), conv("alice")))
             )
         )
+    }
+
+    // ---- configStamp：折叠态必须在指纹里（R31 真机 bug 的守门用例）----
+
+    @Test
+    fun stampChangesWhenOnlyPinFoldedChanges() {
+        // 除折叠态外所有输入都相同 —— 真机上折叠/展开就是这个场景。
+        // 指纹不变 ⇒ rebuild 被短路 ⇒ 日志打了"rebuild"但列表纹丝不动。
+        val a = PinFoldLogic.configStamp(20, true, 0L, false, 123, 456, null)
+        val b = PinFoldLogic.configStamp(20, true, 0L, false, 123, 456, false)
+        val c = PinFoldLogic.configStamp(20, true, 0L, false, 123, 456, true)
+        assertNotEquals(a, b)
+        assertNotEquals(b, c)
+        assertNotEquals(a, c)
+    }
+
+    @Test
+    fun stampIsStableForSameInputs() {
+        assertEquals(
+            PinFoldLogic.configStamp(20, true, 0L, false, 123, 456, true),
+            PinFoldLogic.configStamp(20, true, 0L, false, 123, 456, true),
+        )
+    }
+
+    @Test
+    fun stampStillCoversTheOldSixFields() {
+        // 回归守门：老六项任何一项变化都必须改指纹（曾因漏 showUnread 出过同类 bug）
+        val base = PinFoldLogic.configStamp(20, true, 0L, false, 123, 456, false)
+        val variants = listOf(
+            PinFoldLogic.configStamp(21, true, 0L, false, 123, 456, false),
+            PinFoldLogic.configStamp(20, false, 0L, false, 123, 456, false),
+            PinFoldLogic.configStamp(20, true, 7L, false, 123, 456, false),
+            PinFoldLogic.configStamp(20, true, 0L, true, 123, 456, false),
+            PinFoldLogic.configStamp(20, true, 0L, false, 999, 456, false),
+            PinFoldLogic.configStamp(20, true, 0L, false, 123, 999, false),
+        )
+        for (v in variants) assertNotEquals(base, v)
     }
 }
