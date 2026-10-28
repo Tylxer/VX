@@ -180,6 +180,7 @@ def show(txt, pat, n):
     for l in out[-n:]:
         print(l[:1600])
     print("--- 共 %d 行（去重后），显示最后 %d 行 ---" % (len(out), min(n, len(out))))
+    return len(out)
 
 
 def cmd_ui(text, extra=None):
@@ -229,7 +230,7 @@ def cmd_probe(a):
     kv, pos, i = {}, [], 0
     while i < len(a):
         x = a[i]
-        if x in ("--val", "--grep", "--n", "--wait", "--q"):
+        if x in ("--val", "--grep", "--n", "--wait", "--q", "--key"):
             if i + 1 >= len(a):
                 print("%s 缺值" % x)
                 return
@@ -261,6 +262,10 @@ def cmd_probe(a):
     #    只发 val 会让模块收到空 q，返回「只允许 select/pragma/with（收到 ''）」。
     if "q" in kv:
         ex += ["--es", "q", kv["q"]]
+    # `op=kvget` 读的是 extra **`key`**（EntryReceiver.kt:848），不是 val。
+    # 而且 kvget 走的是**模块自己的配置库**，`op=sql` 打开的是微信 sns.db —— 两者别混。
+    if "key" in kv:
+        ex += ["--es", "key", kv["key"]]
     # 行数上限也要真的传给模块，否则 --n 只截本地显示
     if "n" in kv:
         ex += ["--ei", "n", kv["n"]]
@@ -282,7 +287,16 @@ def cmd_probe(a):
               "或模块未重载。先 am start -n com.tencent.mm/.ui.LauncherUI 再试。\n"
               "!! 下面**不会**打印旧日志，免得你对着过期数据下结论。" % before)
         return
-    show(pull_dbg(), kv.get("grep") or "", int(kv.get("n", "40")))
+    pat = kv.get("grep") or ""
+    matched = show(pull_dbg(), pat, int(kv.get("n", "40")))
+    # ⛔ 第三道闸（R31g 补）：字节数增长**不能**证明本次探针执行了 ——
+    #    像 `K7 perf` 这种每秒刷屏的日志会让文件一直变大，探针一次没跑也"通过闸门"。
+    #    真正可靠的判据是「目标 TAG 有没有出现」，这里用 --grep 的匹配行数补上。
+    if pat and matched == 0:
+        print("!! 指定了 --grep 但 0 行匹配。两种可能：\n"
+              "   ① 探针压根没执行（日志增长来自别的模块刷屏）；\n"
+              "   ② grep 是**大小写敏感**的 —— 只读 SQL 的 TAG 是 `SQLX` 不是 sql，\n"
+              "      配置读是 `PROBE kv`，别凭印象写。")
 
 
 def main():
