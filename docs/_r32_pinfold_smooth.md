@@ -291,3 +291,58 @@ R31 已真机验证「扫已布局文字」是最接近用户所见事实的可�
 | `cachedCount == currentCount` → `!=` | `foldAction` 分支判据 | 3 红 | 否（精确命中 REUSE/REREAD 分支） |
 
 两组均精确变红后还原，还原后 `grep` 复核两处判据文本，全量 802 例重新跑绿。
+
+---
+
+## 9 真机验证（2026-10-28 22:48–23:06，设备 467cf5bc，微信 8.0.48）
+
+### 9.1 装包与冷启
+
+- 模块 `0.2.8`，`lastUpdateTime=23:04:26`（第二轮，含 §9.4 的补扫修正）；首轮 22:48:52。
+- 冷启用 `python tools/dev.py restart`（双次 force-stop + 拉起）。
+
+### 9.2 折叠 / 展开两个方向（含实测耗时）
+
+| 动作 | 日志 | 检测→重建耗时 | 结果 |
+|---|---|---|---|
+| 折叠（点「折叠置顶聊天」） | `pinFold(view) folded=true -> immediate` / `fast folded=true action=RELAYOUT_REUSE count=3002` | **12ms**（另一次 16ms） | 分组行消失，只剩「19个置顶聊天」 |
+| 展开（点「19个置顶聊天」） | `pinFold(view) folded=false -> immediate` / `fast folded=false action=RELAYOUT_REREAD count=3002` | **51–55ms** | G1/G2/G3 回到置顶区首位 |
+
+- 抓屏点：点击后 t+0.35s 的 uiautomator dump 里状态已经正确（该 dump 本身约 1s 才返回，
+  所以只能证明「≤1s 内到位」，精确耗时看上面的日志时间戳）。
+- 改前对应链路最坏 = 100ms 节流 + **250ms 去抖** + 全量重建 ⇒ 用户感知的「慢半拍」。
+
+### 9.3 ⭐ 真机裁决：`wrapped.count` 折叠时会变（原②档假设 → ①档实测）
+
+- 折叠后 `count=2983`，展开后 `count=3002`，**差 19 = 置顶会话数**（「19个置顶聊天」）。
+  ⇒ 折叠入口确实是 inner adapter 的**真实 item**（19 行被合成 1 行），不是 ListView header。
+- 因此 `foldAction` 的 `RELAYOUT_REREAD` 分支是**必须的**，不能只换 layout 复用快照。
+  这一条把 R32-1 文档里「无法静态定论」的假设钉死了。
+- `count` 读数有抖动（同一次折叠曾读到 3002 未变），所以按 count 分支的代码必须两种事实
+  下都正确 —— 现有实现满足（REUSE 只换 layout，REREAD 重读快照，二者最终状态一致）。
+
+### 9.4 真机发现并修复：节流窗口内扫描被丢弃 → 冷启状态失配（P1，已修）
+
+- 现象：22:49:53 冷启后日志只记了 `folded=false`，但界面明明是折叠态（「19个置顶聊天」），
+  且之后再没有任何 `pinFold` 事件 —— 内部状态永久停在「展开」。
+- 根因（① 代码字面）：布局监听里 `if (now - pinScanMs < PIN_FOLD_SCAN_MS) return@...`
+  **直接丢弃**这次扫描。冷启时微信先渲染展开态、100ms 内再切成折叠态，被丢的那次正是最终态。
+- 修复：窗口内改为**在窗口末尾补扫一次**（`pinScanQueued` 去重，`mainHandler.postDelayed`
+  到 `PIN_FOLD_SCAN_MS` 之后），扫描本体抽成 `scanPinFold()` 复用。
+- 修复后冷启复验（23:04:33）：
+  ```
+  K7 pinFold apply folded=false src=data          ← 数据层兜底误判（首次扫描还没落地）
+  K7 pinFold fast folded=true  action=RELAYOUT_REUSE count=2983   ← 视图扫描纠正，12ms
+  ```
+  界面正确（折叠态、无分组行），内部状态最终 `folded=true`。
+
+### 9.5 结论
+
+R32 的目标达成：折叠/展开时分组行的收放从「250ms 去抖 + 全量重建」降到**一帧级**
+（折叠 12–16ms、展开 51–55ms），且分组行不再重建 View 树。流畅度主观感受待用户确认。
+
+### 9.6 仍未做
+
+- 反向对照：关掉「分组行」开关后折叠一次，确认没有「点 A 进 B」（§8.3 修的 P1 那条分支）。
+- 展开态 51–55ms 里 `readSnaps` 只占 6ms，其余在 `ConvLayout.build` 的 O(n) 计算 ——
+  若主观仍觉得展开有顿感，可再优化这一层（当前未做）。

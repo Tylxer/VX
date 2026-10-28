@@ -691,10 +691,9 @@ object ConvFilter {
         // 状态翻转时触发一次轻量重建，置顶分组行就跟着微信一起收放。
         // 只扫文字不改 UI —— 判不出（null）时保持上一次结论，首次判不出就按展开处理。
         runCatching {
-            list.addOnLayoutChangeListener { _, _, _, _, _, _, _, _, _ ->
-                val now = android.os.SystemClock.uptimeMillis()
-                if (now - fa.pinScanMs < PIN_FOLD_SCAN_MS) return@addOnLayoutChangeListener
-                fa.pinScanMs = now
+            // 扫一次「折叠置顶聊天 / N个置顶聊天」文字并推进状态。
+            fun scanPinFold() {
+                fa.pinScanMs = android.os.SystemClock.uptimeMillis()
                 var folded: Boolean? = null
                 walkTexts(list) { t ->
                     if (t == "折叠置顶聊天") folded = false
@@ -705,6 +704,24 @@ object ConvFilter {
                     LogX.i("K7 pinFold(view) folded=$folded -> immediate")
                     runCatching { fa.onPinFoldChanged(folded) }
                 }
+            }
+            list.addOnLayoutChangeListener { _, _, _, _, _, _, _, _, _ ->
+                val now = android.os.SystemClock.uptimeMillis()
+                if (now - fa.pinScanMs < PIN_FOLD_SCAN_MS) {
+                    // ⚠️ 节流窗口内**排一次补扫，而不是丢掉**（R32 真机踩到）：
+                    // 冷启时微信先渲染展开态、100ms 内再切成折叠态，被丢的那次正是最终态，
+                    // 内部状态就永久停在展开（折叠态下分组行插到置顶区上面）。
+                    // 补扫放在窗口末尾，同一窗口只排一个。
+                    if (!fa.pinScanQueued) {
+                        fa.pinScanQueued = true
+                        mainHandler.postDelayed({
+                            fa.pinScanQueued = false
+                            runCatching { scanPinFold() }
+                        }, PIN_FOLD_SCAN_MS)
+                    }
+                    return@addOnLayoutChangeListener
+                }
+                scanPinFold()
             }
         }.onFailure { LogX.w("K7 pinFold listener failed: ${it.javaClass.simpleName}") }
 
@@ -892,6 +909,14 @@ object ConvFilter {
 
         /** 折叠态扫描的节流时间戳（布局回调可能密集） */
         var pinScanMs = 0L
+
+        /**
+         * 节流窗口内是否已经排了一次「补扫」（R32）。
+         *
+         * 节流窗口里**不能直接丢掉**扫描：冷启时微信会先渲染展开态、100ms 内再切成折叠态，
+         * 被丢的那次正是最终态 ⇒ 内部状态永久停在展开，折叠态下分组行会被插到置顶区上面。
+         */
+        var pinScanQueued = false
 
         /** 上次真正传给 ConvLayout.build 的折叠态：只在变化时打一条日志，避免刷屏 */
         var pinApplied: Boolean? = null
