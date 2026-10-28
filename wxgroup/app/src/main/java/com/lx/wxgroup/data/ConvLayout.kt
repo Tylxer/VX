@@ -37,7 +37,16 @@ package com.lx.wxgroup.data
 object ConvLayout {
 
     /** 一条会话。`timeMs` 只用于算分组行的先后，不参与会话排序（见规则 1） */
-    data class ConvEntry(val wxid: String, val timeMs: Long = 0L)
+    /**
+     * @param unreadable 这一项**读不到对象**（`wrapped.getItem(i) == null`），只用于下标占位。
+     *
+     * ⚠️ R31：`wxid` 为空有两种来源，必须靠这个标记区分 ——
+     *  1. `unreadable = true`：`getItem` 返回 null，纯粹是占位，**不代表**列表结构变化；
+     *  2. `unreadable = false` 且 `wxid` 为空：对象拿到了但反射读不到 `field_username`
+     *     ⇒ 它不是一条会话（微信「折叠置顶聊天」的那行就是这类）。
+     * 折叠判据建在第二种上，见 [com.lx.wxgroup.feature.PinFoldLogic.detectPinFolded]。
+     */
+    data class ConvEntry(val wxid: String, val timeMs: Long = 0L, val unreadable: Boolean = false)
 
     /** 分组行的显示信息 */
     data class GroupRowSpec(
@@ -61,12 +70,18 @@ object ConvLayout {
      * @param groups 全部分组（已按 sort_order 排好）
      * @param members 分组 id -> 成员 wxid 集合（数据层保证一人只属于一组）
      * @param enabled false 时原样返回（模块开关关掉 = 零改动）
+     * @param pinFolded 微信「置顶聊天」是否处于**折叠态**。
+     *
+     * R31：折叠态下置顶区被收进「N个置顶聊天」一行，置顶的分组行必须跟着收 ——
+     * 否则它会卡在那一行上面，表现为「分组行没被折叠置顶聊天收进去」。
+     * 默认 false（展开态）保证现有调用点与单测行为逐字节不变。
      */
     fun build(
         convs: List<ConvEntry>,
         groups: List<GroupRowSpec>,
         members: Map<Long, Set<String>>,
         enabled: Boolean = true,
+        pinFolded: Boolean = false,
     ): Layout {
         if (!enabled || groups.isEmpty()) return Layout(passthrough(convs))
 
@@ -116,7 +131,10 @@ object ConvLayout {
         val rows = ArrayList<ConvRow>(convs.size + groups.size)
 
         // A13：置顶的分组行在最前（pinned 组的成员会话在下面统一被隐藏）
-        for (g in pinned) rows.add(ConvRow.Group(g.id))
+        // R31：微信折叠「置顶聊天」时，置顶区整体被收进「N个置顶聊天」一行，
+        // 这几行也必须一起收 —— 它们没有别的位置可去（成员会话恒被隐藏），
+        // 不收就会孤零零地停在那一行上面，看着就是「没被折叠」。
+        if (!pinFolded) for (g in pinned) rows.add(ConvRow.Group(g.id))
 
         for (i in convs.indices) {
             val owner = ownerOf[convs[i].wxid]

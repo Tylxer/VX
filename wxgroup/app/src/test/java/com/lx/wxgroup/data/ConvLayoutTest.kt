@@ -377,4 +377,81 @@ class ConvLayoutTest {
         assertTrue(ConvLayout.orderChanged(convs("", "b"), convs("", "b")))
         assertTrue(ConvLayout.orderChanged(convs("a", ""), convs("a", "")))
     }
+
+    // ------------------------------------------------------------ R31 折叠置顶聊天
+
+    private fun foldFixture(): Triple<
+        List<ConvLayout.ConvEntry>,
+        List<ConvLayout.GroupRowSpec>,
+        Map<Long, Set<String>>
+        > = Triple(
+        convs("a", "b", "c", "d"),
+        listOf(group(1, "p", pinned = true, order = 0), group(2, "n", pinned = false, order = 1)),
+        mapOf(1L to setOf("a", "b"), 2L to setOf("c")),
+    )
+
+    /**
+     * 折叠态下置顶分组行必须消失。
+     *
+     * 微信折叠「置顶聊天」时把置顶区收进「N个置顶聊天」一行；置顶分组行如果还插在
+     * 最前，就会孤零零地停在那一行上面 —— 用户看到的就是「分组行没被折叠收进去」。
+     */
+    @Test
+    fun pinFolded_hides_pinned_group_rows() {
+        val (c, g, m) = foldFixture()
+        val unfolded = ConvLayout.build(c, g, m, pinFolded = false)
+        val folded = ConvLayout.build(c, g, m, pinFolded = true)
+
+        assertEquals("G:1 | G:2 | C:d", unfolded.dump(c))
+        // 置顶组 1 的行没了，非置顶组 2 的行原样保留
+        assertEquals("G:2 | C:d", folded.dump(c))
+    }
+
+    /** 默认参数（不传 pinFolded）必须与「展开态」逐字节一致 —— 防回归的关键用例。 */
+    @Test
+    fun pinFolded_defaultEqualsUnfolded() {
+        val (c, g, m) = foldFixture()
+        val byDefault = ConvLayout.build(c, g, m, enabled = true)
+        val explicit = ConvLayout.build(c, g, m, enabled = true, pinFolded = false)
+        assertEquals(explicit.dump(c), byDefault.dump(c))
+        assertEquals(explicit.size, byDefault.size)
+    }
+
+    /** 没有置顶分组时，折叠态与展开态完全等价（不能因为开关状态影响别的东西）。 */
+    @Test
+    fun pinFolded_withoutPinnedGroupsIsNoop() {
+        val c = convs("a", "b", "c")
+        val g = listOf(group(1, "n1", pinned = false, order = 0))
+        val m = mapOf(1L to setOf("a"))
+        assertEquals(
+            ConvLayout.build(c, g, m, pinFolded = false).dump(c),
+            ConvLayout.build(c, g, m, pinFolded = true).dump(c),
+        )
+    }
+
+    /**
+     * 折叠只藏「分组行」，**不许**因此把置顶组的成员会话放出来。
+     *
+     * 收纳语义（一人只属于一组、成员会话恒被隐藏）跟折叠无关；如果折叠时把 a/b
+     * 放出来，用户会看到同一批人既在分组里又在列表里，属于数据错乱。
+     */
+    @Test
+    fun pinFolded_doesNotLeakPinnedMemberConvs() {
+        val (c, g, m) = foldFixture()
+        val folded = ConvLayout.build(c, g, m, pinFolded = true)
+        val dump = folded.dump(c)
+        assertFalse(dump, dump.contains("C:a"))
+        assertFalse(dump, dump.contains("C:b"))
+        // 也不许把「空行」留在原处：置顶组占的位置必须真的被回收
+        assertEquals(2, folded.size)
+    }
+
+    /** 折叠 + 筛选态：`filtered()` 本来就不插分组行，与折叠无关，这里钉死不回归。 */
+    @Test
+    fun pinFolded_doesNotAffectFilteredPath() {
+        val c = convs("a", "b", "c")
+        val f = ConvLayout.filtered(c, setOf("a", "c"))
+        assertEquals(2, f.size)
+        assertEquals("C:a | C:c", f.dump(c))
+    }
 }

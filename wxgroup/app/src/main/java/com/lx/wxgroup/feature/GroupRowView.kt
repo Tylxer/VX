@@ -94,14 +94,8 @@ object GroupRowView {
             setSingleLine(true)
             layoutParams = LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f)
         })
-        if (m.pinned) {
-            title.addView(TextView(ctx).apply {
-                text = "置顶"
-                textSize = 11f
-                setTextColor(0xFF07C160.toInt())
-                setPadding((6 * d).toInt(), 0, 0, 0)
-            })
-        }
+        // ⛔ 不放「置顶」角标：置顶分组的区分靠位置（排最前），加标签反而脏。
+        // 字段 m.pinned 仍用于 ConvLayout 排序，别删。
         center.addView(title)
 
         center.addView(TextView(ctx).apply {

@@ -12,6 +12,7 @@ import android.widget.BaseAdapter
 import android.widget.HeaderViewListAdapter
 import android.widget.ListAdapter
 import android.widget.ListView
+import android.widget.TextView
 import com.lx.wxgroup.core.ConvReader
 import com.lx.wxgroup.core.HostContext
 import com.lx.wxgroup.data.ConvLayout
@@ -95,6 +96,30 @@ object ConvFilter {
     private const val PROBE_WARN_MS = 8L
 
     private val mainHandler by lazy { Handler(Looper.getMainLooper()) }
+
+    /** R31：扫「置顶聊天」折叠态的节流间隔（布局回调可能密集，100ms 够用且看不出来） */
+    private const val PIN_FOLD_SCAN_MS = 100L
+
+    /**
+     * 遍历视图树读所有 TextView 的文字（只看 8 层，会话行的子树足够浅）。
+     *
+     * R31 只用于判「折叠置顶聊天」状态，不参与任何渲染。
+     * ⚠️ 微信那两行文案来自资源（`%d个置顶聊天` / `折叠置顶聊天`），8.0.48 已实查确认。
+     */
+    private fun walkTexts(root: View, depth: Int = 0, onText: (String) -> Unit) {
+        if (depth > 8) return
+        if (root is TextView) {
+            val t = root.text?.toString()?.trim().orEmpty()
+            if (t.isNotEmpty()) onText(t)
+            return
+        }
+        if (root is ViewGroup) {
+            for (i in 0 until root.childCount) {
+                val c = root.getChildAt(i) ?: continue
+                if (c.visibility == View.VISIBLE) walkTexts(c, depth + 1, onText)
+            }
+        }
+    }
 
     /** listView -> 我们装进去的包装 */
     private val wrappers = Collections.synchronizedMap(WeakHashMap<ListView, GroupedAdapter>())
@@ -661,6 +686,28 @@ object ConvFilter {
         wrappers[list] = fa
         runCatching { wrapListeners(list) }
         rememberAnchor(list)
+
+        // R31：「置顶聊天」折叠态靠**扫已布局文字**判（原因见 [GroupedAdapter.pinFoldedByView]）。
+        // 状态翻转时触发一次轻量重建，置顶分组行就跟着微信一起收放。
+        // 只扫文字不改 UI —— 判不出（null）时保持上一次结论，首次判不出就按展开处理。
+        runCatching {
+            list.addOnLayoutChangeListener { _, _, _, _, _, _, _, _, _ ->
+                val now = android.os.SystemClock.uptimeMillis()
+                if (now - fa.pinScanMs < PIN_FOLD_SCAN_MS) return@addOnLayoutChangeListener
+                fa.pinScanMs = now
+                var folded: Boolean? = null
+                walkTexts(list) { t ->
+                    if (t == "折叠置顶聊天") folded = false
+                    else if (t.length <= 12 && t.endsWith("个置顶聊天")) folded = true
+                }
+                if (folded != null && folded != fa.pinFoldedByView) {
+                    fa.pinFoldedByView = folded
+                    LogX.i("K7 pinFold(view) folded=$folded -> rebuild")
+                    runCatching { fa.onDataChanged() }
+                }
+            }
+        }.onFailure { LogX.w("K7 pinFold listener failed: ${it.javaClass.simpleName}") }
+
         fa.rebuild()
         restoreAnchor(list)
         fa.notifyDataSetChanged()
@@ -833,6 +880,19 @@ object ConvFilter {
         /** 上次 rebuild 的输入指纹；输入没变就直接复用，避免微信连续 notify 时反复全量重算 */
         private var lastStamp = ""
 
+        /**
+         * R31：「置顶聊天」折叠态 —— 由**扫已布局文字**得来（null = 还没扫到过）。
+         *
+         * 为什么需要 sweep 而不是只看数据：折叠行究竟是不是 adapter item 目前无法静态
+         * 定论（可能是微信自己的 header，那就不进 `wrapped.getItem`）。扫文字是唯一
+         * 「照用户能看见的事实」判的办法，数据层判据只作为它扫不到时的兜底。
+         */
+        @Volatile
+        var pinFoldedByView: Boolean? = null
+
+        /** 折叠态扫描的节流时间戳（布局回调可能密集） */
+        var pinScanMs = 0L
+
         /** 上次 rebuild 的快照时间指纹：区分「仅 timeMs 变」与「完全没变」 */
         private var lastTimeFp = 0L
 
@@ -994,7 +1054,13 @@ object ConvFilter {
                         }
                         memberSets = members
                         rebuildModels(db, groups, members, showUnread)
-                        ConvLayout.build(snaps, specs, members, enabled = true)
+                        // R31：置顶分组行要跟着微信「折叠置顶聊天」一起收放。
+                        // 判据优先用「扫已布局文字」（最接近用户看到的事实），
+                        // 扫不到（还没布局过 / 微信换了文案）再退回数据层判据。
+                        ConvLayout.build(
+                            snaps, specs, members, enabled = true,
+                            pinFolded = pinFoldedByView ?: PinFoldLogic.detectPinFolded(snaps),
+                        )
                     }
                 }
             }
@@ -1089,7 +1155,9 @@ object ConvFilter {
             for (i in 0 until n) {
                 val item = runCatching { wrapped.getItem(i) }.getOrNull()
                 if (item == null) {
-                    out.add(ConvLayout.ConvEntry(""))
+                    // R31：标记 unreadable，跟「拿到对象但读不到 username」区分开 ——
+                    // 后者才是「这一项不是会话」（如折叠置顶聊天那行），折叠判据要用它。
+                    out.add(ConvLayout.ConvEntry("", unreadable = true))
                     continue
                 }
                 out.add(ConvLayout.ConvEntry(ConvReader.username(item), ConvReader.timeMs(item)))
