@@ -101,6 +101,19 @@ object ConvFilter {
     private const val PIN_FOLD_SCAN_MS = 100L
 
     /**
+     * R34 P2：认定「行数突变」的最小差值（条）。
+     *
+     * 折叠/展开「置顶聊天」是 ±19（= 置顶会话数，§9.3 实测），远大于这个门限；
+     * 收新消息最多 ±1（新建一条会话），**不命中**，仍走 250ms 去抖。
+     *
+     * 为什么用门限而不是「只要 count 变了就即时重建」：收新消息是高频事件，
+     * 把它从 250ms 去抖变成即时全量重算，等于把 `readSnaps` 压到每条消息一次。
+     * 门限 2 把「高频小幅」与「低频大幅」分开 —— 只有折叠/展开这种一次性 ±19
+     * 才值得即时对齐。
+     */
+    private const val COUNT_JUMP = 2
+
+    /**
      * 遍历视图树读所有 TextView 的文字（只看 8 层，会话行的子树足够浅）。
      *
      * R31 只用于判「折叠置顶聊天」状态，不参与任何渲染。
@@ -671,6 +684,28 @@ object ConvFilter {
         runCatching {
             inner.registerDataSetObserver(object : DataSetObserver() {
                 override fun onChanged() {
+                    // R34 取证 + P2：微信数据已变的这一刻，`inner.count` 与我们的 `snaps`
+                    // 是否还同步 / 是不是「行数突变」。
+                    runCatching {
+                        val nc = inner.count
+                        if (nc != fa.snapSize) {
+                            LogX.i("K7 innerChanged count=$nc snaps=${fa.snapSize} layout=${fa.size}")
+                        }
+                        // ★ R34 P2：行数突变（折叠/展开 ±19）时【即时】对齐，不等 250ms。
+                        //
+                        // 为什么必须即时：ListView 的 DataSetObserver 已被我们挪到本包装
+                        // adapter 上（规矩 1），微信自己那次 notify 【不会】让列表重排 ——
+                        // 屏幕上的行数只在「我们 notify」时才变。折叠时若等到 250ms 去抖
+                        // 才把 19 行去掉，用户看到的就是「点了之后停住，0.25s 后整屏往
+                        // 上滑一大截」。即时对齐把这段位移拉回微信改数据的同一帧。
+                        //
+                        // ⚠️ 这里【不】判折叠方向：方向仍归 scanPinFold 的扫文字（R31/R32
+                        // 已真机验证），本处只负责「行数别撒谎」。
+                        if (nc > 0 && kotlin.math.abs(nc - fa.snapSize) >= COUNT_JUMP) {
+                            LogX.i("K7 innerJump count=$nc snaps=${fa.snapSize}")
+                            runCatching { fa.alignNow() }
+                        }
+                    }
                     // 去抖重建：微信收消息时会高频 notify，直接 rebuild 会把
                     // 2900 条的 readSnaps + 分组行摘要全压在主线程上。
                     // 走 onDataChanged（轻量去抖，不碰滚动锚点）。
@@ -946,6 +981,13 @@ object ConvFilter {
 
         val size: Int get() = layout.size
 
+        /**
+         * R34 取证用：当前快照条数（它才是 `wrapped.count` 的镜像，
+         * [size] 是收纳后的行数，两者天然不等）。
+         * 只读、无副作用，不参与任何判据。
+         */
+        val snapSize: Int get() = snaps.size
+
         /** 原始会话下标 -> wxid（诊断用：核对点击有没有点错人） */
         fun wxidOf(convIndex: Int): String = snaps.getOrNull(convIndex)?.wxid ?: ""
 
@@ -986,7 +1028,20 @@ object ConvFilter {
         private val groupType: Int
             get() = runCatching { wrapped.viewTypeCount }.getOrDefault(1).coerceAtLeast(1)
 
-        fun rebuild() = synchronized(lock) {
+        /**
+         * @return **true = 有东西变了，调用方需要 `notifyDataSetChanged()`**；
+         *         false = 输入指纹与时间指纹都没变，一行都没动，不必 notify。
+         *
+         * R34（P1）：`notifyDataSetChanged()` 会强制 ListView 重排 + 整屏 `getView` 重绑，
+         * 收新消息时它每 250ms 一次全打在已停住的列表上 —— 那既是无谓的主线程开销
+         * （「顿」），也是「我们多出来的一次位移」的载体。这里把「有没有真变」报出去，
+         * 让 [onDataChanged] 只在真变时才 notify。
+         *
+         * ⚠️ false 只由「完全没变」那一条分支返回（配置指纹相同 + 顺序没变 + 时间指纹
+         * 相同 + 摘要版本没变 + 成员版本没变），语义上就是「这次 rebuild 什么都没改」，
+         * 漏刷新的风险为零。其余两条分支（light / full）都返回 true。
+         */
+        fun rebuild(): Boolean = synchronized(lock) {
             // ★ R22 性能探针：把 readSnaps 与整次 rebuild 的耗时量出来。
             //
             // 为什么必须量：R1 修复把「只在条数变化时读快照」改成了「**每次** rebuild
@@ -1057,7 +1112,7 @@ object ConvFilter {
                 val fp = timeFingerprint(fresh)
                 if (fp == lastTimeFp && !summariesDirty) {
                     probeCost(tRebuild, snapsCost, n, "short-circuit")
-                    return@synchronized
+                    return@synchronized false      // R34 P1：真的什么都没变 ⇒ 不必 notify
                 }
                 snaps = fresh
                 lastTimeFp = fp
@@ -1068,7 +1123,7 @@ object ConvFilter {
                     rebuildModels(db, groups, memberSets, showUnread)
                 }
                 probeCost(tRebuild, snapsCost, n, "light")
-                return@synchronized
+                return@synchronized true
             }
 
             snaps = fresh
@@ -1124,6 +1179,15 @@ object ConvFilter {
                 }
             }
             probeCost(tRebuild, snapsCost, n, "full")
+            // R34 取证：把全量重建里 readSnaps 与「其余（ConvLayout.build + rebuildModels
+            // 的 N 次 SQL + nameOf 查表）」拆开量。`total - snapsCost` 才是 build 的真实成本，
+            // 用来裁决展开 51–55ms 里那 45ms 到底是不是 ConvLayout 的 O(n)（候选 ④b）。
+            LogX.i(
+                "K7 full rebuild n=$n snaps=${snapsCost}ms" +
+                    " total=${android.os.SystemClock.uptimeMillis() - tRebuild}ms" +
+                    " layout=${layout.size}"
+            )
+            true
         }
 
         /**
@@ -1181,6 +1245,27 @@ object ConvFilter {
         }
 
         /**
+         * R34 P2：微信行数突变时的**即时对齐**（由 `inner` 的 observer 同步调用）。
+         *
+         * 与 [onDataChanged] 的区别只是「不等 250ms」，本体仍复用 [rebuild] 的全部
+         * 分支逻辑（开关关 / 筛选态 / 无分组 / 折叠方向），不另写一套 —— 这样不会
+         * 出现「passthrough 与 filtered 走错分支」这类新错误。
+         *
+         * 代价：真机实测一次全量 `rebuild()` 只要 9ms（`K7 perf ... total=9ms path=full`），
+         * 远低于一帧，可以放在微信 notify 的同一帧里做。
+         *
+         * ⚠️ 不设 `observerRebuildQueued`、也不取消 [onDataChanged] 已排下的那次：
+         * 那次是 models / memberSets 的兜底刷新，必须保留。它会在 250ms 后再算一遍
+         * 同样的行数（[rebuild] 的 `changed` 由 P1 决定要不要 notify），不会带来
+         * 第二次行数变化 —— 因为 [snaps] 到这里已经对齐了。
+         */
+        fun alignNow() {
+            val changed = runCatching { rebuild() }.getOrDefault(false)
+            LogX.i("K7 alignNow snaps=${snaps.size} layout=${layout.size} changed=$changed")
+            if (changed) runCatching { notifyDataSetChanged() }
+        }
+
+        /**
          * 微信数据变了（收消息 / 置顶变化）时的去抖重建。
          *
          * 为什么**不走 [ConvFilter.refresh]**：refresh 里 `rememberAnchor` +
@@ -1196,8 +1281,19 @@ object ConvFilter {
                 observerRebuildQueued = true
                 mainHandler.postDelayed({
                     observerRebuildQueued = false
-                    runCatching { rebuild() }
-                    runCatching { notifyDataSetChanged() }
+                    val b = layout.size
+                    // R34 P1：rebuild 报「没变」就不再 notify。
+                    // `getOrDefault(true)` 是保险：rebuild 万一抛了，退回原来的无条件刷新，
+                    // 宁可多刷一次也不能漏刷。
+                    val changed = runCatching { rebuild() }.getOrDefault(true)
+                    // R34 取证：这 250ms 去抖的那一次重建有没有【改行数】。
+                    // `layoutBefore != layoutAfter` ⇒ 折叠/展开过程中行数第二次变化
+                    // ⇒ 那一次 notify 会带来一段额外的位移（「上滑」的候选来源）。
+                    LogX.i(
+                        "K7 debounce count=${runCatching { wrapped.count }.getOrDefault(-1)}" +
+                            " snaps=${snaps.size} layoutBefore=$b layoutAfter=${layout.size} changed=$changed"
+                    )
+                    if (changed) runCatching { notifyDataSetChanged() }
                 }, REBUILD_DEBOUNCE_MS)
             }
         }
@@ -1218,8 +1314,23 @@ object ConvFilter {
          */
         fun onPinFoldChanged(folded: Boolean) {
             mainHandler.post {
+                // R34 取证：折叠前后 `child0.top` 的位移量。
+                //  · 位移 ≈ 19 × 行高 ⇒ 行数变化造成的（主假设）
+                //  · 位移是非行高整数倍 ⇒ ScrollDock / correctTooHigh 的整块平移（候选 ④a）
+                // notify 只请求重排，不同步生效，所以 60ms 后再读一次「落定值」。
+                // 纯日志，无副作用。
+                val top0 = {
+                    runCatching {
+                        "top=${list.getChildAt(0)?.top} first=${list.firstVisiblePosition}"
+                    }.getOrDefault("top=n/a")
+                }
+                val t0 = top0()
                 runCatching { rebuildForPinFold(folded) }
                 runCatching { notifyDataSetChanged() }
+                LogX.i("K7 pinFold notify folded=$folded before[$t0] after[${top0()}]")
+                mainHandler.postDelayed({
+                    LogX.i("K7 pinFold settled folded=$folded ${top0()}")
+                }, 60L)
             }
         }
 
@@ -1268,7 +1379,12 @@ object ConvFilter {
                 snaps, lastSpecs, memberSets, enabled = true, pinFolded = detected,
             )
             pinApplied = detected
-            LogX.i("K7 pinFold fast folded=$detected action=$action count=$currentCount")
+            // R34 取证：`snaps.size != count` ⇒ 这次判定【抢跑】了（微信还没把 count 换过来），
+            // 行数这一轮没变，真正的行数变化会落到 250ms 后的 `K7 debounce` 上 ⇒ 两段式。
+            LogX.i(
+                "K7 pinFold fast folded=$detected action=$action count=$currentCount" +
+                    " snaps=${snaps.size} layout=${layout.size}"
+            )
         }
 
         /**
