@@ -554,3 +554,32 @@ assertNull(MediaGuardLogic.hexToken("6139184963485905836"))   // 19 位 msgSvrId
 ---
 
 **被明确判定为「已核，无问题」的项**：§1.3（32 位对图片成立）、§1.4（`contains` 不串号）、§1.7（mediaHit 迁移等价）、§2.1（SKIP 日志补得对）、§2.5（池清理）、§2.6（两分支互斥）、§3.4（无未初始化字段风险）、§3.10（去掉闸门正确 + `selfFiring` 定位准确）、§4.5（多数变异会被抓住）、§5.4（无反向失效）。
+
+---
+
+## 6. 变异验证（补做，2026-10-29）
+
+`d351b11` 提交时标注「⛔ 未做：5 组变异验证」，现已补做完成，**5 组全部被抓住**。
+
+### 工具坑（已解决，别再踩）
+
+| 现象 | 真因 | 解法 |
+|---|---|---|
+| 报告 `tests="10"` 但源码有 15 个 `@Test` | **增量编译不重编测试类**（跑的是 22:33 的旧 `.class`）⇒ 802 vs 807 是假判据 | 先显式 `compileDebugUnitTestKotlin`，再跑 |
+| `export PATH=...` 后报「no `*Test.class`」 | 清 PATH 后 Windows `find.exe` 顶掉 Git `find` ⇒ `_junit.sh` 找不到类 | **编译与测试必须分两次调用**，不能在同一条命令里换 PATH |
+| Python `subprocess(shell=True)` 编不动 | 走 cmd.exe，`export` / `./gradlew` 都不成立 | 改 bash 脚本 `_mut_r34.sh`：子 shell 里换干净 PATH 重编 → 退回原环境跑 `_junit.sh` |
+| PowerShell 在 Python subprocess 里 `FileNotFoundError` | — | 不用它 |
+
+### 结果
+
+| # | 变异 | 失败数 / 总数 | 判定 |
+|---|---|---|---|
+| 1 | `hexToken` 退回「只取最长段」 | 1 / 807 | ✅ 抓住 |
+| 2 | `MIN_TOKEN` 32 → 20 | 2 / 807 | ✅ 抓住（预期 1 个方法红，实际 2 个 ⇒ 强于预期） |
+| 3 | `name.contains` → `p.contains` | 1 / 807 | ✅ 抓住 |
+| 4 | `anyAlive` `>=` → `>` | 1 / 807 | ✅ 抓住 |
+| 5 | `mediaHit` `until <` → `<=` | 1 / 807 | ✅ 抓住 |
+
+对照组：未变异全量 `OK (807 tests)`。
+
+⇒ `d351b11` 的「⛔ 未做」标注**已消除**。临时脚本 `_mut_r34.sh` / `_mut_r34.py` 已删除。
