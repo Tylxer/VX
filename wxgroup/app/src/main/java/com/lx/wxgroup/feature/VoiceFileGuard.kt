@@ -3,6 +3,7 @@ package com.lx.wxgroup.feature
 import com.lx.wxgroup.core.HostContext
 import com.lx.wxgroup.data.Keys
 import com.lx.wxgroup.data.Kv
+import com.lx.wxgroup.data.MediaGuardLogic
 import com.lx.wxgroup.data.VoiceBackupLogic
 import com.lx.wxgroup.util.LogX
 import de.robv.android.xposed.XC_MethodHook
@@ -110,9 +111,6 @@ object VoiceFileGuard {
     /** 保护窗口（图片/视频）。比语音长 10 倍：用户常过几分钟才回头看那张图 */
     private const val PROTECT_MEDIA_MS = 600_000L
 
-    /** 短于此长度的 token 一律不收：`contains` 判据太短会误伤无关文件 */
-    private const val MIN_TOKEN = 16
-
     /**
      * 是否有活着的媒体保护项 —— `File.delete` 是高频路径，靠它把新增开销压到零。
      * （绝大多数时候微信根本没撤回图片，这里恒 false，连 `file.path` 都不取。）
@@ -122,42 +120,38 @@ object VoiceFileGuard {
 
     /** 把某个图片/视频的 imgPath 加入保护名单 */
     fun protectMedia(token: String?, ttlMs: Long = PROTECT_MEDIA_MS) {
-        val t = token?.trim().orEmpty()
-        if (t.length < MIN_TOKEN) return
-        if (!t.all { it in '0'..'9' || it in 'a'..'f' || it in 'A'..'F' }) return
+        // ⛔ R31g 真机：图片消息的 `imgPath` **不是纯 md5**，而是
+        //    `THUMBNAIL_DIRPATH://th_0c947a1dd158f52fcca431bb84954d5b`。
+        //    旧实现要求「整个字符串全是 hex」，于是这条在**第一道判据**就 return 了 ——
+        //    连日志都没打（真机 `grep VFG` = 0 行正是证据），文件照删，点开必然失败。
+        //    现在由 MediaGuardLogic 取最长 hex 段（≥32 位，见其类注释：16 位会误收数字串）。
+        val t = MediaGuardLogic.hexToken(token)
+        if (t == null) {
+            // ⛔ 不能静默 return：上一次「一行日志都没有」害得排查了半天。
+            //    取不到 token = 这张图**完全没被保护**，必须留下痕迹。
+            LogX.w("VFG protectMedia SKIP no-token raw=${token?.take(40)}")
+            return
+        }
         val now = SystemClock.elapsedRealtime()
         protectedMedia[t] = now + ttlMs
         if (protectedMedia.size > 256) {
             protectedMedia.entries.removeIf { it.value < now }
         }
         hasMedia = true
-        LogX.i("VFG protectMedia img=${t.take(10)}..(${t.length}) ttl=${ttlMs}ms pool=${protectedMedia.size}")
+        LogX.i(
+            "VFG protectMedia img=${t.take(10)}..(${t.length}) ttl=${ttlMs}ms " +
+                "pool=${protectedMedia.size} raw=${token?.take(28)}",
+        )
     }
 
     /**
      * 这个路径是不是某个「刚被撤回的图片/视频」的文件。
      *
-     * 判据：路径含 `/image2/` 或 `/video2/` 或 `/video/`，且文件名含某个未过期的 token。
-     * 纯字符串 + map 遍历（池子只有个位数），无 IO。
+     * 判据全部下移到 [MediaGuardLogic.mediaHit]（纯逻辑，有单测覆盖）：
+     * 路径在 `/image2/` `/video2/` `/video/` 下，且文件名含某个未过期的 32 位 token。
      */
-    private fun mediaHit(path: String, now: Long): String? {
-        if (!hasMedia) return null
-        if (path.indexOf("/image2/") < 0 && path.indexOf("/video2/") < 0 &&
-            path.indexOf("/video/") < 0
-        ) {
-            return null
-        }
-        val slash = path.lastIndexOf('/')
-        val name = if (slash >= 0) path.substring(slash + 1) else path
-        var alive = false
-        for ((token, until) in protectedMedia) {
-            if (until < now) continue
-            alive = true
-            if (name.contains(token)) return token
-        }
-        if (!alive) hasMedia = false
-        return null
-    }
+    private fun mediaHit(path: String, now: Long): String? =
+        MediaGuardLogic.mediaHit(path, protectedMedia, now)
 
     /**
      * 开关缓存。
@@ -284,7 +278,13 @@ object VoiceFileGuard {
             if (!hasMedia) return
             val path = runCatching { self.path }.getOrNull() ?: return
             val now = SystemClock.elapsedRealtime()
-            val token = mediaHit(path, now) ?: return
+            val token = mediaHit(path, now)
+            if (token == null) {
+                // 池子已全过期 ⇒ 复位快判，回到「连 path 都不取」的零开销状态。
+                // （不复位的话 hasMedia 会永远 true，每次 File.delete 都白取一次 path）
+                if (!MediaGuardLogic.anyAlive(protectedMedia, now)) hasMedia = false
+                return
+            }
             if (!on()) return
 
             param.result = true
@@ -293,7 +293,8 @@ object VoiceFileGuard {
             val last = logAt[key]
             if (last == null || now - last > LOG_TTL_MS) {
                 logAt[key] = now
-                LogX.i("VFG blocked MEDIA delete img=${token.take(10)}.. name=$name")
+                LogX.i("VFG blocked MEDIA delete img=${token.take(10)}.. name=$name path=$path")
+                dumpDir(self)
             }
         }
     }
@@ -301,5 +302,19 @@ object VoiceFileGuard {
     /** `SystemClock` 的薄封装，避免本文件到处都是 import */
     private object SystemClock {
         fun elapsedRealtime(): Long = android.os.SystemClock.elapsedRealtime()
+    }
+
+    /**
+     * 把命中文件所在目录列出来（限 8 个，带字节数）。
+     *
+     * ⛔ 为什么生产代码要做这件事：`adb shell` 读不到 `MicroMsg/<hash>/image2`（权限 700、无 root），
+     * 而「撤回后点开转圈」到底缺哪个文件，只能靠**模块自己（持有微信权限）**去看。
+     * 一次撤回打印一目，比加探针再装一包快得多；只在命中且过了日志节流时执行，低频。
+     */
+    private fun dumpDir(file: File) {
+        val dir = file.parentFile ?: return
+        val kids = runCatching { dir.listFiles() }.getOrNull() ?: return
+        val s = kids.take(8).joinToString(",") { "${it.name}(${it.length()})" }
+        LogX.i("VFG dir n=${kids.size} ${dir.path.takeLast(28)} :: $s")
     }
 }
