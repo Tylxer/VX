@@ -78,3 +78,37 @@ WorkBuddy 内部 id 由 `decorateCustomModels()` 在 `models.json` 里原值前�
 
 ---
 
+## ⛔ 实证：显式传 `deepseek-v4-pro` 未必按 Pro 发出（2026-10-29 真值回填发现）
+
+**现象**：R33 派的两个 Pro 类 lane，台账记的 spawn 串是 `deepseek-v4-pro`，
+但读 `subagents/*.jsonl` 的 `providerData.requestModelId` 得：
+
+| lane | agent id | spawn 传的串 | **真值 `requestModelId`** |
+|---|---|---|---|
+| `rev-sns`（复核 Sns 注入候选） | `agent-c57d0517` | `deepseek-v4-pro` | **`deepseek-v4.1-flash`** |
+| `rev-hd`（复核 AutoHdImg 递归） | `agent-b17187d5` | `deepseek-v4-pro` | **`deepseek-v4.1-flash`** |
+| `review-r31h`（对照，规划就是 flash） | `agent-32189435` | `deepseek-v4.1-flash` | `deepseek-v4.1-flash` ✅ 相符 |
+
+**结论**：对 `deepseek-v4-pro` 这个 id，L1 请求意图层**可能出现「写了 Pro、实际发 Flash」**，
+与 §四②「裸写 ID 即命中」的假设冲突。对照 `Hy4 preview`（R34 五个 lane 全部真值 `hy4-preview`）
+则**完全相符** ⇒ 问题出在 `deepseek-v4-pro` 这一条，不是所有 id。
+
+**推论（谨慎）**：`rev-hd` 两次 400 / 零产出可能与档位回落同源，但**没有证据**，
+不能当成因果。只记事实。
+
+### 硬核验的正确读法（别再写成「读不到」）
+
+`requestModelId` 在 **`providerData` 里**，不是顶层：
+
+```python
+o = json.loads(line)
+mid = (o.get("providerData") or {}).get("requestModelId")   # ✅
+mid = o.get("requestModelId")                                # ❌ 恒 None
+```
+
+R33/R34 两次自审都漏了真值回填，第二次差点因为顶层读法为 `None`
+就写成「沙箱读不到、事后无补救」—— 那正是 §四② 明令禁止的错误写法。
+
+### 行动项
+- 凡 spawn 串写 `deepseek-v4-pro` 的 lane，**事后必须回填真值**再判「档位合规」。
+- 若后续再见到 pro→flash 回落，优先试 `custom-local:deepseek-v4-pro`（上文「可行做法 1」）。
