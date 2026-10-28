@@ -21,8 +21,24 @@ import java.util.concurrent.atomic.AtomicInteger
  * 我们需要的三个入参喂到嘴边。反过来，自己去 hook「消息入库」要赌存储层的方法签名，
  * 赌错就是静默失效（本项目最大的坑，见 `开发回路速查.md`）。
  *
- * ⛔ **防递归**：我们下原图时也会 `new t1(..., downloadType=0, ...)`，会再次进这个 hook。
- * 所以只认 `downloadType == [TYPE_THUMB]`（微信下压缩图用的档位）作为起跳点。
+ * ## ⛔ 为什么**不用** downloadType 当闸门（R31g 真机实测推翻）
+ *
+ * 原设计「只认 `downloadType == 1`（微信下压缩图的档位）」。真机 8.0.48 实测
+ * `HDIMG installed=true seen=14 fired=0 skipOther=14` —— 微信自己建的 14 次 t1
+ * **全部**被这道闸门挡掉，`fired` 一次没起跳。dex 取证（`tools/_r29_g2_clsdump.py`）：
+ *
+ * ```
+ * inst direct -><init>(JJILcom/tencent/mm/modelbase/t0;)V
+ * inst direct -><init>(JJILcom/tencent/mm/modelbase/t0;I)V
+ * ```
+ *
+ * 参数序列确实是 `(long, long, int, ...)`，第三参落字段 `o`，而 `doScene` 里
+ * `iget o` 只喂给日志 `'doscene id:%d comp:%d off:%d total:%d ...'` —— 所以
+ * **取值逻辑没错，错的是「微信传 1」这个假设**。不能再赌一个常量。
+ *
+ * 现在的起跳判据只有两条硬事实：**`msgId != 0`** 且 **`done` 集合首次收录该 msgId**。
+ * 递归防护改由「`done` 去重 + `selfFiring` 线程标记」承担，不依赖档位：
+ * 我们自己 `fire` 时复用同一个 msgId ⇒ 必然被 `done` 挡成 `skipDup`。
  *
  * ## 判重
  * 用微信自己的口径：`ImgInfo.t == 1` 表示原图已下完（`AutoGetBigImgLogic` 里
@@ -44,7 +60,10 @@ object AutoHdImg {
     private const val C_FOUNDATION = "com.tencent.mm.plugin.messenger.foundation.b1"
     private const val C_LISTENER = "fv.e0"                          // IOnSceneEnd 族
 
-    /** 微信自己下压缩图用的 downloadType —— 只有它才是我们的起跳信号 */
+    /**
+     * 旧闸门用的「微信下压缩图档位」。**已降级为纯日志标签，不再参与判据** ——
+     * 真机实测微信传的不是这个值（见类 KDoc）。留着是为了日志里能一眼看出档位分布。
+     */
     private const val TYPE_THUMB = 1
 
     /** 我们要下的原图档位（与 `AutoGetBigImgLogic` 里写死的 0 一致） */
@@ -70,13 +89,49 @@ object AutoHdImg {
     private val already = AtomicInteger(0)   // 已有原图（ImgInfo.t==1）
     private val skipScope = AtomicInteger(0) // 名单没命中
     private val skipDup = AtomicInteger(0)   // 进程内去重命中
-    private val skipOther = AtomicInteger(0) // 非压缩图档位（含我们自己下的原图）
+    private val skipOther = AtomicInteger(0) // ⚠️ 已不拦截，仅统计「档位不是 TYPE_THUMB」的次数
     private val fail = AtomicInteger(0)
+
+    /**
+     * 「这条 t1 构造是我们自己 fire 出来的」廉价快判，**只在同步路径上有效**。
+     *
+     * ⛔ R31h 真机反证：`seen=2 fired=1 ok=1 skipDup=1` —— 我们只 fire 了 1 次，
+     *    却看见 2 次 t1 构造，且第 2 次落到了 `done` 去重里（skipDup 计数）。
+     *    说明 `svc.c()` 内部建 t1 **不在 pool 线程上**，ThreadLocal 没盖住。
+     *    ⇒ **真正兜住递归的是 [done]，不是这个标记。** 它的价值只剩「同一线程内
+     *    少一次 synchronized 和计数污染」，绝不可当成唯一防线。
+     *    （若哪天 [done] 的口径变了，递归就无兜底 —— 改 done 前先想这一步。）
+     */
+    private val selfFiring = ThreadLocal.withInitial { false }
+
+    /** 档位分布只打一次：key = "参数个数:第一个Int"。用来一次性看清微信到底传什么值 */
+    private val sigSeen = java.util.concurrent.ConcurrentHashMap.newKeySet<String>()
+
+    /**
+     * 「看见了构造但拿不到 msgId」的形状（每种只打一条）。
+     * ⛔ 存在的唯一理由：这条路径原来是静默 return，导致「图片到达却没 fire」查不出原因。
+     */
+    private val missSeen = java.util.concurrent.ConcurrentHashMap.newKeySet<String>()
+
+    /** 拿不到 msgId 的累计次数（探针用） */
+    private val noMsgId = AtomicInteger(0)
 
     @Volatile private var lastErr = ""
     @Volatile private var lastTalker = ""
 
-    /** 进程内去重：一个 msgId 只尝试一次（避免同一张图被反复建任务）。有上限防泄漏 */
+    /**
+     * 进程内去重：一个 msgId 只尝试一次。有上限防泄漏。
+     *
+     * ⛔ **这是递归的唯一硬兜底**（[selfFiring] 跨线程无效，见其注释）：
+     * 我们 fire 出的 t1 构造即便在别的线程被看见，msgId 也必然已在集合里
+     * ⇒ `add` 返回 false ⇒ `skipDup`，循环终止。
+     *
+     * 所以 `done` 的 key 语义**必须是「微信传进来那个 msgId」**，不能换成 localId 或
+     * 别的派生值 —— 换成派生值就与我们 fire 出来的那次对不上，递归无界。
+     *
+     * 淘汰（>1024）后旧 msgId 能被再次 fire，此时靠 [fire] 里的 `ImgInfo.t==1`
+     * 判重兜住（微信自己的口径），代价最多一次无效任务投递。
+     */
     private val done = object : LinkedHashSet<Long>(128) {
         override fun add(element: Long): Boolean {
             val r = super.add(element)
@@ -92,7 +147,8 @@ object AutoHdImg {
     fun stat(): String =
         "$TAG installed=$installed seen=${seen.get()} fired=${fired.get()} ok=${ok.get()} " +
             "already=${already.get()} skipScope=${skipScope.get()} skipDup=${skipDup.get()} " +
-            "skipOther=${skipOther.get()} fail=${fail.get()} lastTalker=$lastTalker lastErr=$lastErr"
+            "skipOther=${skipOther.get()} noMsgId=${noMsgId.get()} fail=${fail.get()} " +
+            "lastTalker=$lastTalker lastErr=$lastErr"
 
     fun install(lpparam: XC_LoadPackage.LoadPackageParam) {
         val cl = lpparam.classLoader
@@ -111,42 +167,105 @@ object AutoHdImg {
         }
         hostCl = cl
         installed = true
-        LogX.i("$TAG installed $C_NETSCENE ctor x${set.size} (默认关闭：${Keys.CHAT_AUTO_HD_IMG})")
+        LogX.i("$TAG installed $C_NETSCENE ctor x${set.size} (开关 ${Keys.CHAT_AUTO_HD_IMG})")
     }
 
     private val ctorHook = object : XC_MethodHook() {
         override fun afterHookedMethod(param: MethodHookParam) {
             // 关着的时候唯一开销就是这一次 Kv 读取，别在这里做任何重活
             if (!Kv.getBool(Keys.CHAT_AUTO_HD_IMG)) return
+            // 我们自己发起的下载会二次进这里 —— 线程标记直接放过，别污染计数
+            if (selfFiring.get() == true) return
             seen.incrementAndGet()
             val args = param.args ?: return
-            var localId = 0L
-            var msgId = 0L
+            var argLocal = 0L
+            var argMsg = 0L
             var type = -1
             var nLong = 0
             for (a in args) {
                 when {
-                    a is Long && nLong == 0 -> { localId = a; nLong = 1 }
-                    a is Long && nLong == 1 -> { msgId = a; nLong = 2 }
-                    a is Int && type < 0 -> type = a   // 第一个 int 就是 downloadType
+                    a is Long && nLong == 0 -> { argLocal = a; nLong = 1 }
+                    a is Long && nLong == 1 -> { argMsg = a; nLong = 2 }
+                    a is Int && type < 0 -> type = a   // 第三个参数 = downloadType（落字段 o）
                 }
             }
-            // ⛔ 只借「微信自己下压缩图」这一脚。type==0 是我们自己下的原图 → 必须放过
-            if (type != TYPE_THUMB) { skipOther.incrementAndGet(); return }
-            if (msgId == 0L) return
+            // ⛔ R31h 真机（2026-10-28）：撤回后点开时微信建的是 `(0, msgId)` 形态 —— 第一参
+            //    localId 为 0，说明「第一参=localId、第二参=msgId」并非所有构造都成立。
+            //    `t1` 的实例字段在构造结束时必然已赋值（dex dump：`h/i/j`=localId、`q`=msgId）
+            //    ⇒ 参数解析落空就改用字段兜底。
+            //    ⚠️ 原来的 `if (msgId == 0L) return` 是**静默丢弃**：真机上有一条被撤回的图片
+            //    到达时压根没 fire，日志里连一行都没有 —— 无头案的教科书案例。
+            val fldLocal = instLong(param.thisObject, "h").let { if (it > 0) it else 0L }
+            val fldMsg = instLong(param.thisObject, "q").let { if (it > 0) it else 0L }
+            val localId = if (argLocal > 0) argLocal else fldLocal
+            val msgId = if (argMsg > 0) argMsg else fldMsg
+            // 档位分布取证：每种 (参数个数, 首个Int) 只打一条，最多 12 条。零装包成本，
+            // 下次真机就能看清微信各场景传的档位 —— 不再靠猜常量。
+            if (type != TYPE_THUMB) skipOther.incrementAndGet()
+            val sig = "${args.size}:$type"
+            if (sigSeen.size < 12 && sigSeen.add(sig)) {
+                LogX.i(
+                    "$TAG sig n=${args.size} type=$type " +
+                        "o=${instInt(param.thisObject, "o")} h=${instLong(param.thisObject, "h")} " +
+                        "i=${instLong(param.thisObject, "i")} j=${instLong(param.thisObject, "j")} " +
+                        "q=${instLong(param.thisObject, "q")} args=$argLocal/$argMsg",
+                )
+            }
+            if (msgId == 0L) {
+                // 参数和字段都拿不到 msgId ⇒ 这条无论如何 fire 不了，必须留下证据（不再静默）
+                if (missSeen.size < 8 && missSeen.add(sig)) {
+                    LogX.w(
+                        "$TAG noMsgId n=${args.size} type=$type args=$argLocal/$argMsg " +
+                            "fld=$fldLocal/$fldMsg cls=${param.thisObject?.javaClass?.name}",
+                    )
+                }
+                noMsgId.incrementAndGet()
+                return
+            }
             synchronized(done) { if (!done.add(msgId)) { skipDup.incrementAndGet(); return } }
             // ⚠️ t1 构造在主线程：下载服务入队会触发 NetScene 投递，绝不能在主线程跑
             runCatching {
                 pool.execute {
-                    runCatching { fire(localId, msgId) }
-                        .onFailure {
-                            fail.incrementAndGet()
-                            lastErr = it.javaClass.simpleName
-                            LogX.w("$TAG fire err ${it.javaClass.simpleName}: ${it.message}")
-                        }
+                    selfFiring.set(true)
+                    try {
+                        runCatching { fire(localId, msgId) }
+                            .onFailure {
+                                fail.incrementAndGet()
+                                lastErr = it.javaClass.simpleName
+                                LogX.w("$TAG fire err ${it.javaClass.simpleName}: ${it.message}")
+                            }
+                    } finally {
+                        selfFiring.set(false)
+                    }
                 }
             }.onFailure { LogX.w("$TAG submit err ${it.javaClass.simpleName}") }
         }
+    }
+
+    private fun instInt(o: Any?, name: String): Int =
+        o?.let { runCatching { XposedHelpers.getIntField(it, name) }.getOrNull() } ?: -999
+
+    private fun instLong(o: Any?, name: String): Long =
+        o?.let { runCatching { XposedHelpers.getLongField(it, name) }.getOrNull() } ?: -999L
+
+    /**
+     * 从 ImgInfo 里捞出任意一个「像图片路径」的字符串字段（纯日志用）。
+     *
+     * ⚠️ **不写死字段名**：ImgInfo 的字段全被混淆成 `e`/`f`/`g` 这种短名，写死就是赌，
+     *    赌错只表现为「日志里是 null」，反而更容易误判成「没有 imgPath」。
+     *    这里遍历所有 String 字段，取第一个带 `://` 或长度落在 24..40 的值。
+     *    只在 fire 时跑一次（每张图一次），开销可忽略。
+     */
+    private fun imgPathOf(img: Any?): String? {
+        if (img == null) return null
+        return runCatching {
+            img.javaClass.declaredFields.asSequence()
+                .filter { it.type == String::class.java }
+                .mapNotNull { f ->
+                    runCatching { f.isAccessible = true; f.get(img) as? String }.getOrNull()
+                }
+                .firstOrNull { it.isNotBlank() && (it.contains("://") || it.length in 24..40) }
+        }.getOrNull()
     }
 
     /**
@@ -163,27 +282,36 @@ object AutoHdImg {
         // 判重：已有原图就不下（微信 AutoGetBigImgLogic 同款口径）
         val storage = XposedHelpers.callStaticMethod(core, "O8")         // ImgInfoStorage
         val img = storage?.let { runCatching { XposedHelpers.callMethod(it, "o2", localId) }.getOrNull() }
-        if (img != null) {
-            val t = runCatching { XposedHelpers.getIntField(img, "t") }.getOrNull()
-            if (t == 1) { already.incrementAndGet(); return }
-        }
+        // ⚠️ 把 `t` 与 imgPath 带进日志：`t==1` 是「原图已下完」的微信口径，
+        //    没有这两个值就没法判「是我们没下」还是「早就有了」，只能靠现象猜。
+        val imgT = if (img != null) runCatching { XposedHelpers.getIntField(img, "t") }.getOrNull() else null
+        val imgPath = imgPathOf(img)
+        if (imgT == 1) { already.incrementAndGet(); return }
 
         val allowRaw = Kv.getList(Keys.CHAT_AUTO_HD_ALLOW)
         val excludeRaw = Kv.getList(Keys.CHAT_AUTO_HD_EXCLUDE)
-        val (groups, labels) = buckets(allowRaw, excludeRaw)
-        val talker = talkerOf(msgId, cl)
-        lastTalker = talker.orEmpty()
-        // ⚠️ 判定口径与 NotifyMute 完全一致（排除优先 / 允许空 = 全部生效 / 空分组不退化）
-        if (!ListResolver.inScope(
-                talker = talker,
-                allowRaw = allowRaw,
-                excludeRaw = excludeRaw,
-                groups = groups,
-                labels = labels,
-            )
-        ) {
-            skipScope.incrementAndGet()
-            return
+        // ⛔ R31g 真机：`seen=20 fired=11 skipScope=11 ok=0 fail=0`，
+        //    `lastErr=talker:NullPointerException` —— 11 次全被名单判定拦在
+        //    `ListResolver.inScope` 第 121 行（`talker` 为空直接 return false），
+        //    一次都没走到 `svc.c()`。而 `talkerOf()` 在本版跳 NPE 是**另一件事**：
+        //    名单为空时它根本不该被调用（语义就是「不过滤」）。
+        //    ⇒ 名单为空短路，省掉一次反射查询，也避开那个 NPE。
+        if (allowRaw.isNotEmpty() || excludeRaw.isNotEmpty()) {
+            val (groups, labels) = buckets(allowRaw, excludeRaw)
+            val talker = talkerOf(msgId, cl)
+            lastTalker = talker.orEmpty()
+            // ⚠️ 判定口径与 NotifyMute 完全一致（排除优先 / 允许空 = 全部生效 / 空分组不退化）
+            if (!ListResolver.inScope(
+                    talker = talker,
+                    allowRaw = allowRaw,
+                    excludeRaw = excludeRaw,
+                    groups = groups,
+                    labels = labels,
+                )
+            ) {
+                skipScope.incrementAndGet()
+                return
+            }
         }
 
         val listener = newListener(cl) ?: throw IllegalStateException("listener null")
@@ -194,7 +322,7 @@ object AutoHdImg {
         )
         if (r == true) {
             ok.incrementAndGet()
-            LogX.i("$TAG fired msgId=$msgId localId=$localId talker=$talker")
+            LogX.i("$TAG fired msgId=$msgId localId=$localId t=$imgT img=${imgPath?.take(36)} talker=$lastTalker")
         } else {
             fail.incrementAndGet()
             lastErr = "svc.c returned $r"
@@ -256,7 +384,13 @@ object AutoHdImg {
             runCatching { XposedHelpers.callMethod(mi, "getTalker") as? String }.getOrNull()
                 ?: runCatching { XposedHelpers.getObjectField(mi, "field_talker") as? String }.getOrNull()
                 ?: runCatching { XposedHelpers.getObjectField(mi, "talker") as? String }.getOrNull()
-        }.onFailure { lastErr = "talker:${it.javaClass.simpleName}" }.getOrNull()
+        }.onFailure {
+            // ⚠️ 只记类名不够（NPE 有无数种来源），带上**首个非反射栈帧**，
+            //    下次真机日志能直接指到是 `b1.a9()` 还是 `h9.u3()` 炸的。
+            val f = it.stackTrace.firstOrNull { s -> s.className.startsWith("com.tencent.") }
+            lastErr = "talker:${it.javaClass.simpleName}@" +
+                (f?.let { s -> "${s.className.substringAfterLast('.')}.${s.methodName}" } ?: "?")
+        }.getOrNull()
     }
 
     /**

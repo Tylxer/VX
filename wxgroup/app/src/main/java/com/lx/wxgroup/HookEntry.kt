@@ -282,8 +282,9 @@ class HookEntry : IXposedHookLoadPackage {
             SnsTimelineSourceFix.installAlbumSyncTrigger(lpparam)
         }.onFailure { LogX.e("SnsTimelineSourceFix.installAlbumSyncTrigger failed", it) }
 
-        // ---- 聊天·自动加载原图（默认关闭：chat.auto_hd_img）----
-        // 借微信自己下压缩图那一脚（t1 构造，downloadType=1）起跳，再调下载服务下原图（=0）。
+        // ---- 聊天·自动加载原图（开关：chat.auto_hd_img）----
+        // 借微信自己下压缩图那一脚（t1 构造）起跳，再调下载服务下原图。
+        // ⛔ 曾按「downloadType==1」当闸门，真机实测微信传的是 0，已废 —— 改用 msgId+done 去重。
         runCatching {
             AutoHdImg.install(lpparam)
         }.onFailure { LogX.e("AutoHdImg install failed", it) }
