@@ -152,4 +152,104 @@ class PinFoldLogicTest {
         )
         for (v in variants) assertNotEquals(base, v)
     }
+
+    // ---------------------------------------------------------------- foldAction：快路径决策
+
+    @Test
+    fun foldAction_noopWhenAppliedEqualsDetected() {
+        // 没翻转（同方向重复上报）⇒ 不动，无论 count 变没变
+        assertEquals(
+            PinFoldLogic.FoldAction.NOOP,
+            PinFoldLogic.foldAction(true, true, 100, 100),
+        )
+        assertEquals(
+            PinFoldLogic.FoldAction.NOOP,
+            PinFoldLogic.foldAction(false, false, 100, 100),
+        )
+        // 即便 count 变了，只要方向没翻，也判 NOOP（count 变化由 rebuild 的 orderDirty 兜）
+        assertEquals(
+            PinFoldLogic.FoldAction.NOOP,
+            PinFoldLogic.foldAction(true, true, 100, 99),
+        )
+    }
+
+    @Test
+    fun foldAction_flipReuseWhenCountUnchanged() {
+        // 快路径成立条件：翻转了 + count 未变 ⇒ 折叠入口不是真实 item，快照可复用
+        assertEquals(
+            PinFoldLogic.FoldAction.RELAYOUT_REUSE,
+            PinFoldLogic.foldAction(false, true, 100, 100),
+        )
+        assertEquals(
+            PinFoldLogic.FoldAction.RELAYOUT_REUSE,
+            PinFoldLogic.foldAction(true, false, 100, 100),
+        )
+    }
+
+    @Test
+    fun foldAction_flipRereadWhenCountChanged() {
+        // 必须重读条件：翻转了 + count 变了 ⇒ 折叠入口是真实 item，快照下标整体偏移
+        assertEquals(
+            PinFoldLogic.FoldAction.RELAYOUT_REREAD,
+            PinFoldLogic.foldAction(false, true, 100, 99),
+        )
+        assertEquals(
+            PinFoldLogic.FoldAction.RELAYOUT_REREAD,
+            PinFoldLogic.foldAction(true, false, 99, 100),
+        )
+    }
+
+    @Test
+    fun foldAction_nullAppliedIsNotNoop() {
+        // 三态不混同：applied=null（从未应用）与任何布尔都不相等 ⇒ 恒触发重建，
+        // 不会和 applied=false（已应用展开）混同成 NOOP
+        assertEquals(
+            PinFoldLogic.FoldAction.RELAYOUT_REUSE,
+            PinFoldLogic.foldAction(null, false, 100, 100),
+        )
+        assertEquals(
+            PinFoldLogic.FoldAction.RELAYOUT_REUSE,
+            PinFoldLogic.foldAction(null, true, 100, 100),
+        )
+        // null 与 true/false 在 NOOP 判据上两两不等
+        assertNotEquals(
+            PinFoldLogic.foldAction(null, false, 100, 100),
+            PinFoldLogic.foldAction(false, false, 100, 100),
+        )
+    }
+
+    @Test
+    fun foldAction_threeStatesDoNotMix() {
+        // applied 的三种取值（null/false/true）在「是否 NOOP」上必须两两可区分：
+        // 对同一 detected=false，三者给出的动作各不相同（null≠false≠true）
+        val fromNull = PinFoldLogic.foldAction(null, false, 10, 10)
+        val fromFalse = PinFoldLogic.foldAction(false, false, 10, 10)
+        val fromTrue = PinFoldLogic.foldAction(true, false, 10, 10)
+        assertNotEquals(fromNull, fromFalse)
+        assertNotEquals(fromFalse, fromTrue)
+        // ⛔ 原断言 `assertNotEquals(fromNull, fromTrue)` 是**错的**（2026-10-28 修）：
+        //    实现只分出两类动作 —— NOOP 与「需要重建」（再按 count 分 REUSE/REREAD）。
+        //    `null`（从未应用）和 `true`（上次折叠、现在检测到展开）都只是「需要重建」，
+        //    count 同为 10 时必然都是 RELAYOUT_REUSE，要求二者不同等于要求实现说谎。
+        //    三态的真正区分点是 **NOOP 判据**（下面几条），不是「动作两两不同」。
+        // false==false 才是 NOOP，true==true 才是 NOOP
+        assertEquals(PinFoldLogic.FoldAction.NOOP, fromFalse)
+        assertNotEquals(PinFoldLogic.FoldAction.NOOP, fromTrue)
+    }
+
+    @Test
+    fun flipRelayoutPutsPinnedRowsCorrectly() {
+        // 翻转后 pinned 行位置正确：展开在最前，折叠被收掉 —— 与 foldAction 决策一致
+        val convs = listOf(conv("alice"), conv("bob"))
+        val groups = listOf(ConvLayout.GroupRowSpec(1L, "g1", pinned = true, sortOrder = 0))
+        val members = mapOf(1L to setOf("alice"))
+        val unfolded = ConvLayout.build(convs, groups, members, pinFolded = false)
+        val folded = ConvLayout.build(convs, groups, members, pinFolded = true)
+        // 展开态：pinned 分组行在最前（isGroupRow 判位置 0）
+        assertTrue(unfolded.isGroupRow(0))
+        // 折叠态：位置 0 不再是分组行（pinned 分组行被收进「N个置顶聊天」）
+        assertFalse(folded.isGroupRow(0))
+        // 决策口径一致：折叠 ⇒ shouldInsertPinned=false
+        assertFalse(PinFoldLogic.shouldInsertPinned(true))
+    }
 }

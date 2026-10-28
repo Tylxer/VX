@@ -702,8 +702,8 @@ object ConvFilter {
                 }
                 if (folded != null && folded != fa.pinFoldedByView) {
                     fa.pinFoldedByView = folded
-                    LogX.i("K7 pinFold(view) folded=$folded -> rebuild")
-                    runCatching { fa.onDataChanged() }
+                    LogX.i("K7 pinFold(view) folded=$folded -> immediate")
+                    runCatching { fa.onPinFoldChanged(folded) }
                 }
             }
         }.onFailure { LogX.w("K7 pinFold listener failed: ${it.javaClass.simpleName}") }
@@ -905,6 +905,17 @@ object ConvFilter {
         /** 上次 rebuild 时消费到的摘要版本号（见 [summariesVersion]） */
         private var lastSummariesVersion = 0
 
+        /**
+         * 上次完整重建（收纳态、有分组）时的分组 spec，供折叠快路径复用。
+         *
+         * R32：折叠翻转只重算 layout，不该重读分组表。这个缓存保证 [lastSpecs] 与
+         * [memberSets] 来自同一次完整重建，不会出现「specs 有、memberSets 无」的错位。
+         * **空列表 = 无分组行可收放**（开关关 / 筛选态 / 无分组），折叠快路径据此直接
+         * return —— 这几种情况下 layout 里根本没有分组行，折叠态不影响渲染。
+         */
+        @Volatile
+        private var lastSpecs: List<ConvLayout.GroupRowSpec> = emptyList()
+
         /** observer 去抖标记（主线程读写，配合 mainHandler.post 串行） */
         private var observerRebuildQueued = false
 
@@ -1046,22 +1057,26 @@ object ConvFilter {
                     // 开关关掉 / DB 没就绪 = 零改动，一条会话都不能少
                     memberSets = emptyMap()
                     models = emptyMap()
+                    lastSpecs = emptyList()
                     ConvLayout.build(snaps, emptyList(), emptyMap(), enabled = false)
                 }
                 filterId > 0 -> {
                     memberSets = emptyMap()
                     models = emptyMap()
+                    lastSpecs = emptyList()
                     ConvLayout.filtered(snaps, cachedMembers)
                 }
                 else -> {
                     if (groups.isEmpty()) {
                         memberSets = emptyMap()
                         models = emptyMap()
+                        lastSpecs = emptyList()
                         ConvLayout.build(snaps, emptyList(), emptyMap(), enabled = false)
                     } else {
                         val specs = groups.map {
                             ConvLayout.GroupRowSpec(it.id, it.name, it.pinned, it.sortOrder)
                         }
+                        lastSpecs = specs
                         val members = LinkedHashMap<Long, Set<String>>()
                         for (g in groups) {
                             members[g.id] = runCatching { db.memberWxids(g.id) }.getOrDefault(emptySet())
@@ -1160,6 +1175,75 @@ object ConvFilter {
                     runCatching { notifyDataSetChanged() }
                 }, REBUILD_DEBOUNCE_MS)
             }
+        }
+
+        /**
+         * 折叠态翻转的**即时路径**（R32）。
+         *
+         * 为什么不能走 [onDataChanged]：那条有 250ms 去抖（为「收新消息」的高频
+         * notify 设计），而折叠/展开是用户主动操作，延迟 250ms 表现为「慢半拍 +
+         * 微信折叠动画结束后分组行才二次跳动」。
+         *
+         * 为什么不能走 [ConvFilter.refresh]：refresh 会 [ConvFilter.rememberAnchor] +
+         * [ConvFilter.restoreAnchor]（`setSelectionFromTop` 把列表钉回顶部），折叠时
+         * 列表本就停在顶部（折叠入口在最上），不该再碰滚动位置 ——
+         * `setSelectionFromTop(0,0)` 会把微信 3046px header 顶出来制造假下拉
+         * （历史坑）。这里只重算 layout + notify，不碰任何滚动锚点，用户无论滚在
+         * 哪里都不会被弹回顶部。
+         */
+        fun onPinFoldChanged(folded: Boolean) {
+            mainHandler.post {
+                runCatching { rebuildForPinFold(folded) }
+                runCatching { notifyDataSetChanged() }
+            }
+        }
+
+        /**
+         * 折叠快路径的重建本体（只重算 layout，不重读快照 / 不查库 / 不重算 models）。
+         *
+         * [PinFoldLogic.foldAction] 判三种动作：
+         *  - [PinFoldLogic.FoldAction.NOOP]：没翻转，直接返回（布局回调可能重复报同方向）。
+         *  - [PinFoldLogic.FoldAction.RELAYOUT_REUSE]：count 未变，快照复用，只换 layout
+         *    （O(n) 纯计算，无反射、无 SQL）。
+         *  - [PinFoldLogic.FoldAction.RELAYOUT_REREAD]：count 变了，折叠入口是真 item，
+         *    快照下标整体偏移，重读一次快照（仍避开 rebuildModels 的 SQL 与 nameOf 查表）。
+         *
+         * ⚠️ 这里**不更新 [lastStamp]**：下一次 [rebuild]（收消息等触发）会用新的
+         * [pinFoldedByView] 算出新指纹，与旧 lastStamp 不同 ⇒ 走一次全量重建，把快照 /
+         * models / memberSets 全部刷新到折叠后的真实状态。折叠是低频操作，这一次额外的
+         * 全量重建代价可忽略，换来的是「折叠后数据绝不残留旧状态」。
+         */
+        private fun rebuildForPinFold(detected: Boolean) = synchronized(lock) {
+            val currentCount = runCatching { wrapped.count }.getOrDefault(snaps.size)
+            val action = PinFoldLogic.foldAction(pinApplied, detected, snaps.size, currentCount)
+            if (action == PinFoldLogic.FoldAction.NOOP) return@synchronized
+
+            // ⚠️ **顺序要紧：先判「有没有分组行可收放」，再决定要不要重读快照。**
+            // 反过来写（先 `snaps = readSnaps(...)` 再判空返回）会留下 `snaps` 已换、
+            // `layout` 未换的错位窗口 —— `layout` 的下标还指着旧快照，而 `wrapped`
+            // 已经变了，表现为「点 A 进的是 B」。
+            //
+            // 无分组行可收放（开关关 / 筛选态 / 无分组）时，折叠态不影响渲染；但底层
+            // 微信列表**真的变了**（折叠入口是真实 item 时 count 会变 ⇒ 下标整体偏移），
+            // 这种情况下必须补一次全量重建。这条分支里本来就没有分组行，不存在
+            // 「分组行慢半拍」的观感问题，正确性优先。
+            if (lastSpecs.isEmpty()) {
+                pinApplied = detected
+                if (action == PinFoldLogic.FoldAction.RELAYOUT_REREAD) {
+                    lastStamp = ""   // 破掉指纹短路，保证下面这次 rebuild 必走全量
+                    rebuild()
+                }
+                return@synchronized
+            }
+
+            if (action == PinFoldLogic.FoldAction.RELAYOUT_REREAD) {
+                snaps = readSnaps(currentCount)
+            }
+            layout = ConvLayout.build(
+                snaps, lastSpecs, memberSets, enabled = true, pinFolded = detected,
+            )
+            pinApplied = detected
+            LogX.i("K7 pinFold fast folded=$detected action=$action count=$currentCount")
         }
 
         /**
@@ -1304,14 +1388,26 @@ object ConvFilter {
             val gid = layout.groupIdAt(position)
             if (gid != ConvLayout.Layout.NOT_A_GROUP) {
                 if (ctx == null) return placeholder(parent)
-                return GroupRowView.build(
-                    ctx,
+                // R32：分组行**复用 convertView**（`create` 只建一次骨架，之后每次只 `bind`）。
+                //
+                // 旧写法每次都 `GroupRowView.build(...)` 新建整棵树，而 `notifyDataSetChanged()`
+                // 会重建所有可见行 ⇒ 折叠/展开置顶时分组行重测量、头像重载、LayoutParams 与
+                // listener 重新分配，视觉上「闪一下、跳一下」，那一帧也变长。
+                //
+                // ⚠️ 必须先过 `isGroupRow`：ListView 的回收池按 viewType 分池，但换 adapter /
+                // 改类型数量之后旧池子仍可能串类型把**会话行**递进来；`bind` 对非本类骨架会
+                // 静默返回，那一行就渲染成空白（规矩 3 的另一面）。
+                val reusable = convertView?.takeIf { GroupRowView.isGroupRow(it) }
+                val row = reusable ?: GroupRowView.create(ctx)
+                GroupRowView.bind(
+                    row,
                     modelOf(gid),
                     onTap = { runCatching { setGroup(gid) } },
                     // ctx 就是创建列表的那个 Activity（View.getContext 必是 Activity），
                     // 直接传下去 —— 比 HostContext.activity() 可靠得多（见 [GroupRowMenu]）
                     onLongTap = { GroupRowMenu.show(ctx, gid) },
                 )
+                return row
             }
 
             val r = layout.convIndexOf(position)

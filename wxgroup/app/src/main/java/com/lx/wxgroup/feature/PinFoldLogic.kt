@@ -68,4 +68,52 @@ object PinFoldLogic {
         groupsHash: Int,
         pinFolded: Boolean?,
     ): String = "$n|$enabled|$filterId|$showUnread|$membersHash|$groupsHash|$pinFolded"
+
+    // ---------------------------------------------------------------- R32 快路径决策
+
+    /**
+     * 折叠态翻转时的重建动作（快路径决策，零 Android 依赖，JVM 直接可测）。
+     *
+     * R32 体验问题的核心判据：折叠/展开必须走**即时路径**（一帧内完成），
+     * 不能和「收新消息」共用 250ms 去抖；同时尽量复用快照，只在必要时重读一次。
+     */
+    enum class FoldAction {
+        /** 没翻转（或重复报同一方向）⇒ 不动 */
+        NOOP,
+
+        /**
+         * 翻转了，且 inner adapter 的 `count` **未变** ⇒ 折叠入口不是 inner 的真实
+         * item（是 header / 独立 View），快照下标未动，可复用缓存的 snaps，只重算 layout。
+         */
+        RELAYOUT_REUSE,
+
+        /**
+         * 翻转了，且 `count` **变了** ⇒ 折叠入口是 inner 的真实 item，快照下标整体
+         * 偏移，必须重读一次快照（但仍避开 rebuildModels 的 SQL 与 nameOf 查表）。
+         */
+        RELAYOUT_REREAD,
+    }
+
+    /**
+     * 折叠态翻转时的重建决策。
+     *
+     * @param applied 上次真正应用进 layout 的折叠态（`null` = 从未应用）
+     * @param detected 刚扫到的折叠态（扫文字，恒为 true/false）
+     * @param cachedCount 上次完整重建时读到的会话条数（snaps.size）
+     * @param currentCount 当前 inner adapter 的 `count`
+     *
+     * ⚠️ 三态不混同：`applied == detected` 判 NOOP 时，`null` 与任何布尔都不相等
+     * （Kotlin `null == false` 为 false）⇒ `null`（从未应用）恒触发重建，不会和
+     * `false`（已应用展开）混同。
+     */
+    fun foldAction(
+        applied: Boolean?,
+        detected: Boolean,
+        cachedCount: Int,
+        currentCount: Int,
+    ): FoldAction {
+        if (applied == detected) return FoldAction.NOOP
+        return if (cachedCount == currentCount) FoldAction.RELAYOUT_REUSE
+        else FoldAction.RELAYOUT_REREAD
+    }
 }
