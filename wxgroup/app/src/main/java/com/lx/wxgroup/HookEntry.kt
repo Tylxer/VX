@@ -32,6 +32,7 @@ import com.lx.wxgroup.feature.ScrollDock
 import com.lx.wxgroup.feature.SnsAlbumMerge
 import com.lx.wxgroup.feature.SnsGuard
 import com.lx.wxgroup.feature.SnsSqlSpy
+import com.lx.wxgroup.feature.SnsDeletedTag
 import com.lx.wxgroup.feature.SnsTag
 import com.lx.wxgroup.feature.SnsTimelineSourceFix
 import com.lx.wxgroup.feature.VoiceFileGuard
@@ -248,6 +249,17 @@ class HookEntry : IXposedHookLoadPackage {
         runCatching {
             SnsTag.install(lpparam)
         }.onFailure { LogX.e("SnsTag install failed", it) }
+
+        // R35-1：「已删除动态打灰标」（灰标 = 灰底的「删除已拦截」角标）。
+        // 与上面 SnsTag 是**两件事**：SnsTag 决定「哪些动态算被删」，本模块负责「把它画到 itemView 上」。
+        // 挂载点从 `WxRecyclerAdapter.onBindViewHolder`（2 参，dex 反汇编证明是**死钩**）
+        // 改为 `c1/d1/a1/b1/l0/n0/k0`（一次拿到 View + snsId，不再靠 pos↔getData 下标对账）。
+        // ⚠️ 不加这行也不致死：`SnsDeletedTag.apply()` 被 SnsTag 首次调用时会用
+        //    `itemView.javaClass.classLoader` 懒装；加了只是把安装时机提前到启动，
+        //    排障时 `SNS_DELTAG installed` 能与其它模块并列出现，更容易判断「装没装上」。
+        runCatching {
+            SnsDeletedTag.install(lpparam)
+        }.onFailure { LogX.e("SnsDeletedTag install failed", it) }
 
         // ---- R30 §6.2 取证：SQL 旁听（默认关闭，`op=snsg sub=sqlspy sub2=on` 才记）----
         // 目的：让微信自己把相册 `getUserMediaSql` 的 **真 SQL** 说出来。
