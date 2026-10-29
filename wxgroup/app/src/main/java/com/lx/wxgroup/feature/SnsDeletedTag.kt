@@ -95,12 +95,16 @@ object SnsDeletedTag {
     @Volatile private var binds = 0
     @Volatile private var snsBinds = 0
     @Volatile private var resolved = 0
+    /** 判定命中的 paint 次数（**不是**画上了几条，见 [paint] 的 KDoc） */
     @Volatile private var hits = 0
+    /** 真的把标记写进时间 TextView 的次数 —— 真机验收的唯一判据是它 >0 */
+    @Volatile private var painted = 0
     @Volatile private var missed = 0
     @Volatile private var lastMiss = ""
     @Volatile private var hooks = 0
 
     private val miscLogged = AtomicInteger(0)
+    private val errLogged = AtomicInteger(0)
 
     /** 供 [SnsTag.stat] 读的「没打上标」信号：>0 说明反射取不到时间控件（字段/方法名漂移）。 */
     internal fun missedTimeCount(): Int = missedTime
@@ -111,6 +115,16 @@ object SnsDeletedTag {
     }
 
     /**
+     * 限流**告警**，与 [logOnce] 分开计额度。
+     *
+     * 为什么要分开：holder/pick、tv host 那些一次性 dump 会把 [LOG_MAX] 条额度很快吃光，
+     * 真出了异常反而一条告警都看不到 —— 而异常正是最该看见的（静默失效排查全靠它）。
+     */
+    private fun warnOnce(msg: String) {
+        if (errLogged.get() < LOG_MAX && errLogged.incrementAndGet() <= LOG_MAX) LogX.w(msg)
+    }
+
+    /**
      * 一个 itemView 当前的绑定关系。
      *
      * ## 为什么从 `View -> Long` 扩成 `View -> Binding`（R35-1c）
@@ -118,14 +132,47 @@ object SnsDeletedTag {
      * - `tvId` —— 解析成功后记住时间 TextView 的**资源 id**，之后 [sweep] 每 2s 重判
      *   时直接 `findViewById`，不必每次遍历子树；
      * - `hint` —— 这条动态的发布时间原文（`ImproveInfo(…, time:44分钟前 …)`），
-     *   用来在子树里按内容认出时间行（dex 已证时间行原文 == `J0()`，见 Logic 的 KDoc）。
+     *   用来在子树里按内容认出时间行（dex 已证时间行原文 == `J0()`，见 Logic 的 KDoc）；
+     * - `pos` —— 绑定时的 RecyclerView position。**复用失效**就靠它：View 被 RecyclerView
+     *   复用给另一条动态时 `bindViewHolder` 会带着**新的 pos** 进来，而 `bound` 的 key
+     *   还是同一个 View ⇒ 只要 `pos` 变了就说明这个 View 换内容了，旧 id/hint 一律作废
+     *   （[invalidateIfReused]）。选它而不是「存一份上次 paint 的文案基线」，是因为
+     *   bind 那一刻时间行的文案常常还是空的（见 [timeTextOf] 的 KDoc：渲染是 suspend，
+     *   `afterHookedMethod` 时还没填），基线对不上反而会误判。
+     *   ⛔ 也**不能**存 View / holder / data（见下面那条强引用禁令）。
      *
      * ⚠️ **不存 holder / data 本体**：[bound] 是 `WeakHashMap`，value 若强引用 key
      * 指向的对象（holder 强引用 itemView == key），条目将永远无法回收。
+     * ⇒ 同理，`pos` 是个 `Int`，不是「把上一条动态的证据留下来」的强引用，安全。
      */
     private class Binding(val id: Long) {
         @Volatile var tvId: Int = View.NO_ID
         @Volatile var hint: String = ""
+        /** 绑定时的 position；`-1` = 未知（[apply] 那条老链路不传 pos，不参与复用判定） */
+        @Volatile var pos: Int = -1
+    }
+
+    /**
+     * 复用失效：这个 View 现在装的还是上一条动态吗？（[Binding.pos]）
+     *
+     * ## 为什么必须显式判，而不是「解析成功就覆盖」
+     * `bound` 只在解析成功时被替换；一旦这一拍**解析不出** id（`a1/b1` 拿到的还是 bind-info，
+     * 或整条链路没挂上），`bound[view]` 里躺着的仍是**上一条**动态的 Binding。
+     * 而 [apply] 的 `snsId=0` 兜底正是拿这个旧 Binding 去 `paint` 的 ⇒ 上一条的
+     * `[删除已拦截]` 会留在新的这条动态上（串味，比不打标糟得多）。
+     * ⇒ 把「复用」变成显式事件：pos 一变就先把旧标记剥掉、再让这一拍重新解析。
+     *
+     * ⚠️ `pos < 0`（老链路 [apply] 建的 Binding，或取不到形参）不参与判定 ——
+     *    那种 Binding 本来就没有可比对的位置，误判成复用会把刚贴上的标又擦掉。
+     */
+    private fun invalidateIfReused(view: View, pos: Int) {
+        if (pos < 0) return
+        val old = synchronized(bound) { bound[view] } ?: return
+        if (old.pos < 0 || old.pos == pos) return
+        // ⚠️ 顺序不能反：`restore()` 内部用 `bound[host]` 的 hint 定位时间行（第 ③ 级解析
+        //    的唯一线索），先从 map 里摘掉就拿不到 hint 了。
+        runCatching { restore(view) }
+        synchronized(bound) { bound.remove(view) }
     }
 
     /** item 根 View → 当前绑定关系（弱引用，绝不钉住宿主 View） */
@@ -189,7 +236,13 @@ object SnsDeletedTag {
             ) break
             for (m in cur.declaredMethods) {
                 if (!matchesBindShape(m)) continue
-                val key = "${m.name}(${m.parameterTypes.joinToString { p -> p.name }})"
+                // ⚠️ 去重键必须带 declaringClass：子类覆写 `c1/d1/a1/b1/…` 时方法名与形参
+                //    与基类的**完全相同**，只按「名字(形参)」去重会把子类覆写版当成「已挂过」
+                //    静默跳过 ⇒ 真正被执行的那一层反倒没挂上（R35 首轮「挂载点选错层」的病根
+                //    就是这么来的，本文件 KDoc:225-227 的补挂措施会被这个键废掉）。
+                //    幂等性不受影响：install() 两次依旧靠 ensureInstalled 的 installed CAS 挡住，
+                //    即使再进这里，同一「类#方法(形参)」也只会挂一次。
+                val key = "${m.declaringClass.name}#${m.name}(${m.parameterTypes.joinToString { p -> p.name }})"
                 if (!hookedSigs.add(key)) continue
                 m.isAccessible = true
                 if (runCatching { XposedBridge.hookMethod(m, bindHook) }.isSuccess) n++
@@ -264,54 +317,87 @@ object SnsDeletedTag {
 
     // ------------------------------------------------------------------ 绑定钩子
 
+    /**
+     * ⚠️ 这个回调的**最外层必须兜住 Throwable，且绝不 rethrow**。
+     *
+     * 为什么这么要紧：9 条 bind 钩子里有一条挂在
+     * `androidx.recyclerview.widget.RecyclerView.Adapter.bindViewHolder` 上 —— 那是
+     * **全应用所有 RecyclerView 的公共入口**，从这里逃逸的异常会顺着 RecyclerView 的
+     * 布局流程往上冒泡 ⇒ **微信崩溃**（不是「标记没了」这种软失效）。模块异常必须和宿主隔离。
+     *
+     * 兜的是「边界」：体内的高风险点（反射、findViewById、setText）各自有 runCatching，
+     * 但 `bound[view]`（WeakHashMap 的 hashCode）、`ensureSweep()` 里的 synchronized、
+     * 末尾 `stat()` 里的 `on()` → SQLite 读，这三层**没有任何一层兜底**，平时不抛、
+     * 一旦抛就是崩微信。
+     *
+     * ⚠️ 只兜异常、不打乱诊断：`missed++` / `lastMiss=` 这些计数都写在 [onBind] 体内、
+     * 且先于可能抛出的点执行，所以「解析失败」的诊断不会因为加了这个 catch 被吞掉。
+     * （同文件里另一个 `afterHookedMethod` —— `hookSetAdapter` 那条 —— 从一开始就自带
+     *   runCatching，不需要再包。）
+     */
     private val bindHook = object : XC_MethodHook() {
         override fun afterHookedMethod(param: MethodHookParam) {
+            // 钩子是不是死的，全看它 —— 必须在 try 之前自增，否则异常路径下
+            // 「一次都没进来」和「进来就崩」会混成同一个数，没法定位。
             binds++
-            // ① 只认朋友圈的 adapter（钩子挂在基类上，全微信的列表都会进这里）
-            val adapter = param.thisObject ?: return
-            if (!adapter.javaClass.name.startsWith(SNS_PREFIX)) return
-            snsBinds++
-            val holder = param.args?.getOrNull(0) ?: return
+            try {
+                onBind(param)
+            } catch (t: Throwable) {
+                // 吞掉 + 限流告警：绝不 rethrow（rethrow = 崩微信）
+                warnOnce("SNS_DELTAG bind err: ${t.javaClass.simpleName}")
+            }
+        }
+    }
 
-            // ② 开关关着时只还原、不解析
-            if (!on()) {
-                runCatching { itemViewOf(holder)?.let { restore(it) } }
-                return
+    /** [bindHook] 的本体。分出来是为了让 try/catch 只包最外一层、内部逻辑仍然平铺。 */
+    private fun onBind(param: XC_MethodHook.MethodHookParam) {
+        // ① 只认朋友圈的 adapter（钩子挂在基类上，全微信的列表都会进这里）
+        val adapter = param.thisObject ?: return
+        if (!adapter.javaClass.name.startsWith(SNS_PREFIX)) return
+        snsBinds++
+        val holder = param.args?.getOrNull(0) ?: return
+
+        // ② 开关关着时只还原、不解析
+        if (!on()) {
+            runCatching { itemViewOf(holder)?.let { restore(it) } }
+            return
+        }
+        val view = itemViewOf(holder)
+        if (view == null) {
+            missed++
+            lastMiss = "noitemview(${holder.javaClass.simpleName})"
+            return
+        }
+        val pos = param.args?.getOrNull(1) as? Int ?: -1
+        // ③ 复用失效：这个 View 若已经装了另一条动态，旧 Binding 必须先作废（见 Binding.pos）
+        invalidateIfReused(view, pos)
+        val data = dataOf(holder, adapter, pos)
+        val id = SnsDeletedTagLogic.snsIdOf(data)
+        if (id == null) {
+            missed++
+            lastMiss = "nodata(${holder.javaClass.simpleName})"
+            // ⚠️ 不在每次解析失败时都 erase：一次 bind 会触发多条 hook，其中只有
+            //    部分（`c1/d1`）拿得到 item（`a1/b1` 写进 `E` 的是 bind-info）。
+            //    无条件 restore 会把刚由 `c1` 打上的标记又擦掉 —— 表现为「标记闪烁/没有」。
+            //    ⇒ 只有这个 view 从来没解析成功过时才还原（那时确实该把复用残留剥掉）。
+            if (synchronized(bound) { bound[view] } == null) restore(view)
+            retryResolve(holder, adapter, pos, view)
+            return
+        }
+        resolved++
+        val prev = bound[view]
+        val b = if (prev != null && prev.id == id && prev.pos == pos) prev else {
+            Binding(id).also {
+                it.hint = timeHintOf(data)
+                it.pos = pos
+                bound[view] = it
             }
-            val view = itemViewOf(holder)
-            if (view == null) {
-                missed++
-                lastMiss = "noitemview(${holder.javaClass.simpleName})"
-                return
-            }
-            val pos = param.args?.getOrNull(1) as? Int ?: -1
-            val data = dataOf(holder, adapter, pos)
-            val id = SnsDeletedTagLogic.snsIdOf(data)
-            if (id == null) {
-                missed++
-                lastMiss = "nodata(${holder.javaClass.simpleName})"
-                // ⚠️ 不在每次解析失败时都 erase：一次 bind 会触发多条 hook，其中只有
-                //    部分（`c1/d1`）拿得到 item（`a1/b1` 写进 `E` 的是 bind-info）。
-                //    无条件 restore 会把刚由 `c1` 打上的标记又擦掉 —— 表现为「标记闪烁/没有」。
-                //    ⇒ 只有这个 view 从来没解析成功过时才还原（那时确实该把复用残留剥掉）。
-                if (synchronized(bound) { bound[view] } == null) restore(view)
-                retryResolve(holder, adapter, pos, view)
-                return
-            }
-            resolved++
-            val prev = bound[view]
-            val b = if (prev != null && prev.id == id) prev else {
-                Binding(id).also {
-                    it.hint = timeHintOf(data)
-                    bound[view] = it
-                }
-            }
-            ensureSweep()
-            paint(view, b, deleted())
-            // 前几条 + 每 20 条打一次自诊断，真机靠 grep SNS_DELTAG 看
-            if (resolved <= 3 || resolved % 20 == 0) {
-                LogX.i("SNS_DELTAG stat ${stat()}")
-            }
+        }
+        ensureSweep()
+        paint(view, b, deleted())
+        // 前几条 + 每 20 条打一次自诊断，真机靠 grep SNS_DELTAG 看
+        if (resolved <= 3 || resolved % 20 == 0) {
+            LogX.i("SNS_DELTAG stat ${stat()}")
         }
     }
 
@@ -356,8 +442,9 @@ object SnsDeletedTag {
         val d = dataOf(holder, adapter, pos) ?: return
         val i = SnsDeletedTagLogic.snsIdOf(d) ?: return
         val prev = bound[view]
-        val b = if (prev != null && prev.id == i) prev else {
-            Binding(i).also { it.hint = timeHintOf(d); bound[view] = it }
+        val b = if (prev != null && prev.id == i && prev.pos == pos) prev else {
+            // pos 也要写进去：否则下一拍 [invalidateIfReused] 认不出这个 Binding 是哪一格
+            Binding(i).also { it.hint = timeHintOf(d); it.pos = pos; bound[view] = it }
         }
         resolved++
         ensureSweep()
@@ -654,6 +741,22 @@ object SnsDeletedTag {
      * 打上的标记又擦掉（两条链路打架）。这时改用本类 [bound] 里自己解析出的 id
      * —— 我们自己解析成功过就用我们的，两边都没解析出来才还原。
      *
+     * ## ⛔ 为什么「本类解析出的 id」优先级高于入参 `snsId`（别把这个 if 顺手简化掉）
+     * 两条链的 id 来源不同：本类取自 holder / 数据本体（R35 dex 取证，见本文件顶部 KDoc），
+     * [SnsTag] 取自「`getData()` 下标 ±2 的窗口 + 作者名对账」（`_r35_sns_tag.md:1358`
+     * 自己写着「偏移校准是**猜**的」）。而时序上 [SnsTag] 那一步跑在本类 `c1/d1` 之后、
+     * `bindViewHolder` 之前 ⇒ 每次 bind 的「最后写入者」都是 [SnsTag]。
+     * 于是旧实现（无条件 `Binding(snsId)`）会用那条**猜出来的** id 整体替换本类的
+     * `Binding`，连 `tvId` / `hint` 一起丢掉 ⇒ 本类自己的 sweep 从此按错误的 id 判定，
+     * 第 ③ 级解析（`hint` 精确比对）也永久失效。⇒ 本类有非 0 id 时**只 paint 不写 bound**
+     * （差一条限流日志，真机 grep `id clash` 就能定性两条链谁对）。
+     *
+     * ## ⛔ 为什么**渲染**仍然用入参 `tagged`，不用本类 `deleted()`
+     * 入参是 [SnsTag] 的 `del + forceSet`（SnsTag.kt:673），`snstag fake / mark` 探针
+     * 设的正是**它那份** `forceSet` —— 真机「不删动态就能验渲染」走的是这条路径。
+     * 换成 `deleted()` 的话探针期间本类判定恒 false ⇒ `paint` 走 `strip` ⇒ **探针完全失效**。
+     * 判定用谁的 id、渲染用谁的清单，这两件事在这里是**故意**不一致的。
+     *
      * 颜色/字号一律不动：时间控件是代码 new 出来的 `ImproveTextView`，改样式风险高；
      * 追加的文字自动继承当前 TextView 的灰色小字样式，无需也不应单独设色。
      */
@@ -665,9 +768,18 @@ object SnsDeletedTag {
 
         if (snsId != 0L) {
             val prev = bound[itemView]
-            val b = if (prev != null && prev.id == snsId) prev else {
+            // 本类解析出来的 id 优先（理由见 KDoc）：有就不覆盖，只按它渲染。
+            // 外部 id 只在「本类还没有」时才被采纳 —— 那时它没有可比对的对象，也就不存在污染。
+            val b = if (prev != null && prev.id != 0L) prev else {
                 Binding(snsId).also { bound[itemView] = it }
             }
+            if (prev != null && prev.id != 0L && prev.id != snsId) {
+                // 两条链对同一格给出不同 id：解析必有一边是错的，真机靠这条定性是谁错
+                warnOnce("SNS_DELTAG: id clash own=" +
+                    java.lang.Long.toUnsignedString(prev.id) + " ext=" +
+                    java.lang.Long.toUnsignedString(snsId))
+            }
+            // ⚠️ 渲染必须用入参 tagged：那是 SnsTag 的 del + forceSet，`snstag fake` 靠它验渲染
             paint(itemView, b, tagged)
             return
         }
@@ -680,12 +792,26 @@ object SnsDeletedTag {
             restore(itemView)
             return
         }
+        // 兜底用的是本类自己的 Binding：它已经在 bind 时按 pos 做过复用失效（[invalidateIfReused]），
+        // 所以这里拿到的 id 一定属于「这个 View 此刻装的那条动态」，不会串到上一条。
         paint(itemView, own, deleted())
     }
 
-    /** 判定 + 计数 + 落笔；[tagged] 命中时 hits++ */
+    /**
+     * 判定 + 计数 + 落笔。
+     *
+     * ⚠️ 两个计数不是一回事，别合并：
+     * - `hits` —— **判定**命中的 paint 次数（在取时间控件**之前**就加了，取不到也算）；
+     * - `painted` —— 真的把标记写进 TextView 的次数（只有末尾 `tv.text = want` 那句
+     *   真的执行了才加，「已经带着标记、无需改写」不算新的一次）。
+     * 分开的理由：`hits>0` 曾经被当成「界面上画上了」的真机判据，而取不到时间控件时
+     * `hits` 照样涨（真机 `hits=0→1` 但界面上什么都没有就是这样误判的）。
+     * ⇒ 验收只看 `painted`（见 [stat] 的「看数顺序」）。`hits` 保留是因为文档与
+     * 真机验收脚本已经用了这个名字，且它仍然回答「清单/符号对不对」这另一个问题。
+     */
     private fun paint(host: View, b: Binding, tagged: Set<Long>) {
-        if (SnsDeletedTagLogic.isTagged(b.id, tagged)) hits++
+        val hit = SnsDeletedTagLogic.isTagged(b.id, tagged)
+        if (hit) hits++
         dumpTree(host)
         val tv = timeTextOf(host, b)
         if (tv == null) {
@@ -698,7 +824,7 @@ object SnsDeletedTag {
         }
         val cur = tv.text?.toString() ?: ""
         val base = strip(cur)
-        val want = if (SnsDeletedTagLogic.isTagged(b.id, tagged)) {
+        val want = if (hit) {
             SnsDeletedTagLogic.appendTag(base)
         } else {
             base
@@ -706,6 +832,8 @@ object SnsDeletedTag {
         // 幂等：text 一致就不 setText，避免无谓重绘（也顺带挡掉「setText 又触发重入」）
         if (want != cur) {
             tv.text = want
+            // 只有这里才叫「画上了」：上面那一句才是真正改了界面的地方
+            if (hit) painted++
         }
     }
 
@@ -775,7 +903,8 @@ object SnsDeletedTag {
      * ③ 子树里文本 == [Binding.hint]（数据对象 `time:` 原文）的 TextView；
      * ④ 子树里文本长得像发布时间的 TextView（[SnsDeletedTagLogic.isTimeLike]，最险，最后才试）。
      *
-     * ②③④ 任一成功就把资源 id 记回 [Binding.tvId]，之后不再遍历。
+     * ②③ 成功就把资源 id 记回 [Binding.tvId]，之后不再遍历；
+     * ⛔ **④ 成功也不记**（[TIME_LEVEL_FALLBACK]）—— 它是猜的，缓存了就把误判固化。
      *
      * @param b 绑定关系，可为 null（[SnsTag] 那条老链路只给 View 和 id）。
      */
@@ -786,18 +915,40 @@ object SnsDeletedTag {
             if (t != null) return t
             if (b != null) b.tvId = View.NO_ID   // 复用后 id 失效，退回全量解析
         }
-        val tv = resolveTime(host, b?.hint.orEmpty())
-        if (tv != null && b != null && tv.id != View.NO_ID) b.tvId = tv.id
-        return tv
+        val hit = resolveTime(host, b?.hint.orEmpty()) ?: return null
+        // ⛔ ④ 级（「长得像时间」的兜底）**绝不写进 tvId** —— 见 [resolveTime] 的 KDoc：
+        //    误命中的后果是把灰标打到错误的控件上，一旦缓存就从「错一次」变成「永远错」。
+        //    只让它在这一轮生效，下一轮重新判，至少有机会自愈。
+        if (hit.second >= TIME_LEVEL_FALLBACK) {
+            warnOnce("SNS_DELTAG: tv by level-4 fallback cls=${hit.first.javaClass.simpleName} " +
+                "txt='${SnsDeletedTagLogic.brief(runCatching { hit.first.text?.toString() }.getOrNull(), 12)}'")
+        } else if (b != null && hit.first.id != View.NO_ID) {
+            b.tvId = hit.first.id
+        }
+        return hit.first
     }
 
-    private fun resolveTime(host: View, hint: String): TextView? {
-        walkForGetter(host, 0)?.let { return it }
+    /** ④ 级的级别号：[timeTextOf] 用它决定是否允许把结果缓存进 [Binding.tvId] */
+    private const val TIME_LEVEL_FALLBACK = 4
+
+    /**
+     * ②③④ 三级解析。
+     *
+     * @return `(时间 TextView, 命中级别)`；级别见 [timeTextOf] 的 KDoc（②=2，③=3，④=4）。
+     *
+     * ⚠️ **④ 级只在本轮生效，禁止缓存**：它判定的是「这段文案长得像发布时间」，
+     * 本质是猜。第二级（`getPublishTimeText()`）哪天被 R8 改名，④ 就变成主力，
+     * 而那时它可能选中视频时长徽章 / 正文 / 卡片日期 ⇒ **标记打错位置**。
+     * 不缓存 ⇒ 每次都重新判，② 修好了就能立刻自愈；缓存 ⇒ 一次误判固化成永久错误。
+     */
+    private fun resolveTime(host: View, hint: String): Pair<TextView, Int>? {
+        walkForGetter(host, 0)?.let { return it to 2 }
         if (hint.isNotEmpty()) {
             val want = hint
-            walkForText(host, 0) { it == want }?.let { return it }
+            walkForText(host, 0) { it == want }?.let { return it to 3 }
         }
-        return walkForText(host, 0) { SnsDeletedTagLogic.isTimeLike(it) }
+        walkForText(host, 0) { SnsDeletedTagLogic.isTimeLike(it) }?.let { return it to 4 }
+        return null
     }
 
     private fun walkForGetter(v: View, depth: Int): TextView? {
@@ -962,10 +1113,14 @@ object SnsDeletedTag {
      * 纯原文案写回时间 TextView（`SnsDeletedTag` 的 R30 KDoc 已记），不补就会被冲掉。
      * 而且 [SnsTag] 的 sweep 以它自己的 `bound` 为准 —— 它解析不出来时 `bound` 为空、
      * sweep 根本不排，本类的标记就再也没人补。
+     *
+     * ⚠️ 判定必须与 `SnsTag.sweep` 同口径，否则两条 2 s sweep 会互相贴/剥（闪烁）：
+     * 那边传的是 `del + forceSet`，这边 [deleted()] 也已经把 [forceSet] 并进去了。
      */
     private fun sweep() {
         val snap = snapshot()
         if (snap.isEmpty()) return
+        // deleted() = 物理删除归档 ∪ forceSet（探针），与 SnsTag.sweep 同口径
         val tagged = if (on()) deleted() else emptySet()
         for ((v, b) in snap) {
             if (!v.isAttachedToWindow) {
@@ -991,8 +1146,40 @@ object SnsDeletedTag {
 
     // ------------------------------------------------------------------ 已删清单
 
-    /** 已救下（= 被删过）的动态清单 */
+    /**
+     * 临时强制打标集合 —— **真机验证专用**（与 `SnsTag` 的 `forceSet` 同一用途）。
+     *
+     * ## 为什么本类也得有一份，光有 `SnsTag` 那份不够
+     * `snstag fake / mark` 这类探针设的是 **`SnsTag` 的** `forceSet`：
+     * - `SnsTag.sweep` 传 `del + forceSet` ⇒ 贴标；
+     * - 本类 [sweep] 传 [deleted()]（**原来不含 forceSet**）⇒ 判定「未删」⇒ `strip` ⇒ **剥标**；
+     * - 下一跳 `SnsTag.sweep` 又贴回来 ⇒ **两条 2 秒 sweep 互相贴/剥**，界面上就是闪烁。
+     *
+     * ⇒ [deleted()] 返回 `delSet + forceSet`，两边的判定就一致了，谁先谁后都一样。
+     * ⚠️ 探针要验本类这条链时，设完 `SnsTag.forceSet` **也要** [forceTag] 一次
+     * （`SnsTag.kt` / `EntryReceiver.kt` 不归本文件改，那里的接线留给那一条 lane）。
+     */
+    @Volatile private var forceSet: Set<Long> = emptySet()
+
+    /**
+     * 探针入口：临时把这几条当成「已删」（真机验证专用，理由见 [forceSet] 的 KDoc）。
+     * 传空集合 = 取消。必须在主线程调。
+     */
+    internal fun forceTag(ids: Set<Long>) {
+        forceSet = ids
+        // 立刻排一拍 sweep：否则要等下一次 bind / 最多 2 s 才看得见变化
+        ensureSweep()
+    }
+
+    /** 已删判据 = 物理删除归档 ∪ 探针强制集合。正常运行时 [forceSet] 恒空 ⇒ 零分配。 */
     private fun deleted(): Set<Long> {
+        val s = archived()
+        val fs = forceSet
+        return if (fs.isEmpty()) s else s + fs
+    }
+
+    /** 已救下（= 被删过）的动态清单（**不含** [forceSet]，仅供 [deleted] 内部用） */
+    private fun archived(): Set<Long> {
         val now = SystemClock.elapsedRealtime()
         if (setAt != 0L && now - setAt < SET_TTL_MS) return delSet
 
@@ -1007,17 +1194,28 @@ object SnsDeletedTag {
         }
         // 之后一律后台刷新：主线程绝不查库
         if (setLoading.compareAndSet(false, true)) {
-            Thread {
-                try {
-                    runCatching {
-                        delSet = loadIds()
-                        setAt = SystemClock.elapsedRealtime()
+            // ⚠️ `Thread{...}.start()` 本身也必须包在 try/catch 里：CAS 已经把 setLoading
+            //    置成 true 了，而 `start()` 是**唯一**会在这个窗口内抛的地方
+            //    （OOM / 线程数打满 / `IllegalThreadStateException`）。
+            //    漏了这层 ⇒ 标志永久 true ⇒ 已删清单从此再也不刷新，而且**完全静默**
+            //    （界面上只是「新删的没有标」，没有任何日志指向这里）。
+            //    ⇒ catch 里必须把标志复位；线程体内的 finally 照旧保留（防的是体内异常）。
+            try {
+                Thread {
+                    try {
+                        runCatching {
+                            delSet = loadIds()
+                            setAt = SystemClock.elapsedRealtime()
+                        }
+                    } finally {
+                        // ⚠️ 必须在 finally 里复位：漏复位的话标志永久卡住，之后再也不刷新
+                        setLoading.set(false)
                     }
-                } finally {
-                    // ⚠️ 必须在 finally 里复位：漏复位的话标志永久卡住，之后再也不刷新
-                    setLoading.set(false)
-                }
-            }.apply { isDaemon = true; name = "sns-deltag-ids" }.start()
+                }.apply { isDaemon = true; name = "sns-deltag-ids" }.start()
+            } catch (t: Throwable) {
+                setLoading.set(false)
+                warnOnce("SNS_DELTAG: id refresh thread failed: ${t.javaClass.simpleName}")
+            }
         }
         return delSet
     }
@@ -1045,13 +1243,20 @@ object SnsDeletedTag {
      * ① `binds>0` —— 钩子活着吗（0 = 完全没挂上）
      * ② `snsBinds>0` —— 朋友圈限定生效吗（binds 大而 snsBinds=0 = 类名前缀写错）
      * ③ `resolved≈snsBinds` —— 解析通吗（差得多就看 lastMiss）
-     * ④ `hits>0` —— 清单/符号对吗
-     * ⑤ `missedTime>0` —— hits 有值但界面上标记没出现时看这个：>0 = 反射取不到时间控件
+     * ④ `painted>0` —— **这才算画上了**（判定命中 + 真的 setText 了）
+     * ⑤ `hits>0 但 painted=0` —— 清单/符号是对的，但没落到界面上 ⇒ 立刻看 `missedTime`
+     * ⑥ `missedTime>0` —— 反射取不到时间控件（字段/方法名漂移）
+     *
+     * ⚠️ ④ 为什么改成 `painted`：`hits` 在取时间控件**之前**就自增了（`paint` 第一行），
+     * 取不到控件时它照样涨 ⇒ 「`hits` 从 0 变 1 ⇒ 界面上出现了标记」这个判据站不住，
+     * R35 真机上就是这样误判过一次（同时 `missedTime=1`）。判据必须对着我能看见的事实：
+     * 只有 `tv.text = want` 真的执行了，界面上才可能有标记。
      */
     fun stat(): String = "SNS_DELTAG stat on=${on()} deleted=${delSet.size} " +
         "bound=${synchronized(bound) { bound.size }} hooks=$hooks " +
         "binds=$binds sns=$snsBinds resolved=$resolved missed=$missed " +
-        "hits=$hits missedTime=$missedTime tv=$tvCached paths=${dataPathCache.size} lastMiss=$lastMiss"
+        "hits=$hits painted=$painted missedTime=$missedTime tv=$tvCached " +
+        "paths=${dataPathCache.size} lastMiss=$lastMiss"
 
     /** 已记住时间 TextView 资源 id 的 item 数：`0` 且 `missedTime>0` ⇒ 三级解析全挂 */
     private val tvCached: Int
