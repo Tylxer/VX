@@ -8,6 +8,7 @@ import de.robv.android.xposed.XposedHelpers
 import de.robv.android.xposed.callbacks.XC_LoadPackage
 import com.lx.wxgroup.data.Keys
 import com.lx.wxgroup.data.Kv
+import com.lx.wxgroup.data.MediaGuardLogic
 import com.lx.wxgroup.util.LogX
 import java.lang.reflect.Method
 import java.util.concurrent.ConcurrentHashMap
@@ -80,6 +81,28 @@ object AntiRevoke {
     private const val TABLE_MESSAGE = "message"
     private const val TABLE_CONV = "rconversation"
 
+    /**
+     * 图片消息的 `message.type`。
+     *
+     * ① dex 级（不是猜的）：`classes10.dex` 里微信自己的 SQL 写死了筛选条件
+     * `WHERE message.type=3`，语句出自 `Lcom/tencent/mm/vfs/ImageGCFileSystem;#c`：
+     * ```
+     * SELECT bigImgPath,thumbImgPath FROM ImgInfo2, message
+     *   WHERE message.type=3
+     *     AND (ImgInfo2.msglocalid=message.msgId OR ImgInfo2.msgSvrId=message.msgSvrId)
+     * ```
+     * 同一条 SQL 还坐实了两个关联式：**`ImgInfo2.msglocalid = message.msgId`**、
+     * `ImgInfo2.msgSvrId = message.msgSvrId`（见 `docs/_r35_revoke_img_anchor.md` §2.2）。
+     */
+    private const val TYPE_IMAGE = 3
+
+    /**
+     * 视频消息（`SELECT imgPath FROM message WHERE type=43`，① dex 级）。
+     * ⚠️ 视频的 `imgPath` **形态未取证**（32 位 md5 只对图片实锤，见
+     * [MediaGuardLogic] 类注释），所以审计日志对 type=43 一样要打 raw 值。
+     */
+    private const val TYPE_VIDEO = 43
+
     /** 撤回文案的公共后缀：认「这次写入是不是撤回」靠它 */
     private const val HINT = "撤回了一条消息"
 
@@ -136,7 +159,7 @@ object AntiRevoke {
     fun currentConfigLine(): String {
         val c = config()
         return "AR cfg enabled=${c.enabled} alsoSelf=${c.alsoSelf} " +
-            "showHint=${c.showHint}(→HintBadge) debug=${c.debugLog}"
+            "showHint=${c.showHint}(→HintBadge) debug=${c.debugLog} | ${imgAnchorStat()}"
     }
 
     @Volatile
@@ -171,15 +194,69 @@ object AntiRevoke {
     @Volatile
     private var probeOn = false
 
+    // ------------------------------------------------------- 图片到达锚点（R35-2）
+
+    /**
+     * 「图片 / 视频消息到达」锚点的开关。
+     *
+     * ⛔ **跟防撤回开关走，不跟 DEBUG_LOG 走**：这个锚点是功能的一部分（它要
+     * 提前把 md5 登记进 `VoiceFileGuard` 的保护池），不是诊断探针。挂到 DEBUG_LOG 上
+     * 会导致「用户没开调试 ⇒ 保护池是空的 ⇒ 撤回时文件照样被删」，静默失效。
+     */
+    @Volatile
+    private var imgAnchorOn = false
+
+    /**
+     * 图片消息到达时从 `insertWithOnConflict` 的 ContentValues 里抠出来的那点东西。
+     *
+     * @param svrId `message.msgSvrId`（服务端 id）。`ImgInfo2` 也能按它关联（① dex）。
+     * @param imgPath `message.imgPath`：type=3 时是 `THUMBNAIL_DIRPATH://th_<32位md5>`
+     *                （① dex 正则 `^THUMBNAIL_DIRPATH://th_[0-9a-f]{32}$` + R31g 真机）。
+     */
+    internal data class ImgAnchor(
+        val svrId: Long,
+        val imgPath: String?,
+        val talker: String?,
+        val at: Long,
+    )
+
+    /**
+     * msgId(=localId) → 锚点。
+     *
+     * ⚠️ 用 `msgId` 当 key 是有意的：`ImgInfo2.msglocalid = message.msgId`（① dex），
+     * 后续要查 `ImgInfo2` / 要喂 `DownloadImgService.c(localId, …)` 用的都是它。
+     */
+    private val imgAnchor = ConcurrentHashMap<Long, ImgAnchor>()
+
+    /** 锚点命中计数（真机判据：`>0` 才说明插入真的走了 `insertWithOnConflict`） */
+    private val anchorSeen = AtomicInteger(0)
+
+    /** 其中 imgPath 取不到 / 取到的不是 32 位 md5 的次数 —— 形态异常必须看得见 */
+    private val anchorBad = AtomicInteger(0)
+
+    /** 锚点体检用：前台 dump 时读（真实机上最快判断「接通没接通」的口径） */
+    internal fun imgAnchorStat(): String {
+        val now = SystemClock.elapsedRealtime()
+        val last = imgAnchor.entries.maxByOrNull { it.value.at }
+        val age = if (last == null) -1L else (now - last.value.at) / 1000L
+        return "imgAnchor on=$imgAnchorOn seen=${anchorSeen.get()} bad=${anchorBad.get()} " +
+            "pool=${imgAnchor.size} lastMsgId=${last?.key} age=${age}s"
+    }
+
+    /** 给 [RevokeRescue] 用：撤回被拦下时把「到达时记住的 imgPath」兜底取回来 */
+    internal fun imgAnchorOf(msgId: Long): ImgAnchor? = imgAnchor[msgId]
+
     fun refresh() {
         val debugLog = Kv.getBool(Keys.DEBUG_LOG)
+        val enabled = Kv.getBool(Keys.ANTIREVOKE_MSG)
         config = Config(
-            enabled = Kv.getBool(Keys.ANTIREVOKE_MSG),
+            enabled = enabled,
             alsoSelf = Kv.getBool(Keys.ANTIREVOKE_DEBUG_SELF),
             showHint = Kv.getBool(Keys.ANTIREVOKE_SHOW_HINT),
             debugLog = debugLog,
         )
         probeOn = debugLog
+        imgAnchorOn = enabled
         cfgAt = SystemClock.elapsedRealtime()
     }
 
@@ -297,8 +374,11 @@ object AntiRevoke {
             LogX.w("AR: updateWithOnConflict not found, antirevoke disabled")
             return
         }
-        // 只记录不拦截：用来确认「撤回会不会绕过 update 走 INSERT OR REPLACE 写库」。
-        // 自己撤回的第 1 步（10002）有几次没被 update 钩子看到，这个探针就是为它准备的。
+        // 两个用途，同一个钩子（message 表的 insert 只会过一次，挂一个就够）：
+        // ① 只记录不拦截：确认「撤回会不会绕过 update 走 INSERT OR REPLACE 写库」。
+        //    自己撤回的第 1 步（10002）有几次没被 update 钩子看到，这个探针就是为它准备的。
+        // ② ⭐ R35-2 图片到达锚点 [anchorImage]：type=3/43 的 message 插入在这里抠出
+        //    msgId / msgSvrId / imgPath，并提前把 md5 登记进 VoiceFileGuard 保护池。
         runCatching { XposedBridge.hookAllMethods(cls, "insertWithOnConflict", insertProbe) }
             .onFailure { LogX.w("AR insert probe not installed: ${it.javaClass.simpleName}") }
         LogX.i("AR installed (antirevoke.msg=${config.enabled} alsoSelf=${config.alsoSelf})")
@@ -326,12 +406,15 @@ object AntiRevoke {
     }
 
     private fun probeInsert(param: XC_MethodHook.MethodHookParam) {
-        // 每次 insert 都会进这里，先做一次 volatile 读把开销压到最低
-        if (!probeOn) return
+        // 每次 insert 都会进这里，先做一次 volatile 读把开销压到最低。
+        // ⚠️ 两个开关是**或**关系：图片锚点是功能（跟防撤回开关），撤回形状探针是诊断（跟 DEBUG_LOG）。
+        if (!imgAnchorOn && !probeOn) return
         val a = param.args ?: return
         if (a.getOrNull(0) as? String != TABLE_MESSAGE) return
         val values = a.getOrNull(1) as? ContentValues ?: return
         val type = values.getAsInteger("type") ?: return
+        if (imgAnchorOn) anchorImage(values, type)
+        if (!probeOn) return
         val low = type and 0x0000FFFF
         if (low != SYS_TYPE_HINT && low != SYS_TYPE_REVOKED) return
         LogX.i(
@@ -340,6 +423,75 @@ object AntiRevoke {
                 "content=${values.getAsString("content")?.take(24)}"
         )
     }
+
+    /**
+     * ⭐ R35-2 新锚点：**图片 / 视频消息到达**（写 `message` 表的那一次 insert）。
+     *
+     * ## 为什么它能补上 `AutoHdImg`（挂 `t1.<init>`）的结构性缺陷
+     * R34 已定案：未点开的图片到达时微信**不一定**建 `t1`（中间隔 4 道门：
+     * 自动下载条件 / 电量前后台 / priority / 会话热度）。而写 `message` 表这一步
+     * **与微信想不想下载完全无关** —— 消息要显示出来就必须入库。
+     * ⇒ 这是「消息到达」的语义锚点，不是「微信决定下载」的语义锚点。
+     *
+     * ## 相对 `t1` 的第二个增益：id 是干净的
+     * `t1.<init>` 那条路真机出现过 `localId=0`（R34 子步 3.4），那是**上游传的 0**，
+     * 结果是下载无效且污染 `m.e` 去重集合。这里从 ContentValues 读到的
+     * `msgId`(=localId) 与 `msgSvrId` 都是**库里的真值**，可以直接当入参用。
+     *
+     * ## 为什么顺手就调 `VoiceFileGuard.protectMedia`
+     * 现有链路是「撤回被拦下 → `RevokeRescue` → `protectMedia`」，也就是**等到撤回那一刻**
+     * 才把 md5 放进保护池。而 `File.delete(image2/…)` 是**异步**跑的（R21c 语音侧实证），
+     * 它跟「撤回 UPDATE 被我们拦下」这两件事的先后**没有取证**。
+     * ⇒ 提前到「消息到达」就入池，等于把这道竞态直接消掉（入池是幂等的，撤回时再入一次也无害）。
+     *
+     * ⚠️ 这里**不查库、不写库**，只做 ContentValues 解析 —— 这条路径是所有表所有 insert
+     * 共用的，任何一次 IO 都会被放大成全进程卡顿。
+     */
+    private fun anchorImage(values: ContentValues, type: Int) {
+        val low = type and 0x0000FFFF
+        if (low != TYPE_IMAGE && low != TYPE_VIDEO) return
+        val msgId = values.getAsLong("msgId") ?: return
+        if (msgId <= 0) return
+        val svrId = values.getAsLong("msgSvrId") ?: 0L
+        val imgPath = values.getAsString("imgPath")
+        val talker = values.getAsString("talker")
+        val md5 = MediaGuardLogic.hexToken(imgPath)
+
+        // 提前入保护池（理由见 KDoc）。失败只留痕，绝不影响入库本身。
+        runCatching { VoiceFileGuard.protectMedia(imgPath) }
+            .onFailure { LogX.w("AR img anchor protect failed: ${it.javaClass.simpleName}") }
+
+        // ⚠️ 同一条消息可能被重复 insert（补拉 / 重试）。重复时不计数也不打日志 ——
+        //    LogX 是 5000 行环形缓冲，刷爆之后**别的诊断日志全丢**（本项目踩过）。
+        // ⚠️ imgPath 为 null 时**不算重复** —— 那正是「形态异常」，必须照常走下面的 BAD 告警
+        val dup = imgPath != null && imgAnchor[msgId]?.imgPath == imgPath
+        if (imgAnchor.size > 256) {
+            val now = SystemClock.elapsedRealtime()
+            imgAnchor.entries.removeIf { now - it.value.at > IMG_ANCHOR_TTL_MS }
+        }
+        imgAnchor[msgId] = ImgAnchor(svrId, imgPath, talker, SystemClock.elapsedRealtime())
+        if (dup) return
+        anchorSeen.incrementAndGet()
+
+        // ⛔ 取不到 md5 / 取到的不是 32 位 ⇒ 保护池里那个 token 永远命中不了文件名，
+        //    撤回时文件照删，而日志里既不是 SKIP 也不是 blocked —— 静默失效。
+        //    ⇒ 必须把 raw 值打出来（与 VoiceFileGuard.protectMedia 同一口径）。
+        if (!MediaGuardLogic.isMd5(md5)) {
+            anchorBad.incrementAndGet()
+            LogX.w(
+                "AR imgAnchor BAD md5 len=${md5?.length} type=$low msgId=$msgId " +
+                    "imgPath=${imgPath?.take(48)}"
+            )
+        }
+        LogX.i(
+            "AR imgAnchor msgId=$msgId svr=$svrId type=$low " +
+                "md5=${md5?.take(10)}..(${md5?.length}) " +
+                "talker=${talker?.take(10)} seen=${anchorSeen.get()}"
+        )
+    }
+
+    /** [imgAnchor] 的淘汰窗口（只用于防泄漏，不参与任何判据） */
+    private const val IMG_ANCHOR_TTL_MS = 30 * 60_000L
 
     // ------------------------------------------------------------------ 判定
 

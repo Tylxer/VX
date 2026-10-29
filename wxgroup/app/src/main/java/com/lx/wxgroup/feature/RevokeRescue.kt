@@ -6,8 +6,10 @@ import com.lx.wxgroup.data.GroupDb
 import com.lx.wxgroup.data.HintTextLogic
 import com.lx.wxgroup.data.Keys
 import com.lx.wxgroup.data.Kv
+import com.lx.wxgroup.data.MediaGuardLogic
 import com.lx.wxgroup.util.LogX
 import de.robv.android.xposed.XposedHelpers
+import java.io.File
 import java.lang.reflect.Method
 
 /**
@@ -119,6 +121,10 @@ object RevokeRescue {
                 if (orig.type == HintTextLogic.TYPE_IMAGE || orig.type == HintTextLogic.TYPE_VIDEO) {
                     runCatching { VoiceFileGuard.protectMedia(orig.imgPath) }
                         .onFailure { LogX.w("RRV media protect failed: ${it.javaClass.simpleName}") }
+                    // ⭐ R35-2：把「这次到底救没救到文件」查清楚并打一行。
+                    //   这是唯一能自证的判据 —— 见 [auditImage] 的 KDoc。
+                    runCatching { auditImage(msgId, orig.imgPath) }
+                        .onFailure { LogX.w("RRV imgAudit failed: ${it.javaClass.simpleName}") }
                 }
                 if (isVoice) {
                     // ① 登记「别删这个文件」（拦 File.delete，见 VoiceFileGuard）
@@ -203,6 +209,115 @@ object RevokeRescue {
                 runCatching { XposedHelpers.callMethod(cur, "close") }
             }
         }.getOrNull()
+    }
+
+    // ------------------------------------------------- 图片文件审计（R35-2）
+
+    /**
+     * ⭐ **「撤回的图片到底能不能点开」的唯一可自证判据**。
+     *
+     * ## 为什么必须是这个形状
+     * R21c 语音侧的教训是「拦 SQL ≠ 拦住删除」：行在、索引在、文件没了 ⇒ 点开无反应。
+     * R34 又定案了 `svc.c()` 返回 true 只 = 任务受理，**不是下载成功**。
+     * ⇒ 判据既不能是「某次调用返回 true」，也不能是「行还在」，只能是
+     * **「磁盘上那个字节文件存在且非空」这个物理事实**。
+     *
+     * ## 查什么
+     * 1. `ImgInfo2`（8.0.48 的真实表名，① dex DDL；**不是** `ImgInfo`）里取
+     *    `bigImgPath` / `thumbImgPath` / `status` / `iscomplete` / `hashdthumb`；
+     *    关联式 `ImgInfo2.msglocalid = message.msgId`（① dex，微信自己的 SQL）。
+     * 2. 对拿到的路径直接 `File.exists()` + `length()`。
+     *
+     * ## 输出（一行，真机 grep `RRV imgAudit`）
+     * ```
+     * RRV imgAudit msgId=19384736 md5=0c947a1d..(32) row=1 status=0 iscomplete=1
+     *   hdThumb=0 big=OK(456789) thumb=OK(12345) hd=MISS rawBig=/…/image2/0c/94/…
+     * ```
+     *
+     * ## ⚠️ 标注清楚的不确定性
+     * - `NA` = 路径不是绝对路径（8.0.48 的 `bigImgPath` 可能是 `wcf://image2/…`
+     *   虚拟路径，① dex 有 `wcf://image2/` 这个串，② 但它是否就是 `bigImgPath` 的形态**未取证**）。
+     *   ⇒ 出现 `NA` 时看 `rawBig=` 打出来的真实形态，据此改解析。
+     * - `hd` 的取法是 `bigImgPath + "hd"` —— **③ 假设**（R34 描述的原图文件名是 `<md5>hd`，
+     *   dex 里有 `image2_thumb_hd` 这个内部名，但「hd 文件名 = 大图名 + hd」没有指令级证据）。
+     * - 本函数**只读**，不写微信库、不改任何状态。
+     */
+    private fun auditImage(msgId: Long, imgPath: String?) {
+        val md5 = MediaGuardLogic.hexToken(imgPath)
+        if (!MediaGuardLogic.isMd5(md5)) {
+            // 与 VoiceFileGuard.protectMedia 同一口径：token 不是 32 位 ⇒ 保护池里的 key
+            // 命中不了文件名 ⇒ 这张图**实际没被保护**，必须留痕（否则是静默失效）
+            LogX.w("RRV imgAudit BAD md5 len=${md5?.length} msgId=$msgId imgPath=${imgPath?.take(48)}")
+        }
+        var big: String? = null
+        var thumb: String? = null
+        var status = -999
+        var iscomplete = -999
+        var hdThumb = -999
+        var row = 0
+        val h = AntiRevoke.msgQueryHandle()
+        if (h == null) {
+            LogX.w("RRV imgAudit no db handle msgId=$msgId (ImgInfo2 查不了，只有 md5)")
+        } else {
+            val (db, m) = h
+            runCatching {
+                // svrId 从「到达锚点」拿（R35-2 新增）；拿不到就只按 msglocalid 查。
+                // ⚠️ msglocalid 有索引（`CREATE INDEX msgLocalIdIndex ON ImgInfo2 (msglocalid)`，① dex），
+                //    这条查询跑在微信的 DB 线程上，必须便宜。
+                val svr = AntiRevoke.imgAnchorOf(msgId)?.svrId ?: 0L
+                val sql = AntiRevokeHint.BYPASS + if (svr > 0) {
+                    "select bigImgPath,thumbImgPath,status,iscomplete,hashdthumb " +
+                        "from ImgInfo2 where msglocalid=? or msgSvrId=? limit 1"
+                } else {
+                    "select bigImgPath,thumbImgPath,status,iscomplete,hashdthumb " +
+                        "from ImgInfo2 where msglocalid=? limit 1"
+                }
+                val args: Any = if (svr > 0) argsFor2(m, msgId.toString(), svr.toString())
+                else argsFor2(m, msgId.toString())
+                val cur = m.invoke(db, sql, args) ?: return@runCatching
+                try {
+                    if (XposedHelpers.callMethod(cur, "moveToFirst") as? Boolean != true) return@runCatching
+                    row = 1
+                    big = XposedHelpers.callMethod(cur, "getString", 0) as? String
+                    thumb = XposedHelpers.callMethod(cur, "getString", 1) as? String
+                    status = XposedHelpers.callMethod(cur, "getInt", 2) as? Int ?: -999
+                    iscomplete = XposedHelpers.callMethod(cur, "getInt", 3) as? Int ?: -999
+                    hdThumb = XposedHelpers.callMethod(cur, "getInt", 4) as? Int ?: -999
+                } finally {
+                    runCatching { XposedHelpers.callMethod(cur, "close") }
+                }
+            }.onFailure {
+                LogX.w("RRV imgAudit query failed msgId=$msgId: ${it.javaClass.simpleName}")
+            }
+        }
+        // ③ 假设（见 KDoc）：原图文件名 = 大图文件名 + "hd"
+        val hd = if (!big.isNullOrBlank() && big!!.startsWith("/")) fileState(big + "hd") else "NA"
+        LogX.i(
+            "RRV imgAudit msgId=$msgId md5=${md5?.take(10)}..(${md5?.length}) row=$row " +
+                "status=$status iscomplete=$iscomplete hdThumb=$hdThumb " +
+                "big=${fileState(big)} thumb=${fileState(thumb)} hd=$hd " +
+                "rawBig=${big?.take(40)} rawThumb=${thumb?.take(40)}"
+        )
+    }
+
+    /** `OK(字节数)` / `MISS` / `NA`（非绝对路径，stat 不了）/ `NULL`（列为空）/ `ERR` */
+    private fun fileState(p: String?): String {
+        if (p.isNullOrBlank()) return "NULL"
+        if (!p.startsWith("/")) return "NA"
+        return runCatching {
+            val f = File(p)
+            if (f.exists()) "OK(${f.length()})" else "MISS"
+        }.getOrDefault("ERR")
+    }
+
+    /** 两个绑定参数，按反射方法的数组形参类型构造（写死下标会恒拿到 Object[] 而抛 IllegalArgumentException） */
+    private fun argsFor2(m: Method, a: String, b: String? = null): Any {
+        val wantString = m.parameterTypes.any { it == Array<String>::class.java }
+        return if (b == null) {
+            if (wantString) arrayOf(a) else arrayOf<Any>(a)
+        } else {
+            if (wantString) arrayOf(a, b) else arrayOf<Any>(a, b)
+        }
     }
 
     // ------------------------------------------------------------------ 显示切换
