@@ -1860,3 +1860,23 @@ R33 已确立「派发零等待成本」（根因 D），但那是**认知结论
 把档位结论的核验**也绑到 `adb install` 之前**（与 §四④ 的「装包前核 ①⑦」合并为同一次检查，
 **零新增动作**）—— 装包前必须能指出「本包涉及哪几个源码文件 + 每个的档位结论写在哪一句」。
 装包是唯一躲不掉、且**发生在用户等待之前**的硬动作。
+
+## R35（2026-10-29 ~ 10-30）
+
+| # | 项 | 结论 | 证据 / 说明 |
+|---|---|---|---|
+| ① | 分包下限 | **PASS** | 改动面：`SnsDeletedTag.kt`(1100 行) / `SnsDeletedTagLogic.kt` / `SnsDeletedTagLogicTest.kt` / `HookEntry.kt`(接线，不计数) = **3 个独立功能文件** ⇒ 须 ≥2 实现 lane。实派实现 lane **2 个**（R35-6 A 修 P1、R35-6 B 补单测）+ 实现 lane 4 个（R35-1/2/3/4 前段）= 合计 6 |
+| ② | 档位显式传 ID | **PASS（有条件）** | 全部 lane 传 `Hy4 preview`（用户临时指令）。按 §四② 应有 4 个 Pro 类（R35-1 灰标 Hook 链 / R35-2 撤回图片锚点 / R35-6A 修 Hook+并发 / R35-5 复核）—— 传的是 `Hy4 preview` 而非 `deepseek-v4-pro`，**属用户临时覆盖，已在台账登记**；未用 `lite`/`reasoning` 别名 |
+| ③ | 文件不重叠 | **PASS** | R35-1/1b/1c/1d/1e/6A 独占 `SnsDeletedTag.kt`+`SnsDeletedTagLogic.kt`；R35-6B 独占 `SnsDeletedTagLogicTest.kt`；R35-2 独占 `AntiRevoke.kt`+`RevokeRescue.kt`；R35-4 独占 `AutoDndGroup.kt`；R35-5 只读 |
+| ④ | 设备锁（子代理不碰 adb） | **PASS** | 每个 lane 的 prompt 都写了「⛔ 不许 adb」。唯一例外：R35-6B 自己跑了 `gradlew testDebugUnitTest`（构建不是设备），且它发现 PATH 坑后写进文档 |
+| ⑤ | 轮次重排 | **PASS** | 台账内已列 R35-6 两条 lane 与执行顺序；下一轮（R36）由**另一会话**在做 Gate/Forward/SnsTag，本会话不再重排 |
+| ⑥ | 真机前交叉复核 | **PASS（后半段补上）** | R35 前段 4 次装包**没有**第二视角（R34 该项 FAIL 的整改当时未落地）。本轮补：`docs/_r35_review_tag.md`（独立 Pro lane，64KB，无 P0/8 条 P1）⇒ 已修完。⚠️ 但"装包前"这个**时点**仍然没做到 —— 复核发生在装包**之后**，属「事后复核」不是「事前交叉」 |
+| ⑦ | Pro 类活有没有被主会话自己做 | **PASS** | 主会话本轮只做：`ID_RE` 正则加边界（单测已把期望/实际/修法写死 = 按现成判据写代码）、跑构建/单测、取证定性、写文档。**判据设计 / 根因推理 / Hook 链路 / 反射 / 异步并发复核全部在 lane 里** |
+
+### 本轮两条要记住的整改
+- **⑥ 的时点问题没解决**：复核做得再好，只要在装包之后，就挡不住「盲测」。
+  下一轮把「派复核 lane」放在 `adb install` **之前**，且装包记录里写「复核 lane 结论已收到」。
+- **⛔ 新增事故类型（§四⁺ 第二次复现）**：第二个会话（`ecc931c7-…`）在本会话执行期间
+  并发改 `VersionGate.kt` / `ForwardPicker.kt` / `SnsTag.kt`，并把这一轮叫 **R36**。
+  发现方式 = `git diff --stat` 里出现「我明确禁止 lane 触碰」的文件 + jsonl mtime。
+  **本会话因此没有装包**（避免抢设备）。⇒ 共用工作区时，`git diff --stat` 现在是**每次提交前必看**。
