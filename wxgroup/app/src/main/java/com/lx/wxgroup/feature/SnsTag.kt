@@ -101,10 +101,22 @@ object SnsTag {
 
     private val miscLogged = AtomicInteger(0)
     private val errLogged = AtomicInteger(0)
+    private val warnLogged = AtomicInteger(0)
 
     /** 限流日志：LogX 是主线程同步文件 IO，热路径上只能留前几条 */
     private fun logOnce(msg: String) {
         if (miscLogged.get() < LOG_MAX && miscLogged.incrementAndGet() <= LOG_MAX) LogX.i(msg)
+    }
+
+    /**
+     * 限流**告警**，与 [logOnce] 分开计额度（同 `SnsDeletedTag.warnOnce` 的做法）。
+     *
+     * 为什么分开：`binds` / `dump` 那些一次性信息会把 [LOG_MAX] 条额度很快吃光，
+     * 真出了异常反而一条告警都看不到 —— 而异常正是最该看见的（静默失效排查全靠它）。
+     * ⚠️ 也不复用 [errLogged]：那个额度被 bind 异常路径按 3 条扣着，这里再扣就只剩 2 条。
+     */
+    private fun warnOnce(msg: String) {
+        if (warnLogged.get() < LOG_MAX && warnLogged.incrementAndGet() <= LOG_MAX) LogX.w(msg)
     }
 
     /** 绑定深度守卫：只防真递归，不阻断「绑定里再绑一条」这种正常情况 */
@@ -215,8 +227,10 @@ object SnsTag {
         enabled = guard
         cfgAt = SystemClock.elapsedRealtime()
         setAt = 0L // 顺手让「已删清单」也重读
-        // 验证用的强制集合只能由探针设置，开关一变就清掉，绝不能让它在正常运行里残留
-        forceSet = emptySet()
+        // 验证用的强制集合只能由探针设置，开关一变就清掉，绝不能让它在正常运行里残留。
+        // ⚠️ 走 [setForce] 双写：`SnsDeletedTag` 那份也要一起清，否则开关切换后
+        // 那边还留着旧探针 id ⇒ 它贴、本类剥 ⇒ 又变回 2 秒闪烁。
+        setForce(emptySet())
         // ⚠️ 不在这里清 bound：清掉的话「关掉再打开」要等下一次 bind 才回来。
         // sweep 会按当前开关状态重判（关=空清单=全摘），2 秒内自动收敛。
         if (!enabled) ensureSweep()
@@ -614,18 +628,37 @@ object SnsTag {
         }
         // 之后一律后台刷新：主线程绝不查库
         if (setLoading.compareAndSet(false, true)) {
-            Thread {
-                try {
-                    runCatching {
-                        delSet = loadIds()
-                        setAt = SystemClock.elapsedRealtime()
+            // ⚠️ `Thread{...}.start()` 本身**也必须**包进 try/catch（R36，与
+            //    `SnsDeletedTag.archived()` 同一处修法）：CAS 已经把 [setLoading] 置成 true 了，
+            //    而 `start()` 是**唯一**会在这个窗口里抛的地方 ——
+            //    典型 `OutOfMemoryError: unable to create new native thread`（微信进程线程数本来就多）。
+            //
+            //    两层都要，缺一不可：
+            //      · 外层 catch   ← 防「线程**根本没起来**」：lambda 体一次都没执行，
+            //                        体内那个 finally 永远轮不到跑；
+            //      · 内层 finally ← 防「线程起来了，但**体内**抛异常」：那条线程不是我们
+            //                        能 catch 的地方，只能靠它自己的 finally 复位。
+            //    漏任何一层 ⇒ [setLoading] 永久为 true ⇒ 之后每次 [deleted] 都 CAS 失败、
+            //    直接返回旧 [delSet] ⇒ **已删清单从此再也不刷新**，而且完全静默
+            //    （界面上只是「新删的没标」，没有任何日志指向这里）。
+            try {
+                Thread {
+                    try {
+                        runCatching {
+                            delSet = loadIds()
+                            setAt = SystemClock.elapsedRealtime()
+                        }
+                    } finally {
+                        // ⚠️ 必须在 finally 里复位：被中断 / Error 路径下漏复位的话，
+                        // 标志永久卡住，之后再也不会刷新清单（标签停在旧数据上）。
+                        setLoading.set(false)
                     }
-                } finally {
-                    // ⚠️ 必须在 finally 里复位：被中断 / Error 路径下漏复位的话，
-                    // 标志永久卡住，之后再也不会刷新清单（标签停在旧数据上）。
-                    setLoading.set(false)
-                }
-            }.apply { isDaemon = true; name = "sns-tag-ids" }.start()
+                }.apply { isDaemon = true; name = "sns-tag-ids" }.start()
+            } catch (t: Throwable) {
+                // 线程没起来 ⇒ 只能在这里复位，否则标志永久卡住
+                setLoading.set(false)
+                warnOnce("SNS_TAG: id refresh thread failed: ${t.javaClass.simpleName}")
+            }
         }
         return delSet
     }
@@ -658,6 +691,30 @@ object SnsTag {
      */
     @Volatile private var forceSet: Set<Long> = emptySet()
 
+    /**
+     * 探针的**唯一**写入口：本类 [forceSet] 与 `SnsDeletedTag` 那份必须**同时**设。
+     *
+     * ## 为什么必须双写（不写就是 2 秒周期的闪烁）
+     * 两条链各有一条 2 s 周期的 sweep，判据必须同口径：
+     * - 本类 `sweep` 传 `del + forceSet`（见 [sweep]）⇒ 贴标；
+     * - `SnsDeletedTag.sweep` 传它自己的 `deleted()` = `归档 ∪ 它的 forceSet` ⇒ 剥标。
+     * 只设本类这份 ⇒ 那边判「未删」⇒ `strip`；下一拍本类又贴回来 ⇒ **互相贴/剥**，
+     * 稳态取决于两条 sweep 的相位（界面表现就是闪烁）。详见 `_r35_review_tag.md` §7.1.2。
+     *
+     * ## 为什么不用 `runCatching` 包 [SnsDeletedTag.forceTag]
+     * ① 它体内只有三步：写自己的 `@Volatile forceSet`、内部 `ensureSweep()` 里的
+     * `synchronized(bound) { bound.isEmpty() }`、`mainHandler.postDelayed` —— 都不抛；
+     * 包了只会把「将来有人在 forceTag 里加了会抛的逻辑」吞成静默，反而更糟。
+     * ② 真出事时应该让它炸到控制台（探针是人工敲的，有日志），不是悄悄降级。
+     *
+     * ⚠️ 必须在主线程调（[markVisible] / [unmark] / [fakeMark] 的探针出口都在主线程，
+     * `refresh()` 由 `on()` 驱动、也在主线程；`install()` 那次同 Xposed 的加载线程）。
+     */
+    private fun setForce(ids: Set<Long>) {
+        forceSet = ids
+        SnsDeletedTag.forceTag(ids)
+    }
+
     private fun isDeleted(id: Long, del: Set<Long>): Boolean = id in del || id in forceSet
 
     /**
@@ -678,7 +735,10 @@ object SnsTag {
     /** 把当前屏幕上解析出来的动态全部强制打标（验证用）。必须在主线程调。 */
     fun markVisible(): String {
         val snap = snapshot()
-        forceSet = snap.mapTo(HashSet()) { it.second }
+        // 双写：两边 sweep 口径必须一致，否则贴/剥打架（理由见 setForce 的 KDoc）
+        setForce(snap.mapTo(HashSet()) { it.second })
+        // ⚠️ 这行的作用范围现在也覆盖了 `SnsDeletedTag.forceSet`：那边只有 [refresh] 会清它，
+        // 而 [refresh] 正是被 `on()` 的 TTL 触发的，延后 cfgAt 就同时护住了两份。
         cfgAt = SystemClock.elapsedRealtime() // 别让 on() 立刻 refresh 把 forceSet 清掉
         // 探针必须和被测对象走同一条路：apply()（时间标记），否则验的不是新呈现
         for ((v, id) in snap) runCatching { apply(v, id) }
@@ -686,8 +746,8 @@ object SnsTag {
     }
 
     fun unmark(): String {
-        forceSet = emptySet()
-        ensureSweep()
+        setForce(emptySet()) // 双写：两边同时撤，见 setForce 的 KDoc
+        ensureSweep() // 本类的；SnsDeletedTag 那份由 forceTag 内部的 ensureSweep 排
         return "SNS_TAG unmark"
     }
 
@@ -701,7 +761,7 @@ object SnsTag {
      */
     fun fakeMark(raw: String): String {
         val id = parseSnsId(raw.trim()) ?: return "SNS_TAG fake bad id=$raw"
-        forceSet = setOf(id)
+        setForce(setOf(id)) // 双写：两边 sweep 口径必须一致，见 setForce 的 KDoc
         setAt = 0L
         cfgAt = SystemClock.elapsedRealtime()
         for ((v, vId) in snapshot()) runCatching { apply(v, vId) }

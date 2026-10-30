@@ -13,6 +13,7 @@ import android.widget.EditText
 import android.widget.LinearLayout
 import android.widget.ListView
 import android.widget.TextView
+import com.lx.wxgroup.core.ChatroomSource
 import com.lx.wxgroup.data.GroupDb
 import com.lx.wxgroup.ui.Panel
 import com.lx.wxgroup.ui.PanelPage
@@ -169,6 +170,17 @@ class ForwardPicker(
             LogX.w("FWDPICK db not ready")
             return out
         }
+        // F1 补齐（R36）：本页自己实现 [loadTabs]，不走 [PickerTabs.all]，
+        // 是唯一没接群聊补跑的选择器入口。缺了这一行，清缓存 / 新装后第一次转发时
+        // 模块表里可能一条群聊都没有 ⇒ 群聊段整段不出现（空段连标题一起隐藏），
+        // 用户会以为「转发不能选群」。
+        // runIfNeeded() 立即返回（起 daemon 线程 + CAS 节流），不阻塞 UI；
+        // 与 PickerTabs.all() 里那次共用同一把节流锁，重复调用不会重复全表扫。
+        // ⚠️ 未做的那一半：补跑完成后的**原地刷新**（要把新出现的群聊段画出来）
+        // 需要持有已构建的 View 引用并处理「页已退出」，属需真机验证的改动，留待后轮。
+        // ⇒ 本次的效果是「打开转发选择器即触发补跑，本次或下次打开可见」，
+        //    不再是「除非手动进通讯录滚一遍，否则永远没有」。
+        ChatroomSource.runIfNeeded()
 
         // Tab1 好友·群聊：一次全量查询后按 wxid_type 拆两段（好友在前、群聊在后）
         val all = runCatching { db.allFriends() }.getOrDefault(emptyList())

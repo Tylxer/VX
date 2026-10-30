@@ -152,6 +152,28 @@ SRCRANK # 6 IN  snsId=-3405768558946217460 [已删台账]
 
 ## F. 收敛后的根因（待最后一步证据）
 
+> ⛔⛔ **本节的「结论与建议」已作废（2026-10-30 标注）· 不要拿它当依据**
+>
+> 本节末尾那句「**6.2 的正确解法不是改库，是干预 `NetSceneSnsUserPage` 的响应合并
+> （`SnsAlbumMerge` 方向）**」—— **这个建议后来没有被采纳**。
+>
+> - **现象判据本身仍然成立**：「点进去的一瞬间有，马上消失」确实是**网络回包覆盖**造成的
+>   （`h3.N` 收响应 → `updateWithOnConflict` 按服务端值整行 upsert → 补好的 bit8 被打回），
+>   这部分与现行代码的认识一致，可继续引用。
+> - **但解法走了相反的路 —— 改库**：现行实现是 `SnsTimelineSourceFix.fixAlbum`
+>   + **`patchAlbumBit`**，并把补位点**压进了写库事务窗口**（由 `SnsGuard.kt` 在
+>   `SnsInfo` 的 update after 里调用），读库时看不到中间态；配套还有
+>   `installAlbumTrigger`（挂 `h3.N` after）与 `installAlbumSyncTrigger`（挂 `x2.onGYNetEnd`）。
+>   三处都在 `HookEntry.kt` **实际启用**（不是注释）。
+> - **为什么否掉响应注入**：相册是**读库渲染**（`qg3/i` 的 `d:List` 元素是 `SnsInfo` 存储实体），
+>   往 `h3.N` 的 `jc5.f` 塞对象**对 UI 无直接增量**，只能借道 `l5.o` 写库，属绕路；
+>   且与上面这套已启用的改库路线**功能重叠**，两套都往 `SnsInfo` 写必然打架。
+>   `SnsAlbumMerge` 至今保持**停用**。
+> - ⇒ **现在若拿本节当依据，会得出与现行代码相反的结论。** 详细论证见
+>   `docs/_r35_pend_decisions.md` P3（推荐：防 / 就此收口 / 不新做响应注入）。
+>
+> （以下原文保留，仅作追溯。）
+
 排除掉：**SQL 谓词 / limit 窗口 / sourceType / type / localFlag / 正文缺失 / 副表缺行**。
 
 唯一剩下的实字段差异是 `createTime`（差 21.8h）+ `head`；但用户亲述

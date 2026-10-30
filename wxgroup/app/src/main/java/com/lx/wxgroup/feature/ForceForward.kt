@@ -14,6 +14,8 @@ import com.lx.wxgroup.core.FileSender
 import com.lx.wxgroup.core.FileSenderB
 import com.lx.wxgroup.core.HostContext
 import com.lx.wxgroup.core.TextSender
+import com.lx.wxgroup.data.Keys
+import com.lx.wxgroup.data.Kv
 import com.lx.wxgroup.ui.Panel
 import com.lx.wxgroup.ui.UiKit
 import com.lx.wxgroup.util.LogX
@@ -22,6 +24,7 @@ import de.robv.android.xposed.XC_MethodHook.MethodHookParam
 import de.robv.android.xposed.XposedBridge
 import de.robv.android.xposed.XposedHelpers
 import de.robv.android.xposed.callbacks.XC_LoadPackage
+import java.io.File
 import java.lang.ref.WeakReference
 import java.util.concurrent.ExecutorService
 import java.util.concurrent.Executors
@@ -42,13 +45,19 @@ import java.util.concurrent.atomic.AtomicLong
  * - 认成 CONV_LIST → 明确不注入（那是 [ConvMenuInject] 的地盘，需求 6.6 不管会话列表）；
  * - 认成 NONE → 静默放弃（别的浮层，绝不多手）。
  *
- * ## v1 边界（诚实声明，详见 [nativeForward] / [resendText] 与报告「取证缺口」）
+ * ## v2 边界（诚实声明，详见 [nativeForward] / [resendText] 与报告「取证缺口」）
  * - 菜单注入、目标选择（K3 三 Tab 选择器 [ForwardPicker]：好友·群聊 / 模块分组 /
  *   微信标签）、目标展开去重、排除当前会话、策略选择、批量执行与汇总 toast
  *   —— **全部接通**，可上机验证；
- * - 「发出去」这一步**未接通**：原生转发锚点未取证（G1）、降级发送（K8）项目里
- *   根本不存在（G3）。未取证前两条发送分支恒记 failed —— **严禁猜微信内部
- *   类名/方法名**（猜错 = 崩微信）。
+ * - **降级重发（K8）已接通**：文本走 [TextSender]（真机落库验证），图片走 [FileSender]；
+ * - **原生转发（G1）已接通 TEXT / IMAGE 两类**（`docs/_r29_g1_forward_forensics.md`）：
+ *   同一条 `hl0/r1 → hl0/q1 → NetScene` 链，多挂一个 `hl0/m`(ForwardInfo) 并设
+ *   `q1.h`（文本 4 / 图片 13）。**转发标记对端是否可见仍需真机复核**（G1 附②：
+ *   文本转发的源 msgId 在 `q0` 构造器体内未被引用）；
+ * - 视频 / 语音 / 普通文件 / 名片 / 位置 / 链接：**没有原生链路也没降级链路**，
+ *   保持 SKIP（`modelimage/o3.j()`、`qf4/r5` 未取证）；
+ * - 任何一步反射失败都**不抛到微信**：[nativeForward] 返回失败阶段，[runBatch]
+ *   按 [ForwardNativeLogic.fallbackStrategy] 回落降级重发。
  *
  * ## 复用 [ConvMenuInject] 的三条硬经验（都踩过坑，别破）
  * 1. show 的瞬间菜单项往往还没挂上 → 主线程轮询重试（0/40/80…ms，最多 8 次）；
@@ -98,6 +107,19 @@ object ForceForward {
     var enabled: Boolean = true
         private set
 
+    /**
+     * 宿主 classLoader（[install] 时存）。原生转发（G1）要用它 `findClass("hl0.r1")` 等。
+     *
+     * 与 [com.lx.wxgroup.core.TextSender] / [com.lx.wxgroup.core.FileSender] 各存一份是
+     * 刻意的：`core/` 是别的 lane 的独占目录，本类不能为了拿 loader 去改它。
+     */
+    @Volatile
+    private var loader: ClassLoader? = null
+
+    /** 原生链路探测结果的缓存（见 [nativeProbe]）。null = 还没探过 */
+    @Volatile
+    private var nativeProbeCache: Boolean? = null
+
     private val popupsSeen = AtomicLong(0)
     private val injected = AtomicInteger(0)
     private val convSkipped = AtomicInteger(0)
@@ -139,6 +161,7 @@ object ForceForward {
 
     /** 签名与其它 feature 的 install 保持一致（lpparam 预留，当前 hook 的都是 android 框架类） */
     fun install(lpparam: XC_LoadPackage.LoadPackageParam) {
+        loader = lpparam.classLoader
         // 1) 长按链路第一站记目标视图（注入判据与点击时取原料都要用）
         installLongPressTrap()
         // 2) ★ 注入点：微信的长按菜单就是它自己画的 PopupWindow
@@ -451,22 +474,161 @@ object ForceForward {
         }.onFailure { LogX.e("FF forward click failed", it) }
     }
 
+    private fun snapshotNow(): ForwardLogic.Snapshot = snapshotOf(pressedView())
+
     /**
-     * 从长按 burst 里最深处的 View 提取消息文本（**只走 View 树，不碰微信内部对象**）。
+     * 从长按的 View 抓一次消息快照（文本 + **消息对象三要素**）。
      *
-     * 拿得到文本 = 将来降级重发（RESEND_TEXT）的原料；拿不到就按 SKIP 处理。
-     * 消息种类（msgType）锚点未取证（G2），这里**不猜**，恒 UNKNOWN。
+     * 两条原料来源，取长补短：
+     * 1. **View 树文本**（[extractText]）：老路径，能拿到渲染出来的正文，但可能抽到噪声；
+     * 2. **消息对象 `h9`**（[msgRefOf]，G2 ① 路径）：拿 `msgId / msgType / msgSvrId /
+     *    field_imgPath / field_talker / content`，这是原生转发（G1）**必需的源 msgId**
+     *    与图片本地路径的唯一来源。
+     *
+     * ⚠️ G2 链路全程 `runCatching` 单步兜底：拿不到 h9 就退回 v1 的形状
+     * （kind=UNKNOWN、text=View 树文本）⇒ `planFor` 会判 SKIP，**不会比现在更差**。
      */
-    private fun snapshotNow(): ForwardLogic.Snapshot {
-        val text = pressedView()?.let { extractText(it) }.orEmpty()
+    private fun snapshotOf(v: View?): ForwardLogic.Snapshot {
+        val viewText = v?.let { extractText(it) }.orEmpty()
+        val ref = v?.let { runCatching { msgRefOf(it) }.getOrNull() }
+        val kind = ref?.kind ?: ForwardLogic.Kind.UNKNOWN
+        // View 树抽不出正文时，文本消息直接用库里的 content（更准；XML 类的消息不用它）
+        val text = viewText.ifBlank {
+            if (kind == ForwardLogic.Kind.TEXT) ref?.content.orEmpty() else ""
+        }
+        val path = ref?.imgPath.orEmpty()
         return ForwardLogic.Snapshot(
-            kind = ForwardLogic.Kind.UNKNOWN,
+            kind = kind,
             text = text,
-            localPath = "",
-            fileExists = false,
+            localPath = path,
+            fileExists = path.isNotBlank() && runCatching { File(path).exists() }.getOrDefault(false),
             sourceChat = currentChatTalker(),
+            raw = ref?.raw,
+            msgId = ref?.msgId ?: 0L,
+            msgSvrId = ref?.msgSvrId ?: 0L,
         )
     }
+
+    /**
+     * G2：长按的 View → 消息对象 `h9` → 转发要用的那几个值。
+     *
+     * 反射序列全部来自 `docs/_r29_g2_msg_object.md` §3（①）与 `docs/_r16_g2_msgsnap.md` §3.2/3.3（①），
+     * 与本类探针 [msgsnapReport] 已真机跑通的那条链是同一条，只是**砍掉了探针特有的
+     * 诊断字段与 A0 扫描兜底**（生产路径跑在主线程长按回调里，越短越好）。
+     *
+     * ⚠️ 与 [msgsnapReport] 的三条共同纪律（别改回去）：
+     * 1. 列表按**继承链**判定（[listKindOf]），不能用类名 contains —— 运行时是子类；
+     * 2. `ChattingRecyclerView.getPositionForView` 是恒 -1 的空桩 ⇒ recycler 必须走
+     *    `F0 / G0 / getChildAdapterPosition / getChildLayoutPosition` 候选链；
+     * 3. `getItem(int)` 返回 `Object`，**按名字反射取值，不强转 h9**。
+     */
+    private fun msgRefOf(v: View): MsgRef? {
+        // 1) 向上 ≤12 层找列表 + 外层容器 MMChattingListView
+        var node: View? = v
+        var list: View? = null
+        var outer: View? = null
+        var guard = 0
+        while (node != null && guard++ < 12) {
+            if (list == null) {
+                // 只认继承链命中（recycler/listview）；"unknown" 不占位 —— 与 msgsnapReport 同纪律
+                when (listKindOf(node)) {
+                    "recycler", "listview" -> list = node
+                }
+            }
+            if (node.javaClass.name.contains("MMChattingListView")) {
+                outer = node
+                break
+            }
+            node = node.parent as? View
+        }
+        // 兜底：MMChattingListView.getListView() 直接拿列表对象（比在 parent 链里猜硬）
+        if (list == null && outer != null) {
+            list = runCatching {
+                outer.javaClass.getMethod("getListView").invoke(outer) as? View
+            }.getOrNull()
+        }
+        if (list == null) return null
+
+        // 2) position
+        val pos = positionOf(list, v)
+        if (pos < 0) return null
+
+        // 3) adapter：优先未混淆的 getBaseAdapter()，退回混淆名 m()
+        var adapter: Any? = null
+        if (outer != null) {
+            adapter = runCatching { outer.javaClass.getMethod("getBaseAdapter").invoke(outer) }.getOrNull()
+        }
+        if (adapter == null) {
+            adapter = runCatching { list.javaClass.getMethod("m").invoke(list) }.getOrNull()
+        }
+        if (adapter == null) return null
+
+        // 4) getItem(int) → h9（Object，不强转）
+        val h9 = runCatching {
+            adapter.javaClass.getMethod("getItem", Int::class.javaPrimitiveType).invoke(adapter, pos)
+        }.getOrNull() ?: return null
+
+        // 5) 按名字取值（getter 未混淆；字段在父类 jj/m7 且 PRIVATE ⇒ 走 XposedHelpers 沿类链找）
+        val msgId = runCatching { h9.javaClass.getMethod("getMsgId").invoke(h9) as? Long }.getOrNull() ?: 0L
+        val msgType = runCatching { h9.javaClass.getMethod("getType").invoke(h9) as? Int }.getOrNull() ?: 0
+        val content = runCatching { h9.javaClass.getMethod("getContent").invoke(h9) as? String }.getOrNull().orEmpty()
+        val imgPath = runCatching { XposedHelpers.getObjectField(h9, "field_imgPath") as? String }.getOrNull().orEmpty()
+        val talker = runCatching { XposedHelpers.getObjectField(h9, "field_talker") as? String }.getOrNull().orEmpty()
+        val msgSvrId = runCatching { XposedHelpers.getLongField(h9, "field_msgSvrId") }.getOrNull() ?: 0L
+        return MsgRef(
+            raw = h9,
+            msgId = msgId,
+            msgSvrId = msgSvrId,
+            content = content,
+            imgPath = imgPath,
+            talker = talker,
+            kind = ForwardLogic.kindOf(msgType, ForwardLogic.appMsgTypeOf(content)),
+        )
+    }
+
+    /**
+     * 列表内定位：recycler 走混淆名候选链，listview 走 `getPositionForView`。
+     *
+     * @return position，-1 = 没定位到（调用方按「拿不到消息对象」处理）
+     */
+    private fun positionOf(list: View, v: View): Int {
+        val kind = listKindOf(list)
+        if (kind == "recycler" || (kind == "unknown" && list.javaClass.name.contains("Recycler"))) {
+            // item 根 View：从 v 沿 parent 向上直到 parent == list
+            var itemRoot: View? = null
+            var n: View? = v
+            var g = 0
+            while (n != null && g++ < 12) {
+                if (n.parent === list) {
+                    itemRoot = n
+                    break
+                }
+                n = n.parent as? View
+            }
+            if (itemRoot == null) return -1
+            // 混淆名在前（当前 8.0.48 实测 F0/G0），原名在后（未来版本兜底）
+            for (name in arrayOf("F0", "G0", "getChildAdapterPosition", "getChildLayoutPosition")) {
+                val m = runCatching { list.javaClass.getMethod(name, View::class.java) }.getOrNull() ?: continue
+                val p = runCatching { m.invoke(list, itemRoot) as Int }.getOrNull() ?: -1
+                if (p >= 0) return p
+            }
+            return -1
+        }
+        val m = runCatching { list.javaClass.getMethod("getPositionForView", View::class.java) }.getOrNull()
+            ?: return -1
+        return runCatching { m.invoke(list, v) as Int }.getOrNull() ?: -1
+    }
+
+    /** [msgRefOf] 的结果：拿到什么算什么，拿不到的是「与微信默认值一致」的空值 */
+    private data class MsgRef(
+        val raw: Any? = null,
+        val msgId: Long = 0L,
+        val msgSvrId: Long = 0L,
+        val content: String = "",
+        val imgPath: String = "",
+        val talker: String = "",
+        val kind: ForwardLogic.Kind = ForwardLogic.Kind.UNKNOWN,
+    )
 
     private fun pressedView(): View? = synchronized(pressLock) {
         val ref = burstDeepest ?: return null
@@ -540,10 +702,10 @@ object ForceForward {
      * 抛异常 / 返回 false 都只计 failed，循环继续；**不加「连续失败 N 条中止」**
      * （那是 6.5 群发的规则，本任务不继承）。
      *
-     * v1 的诚实边界：两条发送链路都未接通（见 [nativeForward] / [resendText]），
-     * 非 SKIP 分支全部记 failed；**sent==0 一律加「未实际发送」后缀**（含 SKIP：
-     * 真机长按路径 kind 恒 UNKNOWN，恒走 SKIP 且 failed 恒 0，文案必须诚实）。
-     * 链路接通后这里只需把对应分支换成真调用，计数与文案不用动。
+     * sent==0 的文案纪律（**别删**）：SKIP 分支加「发送链路未接通，未实际发送」后缀
+     * —— 长按拿不到消息对象时 kind 恒 UNKNOWN ⇒ 恒 SKIP 且 failed 恒 0，
+     * 若文案只剩「跳过 N」，看着像成功了。**没发出去就必须说没发出去。**
+     * 非 SKIP 而 sent==0 是「真发了但全失败」，文案要与前者区分（见 [runBatch] 末尾）。
      */
     private fun execute(snap: ForwardLogic.Snapshot, picked: ForwardPicker.Result) {
         runCatching {
@@ -566,7 +728,19 @@ object ForceForward {
         }.onFailure { LogX.e("FF execute failed", it) }
     }
 
-    /** 批量执行的线程体：逐个目标发，单条失败只计数不中断 */
+    /**
+     * 批量执行的线程体：逐个目标发，单条失败只计数不中断。
+     *
+     * ## 原生失败 → 回落降级（G1 接通后新增，是本批次的 fail-safe 底线）
+     *
+     * [nativeForward] 返回 false 时**不能只记 failed**：现在的降级重发是能工作的，
+     * 只因为试了一次原生就把整条消息丢掉，比 v1（全部走降级）还倒退。所以：
+     * - 先按 [ForwardNativeLogic.fallbackStrategy] 回落（有文本重发文本、有图重发图）；
+     * - 回落后成功 ⇒ 计 sent + degraded（走降级就是「无转发标记」，toast 必须说）；
+     * - 回落到 SKIP（这条既没正文也没可用文件）⇒ 计 skipped；
+     * - [ForwardNativeLogic.isStructural] 的失败（类/方法/构造层）⇒ 本批剩余目标
+     *   **不再试原生**（同一个失败会重复 N 次，日志全是同样的 stage，纯噪音）。
+     */
     private fun runBatch(
         snap: ForwardLogic.Snapshot,
         plan: ForwardLogic.Plan,
@@ -576,25 +750,58 @@ object ForceForward {
         var degraded = 0
         var skipped = 0
         var failed = 0
+        var nativeUsable = plan.strategy == ForwardLogic.Strategy.NATIVE
         for (t in targets) {
             if (plan.strategy == ForwardLogic.Strategy.SKIP) {
                 skipped++
                 continue
             }
-            val ok = runCatching {
-                when (plan.strategy) {
-                    ForwardLogic.Strategy.NATIVE -> nativeForward(snap, t)
-                    ForwardLogic.Strategy.RESEND_TEXT -> resendText(snap, t)
-                    ForwardLogic.Strategy.RESEND_FILE -> resendFile(snap, t)
-                    ForwardLogic.Strategy.SKIP -> false
+            var strategy =
+                if (nativeUsable) plan.strategy else ForwardNativeLogic.fallbackStrategy(snap)
+            var ok = false
+            when (strategy) {
+                ForwardLogic.Strategy.NATIVE -> {
+                    val r = runCatching { nativeForward(snap, t) }
+                        .onFailure {
+                            LogX.w("FORWARD native threw ${t.take(24)}: ${it.javaClass.simpleName}")
+                        }
+                        .getOrDefault(
+                            ForwardNativeLogic.NativeResult.fail(ForwardNativeLogic.FailStage.METHOD)
+                        )
+                    ok = r.ok
+                    if (!ok) {
+                        LogX.w("FORWARD native fail stage=${r.stage} target=${t.take(24)} → 回落")
+                        if (ForwardNativeLogic.isStructural(r.stage)) nativeUsable = false
+                        strategy = ForwardNativeLogic.fallbackStrategy(snap)
+                        if (strategy == ForwardLogic.Strategy.SKIP) {
+                            skipped++
+                            continue
+                        }
+                        ok = runCatching { send(strategy, snap, t) }
+                            .onFailure {
+                                LogX.w("FORWARD fallback threw ${t.take(24)}: ${it.javaClass.simpleName}")
+                            }
+                            .getOrDefault(false)
+                    }
                 }
-            }.onFailure {
-                LogX.w("FORWARD target threw ${t.take(24)}: ${it.javaClass.simpleName}")
-            }.getOrDefault(false)
+
+                ForwardLogic.Strategy.SKIP -> {
+                    skipped++
+                    continue
+                }
+
+                else -> {
+                    ok = runCatching { send(strategy, snap, t) }
+                        .onFailure {
+                            LogX.w("FORWARD target threw ${t.take(24)}: ${it.javaClass.simpleName}")
+                        }
+                        .getOrDefault(false)
+                }
+            }
             if (ok) {
                 sent++
                 // 走降级的都算「已作为普通消息发送，无转发标记」
-                if (plan.strategy != ForwardLogic.Strategy.NATIVE) degraded++
+                if (strategy != ForwardLogic.Strategy.NATIVE) degraded++
             } else {
                 failed++
             }
@@ -608,7 +815,11 @@ object ForceForward {
             // failed 也恒 0。若把 SKIP 排除在后缀条件外，toast 只剩「已发送 0 个
             // 目标 · 跳过 N」，看着像成功了 —— 没发出去就必须说「未实际发送」。
             val text = if (sent == 0) {
-                "$msg（发送链路未接通，未实际发送，详见日志 FORWARD）"
+                if (plan.strategy == ForwardLogic.Strategy.SKIP) {
+                    "$msg（发送链路未接通，未实际发送，详见日志 FORWARD）"
+                } else {
+                    "$msg（全部失败，详见日志 FORWARD）"
+                }
             } else {
                 // 需求点名的降级提示：只要有一条走了重发分支就必须说清楚没有转发标记
                 if (degraded > 0) "$msg · ${ForwardLogic.TOAST_DEGRADED}" else msg
@@ -617,23 +828,301 @@ object ForceForward {
         }
     }
 
+    /** 降级重发的分发（NATIVE 由 [runBatch] 单独处理，不在本函数里） */
+    private fun send(
+        strategy: ForwardLogic.Strategy,
+        snap: ForwardLogic.Snapshot,
+        target: String,
+    ): Boolean = when (strategy) {
+        ForwardLogic.Strategy.RESEND_TEXT -> resendText(snap, target)
+        ForwardLogic.Strategy.RESEND_FILE -> resendFile(snap, target)
+        ForwardLogic.Strategy.NATIVE, ForwardLogic.Strategy.SKIP -> false
+    }
+
     /**
-     * 原生转发链路状态。v1 恒为 UNKNOWN：锚点（G1）未取证前不声称可用。
-     * 取证接通后这里改成运行时探测结果（AVAILABLE / REJECTED）。
+     * 原生转发链路状态：**运行时探测**（不再恒 UNKNOWN）。
+     *
+     * 探测内容 = ①档锚点是否还在（`hl0.r1` / `hl0.m` 两个类 + `hl0.r1.b(String)` 静态方法）。
+     * 这几个名字是 R8 混淆出来的，**换版本就会变** ⇒ 每次真跑都重新确认一遍，
+     * 变了的症状就是这里回到 UNKNOWN、整体走降级（而不是崩微信 / 发出没标记的消息）。
      */
-    private fun nativeState(): ForwardLogic.NativeState = ForwardLogic.NativeState.UNKNOWN
+    private fun nativeState(): ForwardLogic.NativeState {
+        // ⛔ 闸门（R36）：原生链路**默认关闭**。
+        //
+        // 为什么必须默认关：这条路要往微信自己的 `hl0/q1` 上写字段（`q1.h`）、挂
+        // `hl0/m`、然后直接调 `q1.a()/q1.b()` 入队 —— 全部是**未经真机验证**的反射
+        // 写宿主对象。锚点探测只证明「类和方法还在」，**不证明语义对**：
+        // 子类型号或 ForwardInfo 字段填错，轻则发出去没有转发标记（看不出来，等于假成功），
+        // 重则发出空壳或让微信抛异常。
+        // 关着的时候行为与引入本链路之前**逐字节相同**：一律走降级重发（已真机验证的通路）。
+        //
+        // 开法（验证用）：`kvset chat.forward_native true`，然后重启微信。
+        // 验证判据见 `docs/_r36_forward.md`；验不过就保持关。
+        if (!Kv.getBool(Keys.FORWARD_NATIVE)) return ForwardLogic.NativeState.UNKNOWN
+        return if (nativeProbe()) ForwardLogic.NativeState.AVAILABLE else ForwardLogic.NativeState.UNKNOWN
+    }
+
+    /**
+     * 原生锚点探测（结果缓存，进程内只探一次成功的）。
+     *
+     * ⚠️ `XposedHelpers.findClass` 找不到类抛的是 `ClassNotFoundError`（`Error` 不是
+     * `Exception`）—— Kotlin 的 [runCatching] 抓 `Throwable`，这里能兜住；**别换成 catch (Exception)**。
+     */
+    private fun nativeProbe(): Boolean {
+        nativeProbeCache?.let { return it }
+        val cl = loader
+        if (cl == null) {
+            LogX.w("FORWARD native no classLoader（模块未 prepare）")
+            return false
+        }
+        val ok = runCatching {
+            val r1 = XposedHelpers.findClass("hl0.r1", cl)
+            XposedHelpers.findClass("hl0.m", cl)
+            r1.getDeclaredMethod("b", String::class.java)
+            true
+        }.onFailure {
+            LogX.w("FORWARD native probe failed: ${it.javaClass.simpleName}: ${it.message}")
+        }.getOrDefault(false)
+        LogX.i("FORWARD native probe=$ok")
+        if (ok) nativeProbeCache = true
+        return ok
+    }
 
     /**
      * 原生转发（保留「转发」标记）。
      *
-     * ⚠️ **v1 恒 false**：需要「msgId + 目标 talker → 微信原生转发入口」的真实
-     * 类名/方法名（取证缺口 G1）。接通前一律返回 false 让上层走降级。
-     * **严禁猜微信内部 API** —— 猜错就是崩微信。
+     * 链路（`docs/_r29_g1_forward_forensics.md` §5，①）：**与普通发送同一条链**
+     * `hl0/r1` → `hl0/q1` → NetScene，只多做两件事：挂 `hl0/m`(ForwardInfo)、设 `q1.h`。
+     *
+     * @return [ForwardNativeLogic.NativeResult]：ok=false 时带失败阶段，
+     *         由 [runBatch] 决定回落到哪种降级重发。**本函数自己不回落**（保持单一职责）。
      */
-    private fun nativeForward(snap: ForwardLogic.Snapshot, target: String): Boolean {
-        LogX.w("FORWARD native anchor not located yet (G1), target=${target.take(24)}")
-        return false
+    private fun nativeForward(
+        snap: ForwardLogic.Snapshot,
+        target: String,
+    ): ForwardNativeLogic.NativeResult {
+        val cl = loader
+            ?: return ForwardNativeLogic.NativeResult.fail(ForwardNativeLogic.FailStage.CLASS)
+        if (target.isBlank()) {
+            return ForwardNativeLogic.NativeResult.fail(ForwardNativeLogic.FailStage.MATERIAL)
+        }
+        return when (ForwardNativeLogic.subTypeOf(snap.kind)) {
+            ForwardNativeLogic.SubType.TEXT_FORWARD -> nativeForwardText(cl, snap, target)
+            ForwardNativeLogic.SubType.IMAGE_FORWARD -> nativeForwardImage(cl, snap, target)
+            // 多图（h=19）与其它种类：没接通，别硬试（直接回落降级）
+            ForwardNativeLogic.SubType.MULTI_IMAGE, ForwardNativeLogic.SubType.NONE ->
+                ForwardNativeLogic.NativeResult.fail(ForwardNativeLogic.FailStage.METHOD)
+        }
     }
+
+    /**
+     * 文本原生转发：`r1.b(talker)` → `q1.e(content)` → `q1.f(m)` → `q1.h=4` → 入队。
+     *
+     * 反射点档位（**全部 ①**，出处 `docs/_r29_g1_forward_forensics.md`）：
+     * - `hl0.r1.b:(String)q1`（§5.1，PUBLIC STATIC FINAL）；
+     * - `q1.e:(String)q1`（§2.2 设 content）、`q1.f:(hl0/m)q1`（§2.2 挂 ForwardInfo）；
+     * - `q1.h` int 字段直写 = 4（§2.4 值表：文本转发吃 `m.b`）；
+     * - `hl0/m` 字段 `a/b/e/f`（§2.1，`toString` 明文钉死）。
+     *
+     * 发送动作两条候选，**绝不重复发**：
+     * - 首选 `q1.a() -> l1` + `l1.a()`（与微信 `MsgRetransmitUI.z6` 的同步入队分支同款，
+     *   能拿到「是否入队」的布尔值，① `docs/_r29_g1_forward_forensics.md` §3.1）；
+     * - `q1.a()` 拿不到 l1（方法不存在 / 抛异常，**此时还没发出去**）才退回
+     *   `q1.b()`（executeByPPC 异步，[com.lx.wxgroup.core.TextSender] 真机验证过的那条）。
+     *
+     * ⚠️ 挂 ForwardInfo / 设 `q1.h` 失败时**不裸发**：`h` 缺省 0 会落到 `t81/g.l` 的
+     * default 分支（`q0` 空壳），那比走降级重发还糟 ⇒ 直接判 CONSTRUCT 失败让上层回落。
+     */
+    private fun nativeForwardText(
+        cl: ClassLoader,
+        snap: ForwardLogic.Snapshot,
+        target: String,
+    ): ForwardNativeLogic.NativeResult {
+        val r1: Class<*>
+        val mCls: Class<*>
+        try {
+            r1 = XposedHelpers.findClass("hl0.r1", cl)
+            mCls = XposedHelpers.findClass("hl0.m", cl)
+        } catch (t: Throwable) {
+            LogX.w("FORWARD native text stage=CLASS ${t.javaClass.simpleName}")
+            return ForwardNativeLogic.NativeResult.fail(ForwardNativeLogic.FailStage.CLASS)
+        }
+        if (snap.text.isBlank()) {
+            LogX.w("FORWARD native text stage=MATERIAL（正文为空，不猜内容）")
+            return ForwardNativeLogic.NativeResult.fail(ForwardNativeLogic.FailStage.MATERIAL)
+        }
+        val q1: Any
+        try {
+            q1 = XposedHelpers.callStaticMethod(r1, "b", target)
+                ?: run {
+                    LogX.w("FORWARD native text r1.b() -> null")
+                    return ForwardNativeLogic.NativeResult.fail(ForwardNativeLogic.FailStage.CONSTRUCT)
+                }
+            XposedHelpers.callMethod(q1, "e", snap.text)
+        } catch (t: Throwable) {
+            LogX.w("FORWARD native text stage=METHOD ${t.javaClass.simpleName}: ${t.message}")
+            return ForwardNativeLogic.NativeResult.fail(ForwardNativeLogic.FailStage.METHOD)
+        }
+        try {
+            attachForwardInfo(q1, mCls, snap)
+            XposedHelpers.setIntField(q1, "h", ForwardNativeLogic.SUBTYPE_TEXT_FORWARD)
+        } catch (t: Throwable) {
+            LogX.w("FORWARD native text stage=CONSTRUCT ${t.javaClass.simpleName}: ${t.message}")
+            return ForwardNativeLogic.NativeResult.fail(ForwardNativeLogic.FailStage.CONSTRUCT)
+        }
+        val fi = ForwardNativeLogic.forwardInfoOf(snap)
+        return try {
+            val l1 = runCatching { XposedHelpers.callMethod(q1, "a") }.getOrNull()
+            if (l1 == null) {
+                // 还没发出去 ⇒ 退回 TextSender 那条真机验证过的异步路径
+                XposedHelpers.callMethod(q1, "b")
+                LogX.i(
+                    "FORWARD native text via=q1.b() target=${target.take(24)} " +
+                        "sub=4 marked=${ForwardNativeLogic.hasForwardMark(fi)} msgId=${fi.msgId}"
+                )
+                ForwardNativeLogic.NativeResult.ok()
+            } else {
+                val queued = XposedHelpers.callMethod(l1, "a") as? Boolean ?: false
+                if (!queued) {
+                    LogX.w("FORWARD native text l1.a()=false target=${target.take(24)}")
+                    return ForwardNativeLogic.NativeResult.fail(ForwardNativeLogic.FailStage.SEND)
+                }
+                LogX.i(
+                    "FORWARD native text via=l1.a() target=${target.take(24)} " +
+                        "sub=4 marked=${ForwardNativeLogic.hasForwardMark(fi)} msgId=${fi.msgId}"
+                )
+                ForwardNativeLogic.NativeResult.ok()
+            }
+        } catch (t: Throwable) {
+            LogX.w("FORWARD native text stage=SEND ${t.javaClass.simpleName}: ${t.message}")
+            ForwardNativeLogic.NativeResult.fail(ForwardNativeLogic.FailStage.SEND)
+        }
+    }
+
+    /**
+     * 图片原生转发：与 [com.lx.wxgroup.core.FileSender] 同一套字段序列
+     * （逐字段复刻微信 `qf4/o4.O8`），差别只有两处：
+     * 1. `hl0/m` **不再是全默认**，填 `b`(源 msgId) / `e`(源 svrId) / `f`(源 talker)；
+     * 2. `q1.h` 仍 13，但语义坐实为「图片转发」（G1 §2.4 值表）。
+     *
+     * ⚠️ 为什么不直接调 [com.lx.wxgroup.core.FileSender]：它内部 `new m()` 全默认，
+     *    而 `core/` 是别的 lane 的独占目录，本 lane 不能改 ⇒ 在本类里按同一份字节码
+     *    （`docs/_r29_g1_forward_forensics.md` §5.2 + FileSender 类注释的地址表）重建一遍。
+     *
+     * ⚠️ `m.a`(forwardFromImgId) **恒 -1**：没有①档的 CDN imgId 获取路径
+     *    ⇒ 图片会重传（与降级重发一致），转发标记靠 `h=13` + `m.b`。
+     */
+    private fun nativeForwardImage(
+        cl: ClassLoader,
+        snap: ForwardLogic.Snapshot,
+        target: String,
+    ): ForwardNativeLogic.NativeResult {
+        if (snap.localPath.isBlank() || !snap.fileExists) {
+            LogX.w(
+                "FORWARD native image stage=MATERIAL path='${snap.localPath.take(80)}' " +
+                    "exists=${snap.fileExists}"
+            )
+            return ForwardNativeLogic.NativeResult.fail(ForwardNativeLogic.FailStage.MATERIAL)
+        }
+        val r1: Class<*>
+        val mCls: Class<*>
+        val o1: Any
+        try {
+            r1 = XposedHelpers.findClass("hl0.r1", cl)
+            mCls = XposedHelpers.findClass("hl0.m", cl)
+            val o1Cls = XposedHelpers.findClass("hl0.o1", cl)
+            // 枚举按 name 取（`const-string "IMAGE"` 在 <clinit> 里是明文），取不到退回 values()[1]
+            o1 = runCatching { o1Cls.getMethod("valueOf", String::class.java).invoke(null, "IMAGE") }
+                .getOrNull()
+                ?: (XposedHelpers.callStaticMethod(o1Cls, "values") as? Array<*>)?.get(1)
+                ?: run {
+                    LogX.w("FORWARD native image o1.IMAGE n/a")
+                    return ForwardNativeLogic.NativeResult.fail(ForwardNativeLogic.FailStage.CONSTRUCT)
+                }
+        } catch (t: Throwable) {
+            LogX.w("FORWARD native image stage=CLASS ${t.javaClass.simpleName}")
+            return ForwardNativeLogic.NativeResult.fail(ForwardNativeLogic.FailStage.CLASS)
+        }
+        val q1: Any
+        try {
+            q1 = XposedHelpers.callStaticMethod(r1, "a", o1)
+                ?: run {
+                    LogX.w("FORWARD native image r1.a(o1=IMAGE) -> null")
+                    return ForwardNativeLogic.NativeResult.fail(ForwardNativeLogic.FailStage.CONSTRUCT)
+                }
+            val f = File(snap.localPath)
+            // ---- 逐字段照抄 qf4/o4.O8（顺序对齐 FileSender 注释里的字节码地址）----
+            XposedHelpers.setIntField(q1, "i", Q1_I_IMAGE)                 // 8457a8
+            XposedHelpers.callMethod(q1, "g", f.name)                      // 8457ac -> q1.b（文件名）
+            XposedHelpers.callMethod(q1, "h", target)                      // 8457b2 -> q1.a（目标会话）
+            XposedHelpers.setObjectField(q1, "j", snap.localPath)          // 8457b8 -> q1.j（★ 完整路径）
+            XposedHelpers.setIntField(q1, "k", 0)                          // 8457bc
+            XposedHelpers.setObjectField(q1, "l", null)                    // 8457c0
+            XposedHelpers.setIntField(q1, "n", 0)                          // 8457c6
+            XposedHelpers.setBooleanField(q1, "p", true)                   // 8457d4
+            XposedHelpers.setIntField(q1, "o", Q1_O_RES_ID)                // 8457de（int！不是 float）
+        } catch (t: Throwable) {
+            LogX.w("FORWARD native image stage=METHOD ${t.javaClass.simpleName}: ${t.message}")
+            return ForwardNativeLogic.NativeResult.fail(ForwardNativeLogic.FailStage.METHOD)
+        }
+        try {
+            attachForwardInfo(q1, mCls, snap)
+            XposedHelpers.setIntField(q1, "h", ForwardNativeLogic.SUBTYPE_IMAGE_FORWARD)  // 8457fc
+        } catch (t: Throwable) {
+            LogX.w("FORWARD native image stage=CONSTRUCT ${t.javaClass.simpleName}: ${t.message}")
+            return ForwardNativeLogic.NativeResult.fail(ForwardNativeLogic.FailStage.CONSTRUCT)
+        }
+        val fi = ForwardNativeLogic.forwardInfoOf(snap)
+        return try {
+            val l1 = XposedHelpers.callMethod(q1, "a")                     // 845804
+                ?: run {
+                    LogX.w("FORWARD native image q1.a() -> null")
+                    return ForwardNativeLogic.NativeResult.fail(ForwardNativeLogic.FailStage.SEND)
+                }
+            // g6 只上报（全程只读 l1），失败不该影响真正 execute ⇒ 单独兜住
+            runCatching {
+                val mrui = XposedHelpers.findClass("com.tencent.mm.ui.transmit.MsgRetransmitUI", cl)
+                XposedHelpers.callStaticMethod(mrui, "g6", l1)
+            }.onFailure { LogX.w("FORWARD native image g6 skipped: ${it.javaClass.simpleName}") }
+            val queued = XposedHelpers.callMethod(l1, "a") as? Boolean ?: false  // 845812
+            if (!queued) {
+                LogX.w("FORWARD native image l1.a()=false target=${target.take(24)}")
+                return ForwardNativeLogic.NativeResult.fail(ForwardNativeLogic.FailStage.SEND)
+            }
+            LogX.i(
+                "FORWARD native image queued target=${target.take(24)} sub=13 " +
+                    "marked=${ForwardNativeLogic.hasForwardMark(fi)} msgId=${fi.msgId}"
+            )
+            ForwardNativeLogic.NativeResult.ok()
+        } catch (t: Throwable) {
+            LogX.w("FORWARD native image stage=SEND ${t.javaClass.simpleName}: ${t.message}")
+            ForwardNativeLogic.NativeResult.fail(ForwardNativeLogic.FailStage.SEND)
+        }
+    }
+
+    /**
+     * 造 `hl0/m` 并挂到 `q1`（`q1.f(m)`）。
+     *
+     * 字段取值全部来自 [ForwardNativeLogic.forwardInfoOf]（纯函数，有单测），
+     * 这里只做「值 → 微信字段」的搬运，不再有任何判断。
+     */
+    private fun attachForwardInfo(q1: Any, mCls: Class<*>, snap: ForwardLogic.Snapshot) {
+        val fi = ForwardNativeLogic.forwardInfoOf(snap)
+        val fw = XposedHelpers.newInstance(mCls)
+        XposedHelpers.setLongField(fw, "a", fi.fromImgId)   // forwardFromImgId（恒 -1，见注释）
+        XposedHelpers.setLongField(fw, "b", fi.msgId)       // forwardMsgId（源消息）
+        XposedHelpers.setObjectField(fw, "c", fi.snsLocalId)// forwardSnsLocalId（恒 ""）
+        if (fi.uuid != null) XposedHelpers.setObjectField(fw, "d", fi.uuid)
+        if (fi.svrId != null) XposedHelpers.setObjectField(fw, "e", fi.svrId)
+        if (fi.talker.isNotBlank()) XposedHelpers.setObjectField(fw, "f", fi.talker)
+        XposedHelpers.callMethod(q1, "f", fw)
+    }
+
+    /** `qf4/o4.O8` 里 `q1.i` 的字面量（与 [com.lx.wxgroup.core.FileSender] 同值） */
+    private const val Q1_I_IMAGE = 4
+
+    /** `qf4/o4.O8` 里 `q1.o` 的字面量。**是 int（字符串资源 id），不是 float** */
+    private const val Q1_O_RES_ID = 0x7f0803d6
 
     /**
      * 降级重发文本（无转发标记）。
@@ -699,6 +1188,11 @@ object ForceForward {
      *              真机首验先跑这个再跑正式菜单，避免把「链路没 prepare」误判成「发送失败」
      * - `filebrdy` 普通文件（B 档 `qf4/r5`）探针就绪性。**不发消息**
      * - `fileb`    普通文件（B 档）**真发**。⚠️ 会真的发消息，必须带 `--es talker` + `--es val`
+     * - `msgsnap` 消息种类识别链（G2）一次抓全：列表形态 / position / adapter / h9 / msgId / type / imgPath
+     * - `nativerdy` 原生转发（G1）链路就绪性：**不发消息**，只报 loader / 锚点类 / 探测结果
+     * - `snap`    生产路径的快照（走 [snapshotOf]，忽略 TTL）：kind / msgId / svrId / path / exists。
+     *             与 `msgsnap` 的区别是它走**生产那条链**（G2 结果经 `kindOf` 归成 Kind），
+     *             真机核对「长按这条到底是什么」用它最直接
      */
     fun probe(sub: String, talker: String = "", path: String = ""): String = runCatching {
         when (sub.lowercase()) {
@@ -743,9 +1237,48 @@ object ForceForward {
                 // ⚠️ 本分支会复制文件 + 入网，**必须由调用方投后台线程**（见 EntryReceiver）。
                 "fileb " + FileSenderB.probe(talker, path)
             "msgsnap" -> msgsnapReport()
-            else -> "subs=stat,on,off,dump,pick,filerdy,filebrdy,fileb,msgsnap"
+            "nativerdy" -> nativeReadyReport()
+            "snap" -> snapReport()
+            else ->
+                "subs=stat,on,off,dump,pick,filerdy,filebrdy,fileb,msgsnap,nativerdy,snap"
         }
     }.getOrElse { "error=${it.javaClass.simpleName}" }
+
+    // ------------------------------------------------------------ G1 探针（原生转发链路）
+
+    /**
+     * G1 就绪性探针（**不发消息**）：真机首验先跑这个，再走正式菜单。
+     *
+     * 把「三个①档锚点类还在不在」分开报，是为了让「哪个类名变了」一眼可见 ——
+     * 换微信版本时最先坏的就是这几个 R8 混淆名（`hl0.r1` / `hl0.m` / `hl0.o1`）。
+     */
+    private fun nativeReadyReport(): String {
+        val cl = loader
+        fun has(name: String): String = if (cl == null) "noLoader" else runCatching {
+            XposedHelpers.findClass(name, cl)
+            "yes"
+        }.getOrDefault("no")
+        return "FORWARD NATIVERDY loader=${cl != null} state=${nativeState()} " +
+            "hl0.r1=${has("hl0.r1")} hl0.m=${has("hl0.m")} hl0.o1=${has("hl0.o1")} " +
+            "subTypes=[text=${ForwardNativeLogic.SUBTYPE_TEXT_FORWARD}," +
+            "image=${ForwardNativeLogic.SUBTYPE_IMAGE_FORWARD}," +
+            "multi=${ForwardNativeLogic.SUBTYPE_MULTI_IMAGE}]"
+    }
+
+    /**
+     * 生产快照探针：忽略 TTL 读最近一次长按的 View，走 [snapshotOf] 出结果。
+     *
+     * ⚠️ 与 [msgsnapReport] 一样要忽略 TTL：adb 广播到模块收到常超过 10s，
+     *    用 [pressedView] 会稳定拿到 null，被误判成「G2 链路不通」。
+     */
+    private fun snapReport(): String {
+        val snap = snapshotOf(staleViewForProbe())
+        return "FORWARD SNAP kind=${snap.kind} msgId=${snap.msgId} svrId=${snap.msgSvrId} " +
+            "textLen=${snap.text.length} path='${snap.localPath.take(80)}' " +
+            "exists=${snap.fileExists} chat=${snap.sourceChat.take(24)} " +
+            "raw=${snap.raw?.javaClass?.name ?: "none"} " +
+            "native=${ForwardNativeLogic.forwardInfoOf(snap)}"
+    }
 
     // ------------------------------------------------------------ G2 探针（消息种类识别链）
 

@@ -8,7 +8,8 @@ import java.security.MessageDigest
  * 版本门控。宁可功能失效，也不能让微信闪退。
  *
  * 微信每次升级都可能重排混淆，本模块只在白名单版本内打钩子。
- * 版本不匹配时静默退出，一行桩都不打。
+ * 版本不匹配时不打任何桩，并打一条 `LogX.w("DISABLED: <reason>")` 后退出
+ * （见 HookEntry.kt 的 `Verdict.Reject` 分支）—— 便于排查，不是无声无息。
  */
 object VersionGate {
 
@@ -51,8 +52,20 @@ object VersionGate {
             versionCode = 2588L,
             signatureSha256 = "0fe4ff85c215918396dadc7cd8ce6963339af33d37751a56e54c7206b63a3c7c",
         ),
-        // 原定目标版本，实机尚未安装，先留着
-        Target(Channel.GOOGLE_PLAY, "8.0.72"),
+        // ⛔ 2026-10-30 删除：原 8.0.72 条目只给了 channel + versionName，
+        // versionCode 取默认 0L、signatureSha256 取默认 null。而 check() 里两条校验分别是
+        // `if (matched.versionCode != 0L && …)` 与 `if (matched.signatureSha256 != null && …)`，
+        // 两个前置条件都为假 ⇒ 整段短路 ⇒ 该条目等价于「无条件 Ok」。
+        // 这是 fail-open：微信升到 8.0.72 时闸门放行，但锚点仍是 Anchors848 里按 8.0.48
+        // 硬编码的常量、DexKitLocator 的跨版本自动定位尚未接入 ⇒ 钩子全挂不上，
+        // 最坏反射取到错对象导致微信闪退 —— 正与本文件开头「宁可功能失效也不能闪退」相反。
+        // 现在版本不匹配会得到 Reject("version 8.0.72 not whitelisted, supported: 8.0.48")。
+        //
+        // 以后要支持 8.0.72：必须**连同锚点一起**加（先取证该版本的类名/方法/字段，
+        // 再按版本分派，Anchors848 只覆盖 8.0.48），否则加回来就是重开这个 fail-open。
+        // ⛔ 不要用「versionCode=0 表示不校验」这种隐式写法表达「临时放行」——
+        // 这就是本次这个坑的成因。取证期需要临时放行：本地改、不入库，
+        // 或显式加一个 allowIncomplete 字段并在日志里打 "gate ok (INCOMPLETE TARGET)"。
     )
 
     fun isMainProcess(processName: String?): Boolean = processName == HOST_MAIN_PROCESS

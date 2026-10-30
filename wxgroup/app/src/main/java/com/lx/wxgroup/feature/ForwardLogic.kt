@@ -216,6 +216,16 @@ object ForwardLogic {
         val sourceChat: String = "",
         /** 原生转发链路要用到的宿主对象（可能是任意类型，只在 hook 侧传递，不参与比较） */
         val raw: Any? = null,
+        /**
+         * 源消息 msgId（`h9.getMsgId()`，① G2 §4）。**0 = 没拿到**
+         * —— 原生转发靠它填 `hl0/m.b`(forwardMsgId)，拿不到就退回微信自己的默认值 0。
+         */
+        val msgId: Long = 0L,
+        /**
+         * 源消息服务端 id（`h9.field_msgSvrId`，`J`，① `docs/_r16_g2_msgsnap.md` §3.2）。
+         * **0 = 没拿到**。用于填 `hl0/m.e`(forwardMsgSvrId)。
+         */
+        val msgSvrId: Long = 0L,
     )
 
     enum class NativeState {
@@ -244,7 +254,13 @@ object ForwardLogic {
      */
     fun planFor(snap: Snapshot, nativeState: NativeState): Plan {
         if (!isCovered(snap.kind)) return Plan(Strategy.SKIP, "不支持的消息类型：${labelOf(snap.kind)}")
-        if (nativeState == NativeState.AVAILABLE) return Plan(Strategy.NATIVE)
+        // ⚠️ 原生可用 ≠ 这条消息能走原生：原生链路目前只接通 TEXT / IMAGE
+        //    （视频要 modelimage/o3、普通文件要 qf4/r5，都没取证，见 ForwardNativeLogic.subTypeOf）。
+        //    不加这个判据，名片/位置/链接会被送进原生链撞壁 —— 那比直接降级还慢，
+        //    而且失败原因会写成 METHOD 之类，看起来像「锚点失效」，误导排查方向。
+        if (nativeState == NativeState.AVAILABLE && ForwardNativeLogic.supportsNative(snap.kind)) {
+            return Plan(Strategy.NATIVE)
+        }
         val hasText = snap.text.isNotBlank()
         val hasFile = snap.localPath.isNotBlank() && snap.fileExists
         if (hasText) return Plan(Strategy.RESEND_TEXT, "原生转发不可用，降级重发文本")

@@ -93,6 +93,22 @@ object Keys {
     const val CHAT_MUTE_AT_EXCLUDE = "chat.mute_at_exclude"
 
     /**
+     * 原生转发（G1）：让转出去的消息**带「转发」标记**，而不是降级重发成一条普通消息。
+     *
+     * ⛔ **默认 false**，且这是刻意的，不是「没做完先关着」：
+     * 这条链路要往微信自己的 `hl0/q1` 写字段（`q1.h` 子类型）、挂一个 `hl0/m`（ForwardInfo）、
+     * 再直接调 `q1.a()/q1.b()` 入队 —— 全是**未经真机验证**的反射写宿主对象。
+     * 锚点探测只能证明「类和方法还在」，**不能证明语义对**：子类型号或 ForwardInfo 字段填错时，
+     * 轻则消息发出去但没有转发标记（界面上看不出来 = 假成功），重则发出空壳、或让微信抛异常。
+     *
+     * 关着 = 与引入这条链路之前的行为完全一致，一律走降级重发（已真机验证的通路）。
+     *
+     * 开法：`kvset chat.forward_native true` 后重启微信。先按 `docs/_r36_forward.md` 的判据验，
+     * 验不过就保持关。
+     */
+    const val FORWARD_NATIVE = "chat.forward_native"
+
+    /**
      * 收到图片消息时**自动把原图下载下来**（不用手点「查看原图」）。
      *
      * 判定「是否已有原图」用 `ImgInfo.t == 1`（微信自己的 `AutoGetBigImgLogic` 用的
@@ -289,6 +305,10 @@ object Prefs {
     val ALL: List<PrefSpec> = listOf(
         // 聊天域
         PrefSpec(Keys.CHAT_GROUP_ROW_ENABLED, PrefKind.SWITCH, "true", "聊天", "启用分组行"),
+        PrefSpec(
+            Keys.FORWARD_NATIVE, PrefKind.SWITCH, "false", "聊天",
+            "原生转发（带「转发」标记）—— 未真机验证，默认关；关着走降级重发"
+        ),
         PrefSpec(
             Keys.CHAT_CONV_MENU_ENABLED, PrefKind.SWITCH, "true", "聊天",
             "长按会话菜单加「加入分组」（追加在微信菜单末尾，不顶掉原生项）"
