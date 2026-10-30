@@ -439,3 +439,51 @@ h3.N 收响应 → updateWithOnConflict 按服务端值整行 upsert（sourceTyp
   `MOMENT export done rows=500 written=0 listMiss=500`（**全仓检索无此行**）。
 
 [DONE]
+
+---
+
+## 拍板结果（2026-10-30 20:40，用户逐项确认）
+
+| # | 项 | 拍板 | 落地状态 |
+|---|---|---|---|
+| P1 | `VersionGate` 8.0.72 条目 | **A（删条目）** | ✅ 已落地（R36 `r36-gate` lane，`6e2cad2`）。待真机 P1-J2 冷启验 + P1-J3 造不匹配验 |
+| P2 | `SnsAlbumMerge` 注入口径 | **③ 维持停用** | ✅ 无需改码。验 P2-J2：日志**无** `SNS-ALBUM hook h3.N installed`、**有** `SNS-ALBUMFIX hook …onGYNetEnd installed` |
+| P3 | 相册回包覆盖 | **先维持防，批 3 验完再定** | ⏳ 见下「P3 的后续判定规则」 |
+| P4 | §三 F 三项 | **确认现状 + 补真机验 + 订正文档** | F-1 维持②、F-2 维持①、F-3 已物理删除（无需拍板）。文档已订正 |
+
+### ⚠️ P2 与 P3 曾出现互相冲突的拍板，已消解 —— 记下来防止重犯
+
+用户第一次给的是 **P2=③ + P3=「改做响应注入」**。这两条**不能共存**：
+「响应注入」的实现就是 `SnsAlbumMerge`，P2 选③ 是停用它 ⇒ 字面矛盾；
+若真按 P3 走，落地时必然是「停用 A」+「启用 A」在同一份代码里打架。
+
+消解过程：把冲突摆出来后用户改选 **「先验防法再定」**。
+
+**三条硬事实（当时据此判定，后续仍适用）：**
+1. 注入前提已被源码否掉：相册是**读库渲染**（`qg3/i` 的 `d:List` 元素是 `SnsInfo` 存储实体，
+   SQL 由 `SnsInfoStorage.getUserMediaSql` 生成）⇒ 往 `h3.N` 的 `jc5.f` 塞对象对 UI 无直接增量。
+2. 6.2 已换治本路线且**已启用**：`SnsTimelineSourceFix.installAlbumTrigger`(`h3.N` after) +
+   `installAlbumSyncTrigger`(`x2.onGYNetEnd`) + `SnsGuard.kt:332-347` 写库瞬间补 bit8。
+   再开 `SnsAlbumMerge` = 同一目标的第二套写库路径，必打架。
+3. **当前无样本可验响应注入**：12 条被删动态无一可验证 6.2（verity 全 11 条 `type=2` 视频、
+   微信相册只收 `type∈{1,15}`；其余带 die 位 / `type=28` / 物理删除无行）。开了只能看出「有没有崩」。
+
+### P3 的后续判定规则（锁定「什么条件下才允许改做响应注入」）
+
+批 3 跑完这两条判据后再定：
+
+| 判据 | 通过 | 不通过 |
+|---|---|---|
+| **P3-J2** `op=snsg sub=srcfix sub2=album` 后 `SNS-ALBUMFIX` 的 `albumpatch count=` | `count > 0` ⇒ 治本路径真被走到 | `count = 0` ⇒ 补位根本没触发，需先查 hook 是否挂上（P3-J1） |
+| **P3-J4** 进好友个人相册，**刷新之后**看 | 已删动态**不再「闪一下就没」** | 现象仍在 ⇒ **此时才**考虑改做响应注入 |
+
+⇒ **两个条件同时成立（J2>0 且 J4 现象消失）⇒ P3 收口，不写响应注入。**
+⇒ 若 J2>0 但 J4 现象仍在 ⇒ 说明「写库补位」不够，**才**上响应注入；
+   届时**必须同步把 P2 从 ③ 改成 ②**（改口径 ~40 行 + 四条硬约束：只认 `T_SNS` / `attrBuf` 兜底 /
+   `badCt` 闸门 / 轮转限流），并**先停** `installAlbumTrigger` + `installAlbumSyncTrigger` 做 A/B。
+   ⛔ 不许两套同时开。
+
+> ⚠️ 判据纪律（P3-J4 是唯一与 P3 一对一的判据；`count>0` 只证补位跑了，不证覆盖被防住）：
+> J4 需要一位好友配合删一条**带图片**的动态 —— 当前样本里没有这样的数据。
+
+[DONE] 拍板结果
