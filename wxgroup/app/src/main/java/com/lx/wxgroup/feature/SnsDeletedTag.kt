@@ -88,8 +88,43 @@ object SnsDeletedTag {
 
     @Volatile private var dbWarned = false
 
-    /** 取不到时间控件时的告警计数（不去重，用于诊断「字段/方法名漂移」） */
+    /**
+     * 取不到时间控件时的告警计数（用于诊断「字段/方法名漂移」）。
+     *
+     * ## ⚠️ R37-1 起改为**按 Binding 去重**
+     * 同一个 View 会被 2 秒 sweep 反复重判（这是故意的，用来扛 `realTimeUpdate` 把纯时间原文写回），
+     * 所以一处持续失败能在几十秒内把这个数刷到几十 ⇒ 原实现的总数完全回答不了「几条动态画不上」
+     * （真机 `missedTime=43` 实际只来自 1 个错绑的 header）。
+     * 去重挂在 Binding 上而不是「View 一辈子只计一次」：View 被复用给另一条动态时 Binding 是
+     * 全新对象 ⇒ 新内容仍然会计一次，不会把真实故障也一起抹掉。
+     */
     @Volatile private var missedTime = 0
+
+    /**
+     * [missedTime] 里「判定命中、却找不到时间控件」的那部分 —— **真故障**：该画的没画上。
+     *
+     * 为什么必须和 [missedTimeRestore] 分开：这两种失败的修法完全不同。这一路涨说明
+     * 「清单/判定是对的，但 View 结构漂了」，下一轮要去看 `getPublishTimeText()` 的方法名。
+     */
+    @Volatile private var missedTimeHit = 0
+
+    /**
+     * [missedTime] 里「未命中、只是尝试还原」的那部分 —— **探索失败，不是故障**。
+     *
+     * 隔开它的理由：反过来，某一格不打标时代码照样会去找时间控件准备剥掉可能残留的标记，
+     * 找不到是**正常结果**（这格的宿主多半本来就是封面/广告卡这类没有时间行的容器）。
+     * 混在一个总数里，它会把 [missedTimeHit] 那几个真正该修的样本整个淹没。
+     */
+    @Volatile private var missedTimeRestore = 0
+
+    /**
+     * 最近一次「View ↔ 数据」对账的**细粒度**失败原因（诊断专用）。
+     *
+     * 为什么单开一个字段：[lastMiss] 会被 `nodata(...)` 这种粗粒度原因覆盖，而
+     * 「作者文本还没渲染出来」与「同作者相邻动态导致歧义」两种失败的**修法完全不同**
+     * （前者要延后重试，后者是无解的歧义），真机却只看得到一条 lastMiss ⇒ 盖掉就等于失明。
+     */
+    @Volatile private var lastRecon = ""
 
     /** 自诊断：静默失效全靠这几个数定位（binds>0 才说明钩子活着） */
     @Volatile private var binds = 0
@@ -105,6 +140,33 @@ object SnsDeletedTag {
 
     private val miscLogged = AtomicInteger(0)
     private val errLogged = AtomicInteger(0)
+
+    /** 每个 key 自己有几条日志额度（[logKeyOnce]） */
+    private const val PER_KEY_LOG_MAX = 2
+
+    /**
+     * key → 已打出条数。[logKeyOnce] 的分桶账本。
+     *
+     * ⚠️ 只存 String/Int：**不许**把 View 或 holder 塞进来当 key（进程级 Map ⇒ 条目永不回收）。
+     */
+    private val perKeyLogged = Collections.synchronizedMap(HashMap<String, Int>())
+
+    /**
+     * **按 key 分桶**的限流日志。
+     *
+     * ## 为什么要分桶（R37-1）
+     * [logOnce] 是进程级 5 条：第一次进朋友圈就被 holder pick / tv 成功 / tree dump 抢光了，
+     * 而 `miscLogged` 从来不在 Activity 切换时重置 ⇒ 同一个用户**第二次再进朋友圈**时，
+     * 换了一批 View 实例却**一条成功或失败日志都看不到**（R37 里正是这样被误导成
+     * 「只有 1 次成功、其余全失败」）。⇒ 按 key（一般取 host 类名）分桶，每桶独立额度，
+     * 第二次进 Activity 的结果仍然可见。
+     */
+    private fun logKeyOnce(key: String, msg: String, warn: Boolean = false) {
+        val n = perKeyLogged[key] ?: 0
+        if (n >= PER_KEY_LOG_MAX) return
+        perKeyLogged[key] = n + 1
+        if (warn) LogX.w(msg) else LogX.i(msg)
+    }
 
     /** 供 [SnsTag.stat] 读的「没打上标」信号：>0 说明反射取不到时间控件（字段/方法名漂移）。 */
     internal fun missedTimeCount(): Int = missedTime
@@ -150,6 +212,14 @@ object SnsDeletedTag {
         @Volatile var hint: String = ""
         /** 绑定时的 position；`-1` = 未知（[apply] 那条老链路不传 pos，不参与复用判定） */
         @Volatile var pos: Int = -1
+        /**
+         * 这一格是否已经计过一次「取不到时间控件」（[missedTime] 系列的去重开关）。
+         *
+         * ⚠️ 去重挂在 Binding 而不是「View 一辈子只计一次」：View 被复用给另一条动态时 Binding
+         *    是全新对象 ⇒ 新的那条动态仍然会计一次，不会把真实故障也一起抹掉；同一格反复 sweep
+         *    则只计一次。
+         */
+        @Volatile var missCounted = false
     }
 
     /**
@@ -371,11 +441,16 @@ object SnsDeletedTag {
         val pos = param.args?.getOrNull(1) as? Int ?: -1
         // ③ 复用失效：这个 View 若已经装了另一条动态，旧 Binding 必须先作废（见 Binding.pos）
         invalidateIfReused(view, pos)
-        val data = dataOf(holder, adapter, pos)
+        // ④ itemView 必须带进去：没有它，`adapter.data[pos]` 那条路径只能「能解析出 snsId 就采用」
+        //    ⇒ 封面 header 会被错绑成第一条动态（R37 真机 `host=FrameLayout hint='25分钟前'`）。
+        lastRecon = ""
+        val data = dataOf(holder, adapter, pos, view)
         val id = SnsDeletedTagLogic.snsIdOf(data)
         if (id == null) {
             missed++
-            lastMiss = "nodata(${holder.javaClass.simpleName})"
+            // 优先用 [reconcileAt] 记下的细粒度原因：知道是「作者文本没渲染完」还是
+            // 「同作者相邻动态歧义」，才知道该延后重试还是干脆认栽。
+            lastMiss = lastRecon.ifEmpty { "nodata(${holder.javaClass.simpleName})" }
             // ⚠️ 不在每次解析失败时都 erase：一次 bind 会触发多条 hook，其中只有
             //    部分（`c1/d1`）拿得到 item（`a1/b1` 写进 `E` 的是 bind-info）。
             //    无条件 restore 会把刚由 `c1` 打上的标记又擦掉 —— 表现为「标记闪烁/没有」。
@@ -430,6 +505,12 @@ object SnsDeletedTag {
      * ⚠️ 只补**一拍**，不做多帧轮询（滚动时堆 Runnables 会掉帧）。
      * ⚠️ 拿到的是 holder **当前**的数据：就算这两帧之间 ViewHolder 被复用了，
      *    `holder → itemView` 的对应关系不变，画上去的仍是这一格此刻的正确内容。
+     *
+     * ## R37-1：它现在还兼着「等作者文本渲染出来」的职责
+     * [reconcileAt] 的作者名对账在 TextView 还没填字时**明确判不过**（不是跳过校验）。
+     * 那一拍的合理处置就是排到下一拍重试 —— 昵称/头像在 bind 早期就 `setText`，
+     * 通常一拍之后可见文本就够了。⇒ 看到 `lastMiss=noname(...)` 且随后 `resolved` 跟上，
+     * 属正常；持续 `noname` 才说明 `ImproveInfo.name` 没有出现在子树里。
      */
     private fun retryResolve(holder: Any, adapter: Any?, pos: Int, view: View) {
         if (retryLeft <= 0) return
@@ -439,7 +520,8 @@ object SnsDeletedTag {
 
     private fun retryPaint(holder: Any, adapter: Any?, pos: Int, view: View) {
         if (!on()) return
-        val d = dataOf(holder, adapter, pos) ?: return
+        lastRecon = ""
+        val d = dataOf(holder, adapter, pos, view) ?: return
         val i = SnsDeletedTagLogic.snsIdOf(d) ?: return
         val prev = bound[view]
         val b = if (prev != null && prev.id == i && prev.pos == pos) prev else {
@@ -511,12 +593,44 @@ object SnsDeletedTag {
 
     /**
      * path step 语法（step 之间用 `;` 连）：
-     * - `@` = `adapter.data[pos]`（与 holder 字段无关的独立来源）
+     * - `@` = `adapter.data[pos]`；`@-1` / `@2` = `adapter.data[pos-1]` / `[pos+2]`
+     *   —— **带偏移的 `@` 只有在通过 View↔数据对账之后才会被生成**，见 [reconcileAt]
      * - `z` = 调 holder 的无参 getter `z()`；其余单个名字 = 读 holder 的同名字段
      * - `f:xxx` = 读上一步结果的字段 `xxx`
      * - `m:xxx` = 调上一步结果的无参方法 `xxx`
      */
-    private val dataPathCache = Collections.synchronizedMap(HashMap<String, String>())
+
+    /**
+     * 一条**经过验证**的数据来源描述（[dataPathCache] 的 value）。
+     *
+     * ## R37-1 为什么不能只存一条路径字符串
+     * 原来就是 `holder 类名 -> "路径串"`，而且**没有任何失效条件**。于是「某一格侥幸通过」
+     * 会把取数方式固化给**同 holder 类的后续所有 View**。真机后果：封面 header 上那次 `@`
+     * 被缓存下来，之后无论这一格是 header 还是普通动态，都按同一个偏移去 `adapter.data` 里取
+     * ⇒ header 与第一条动态长期错绑（指纹 `host=FrameLayout hint='25分钟前'`）。
+     * ⇒ value 必须带**证据**：用哪个偏移（编码在 path 里）+ 当时对账命中的作者名；
+     *    下次命中缓存时用同样的证据**重新对账**（[srcStillValid]），失配立刻作废重探。
+     *
+     * ⛔ 这里**不许**存 View / holder / 数据对象本体：这是个进程级长寿命 Map，value 一旦
+     *    强引用 itemView（holder 必然强引用自己的 itemView）⇒ RecyclerView 条目永不回收。
+     *    ⇒ 只存 String / Int 这类可重放的**描述**，真正的数据每次都重新从 live 对象上取。
+     *
+     * ⚠️ 保持纯数据类（不引用外层 object 的成员）：嵌套类访问外层单例的成员要走合成访问器，
+     *    编译能不能过取决于 Kotlin 版本，没必要为省一个函数冒这个风险。
+     *
+     * @property path step 路径串（语法见上面的 KDoc）
+     * @property name 对账命中候选的作者名；`""` = 这条路径不依赖 position（holder 自带的数据）
+     */
+    private class DataSrc(val path: String, val name: String)
+
+    /**
+     * holder 类 × adapter 类 → 已验证的数据来源。
+     *
+     * ⚠️ key 里带上 adapter 类：同一个 holder 类会被不同 adapter（时间线 / 个人相册 / 搜索结果）
+     *    复用，各自 `data` 的排列与 header 结构并不相同 ⇒ 只用 holder 类名做 key，会把在一个界面
+     *    上校准出来的偏移搬到另一个界面上用。
+     */
+    private val dataPathCache = Collections.synchronizedMap(HashMap<String, DataSrc>())
 
     private val probeLeft = Collections.synchronizedMap(HashMap<String, Int>())
 
@@ -543,42 +657,168 @@ object SnsDeletedTag {
      * 也永远读不到 ⇒ 真机 100% `no snsId on holder`。这里是那个 bug 的修法：
      * ① 负缓存改成**有预算的探测**；② 候选里加一条不依赖 `E` 的独立来源（`@`）。
      *
-     * @param adapter 被 hook 方法的 `thisObject`（adapter），用来走 `@` 这条独立路径。
-     * @param pos     绑定下标（`c1/d1/a1/b1` 的形参[1]，恒为 int）。
+     * @param adapter  被 hook 方法的 `thisObject`（adapter），用来走 `@` 这条独立路径。
+     * @param pos      绑定下标（`c1/d1/a1/b1` 的形参[1]，恒为 int）。
+     * @param itemView holder 当前对应的 item 根 View —— **`@` 路径的对账要用它**，没有它
+     *                  就退化成「只要 `data[pos]` 能解析出 snsId 就采用」的 R37 错绑。
      */
-    private fun dataOf(holder: Any, adapter: Any?, pos: Int): Any? {
-        val key = holder.javaClass.name
+    private fun dataOf(holder: Any, adapter: Any?, pos: Int, itemView: View): Any? {
+        val key = cacheKey(holder, adapter)
         bumpSeen(key)
-        val cached = dataPathCache[key]
-        if (cached != null) {
-            val v = walkPath(holder, adapter, pos, cached)
-            if (v != null) return v
+        val src = dataPathCache[key]
+        if (src != null) {
+            val v = walkPath(holder, adapter, pos, src.path)
+            if (v != null) {
+                // 缓存只能说明「上次这么取过并且那次对账通过」，证明不了这一格现在装的还是
+                // 那条动态 ⇒ 必须复查。少这一句，一次侥幸通过就变成永久事实（见 [DataSrc]）。
+                if (srcStillValid(src, itemView, adapter, pos)) return v
+                dataPathCache.remove(key)
+            }
         }
         if (!takeProbe(key)) {
             logDataFail(key)
             return null
         }
-        val found = probePath(holder, adapter, pos)
+        val found = probePath(holder, adapter, pos, itemView)
         if (found == null) {
             logDataFail(key)
+            // 走到这里 = 没有任何候选通过 View↔数据对账 ⇒ **绝不**回落去取未经校验的数据：
+            // 「猜一个 id 也比一个都画不上好」这个想法在本项目已经付过一次学费
+            // （见 Binding 上面那条 R31h 事故的注释）。
             return null
         }
-        dataPathCache[key] = found
-        LogX.i("SNS_DELTAG path ${holder.javaClass.simpleName} -> $found")
-        return walkPath(holder, adapter, pos, found)
+        val s = DataSrc(found.first, found.second)
+        dataPathCache[key] = s
+        LogX.i("SNS_DELTAG path ${holder.javaClass.simpleName} -> ${s.path} " +
+            "name='${SnsDeletedTagLogic.brief(s.name, 12)}'")
+        return walkPath(holder, adapter, pos, s.path)
     }
 
-    /** 全量探测：按优先级试所有候选，返回第一条能解析出 snsId 的路径 */
-    private fun probePath(holder: Any, adapter: Any?, pos: Int): String? {
+    /**
+     * [dataPathCache] 的 key：holder 类 × adapter 类（为什么必须带 adapter 类见 [dataPathCache]）。
+     */
+    private fun cacheKey(holder: Any, adapter: Any?): String =
+        "${holder.javaClass.name}|${adapter?.javaClass?.name ?: "-"}"
+
+    /**
+     * 这次命中缓存时，缓存里那份**已验证关联**还成立吗。
+     *
+     * 为什么必须每次复查：下拉刷新、插入/移除头部、时间线与个人相册混排都会改变整体偏移，
+     * 而 holder 类名不变。只把 `list.size` 塞进 key 也挡不住 —— header 与动态混排时 size
+     * 完全可能一模一样（所以这里不赌指纹，直接把当时的对账证据重算一遍）。
+     *
+     * ⚠️ 只复核**依赖 position 的**那类路径（`@…`）：holder 自带的数据（`E`/`z`/`D`…）是
+     *    同一个 holder 自己的字段，而 holder 与 itemView 天生一一对应，它不可能变成
+     *    「隔壁那一格的数据」，也没有偏移可言。
+     */
+    private fun srcStillValid(src: DataSrc, itemView: View, adapter: Any?, pos: Int): Boolean {
+        if (!src.path.startsWith("@")) return true
+        val pick = reconcileAt(adapter, pos, itemView) ?: return false
+        // ⛔ 只取**首个 step** 解偏移：path 可能是两步（`@-1;f:xxx`），整串喂给 atOffset
+        //    会解出 0，于是每次命中缓存都判失配 ⇒ remove→全量重探→又存同一条，
+        //    12 次探测预算烧光后这一屏**永远不打标**（静默失效，只有一条被节流的日志）。
+        return pick.first == atOffset(src.path.substringBefore(";")) && pick.second == src.name
+    }
+
+    /**
+     * 全量探测：按优先级试所有候选，返回第一条**通过 View↔数据对账**的路径 + 对账证据。
+     *
+     * ⛔ `@`（`adapter.data[pos]`）不是「能解析出 snsId 就采用」：它是**唯一**依赖 position 的
+     *    来源，而 RecyclerView 的 position 在有 header / 封面 / 广告卡时会整体偏移 ⇒ 必须先对账。
+     *
+     * @return `(路径, 命中候选的作者名)`；holder 自带的路径作者名留空（无需对账）。
+     */
+    private fun probePath(holder: Any, adapter: Any?, pos: Int, itemView: View): Pair<String, String>? {
         dumpFields(holder, "holder")
         for (h in arrayOf("@", "z", "E", "D")) {
+            if (h == "@") {
+                // ⛔ R37-1 的病根就在这条分支：原来只要 `adapter.data[pos]` 能解析出 snsId
+                //   就返回 `@`，于是任何装着这条数据的 View（封面 header 也算）都被当成
+                //   「这条动态」。header 没时间控件时只表现为漏画；同一偏移一旦落到普通动态，
+                //   就会把邻居的删除状态画到错误的动态上。⇒ 先过 [reconcileAt] 的位置对账。
+                val pick = reconcileAt(adapter, pos, itemView) ?: continue
+                val cand = adapterItem(adapter, pos + pick.first) ?: continue
+                dumpFields(cand, "item(@${pick.first})")
+                if (SnsDeletedTagLogic.snsIdOf(cand) != null) return "@${pick.first}" to pick.second
+                val sub = unwrap(cand) ?: continue
+                if (SnsDeletedTagLogic.snsIdOf(sub.second) != null)
+                    return "@${pick.first};${sub.first}" to pick.second
+                continue
+            }
             val v = stepOf(holder, adapter, pos, h) ?: continue
             dumpFields(v, "item($h)")
-            if (SnsDeletedTagLogic.snsIdOf(v) != null) return h
+            if (SnsDeletedTagLogic.snsIdOf(v) != null) return h to ""
             val sub = unwrap(v) ?: continue
-            if (SnsDeletedTagLogic.snsIdOf(sub.second) != null) return "$h;${sub.first}"
+            if (SnsDeletedTagLogic.snsIdOf(sub.second) != null) return "$h;${sub.first}" to ""
         }
         return null
+    }
+
+    /**
+     * `adapter.data` 这条独立来源的**位置对账**（三条原则，与 `SnsTag.resolve` 同口径）。
+     *
+     * ① **精确位置优先**：先试 `data[pos]`；② **±2 窗口**：对不上就在
+     * `pos, pos+1, pos-1, pos+2, pos-2` 里找作者名能对上 itemView **可见**文本的候选；
+     * ③ **唯一命中**：窗口里通过的个数 ≠ 1 ⇒ 返回 null（偏移猜错比不打标糟得多）。
+     *
+     * ⚠️ 作者文本为空串时 [SnsDeletedTagLogic.matchName] 判 **false**，这里因此返回 null
+     *    —— **不是**跳过校验。渲染是 suspend 的（时间/昵称都可能一拍之后才填上），
+     *     caller 侧有「延后一拍重试」（[retryResolve]）兜底，等文本填上后再判一次。
+     *
+     * @return `(已校准偏移, 命中候选的作者名)`；null = 没有唯一可信候选
+     *         （细粒度原因写进 [lastRecon]，别让 caller 用粗的 `nodata` 盖掉）。
+     */
+    private fun reconcileAt(adapter: Any?, pos: Int, itemView: View): Pair<Int, String>? {
+        val list = dataListOf(adapter) ?: return null
+        if (pos < 0 || list.isEmpty()) return null
+        val texts = visibleTexts(itemView)
+        val pick = SnsDeletedTagLogic.pickWindow(pos, list.size) { i ->
+            val cand = list[i] ?: return@pickWindow false
+            SnsDeletedTagLogic.snsIdOf(cand) != null &&
+                SnsDeletedTagLogic.matchName(SnsDeletedTagLogic.nameOf(cand), texts)
+        }
+        val idx = pick.index
+        // 诊断必须区分「0 命中」与「歧义」：前者多半是渲染还没完成（延后重试即可），
+        // 后者是同作者相邻动态导致的无解歧义（只能不打标）。混成一条就没法排障。
+        lastRecon = if (pick.hits == 0) {
+            "noname(pos=$pos/${list.size} texts=${texts.size})"
+        } else if (idx < 0) {
+            "ambig${pick.hits}(pos=$pos/${list.size})"
+        } else {
+            ""
+        }
+        if (idx < 0) return null
+        val cand = list[idx] ?: return null
+        return (idx - pos) to SnsDeletedTagLogic.nameOf(cand).orEmpty()
+    }
+
+    /**
+     * itemView 子树里的**可见非空**文本（给作者名对账用）。
+     *
+     * ⚠️ 上限 20 条 / 深度 8：作者名 TextView 常常埋在内容区之后，取太少 ⇒ 名字压根不在列表里
+     *    ⇒ 对账恒不过 ⇒ 静默地一个标签都不打（比报错难查得多）。
+     * ⚠️ 只要 `visibility != VISIBLE` 就跳过：GONE 的子树常常留着复用前的旧文本，
+     *    拿它去对账会对上**上一条动态**的作者 —— 正是本轮要防的串味。
+     *    （不用 `isShown`：绑定期 View 可能还没 attach，`isShown` 恒 false，会把正常绑定误判掉。）
+     */
+    private fun visibleTexts(root: View, max: Int = 20): List<String> {
+        val out = ArrayList<String>(max)
+        fun walk(v: View, d: Int) {
+            if (out.size >= max || d > 8) return
+            if (v is TextView) {
+                val t = runCatching { v.text?.toString() }.getOrNull()?.trim()
+                if (!t.isNullOrEmpty() && v.visibility == View.VISIBLE) out.add(t)
+            }
+            if (v is ViewGroup) {
+                val n = minOf(v.childCount, WALK_KIDS)
+                for (i in 0 until n) {
+                    val c = runCatching { v.getChildAt(i) }.getOrNull() ?: continue
+                    walk(c, d + 1)
+                }
+            }
+        }
+        runCatching { walk(root, 0) }
+        return out
     }
 
     /**
@@ -631,29 +871,45 @@ object SnsDeletedTag {
         return cur
     }
 
-    /** 单个 step：`@` = adapter.data[pos]，`z` = 无参 getter，其余 = 字段名 */
-    private fun stepOf(holder: Any, adapter: Any?, pos: Int, step: String): Any? = when {
-        step == "@" -> adapterItem(adapter, pos)
-        step == "z" -> runCatching { XposedHelpers.callMethod(holder, "z") }.getOrNull()
-        else -> runCatching { XposedHelpers.getObjectField(holder, step) }.getOrNull()
+    /**
+     * 单个 step：`@<off>` = `adapter.data[pos+off]`（`@`/`@0` = 原位），`z` = 无参 getter，其余 = 字段名。
+     *
+     * ⚠️ 偏移是这个 step 的一部分，不是别处记的派生量：这么写之后「这条数据来源用的哪个偏移」
+     * 就只能在**路径本身**里体现，缓存/日志/重放三者不可能各说一套（见 [DataSrc]）。
+     */
+    private fun stepOf(holder: Any, adapter: Any?, pos: Int, step: String): Any? {
+        if (step.startsWith("@")) return adapterItem(adapter, pos + atOffset(step))
+        if (step == "z") return runCatching { XposedHelpers.callMethod(holder, "z") }.getOrNull()
+        return runCatching { XposedHelpers.getObjectField(holder, step) }.getOrNull()
+    }
+
+    /** `@` step 里带的偏移：`@`/`@0` = 0，`@-1` = -1，`@2` = +2。解析不出来一律按原位。 */
+    private fun atOffset(step: String): Int = step.substring(1).toIntOrNull() ?: 0
+
+    /** adapter → 数据列表。字段 `data` **没被混淆**（见 [adapterItem] 的 dex 取证）。 */
+    private fun dataListOf(adapter: Any?): java.util.List<*>? {
+        val a = adapter ?: return null
+        return runCatching {
+            XposedHelpers.getObjectField(a, "data") as? java.util.List<*>
+        }.getOrNull()
     }
 
     /**
-     * 与 `m0.E` **完全无关**的独立来源：`WxRecyclerAdapter->data` 的第 pos 项。
+     * 与 `m0.E` **完全无关**的独立来源：`WxRecyclerAdapter->data` 的第 index 项。
      *
      * dex：`WxRecyclerAdapter.c1(m0,I)` 体内就是
      * `iget-object … WxRecyclerAdapter->data : Ljava/util/ArrayList;` + `ArrayList.get(I)`，
      * 这正是微信自己取 item 的方式，不受「`E` 被 `a1/b1` 临时写成 bind-info」影响。
      * 字段名 `data` **没被混淆**，比 `E`/`z` 稳。
+     *
+     * @param index **绝对**下标（调用方负责先把已校准的偏移加上去），不是 position。
      */
-    private fun adapterItem(adapter: Any?, pos: Int): Any? {
+    private fun adapterItem(adapter: Any?, index: Int): Any? {
         val a = adapter ?: return null
-        if (pos < 0) return null
-        val list = runCatching {
-            XposedHelpers.getObjectField(a, "data") as? java.util.List<*>
-        }.getOrNull() ?: return null
-        if (pos >= list.size) return null
-        return runCatching { list[pos] }.getOrNull()
+        if (index < 0) return null
+        val list = dataListOf(a) ?: return null
+        if (index >= list.size) return null
+        return runCatching { list[index] }.getOrNull()
     }
 
     private fun takeProbe(key: String): Boolean {
@@ -751,6 +1007,14 @@ object SnsDeletedTag {
      * 第 ③ 级解析（`hint` 精确比对）也永久失效。⇒ 本类有非 0 id 时**只 paint 不写 bound**
      * （差一条限流日志，真机 grep `id clash` 就能定性两条链谁对）。
      *
+     * ## R37-1：「本类还没有」时也不再无条件采纳外部 id
+     * 上面那条规则守住了「不要覆盖」，却没守住「不要新增」：本类没有 Binding 时，
+     * 任何拿进来的非 0 id 都会被登记成一条动态并排进 2 秒 sweep。封面 header 这类
+     * **不是动态**的容器一旦被登记，就每 2 秒重试一次注定失败的「找时间控件」
+     * ⇒ `missedTime` 被单个 View 刷到 43、`bound` 里躺着的却不是真动态。
+     * ⇒ 本类没有 Binding 时，先要求这个 View **结构性像一条动态**（[hasTimeControl]），
+     *    不通过就当场放弃，连 `bound` 都不写。
+     *
      * ## ⛔ 为什么**渲染**仍然用入参 `tagged`，不用本类 `deleted()`
      * 入参是 [SnsTag] 的 `del + forceSet`（SnsTag.kt:673），`snstag fake / mark` 探针
      * 设的正是**它那份** `forceSet` —— 真机「不删动态就能验渲染」走的是这条路径。
@@ -768,17 +1032,35 @@ object SnsDeletedTag {
 
         if (snsId != 0L) {
             val prev = bound[itemView]
-            // 本类解析出来的 id 优先（理由见 KDoc）：有就不覆盖，只按它渲染。
-            // 外部 id 只在「本类还没有」时才被采纳 —— 那时它没有可比对的对象，也就不存在污染。
-            val b = if (prev != null && prev.id != 0L) prev else {
-                Binding(snsId).also { bound[itemView] = it }
+            if (prev != null && prev.id != 0L) {
+                if (prev.id != snsId) {
+                    // 两条链对同一格给出不同 id：解析必有一边是错的，真机靠这条定性是谁错
+                    warnOnce("SNS_DELTAG: id clash own=" +
+                        java.lang.Long.toUnsignedString(prev.id) + " ext=" +
+                        java.lang.Long.toUnsignedString(snsId))
+                }
+                // ⚠️ 渲染必须用入参 tagged：那是 SnsTag 的 del + forceSet，`snstag fake` 靠它验渲染
+                paint(itemView, prev, tagged)
+                return
             }
-            if (prev != null && prev.id != 0L && prev.id != snsId) {
-                // 两条链对同一格给出不同 id：解析必有一边是错的，真机靠这条定性是谁错
-                warnOnce("SNS_DELTAG: id clash own=" +
-                    java.lang.Long.toUnsignedString(prev.id) + " ext=" +
-                    java.lang.Long.toUnsignedString(snsId))
+            // ⛔ R37-1：外部 id 不再是「无条件写一份 Binding」。
+            //   原来只要拿到非 0 id 就 `Binding(snsId)` 写进 bound，于是连封面 header 这种
+            //   **根本不是动态**的 View 也被当成一条动态登记下来，并且被 2 秒 sweep 反复重判
+            //   —— 它上面根本没有时间控件，每一次重判都必然 miss（真机 `missedTime=43`
+            //   就这样只由 1 个 View 刷出来）。而真正被 fake 的那条动态反而没有 Binding 可用。
+            //   ⇒ 先过结构性闸门 [hasTimeControl]：连时间控件都没有的宿主，这辈子也画不上标记，
+            //   登记它只会污染 bound 和 miss 计数，不如当场放弃。
+            if (!hasTimeControl(itemView)) {
+                lastMiss = "nodynamic(${itemView.javaClass.simpleName})"
+                logKeyOnce("nodynamic:${itemView.javaClass.name}",
+                    "SNS_DELTAG: skip non-timeline host=${itemView.javaClass.name}", warn = true)
+                return
             }
+            val b = Binding(snsId).also { bound[itemView] = it }
+            // 必须注册 sweep：`ImproveTimelineItemMeasure.d()`（realTimeUpdate）会周期性地把
+            // 纯时间原文写回控件（本文件 sweep 的 KDoc 已记），只画一次会被微信自己冲掉；
+            // 补上这一层之后，被 forced 的那条动态才能在 30 秒 force TTL 内稳定看到标记。
+            ensureSweep()
             // ⚠️ 渲染必须用入参 tagged：那是 SnsTag 的 del + forceSet，`snstag fake` 靠它验渲染
             paint(itemView, b, tagged)
             return
@@ -815,11 +1097,7 @@ object SnsDeletedTag {
         dumpTree(host)
         val tv = timeTextOf(host, b)
         if (tv == null) {
-            val n = ++missedTime
-            // 限流：这是主线程热路径，LogX 同步写盘，只能留前几条
-            if (n <= 5) {
-                LogX.w("SNS_DELTAG: no time TextView snsId=${b.id} host=${host.javaClass.name} hint='${b.hint}'")
-            }
+            noteMissTime(host, b, hit)
             return
         }
         val cur = tv.text?.toString() ?: ""
@@ -835,6 +1113,36 @@ object SnsDeletedTag {
             // 只有这里才叫「画上了」：上面那一句才是真正改了界面的地方
             if (hit) painted++
         }
+    }
+
+    /**
+     * 「取不到时间控件」的计数 + 告警（R37-1 重写）。
+     *
+     * ## 为什么拆成 [missedTimeHit] / [missedTimeRestore] 两路
+     * 原来共用 `missedTime` 一个总数，而 `paint()` 对 `hit=false` 的格子也会去找时间控件
+     * （为了剥掉可能残留的标记）⇒ 封面 header 那种没有时间行的容器每 2 秒 sweep 一次就加一，
+     * 一个 View 就能把总数刷到 43，完全没法反推「几条动态画不上」。
+     * ⇒ 命中却画不上（= 真故障，看 View 结构漂移）与非命中时的还原探索（= 正常结果）彻底分开。
+     *
+     * ## 为什么按 Binding（一格的一次绑定）去重
+     * 同一个 View 被 2 秒 sweep 反复重判是**设计如此**（扛 realTimeUpdate 写回），不加去重
+     * 的计数永远在涨，看不出「是 1 个 View 在反复 miss 还是 43 条动态都没画上」。
+     * ⚠️ 去重挂在 Binding 而不是「这个 View 一辈子只计一次」：View 被复用给另一条动态时
+     *    Binding 是全新对象 ⇒ 新内容照会计一次，不会把真实故障也一起抹掉。
+     *
+     * ## 为什么日志按 host 类名分桶
+     * 原来是 `n <= 5` 的全局额度：第一个 View 就把 5 条吃光，之后再有**别的结构**的 View
+     * 失败，一行都看不到 ⇒ 排障的人只能看到「最先失败的那个」，且第二次进朋友圈依然如此。
+     */
+    private fun noteMissTime(host: View, b: Binding, hit: Boolean) {
+        if (b.missCounted) return
+        b.missCounted = true
+        missedTime++
+        if (hit) missedTimeHit++ else missedTimeRestore++
+        logKeyOnce("notv:${host.javaClass.name}",
+            "SNS_DELTAG: no time TextView ${if (hit) "HIT" else "restore"} " +
+                "snsId=${java.lang.Long.toUnsignedString(b.id)} " +
+                "host=${host.javaClass.name} hint='${b.hint}'", warn = true)
     }
 
     /** 只做还原（剥掉可能残留的标记），不判定 */
@@ -928,6 +1236,37 @@ object SnsDeletedTag {
         return hit.first
     }
 
+    /**
+     * 这个 View 是不是**真动态**的 item 根（结构性闸门）。
+     *
+     * 判据：子树（含整条父类链）里有没有声明 `getPublishTimeText()` —— 与 [timeTextOf] ② 级
+     * 同源，差别是这里**不调用** getter，只看类有没有这个方法（结果按类名负缓存，几乎零成本）。
+     *
+     * ## 为什么用它当「是不是动态」的闸门
+     * R37-1 要的是「forced id 必须落到真实动态上」。外部那条老链只会给一个 id 和一个 View，
+     * 没有 pos / adapter 可供对账，唯一能当场验的就是**结构**：真动态根（`u3/g2/i3/…` 那一族）
+     * 的父类链到第 9 层就是声明 `getPublishTimeText()` 的 `Llh3/l1`；封面 header 是裸
+     * `FrameLayout`、广告卡/分割线也没有 ⇒ 一律拦下。
+     * 而且这个判据同时保证了「拦下的 host 本来也画不上」：没有时间控件 ⇒ 不可能打到界面上。
+     *
+     * ⛔ 别在这儿放宽 ④ 级 `isTimeLike` 兜底去迁就空文本：那会把视频时长徽章 `00:15`
+     *    当成时间行 ⇒ 标记打到错误的控件上（比不打标糟得多）。空文本由 [timeTextOf] ② 级
+     *    照常处理 —— getter 返回的是对象，文本是不是空不影响它。
+     */
+    private fun hasTimeControl(host: View): Boolean = walkForTimeHolder(host, 0) != null
+
+    private fun walkForTimeHolder(v: View, depth: Int): View? {
+        if (publishTimeMethod(v.javaClass) != null) return v
+        if (depth >= WALK_MAX || v !is ViewGroup) return null
+        val n = minOf(v.childCount, WALK_KIDS)
+        for (i in 0 until n) {
+            val c = runCatching { v.getChildAt(i) }.getOrNull() ?: continue
+            val t = walkForTimeHolder(c, depth + 1)
+            if (t != null) return t
+        }
+        return null
+    }
+
     /** ④ 级的级别号：[timeTextOf] 用它决定是否允许把结果缓存进 [Binding.tvId] */
     private const val TIME_LEVEL_FALLBACK = 4
 
@@ -956,11 +1295,14 @@ object SnsDeletedTag {
         if (m != null) {
             val t = runCatching { m.invoke(v) as? TextView }.getOrNull()
             if (t != null) {
-                logOnce("SNS_DELTAG tv host=${v.javaClass.simpleName} " +
+                // 按 host 类名分桶而不是用全局 [logOnce]：否则第二次进朋友圈时，同类 View 的成功
+                // 日志会静默消失，看上去就像「成功只有一次」（R37 就是这样被误导的）。
+                logKeyOnce("tv:${v.javaClass.name}", "SNS_DELTAG tv host=${v.javaClass.simpleName} " +
                     "cls=${t.javaClass.simpleName} id=${Integer.toHexString(t.id)} depth=$depth")
                 return t
             }
-            logOnce("SNS_DELTAG: getPublishTimeText() returned null on ${v.javaClass.name}")
+            logKeyOnce("tvnull:${v.javaClass.name}",
+                "SNS_DELTAG: getPublishTimeText() returned null on ${v.javaClass.name}", warn = true)
         }
         if (depth >= WALK_MAX || v !is ViewGroup) return null
         val n = minOf(v.childCount, WALK_KIDS)
@@ -1245,7 +1587,13 @@ object SnsDeletedTag {
      * ③ `resolved≈snsBinds` —— 解析通吗（差得多就看 lastMiss）
      * ④ `painted>0` —— **这才算画上了**（判定命中 + 真的 setText 了）
      * ⑤ `hits>0 但 painted=0` —— 清单/符号是对的，但没落到界面上 ⇒ 立刻看 `missedTime`
-     * ⑥ `missedTime>0` —— 反射取不到时间控件（字段/方法名漂移）
+     * ⑥ `missedTime>0` —— 反射取不到时间控件（字段/方法名漂移）。
+     *    R37-1 起这个数**按 Binding 去重**（同一个 View 反复 sweep 只计一次），并拆成后面
+     *    三个附加字段。`missedTime` 这个名字与位置都保留（真机验收文档已引用），只加不删：
+     *    - `mtHit` —— **命中却找不到时间控件**（真故障：该画的没画上，最该盯的就是它）；
+     *    - `mtRestore` —— 未命中、仅尝试还原时找不到控件（多为封面/广告卡，属正常探索失败）；
+     *    - `lastRecon` —— 最近一次 View↔数据对账的细粒度原因（`noname` = 作者文本还没渲染
+     *      出来、等下一拍重试即可；`ambig<N>` = 同作者相邻动态导致歧义，只能不打标）。
      *
      * ⚠️ ④ 为什么改成 `painted`：`hits` 在取时间控件**之前**就自增了（`paint` 第一行），
      * 取不到控件时它照样涨 ⇒ 「`hits` 从 0 变 1 ⇒ 界面上出现了标记」这个判据站不住，
@@ -1256,7 +1604,8 @@ object SnsDeletedTag {
         "bound=${synchronized(bound) { bound.size }} hooks=$hooks " +
         "binds=$binds sns=$snsBinds resolved=$resolved missed=$missed " +
         "hits=$hits painted=$painted missedTime=$missedTime tv=$tvCached " +
-        "paths=${dataPathCache.size} lastMiss=$lastMiss"
+        "paths=${dataPathCache.size} lastMiss=$lastMiss " +
+        "mtHit=$missedTimeHit mtRestore=$missedTimeRestore lastRecon=$lastRecon"
 
     /** 已记住时间 TextView 资源 id 的 item 数：`0` 且 `missedTime>0` ⇒ 三级解析全挂 */
     private val tvCached: Int

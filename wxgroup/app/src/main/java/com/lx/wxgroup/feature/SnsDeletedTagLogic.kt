@@ -107,6 +107,108 @@ object SnsDeletedTagLogic {
     }
 
     /**
+     * `ImproveInfo(name=…, snsID='…', …)` 里的**作者名**。
+     *
+     * R37-1 新加：`adapter.data[pos]` 这条取数路径要做「View ↔ 数据」对账，而对账唯一可用的
+     * 锚就是作者昵称。时间文本不能当锚：渲染是 suspend 的（`Llh3/j0->g(...)` 全带
+     * Continuation），绑定回调那一刻时间行通常还是空串（R37 根因里 `missedTime` 涨到 43
+     * 就是从这儿来的）。
+     *
+     * ## ⛔ `[^A-Za-z]name` 那个前缀为什么不能省
+     * 省掉前缀的话 `nickname=…` / `displayname=…` 这类**另一个字段**会抢先命中（它们同样
+     * 以 `name=` 结尾），拿去跟界面文本比对的结果就不再代表 ImproveInfo.name ⇒ 对账判据失真。
+     * 失真方向是随机的：既可能恒不命中（一个标签都不打），也可能恒命中（相邻动态全过）。
+     *
+     * ## 为什么不直接调 `SnsTagLogic.nameOk`
+     * 那条 lane 正在改 `SnsTag.kt`（本轮只允许改两个文件），跨文件复用会把两条 lane 的改动
+     * 锁死在同一个提交上。⇒ 这里写**等价实现**，判据理由逐条写在上一段里，改之前先看它，
+     * 别把 [matchName] 当成可以随手放宽的相似度判断。
+     */
+    private val NAME_RE = Regex("""[^A-Za-z]name\s*=\s*'?([^,'\n]{1,32})""")
+
+    /**
+     * 任意对象 → 作者名（`toString()` 里的 `name=`）。取不到返回 `null`（调用方按「不可利用」处理）。
+     */
+    fun nameOf(obj: Any?): String? {
+        if (obj == null) return null
+        val s = runCatching { obj.toString() }.getOrNull() ?: return null
+        return NAME_RE.find(s)?.groupValues?.get(1)?.trim()?.takeIf { it.isNotEmpty() }
+    }
+
+    /**
+     * 候选数据的作者名 ↔ itemView 子树里的可见文本，能不能对上（`SnsTagLogic.nameOk` 的等价实现）。
+     *
+     * ## 为什么是**双向包含**而不是相等
+     * 微信对昵称做过加工：界面上可能是 `陈健峰` 而 `ImproveInfo.name` 是 `贸易商陈健峰`
+     * （也可能因 ellipsize 被截断）。单向 `contains` 必有一边恒不成立 ⇒ 两个方向都要试。
+     * 反向只在**文本够长**时才算：`t.length >= 3 && n.contains(t)` —— 否则一两个字的碎片
+     * 会让**任何**候选都能通过 ⇒ 等于没有校验（这正是 R37 要防的形态）。
+     *
+     * ## ⚠️ 可见文本为空 ⇒ 返回 **false**（不通过），不许退化成「没文本就算过」
+     * 绑定回调那一刻子树里的 TextView 可能一个字都还没填（binding 提前、渲染在后）。
+     * 若退化成「文本为空就跳过校验」，绑定当拍恰好全空 ⇒ 校验被整体绕开 ⇒ 又回到 R37
+     * 的 header 错绑，而且这一次连日志都看不到。⇒ 明确判不过，由调用方延后一拍重试，
+     * 等作者名真正填进 TextView 之后再判。
+     *
+     * @param candName    候选数据的作者名（[nameOf]）；`null` / 短于 2 字 ⇒ 一律不采信。
+     * @param visibleTexts itemView 子树里**非空且可见**的 TextView 文本。
+     */
+    fun matchName(candName: String?, visibleTexts: List<String>): Boolean {
+        val n = candName ?: return false
+        if (n.length < 2) return false
+        if (visibleTexts.isEmpty()) return false
+        // ⛔ 正向判定必须有**长度上界**：visibleTexts 收的是子树里所有可见 TextView 文本，
+        //    不区分角色 —— 正文、转发来源、点赞文案都在里面。没有上界时「正文里恰好提到
+        //    邻居的名字」就会让邻居的候选命中；若正确候选因**备注名**（界面显示「李总」、
+        //    ImproveInfo.name 仍是「李四」）而恒不命中，邻居就成了唯一命中 ⇒
+        //    这一格绑上邻居的 snsId ⇒ 邻居有被删动态时，**这条动态被打错标签**（R31h 同款）。
+        //    作者昵称 TextView 不会很长，正文会 ⇒ 用上界把长正文排除在对账语料外。
+        val maxLen = maxOf(n.length + 8, NAME_TEXT_MAX)
+        return visibleTexts.any { t ->
+            t.length >= 2 && t.length <= maxLen &&
+                (t.contains(n) || (t.length >= 3 && n.contains(t)))
+        }
+    }
+
+    /**
+     * ±2 窗口的挑选结果。
+     *
+     * @property index 唯一命中候选的**绝对下标**；`-1` = 没有唯一命中（0 个或 ≥2 个）。
+     * @property hits  窗口内通过校验的个数，纯给诊断用：`0` = 作者名对不上（或文本还没渲染出来），
+     *                  `≥2` = 同作者的相邻动态互相也能对上 ⇒ 这两种情况的修法完全不同。
+     */
+    data class WindowPick(val index: Int, val hits: Int)
+
+    /**
+     * 在 `pos, pos+1, pos-1, pos+2, pos-2` 里找**唯一**通过 [ok] 的下标。
+     *
+     * ## 为什么必须「唯一命中」而不是「第一个命中」
+     * [matchName] 是双向包含：**同一作者**的相邻动态互相都能通过校验。取第一个命中会把邻居的
+     * snsId 用在这一格上 ⇒ 把相邻条目的删除状态画到错误的动态上（R31h 事故同款，也是本轮
+     * 修 P0 #1 真正要挡的形态）。宁可 `hits != 1` 返回 `-1` 让这一格不打标。
+     *
+     * ## 为什么窗口只有 ±2 而不是更大
+     * header / footer 造成的整体偏移实测在 1 以内；窗口放大会让「多个候选同时通过」的概率上升，
+     * 反倒把可用结果变少。「宁可不打标」本来就是本文件各处判据统一的取舍。
+     *
+     * @param size 数据列表长度；越界下标自动跳过。
+     * @param ok   下标 → 该候选是否合格（「解析得出 snsId **且** 作者名对账通过」）。
+     *             ⚠️ lambda 里**不许有副作用**：窗口内每个下标都会被调用一次。
+     */
+    fun pickWindow(pos: Int, size: Int, ok: (Int) -> Boolean): WindowPick {
+        var found = -1
+        var n = 0
+        for (d in intArrayOf(0, 1, -1, 2, -2)) {
+            val i = pos + d
+            if (i < 0 || i >= size) continue
+            if (!ok(i)) continue
+            n++
+            if (n == 1) found = i
+        }
+        return WindowPick(if (n == 1) found else -1, n)
+    }
+
+    /**
      * 形状校验：必须是**纯数字**（允许负号）。这是最后一道防线 —— 取错字段时几乎
      * 不可能同时满足这个形状，「打错标签」（比不打标签糟糕得多）就基本不会发生。
      */
@@ -173,6 +275,16 @@ object SnsDeletedTagLogic {
 
     /** ④ 级的长度闸门：朋友圈时间行不会比这更长，超了必是正文/昵称这类自由文本 */
     private const val TIME_LIKE_MAX = 20
+
+    /**
+     * [matchName] 正向判定的**文本长度上界兜底值**。
+     *
+     * 为什么需要兜底而不是只用 `n.length + 8`：`name` 只有 2~3 字时 `n.length + 8` 太紧，
+     * 「界面显示名比 name 长一截」（如「来自深圳的陈健峰」）会被误排除。
+     * ⚠️ 这个值只挡「长正文」，不挡「长昵称」—— 真微信昵称基本都在 16 字内。
+     * 调参依据：真机 `lastRecon` 的 `texts=` 里若大量出现 `ambig2`，说明上界偏紧而非偏松。
+     */
+    private const val NAME_TEXT_MAX = 16
 
     /**
      * 这个文案长得像不像「发布时间」。
