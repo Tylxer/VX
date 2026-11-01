@@ -290,7 +290,8 @@ Robolectric，`View`/`Class` 链拿不到真实 Android 运行时。这就是 §
 | `seen` vs `cap` | 定性 | 动作 |
 |---|---|---|
 | `seen >= cap`（如 `seen=48 cap=48`） | **采样被截断**：作者行排在采样窗口之后 | 抬 `SnsDeletedTag.VIS_TEXT_MAX`；⛔ **不许**改 `AUTHOR_VIEW_CLS` |
-| `seen < cap` 且 `cls=` 没出现 `AsyncTextView` | **类名漂了** | 把 `cls=` 里的类名抄进 `AUTHOR_VIEW_CLS` |
+| `seen < cap` **且 `cls` 只含基类**（`TextView` / `View`）| **这个条目本来就没有作者行**（封面/特殊卡片/提示条）—— R37-6 真机实测：`noauthor(pos=0/20 seen=4 cap=48 cls=[TextView])` | ⛔ **不许**动 `AUTHOR_VIEW_CLS`：抄基类会让**全应用所有 TextView** 都成为作者行 ⇒ 打错标签。不打标就是正确行为 |
+| `seen < cap` 且 `cls=` 没出现 `AsyncTextView`，**且不是只含基类** | **类名漂了** | 把 `cls=` 里的类名抄进 `AUTHOR_VIEW_CLS` |
 | `cls=` 里**有** `AsyncTextView` | 不该发生（`rows` 必 >0） | 去查 `SNS_DELTAG bind err`（`SnsDeletedTag.kt:441`）有没有吐异常 |
 
   补充取证：`adb logcat -d | grep "SNS_DELTAG tree"`（`SnsDeletedTag.kt:1520` 的一次性
