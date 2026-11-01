@@ -736,128 +736,380 @@ class SnsDeletedTagLogicTest {
         assertEquals("前面有空格就正常了", "李四", SnsDeletedTagLogic.nameOf(" name=李四"))
     }
 
-    // ========================================================= matchName（R37-1C）
+    // ============================================ 作者行锚定（R37-2）· isAuthorRowClass
 
     /**
-     * `matchName` 是「候选数据 ↔ itemView 子树可见文本」的**唯一**校验闸门。
+     * R37-2 新增的一层判据：作者昵称 TextView 是**按类名**认出来的
+     * （真机 depth=9 dump：作者名 `AsyncTextView`、正文与时间行 `ImproveTextView`），
+     * 不再是「拿子树所有可见文本、靠长度猜哪个是昵称」。
      *
-     * 本轮（R37-1）给它加了**正向判定的长度上界**。为什么必须有：
-     * `visibleTexts` 收的是子树里**所有**可见 TextView 的文本，不区分角色 —— 正文、转发来源、
-     * 点赞文案都在里面。没有上界时「正文里恰好提到邻居的名字」就会让邻居的候选命中；
-     * 若正确候选因**备注名**恒不命中，邻居就成了唯一命中 ⇒ 这一格绑上邻居的 snsId ⇒
-     * **这条动态被打错标签**（R31h 同款）。作者昵称 TextView 不会很长，正文会 ⇒ 用上界把
-     * 长正文排除在对账语料外。
+     * ## 为什么必须换判据
+     * [SnsDeletedTagLogic.matchName] 的长度上界（`NAME_TEXT_MAX = 16`）只能挡住 **>16 字**
+     * 的长正文，**9~16 字短正文照样命中**：`matchName("李四", ["今天和李四一起吃饭"])` 实测 true。
+     * 于是「正文里提到邻居的名字」会让**邻居**候选通过校验；当正确候选因**备注名**恒不命中时，
+     * 邻居就成了窗口内唯一命中 ⇒ 这一格绑上邻居的 snsId ⇒ **这条动态被打错标签**（用户看得见）。
+     *
+     * ## 为什么这里全是纯函数
+     * View 侧（`collectVisTexts`）在真机上跑，JVM 里没有 Robolectric 可用 ⇒ 判据必须下沉到
+     * 本文件：View 侧只做「可见 TextView + 类名链」的**哑采集**，角色判定全在这里。
      */
+
+    private val AUTHOR_CHAIN = listOf("AsyncTextView", "TextView", "View")
+    private val BODY_CHAIN = listOf("ImproveTextView", "TextView", "View")
+
+    private fun vt(text: String, cls: List<String>) = SnsDeletedTagLogic.VisText(text, cls)
 
     /**
-     * ⭐ 本轮修的核心形态：正文里提到候选名字。
-     * 23 字 > 上界 16 ⇒ 必须 false。放行的话，邻居的 snsId 会被绑到这条动态上 ⇒ **画错**。
+     * 「认出了作者行、文本也已渲染」的语料（正常情况）。
+     *
+     * `seen` 取 `texts.size` 表示「全采到了，没被截断」—— 与 View 侧
+     * （`collectVisTexts` 采满 48 条就停）传上来的真值是同一套语义：
+     * **`seen` 永远 ≥ [items] 的大小**，相等就是没截断。
+     */
+    private fun author(vararg texts: String) = SnsDeletedTagLogic.AuthorCorpus(
+        texts.filter { it.isNotEmpty() }, texts.size, setOf("AsyncTextView"), texts.size,
+    )
+
+    /** 「一个作者行都没认出」的语料（类名漂移时的形态：`seen` 小于 View 侧上限） */
+    private fun noAuthor() = SnsDeletedTagLogic.AuthorCorpus(
+        emptyList(), 0, setOf("ImproveTextView"), 2,
+    )
+
+    /** 「一个作者行都没认出」的另一种成因：**采样被截断**（`seen >= cap`，作者行压根没走到） */
+    private fun truncated(cap: Int = 48) = SnsDeletedTagLogic.AuthorCorpus(
+        emptyList(), 0, setOf("ImproveTextView"), cap,
+    )
+
+    @Test
+    fun `作者行类名：命中`() {
+        assertTrue(
+            "真机 dump 里作者名就是 AsyncTextView（正文是 ImproveTextView）",
+            SnsDeletedTagLogic.isAuthorRowClass(AUTHOR_CHAIN),
+        )
+    }
+
+    @Test
+    fun `子类也算作者行：链上有这一层就命中`() {
+        assertTrue(
+            "微信常用子类承载不同位置的文本，子类名可能是混淆名 ⇒ 必须比整条父类链",
+            SnsDeletedTagLogic.isAuthorRowClass(listOf("ki4.a", "AsyncTextView", "TextView")),
+        )
+    }
+
+    @Test
+    fun `正文类与普通 TextView：不命中`() {
+        assertFalse(
+            "ImproveTextView 是正文/时间行，不能进作者语料",
+            SnsDeletedTagLogic.isAuthorRowClass(BODY_CHAIN),
+        )
+        assertFalse(SnsDeletedTagLogic.isAuthorRowClass(listOf("TextView", "View")))
+        assertFalse("AppCompatTextView 也不是作者行", SnsDeletedTagLogic.isAuthorRowClass(listOf("AppCompatTextView", "TextView")))
+    }
+
+    @Test
+    fun `空链：不命中`() {
+        assertFalse("判不出就是判不出，不许退化成默认通过", SnsDeletedTagLogic.isAuthorRowClass(emptyList()))
+    }
+
+    /**
+     * ⛔ 严格相等，不许放宽成 `contains` / 前缀匹配。
+     * 放宽会把 `AsyncTextView2` / `XxxAsyncTextViewWrapper` 这类**另一个控件**也当成作者行
+     * ⇒ 语料重新被污染 ⇒ 本轮修的洞又回来了。
      */
     @Test
-    fun `长正文提到候选名字：被长度上界挡掉`() {
+    fun `相似但不同的类名：一律不命中（不许放宽成 contains）`() {
+        for (n in listOf("AsyncTextView2", "AsyncTextViewWrapper", "asyncTextView", "AsyncText", "MyAsync")) {
+            assertFalse(
+                "「$n」不是作者行控件；放宽成 contains 会被误收 ⇒ 正文又混进语料",
+                SnsDeletedTagLogic.isAuthorRowClass(listOf(n, "TextView")),
+            )
+        }
+    }
+
+    // ============================================== 作者行锚定（R37-2）· authorCorpusOf
+
+    @Test
+    fun `作者行与正文混排：语料里只剩作者行`() {
+        val c = SnsDeletedTagLogic.authorCorpusOf(
+            listOf(
+                vt("10分钟前", BODY_CHAIN),
+                vt("今天和李四一起吃饭", BODY_CHAIN),
+                vt("王贝拉", AUTHOR_CHAIN),
+            ),
+        )
+        assertEquals("正文与时间行都不是作者行 ⇒ 不得进语料", listOf("王贝拉"), c.texts)
+        assertEquals(1, c.rows)
+        assertEquals(
+            "类名集合是诊断用的，两类都要记（漂了一眼看得出来）",
+            setOf("ImproveTextView", "AsyncTextView"), c.classes,
+        )
+    }
+
+    /**
+     * ⭐ 区分「还没渲染」与「类名漂了」的关键：文本为空的作者行**仍然算一行**。
+     * 少这一条，`rows` 与 `texts` 同时为 0，真机就只能看到一个笼统的「对账不过」，
+     * 分不清该「等一拍重试」还是该「改类名常量」。
+     */
+    @Test
+    fun `作者行文本为空：rows 仍为 1 但 texts 为空`() {
+        val c = SnsDeletedTagLogic.authorCorpusOf(listOf(vt("", AUTHOR_CHAIN)))
+        assertEquals("作者行控件在，只是还没填字 ⇒ rows 必须仍为 1", 1, c.rows)
+        assertTrue("文本为空 ⇒ 不进语料（由 matchName 判不过）", c.texts.isEmpty())
+    }
+
+    /**
+     * ⛔ 降级形态：一个作者行都没认出。语料**必须为空** —— 不许退回「子树全文 + 长度上界」，
+     * 那等于把 9~16 字短正文又放回语料，本轮修的洞原样留着。
+     */
+    @Test
+    fun `一个作者行都没有：rows 为 0 且语料为空，不许退回全文`() {
+        val c = SnsDeletedTagLogic.authorCorpusOf(
+            listOf(vt("李四", BODY_CHAIN), vt("10分钟前", BODY_CHAIN)),
+        )
+        assertEquals(0, c.rows)
+        assertTrue("认不出作者行 ⇒ 语料为空（降级成全文就是把洞留着）", c.texts.isEmpty())
+        assertEquals("类名照记：真机靠它看出该改成哪个类名", setOf("ImproveTextView"), c.classes)
+    }
+
+    @Test
+    fun `多个作者行：都进语料`() {
+        val c = SnsDeletedTagLogic.authorCorpusOf(listOf(vt("王贝拉", AUTHOR_CHAIN), vt("李四", AUTHOR_CHAIN)))
+        assertEquals(2, c.rows)
+        assertEquals(listOf("王贝拉", "李四"), c.texts)
+    }
+
+    @Test
+    fun `空输入：rows 为 0 且类名集合为空`() {
+        val c = SnsDeletedTagLogic.authorCorpusOf(emptyList())
+        assertEquals(0, c.rows)
+        assertTrue(c.texts.isEmpty())
+        assertTrue(c.classes.isEmpty())
+    }
+
+    @Test
+    fun `classes 只记自己那一层的类名且去重`() {
+        val c = SnsDeletedTagLogic.authorCorpusOf(
+            listOf(vt("a", AUTHOR_CHAIN), vt("b", AUTHOR_CHAIN), vt("c", BODY_CHAIN)),
+        )
+        assertEquals("同一个类名出现两次只记一次", setOf("AsyncTextView", "ImproveTextView"), c.classes)
+    }
+
+    // ------------------------------------------------ seen：`rows == 0` 的两种成因靠它分
+
+    /**
+     * ⭐ `rows == 0` 有两个成因，真机上的处置完全不同：
+     *   - **类名漂了**：`seen < cap`，作者行走到了、只是认不出 ⇒ 照抄 `cls=` 改类名常量；
+     *   - **采样被截断**：`seen >= cap`，作者行排在 View 侧上限之后、压根没被遍历到
+     *     ⇒ 抬 `VIS_TEXT_MAX`，⛔ **不许**照抄 `cls=` —— 截断时 `cls=` 里是先遇到的一批类名
+     *     （大概率是正文的 `ImproveTextView`），抄进 `AUTHOR_VIEW_CLS` ⇒ 正文重新成为语料
+     *     ⇒ 9~16 字短正文提到邻居名字 ⇒ **打错标签**（比不打标糟得多）。
+     *
+     * ⇒ `seen` 必须能从 View 侧一路传到 `AuthorCorpus`，中间不许被默认值吞掉。
+     */
+    @Test
+    fun `seen 由 View 侧带出：不传时等于采样条数，传了就用真值`() {
+        val items = listOf(vt("李四", BODY_CHAIN), vt("王贝拉", AUTHOR_CHAIN))
+        // 不传 ⇒ 退化成「没截断」的语义
+        assertEquals("默认 seen = 采样条数（表示全采到了）", 2, SnsDeletedTagLogic.authorCorpusOf(items).seen)
+        // View 侧传真值 ⇒ 必须原样带出，哪怕远大于 items.size（那是被截断的形态）
+        assertEquals(
+            "View 侧采满 48 条但子树里有 137 个可见 TextView ⇒ seen 必须是 137",
+            137, SnsDeletedTagLogic.authorCorpusOf(items, 137).seen,
+        )
+        assertEquals(
+            "语料本身与 seen 无关：seen 只是诊断字段",
+            listOf("王贝拉"), SnsDeletedTagLogic.authorCorpusOf(items, 137).texts,
+        )
+        assertEquals(1, SnsDeletedTagLogic.authorCorpusOf(items, 137).rows)
+    }
+
+    @Test
+    fun `seen 与 rows 互不干扰：认出作者行时 rows 照常被 seen 之外的值带着`() {
+        val c = SnsDeletedTagLogic.authorCorpusOf(listOf(vt("王贝拉", AUTHOR_CHAIN)), 48)
+        assertEquals(1, c.rows)
+        assertEquals("rows>0 时 seen 照样是 48 ⇒ 两个字段各记各的", 48, c.seen)
+    }
+
+    /** 截断形态的语料：`rows=0` + `seen >= cap` —— 这时 `cls=` 里的类名**没有证据力** */
+    @Test
+    fun `采样被截断：rows 为 0 且 seen 达到上限`() {
+        val c = truncated()
+        assertEquals(0, c.rows)
+        assertTrue(c.seen >= 48)
+        assertFalse(
+            "截断时 cls 里只有先遇到的一批类名（正文类）⇒ 不许当成作者类名去改常量",
+            c.classes.any { it == SnsDeletedTagLogic.AUTHOR_VIEW_CLS },
+        )
+    }
+
+    /** 反例：同样是 `rows=0`，但 `seen` 远小于上限 ⇒ 这才是「类名漂了」的形态 */
+    @Test
+    fun `类名漂移：rows 为 0 且 seen 远小于上限`() {
+        val c = noAuthor()
+        assertEquals(0, c.rows)
+        assertTrue("seen 没打满 ⇒ 作者行走到了，只是认不出 ⇒ 这时才能照抄 cls", c.seen < 48)
+    }
+
+    // ================================================== matchName（R37-1C / R37-2 重写）
+
+    /**
+     * `matchName` 是「候选数据 ↔ itemView」的**唯一**校验闸门。
+     *
+     * R37-2 起它的入参不再是「子树所有可见文本」，而是**按类名限定的作者行语料**
+     * （[SnsDeletedTagLogic.AuthorCorpus]）：正文/转发来源/点赞文案根本不会传进来
+     * ⇒ 「正文里提到邻居名字」这条打错标签的路径被**从语料层面**堵死，
+     * 而不是靠长度上界去猜（上界挡不住 9~16 字的短正文）。
+     */
+
+    /** ⭐ 本轮要堵的洞：**正文**里提到候选名字 —— 它压根不该出现在语料里 */
+    @Test
+    fun `短正文提到候选名字：正文不进语料，判不过`() {
+        val items = listOf(vt("今天和李四一起吃饭", BODY_CHAIN), vt("李总", AUTHOR_CHAIN))
+        val c = SnsDeletedTagLogic.authorCorpusOf(items)
+        assertFalse(
+            "10 字正文提到「李四」不再命中（R37-1 的长度上界挡不住它，靠类名限定挡）",
+            SnsDeletedTagLogic.matchName("李四", c),
+        )
+        assertTrue("作者行「李总」本身要照常命中", SnsDeletedTagLogic.matchName("李总", c))
+    }
+
+    /**
+     * 反证（说明上一条为什么值钱）：只要正文混进语料，邻居候选立刻成为命中项。
+     * 「去掉类名限定」这个变异会让上一组断言变红，就是因为语料会退化成这个样子。
+     */
+    @Test
+    fun `反证：正文一旦混进语料就会命中（这就是要防的形态）`() {
+        val bad = SnsDeletedTagLogic.AuthorCorpus(
+            listOf("贝拉", "今天和李四一起吃饭"), 2, setOf("AsyncTextView"), 2,
+        )
+        assertTrue(
+            "正文混进语料 ⇒ 「李四」靠正文命中 ⇒ 这一格会被绑上邻居的 snsId ⇒ 打错标签",
+            SnsDeletedTagLogic.matchName("李四", bad),
+        )
+        assertFalse(
+            "而干净的语料（只有作者行「贝拉」）里它不命中",
+            SnsDeletedTagLogic.matchName("李四", author("贝拉")),
+        )
+    }
+
+    @Test
+    fun `超长正文提到候选名字：同样判不过`() {
         val body = "今天和李四一起吃饭，聊了很久关于孩子上学的事情"
-        assertEquals("用例自身校验：正文必须够长才测得到上界", 23, body.length)
-        assertTrue("用例自身校验：正文必须真的含这个名字", body.contains("李四"))
-        assertFalse(
-            "23 字正文里提到「李四」不是昵称行，必须被上界挡掉（否则打错标签）",
-            SnsDeletedTagLogic.matchName("李四", listOf(body)),
-        )
+        assertEquals("用例自身校验：正文必须够长", 23, body.length)
+        val c = SnsDeletedTagLogic.authorCorpusOf(listOf(vt(body, BODY_CHAIN)))
+        assertFalse("23 字正文也不是作者行", SnsDeletedTagLogic.matchName("李四", c))
     }
 
-    /** 转发来源（“转发 张三 的动态 …”）同样不是昵称，必须挡掉 */
     @Test
-    fun `转发来源提到候选名字：同样被上界挡掉`() {
-        val body = "转发 张三 的动态：这是一条很长的朋友圈正文内容"
-        assertEquals("用例自身校验：转发文案必须够长才测得到上界", 24, body.length)
-        assertFalse(
-            "转发来源行提到「张三」不是昵称行，必须被上界挡掉",
-            SnsDeletedTagLogic.matchName("张三", listOf(body)),
-        )
-    }
-
-    /** 200 字正文：上界在极端长度下也要成立 */
-    @Test
-    fun `200 字正文含名字：被上界挡掉`() {
-        val body = "李四" + "内容".repeat(100)
-        assertTrue("用例自身校验：必须含名字且远超上界", body.contains("李四") && body.length > 16)
-        assertFalse(
-            "超长正文提到名字，长度上界必须生效",
-            SnsDeletedTagLogic.matchName("李四", listOf(body)),
-        )
+    fun `转发来源提到候选名字：同样判不过`() {
+        val c = SnsDeletedTagLogic.authorCorpusOf(listOf(vt("转发 张三 的动态", BODY_CHAIN)))
+        assertFalse("转发来源行不是作者行", SnsDeletedTagLogic.matchName("张三", c))
     }
 
     @Test
     fun `正常昵称：精确命中`() {
-        assertTrue("昵称行就是名字本身", SnsDeletedTagLogic.matchName("李四", listOf("李四")))
-        assertTrue("昵称后面跟了别的文案也能命中", SnsDeletedTagLogic.matchName("李四", listOf("李四 昨天")))
-        assertTrue("昵称前面加了别的内容也能命中", SnsDeletedTagLogic.matchName("李四", listOf("小明 李四")))
+        assertTrue("昵称行就是名字本身", SnsDeletedTagLogic.matchName("李四", author("李四")))
+        assertTrue("昵称后面跟了别的文案也能命中", SnsDeletedTagLogic.matchName("李四", author("李四 昨天")))
+        assertTrue("昵称前面加了别的内容也能命中", SnsDeletedTagLogic.matchName("李四", author("小明 李四")))
     }
 
     /**
-     * 长度上界**只挡长正文，不挡长昵称**：`n.length + 8` 对 2~3 字的名字太紧，
-     * 靠 `NAME_TEXT_MAX = 16` 兜底 ⇒ 8 字前缀（「来自深圳的」）下仍能命中。
+     * 长度上界**只挡长昵称以外的极端文本，不挡正常长昵称**：
+     * `n.length + 8` 对 2~3 字的名字太紧，靠 `NAME_TEXT_MAX = 16` 兜底 ⇒ 8 字前缀仍能命中。
      */
     @Test
     fun `昵称带前后缀：仍要命中`() {
         assertTrue(
             "「来自深圳的陈健峰」只有 8 字，界面前缀不该把昵称挡掉",
-            SnsDeletedTagLogic.matchName("陈健峰", listOf("来自深圳的陈健峰")),
+            SnsDeletedTagLogic.matchName("陈健峰", author("来自深圳的陈健峰")),
         )
         assertTrue(
             "数据名比界面名长一截（ImproveInfo.name=贸易商陈健峰）时也要命中",
-            SnsDeletedTagLogic.matchName("贸易商陈健峰", listOf("来自深圳的贸易商陈健峰")),
+            SnsDeletedTagLogic.matchName("贸易商陈健峰", author("来自深圳的贸易商陈健峰")),
         )
     }
 
-    /**
-     * 兜底常量的**专属**守门用例：文本长度 13 > `n.length + 8`（= 11）但 ≤ 16。
-     * 只靠 `n.length + 8` 这条会被误排除 ⇒ 删掉 16 兜底这条就会变红。
-     */
+    /** 兜底常量的专属守门用例：13 > `n.length + 8`（= 11）但 ≤ 16 ⇒ 靠 16 兜底命中 */
     @Test
     fun `文本比 name 加 8 更长但不超过 16：靠 NAME_TEXT_MAX 兜底命中`() {
         val t = "来自广东深圳南山区的陈健峰"
         assertEquals("用例自身校验：必须真的超出 n+8 但不超过 16", 13, t.length)
+        assertTrue("兜底值 16 就是为了让这种长昵称仍能命中", SnsDeletedTagLogic.matchName("陈健峰", author(t)))
+    }
+
+    /**
+     * ⛔ 长度上界仍在（纵深防御）：作者行文本 17 字且含名字 ⇒ 判不过。
+     * 万一将来有人把别的角色的文本混进语料，这条仍能挡住长文本 ⇒ 不至于一次性全崩。
+     * 「去掉长度上界」这个变异会让本条变红。
+     */
+    @Test
+    fun `作者行文本超过 16 字：仍被长度上界挡掉`() {
+        val t = "来自广东深圳南山区的陈健峰的好友们"
+        assertEquals("用例自身校验：必须真的超过上界 16", 17, t.length)
+        assertTrue("用例自身校验：必须真的含这个名字", t.contains("陈健峰"))
+        assertFalse(
+            "长度上界是类名限定之外的第二道闸，不许拆",
+            SnsDeletedTagLogic.matchName("陈健峰", author(t)),
+        )
         assertTrue(
-            "兜底值 16 就是为了让这种长昵称仍能命中",
-            SnsDeletedTagLogic.matchName("陈健峰", listOf(t)),
+            "反例：16 字以内（上界之内）仍要命中，否则上界就变成另一种静默失效",
+            SnsDeletedTagLogic.matchName("陈健峰", author("来自广东深圳南山区的陈健峰的好友")),
         )
     }
 
+    /**
+     * ⛔ 降级闸门：**认不出作者行 ⇒ 判不过**（不许退化成「认不出就当通过」）。
+     * 「把 `rows == 0` 改成返回 true」这个变异会让本条变红。
+     */
     @Test
-    fun `可见文本为空：不通过`() {
+    fun `一个作者行都没认出：判不过，不许退化成通过`() {
         assertFalse(
-            "文本还没渲染出来时必须判不过（退化成「没文本就算过」会整体绕开校验）",
-            SnsDeletedTagLogic.matchName("李四", emptyList()),
+            "类名漂了时宁可这一格不打标；退化成通过 ⇒ 窗口内所有候选乱绑",
+            SnsDeletedTagLogic.matchName("李四", noAuthor()),
+        )
+        assertFalse(
+            "名字再怎么像也不能补救语料缺失",
+            SnsDeletedTagLogic.matchName("王贝拉", noAuthor()),
+        )
+    }
+
+    /**
+     * ⛔ 空文本闸门：作者行控件在、但文本还没渲染出来 ⇒ **判不过**，由调用方延后一拍重试。
+     * 「把空文本改成通过」这个变异会让本条变红。
+     */
+    @Test
+    fun `作者行文本为空：判不过（不是跳过校验）`() {
+        assertFalse(
+            "绑定当拍作者行可能一个字都没有；退化成通过会整体绕开校验 ⇒ 又是 R37 的错绑",
+            SnsDeletedTagLogic.matchName("李四", author("")),
+        )
+        assertFalse(
+            "多个作者行全空同理",
+            SnsDeletedTagLogic.matchName("李四", author("", "")),
         )
     }
 
     @Test
     fun `null 名字与单字名字：都不采信`() {
-        assertFalse("null 名字不可利用", SnsDeletedTagLogic.matchName(null, listOf("李四")))
-        assertFalse("单字名字不采信", SnsDeletedTagLogic.matchName("李", listOf("李四")))
-        assertFalse("空名字不采信", SnsDeletedTagLogic.matchName("", listOf("李四")))
+        assertFalse("null 名字不可利用", SnsDeletedTagLogic.matchName(null, author("李四")))
+        assertFalse("单字名字不采信", SnsDeletedTagLogic.matchName("李", author("李四")))
+        assertFalse("空名字不采信", SnsDeletedTagLogic.matchName("", author("李四")))
     }
 
-    /** 可见文本只有 1 个字也不采信：太短的碎片会让**任何**候选都能通过 */
+    /** 语料里只有 1 个字也不采信：太短的碎片会让**任何**候选都能通过 */
     @Test
-    fun `单字可见文本：不采信`() {
+    fun `单字作者行文本：不采信`() {
         assertFalse(
             "1 字碎片不能参与对账（去掉 t.length >= 2 闸门这条就会变红）",
-            SnsDeletedTagLogic.matchName("李四", listOf("李")),
+            SnsDeletedTagLogic.matchName("李四", author("李")),
         )
     }
 
-    /** 子树里有多个 TextView，其中**一条**短文本命中即可 */
+    /** 作者行有多条时，有一条命中即可 */
     @Test
-    fun `多条可见文本：有一条短文本命中即可`() {
-        assertTrue(
-            "昵称行与长正文共存时，昵称行那条要能命中",
-            SnsDeletedTagLogic.matchName("李四", listOf("李四", "今天和李四一起吃饭，聊了很久关于孩子上学的事情")),
-        )
-        assertTrue(
-            "顺序无关：长正文在前也不影响",
-            SnsDeletedTagLogic.matchName("李四", listOf("今天和李四一起吃饭，聊了很久关于孩子上学的事情", "李四")),
-        )
+    fun `多条作者行文本：有一条命中即可`() {
+        assertTrue(SnsDeletedTagLogic.matchName("李四", author("李四", "王贝拉")))
+        assertTrue("顺序无关", SnsDeletedTagLogic.matchName("李四", author("王贝拉", "李四")))
     }
 
     /** 反向包含：界面显示的是**截断/短写**的名字，数据名更长 */
@@ -865,27 +1117,27 @@ class SnsDeletedTagLogicTest {
     fun `反向包含：文本够长时可用`() {
         assertTrue(
             "界面被 ellipsize 截短成「陈健峰」时也要能对上",
-            SnsDeletedTagLogic.matchName("贸易商陈健峰", listOf("陈健峰")),
+            SnsDeletedTagLogic.matchName("贸易商陈健峰", author("陈健峰")),
         )
     }
 
     /**
      * ⛔ 反向判定的 3 字闸门：`t.length >= 3 && n.contains(t)`。
-     * 去掉闸门 ⇒ 一两个字的碎片能让**任何**候选通过 ⇒ 等于没有校验（正是 R37 要防的形态）。
+     * 去掉闸门 ⇒ 一两个字的碎片能让**任何**候选通过 ⇒ 等于没有校验。
      */
     @Test
     fun `反向包含：文本只有 2 字时不采信`() {
         assertFalse(
             "「健峰」是「陈健峰」的子串，但 2 字碎片不能当证据（3 字闸门）",
-            SnsDeletedTagLogic.matchName("陈健峰", listOf("健峰")),
+            SnsDeletedTagLogic.matchName("陈健峰", author("健峰")),
         )
         assertFalse(
             "「李四」是「张三李四」的子串，同理不能采信",
-            SnsDeletedTagLogic.matchName("张三李四", listOf("李四")),
+            SnsDeletedTagLogic.matchName("张三李四", author("李四")),
         )
         assertTrue(
             "反例：3 字就应当放行，否则反向判定形同虚设",
-            SnsDeletedTagLogic.matchName("贸易商陈健峰", listOf("陈健峰")),
+            SnsDeletedTagLogic.matchName("贸易商陈健峰", author("陈健峰")),
         )
     }
 
@@ -894,39 +1146,121 @@ class SnsDeletedTagLogicTest {
     fun `备注名与数据名不一致：不命中`() {
         assertFalse(
             "对不上就不打标（漏标好过把邻居的删除状态画到这条上）",
-            SnsDeletedTagLogic.matchName("李四", listOf("李总")),
+            SnsDeletedTagLogic.matchName("李四", author("李总")),
         )
         assertFalse(
             "界面昵称中间插字（李总四）也不是子串 ⇒ 双向包含都救不了，同样不打标",
-            SnsDeletedTagLogic.matchName("李四", listOf("李总四")),
+            SnsDeletedTagLogic.matchName("李四", author("李总四")),
         )
     }
 
+    // ================================================ pickByAuthor（R37-2 新增纯判据）
+
     /**
-     * ⚠️ 疑似缺陷 #4（R37-1C 发现，**不改实现**，留给 SnsDeletedTag 那条 lane 定夺）
-     *
-     * - 输入：`matchName("李四", ["今天和李四一起吃饭"])`（9 字）
-     * - 任务书期望：`false`（长正文提到名字 ⇒ 应被上界挡掉）
-     * - 实际：`true` —— 上界是 `maxOf(n.length + 8, NAME_TEXT_MAX)`，`NAME_TEXT_MAX = 16`
-     *   的兜底让 **≤16 字**的正文全部落在上界之内，9 字正文自然也命中
-     * - 缺口：真正被挡掉的只有 **>16 字**的正文。10~16 字的短正文（如
-     *   「今天和李四一起吃饭」「转发 张三 的动态」）**仍会让邻居候选命中**
-     * - 危害：与 #1 同方向 —— 若正确候选因备注名恒不命中，邻居成为唯一命中 ⇒ **打错标签**
-     * - 可选修法（需与真机 `texts=` 采样一起定）：把兜底 16 降到 8~10，
-     *   或改成「按 TextView 角色/资源 id 取昵称行」而不是拿子树全文当语料
-     *
-     * 这里先按**现状**锁住行为（断言 true），避免把“期望”写成一条永远红的用例。
+     * `pickByAuthor` 是 `SnsDeletedTag.reconcileAt` 的纯判据部分（窗口挑选 + 对账）。
+     * 抽出来就是为了让「邻居候选抢走这一格」这种**真机才看得到**的失效能在 JVM 里锁死。
+     */
+
+    /**
+     * ⭐ 本轮真正要堵的失效形态（任务书点名的那条）：
+     * 这一格显示的是王贝拉的**备注名**「贝拉」（数据名「王贝拉」对不上），
+     * 而它的正文里提到了邻居「李四」（10 字 —— 长度上界挡不住）。
+     * ⇒ 作者行限定之后：两个候选都判不过 ⇒ 这一格**不打标**（正确处置）；
+     *   旧行为（语料含正文）下「李四」会成为唯一命中 ⇒ **打错标签**。
      */
     @Test
-    fun `现状锁定：9 字正文提到名字时仍会命中（疑似缺陷 见文档）`() {
-        assertTrue(
-            "现状：上界兜底 16 让 9 字正文落在界内 ⇒ 命中（这是疑似缺陷，不是期望语义）",
-            SnsDeletedTagLogic.matchName("李四", listOf("今天和李四一起吃饭")),
+    fun `邻居靠正文抢走这一格：作者行限定后判不过`() {
+        val names = listOf("王贝拉", "李四")
+        val pick = SnsDeletedTagLogic.pickByAuthor(0, names.size, author("贝拉"), { names[it] }, { true })
+        assertEquals("作者行只有「贝拉」⇒ 两个候选都对不上 ⇒ 这一格不打标", -1, pick.index)
+        assertEquals(0, pick.hits)
+    }
+
+    /** 反证：语料里一旦混入正文，邻居立刻成为唯一命中 ⇒ 这一格绑上邻居的 snsId */
+    @Test
+    fun `反证：正文混进语料时邻居成为唯一命中（打错标签的成因）`() {
+        val names = listOf("王贝拉", "李四")
+        val bad = SnsDeletedTagLogic.AuthorCorpus(
+            listOf("贝拉", "今天和李四一起吃饭"), 2, setOf("AsyncTextView"), 2,
         )
-        assertTrue(
-            "「转发 张三 的动态」9 字同理仍命中",
-            SnsDeletedTagLogic.matchName("张三", listOf("转发 张三 的动态")),
+        val pick = SnsDeletedTagLogic.pickByAuthor(0, names.size, bad, { names[it] }, { true })
+        assertEquals("「李四」靠正文命中 ⇒ 这一格会被绑成邻居那条动态", 1, pick.index)
+        assertEquals(1, pick.hits)
+    }
+
+    @Test
+    fun `唯一命中：返回绝对下标`() {
+        val names = listOf("王贝拉", "李四", "赵六")
+        val pick = SnsDeletedTagLogic.pickByAuthor(0, names.size, author("李四"), { names[it] }, { true })
+        assertEquals(1, pick.index)
+        assertEquals(1, pick.hits)
+    }
+
+    @Test
+    fun `作者名必须对上：只认作者行里的那条`() {
+        val names = listOf("王贝拉", "李四", "赵六")
+        val pick = SnsDeletedTagLogic.pickByAuthor(0, names.size, author("赵六"), { names[it] }, { true })
+        assertEquals("唯一命中的是 pos+2 那条", 2, pick.index)
+        assertEquals(1, pick.hits)
+    }
+
+    /** ⛔ 唯一命中语义没被放宽：两个候选都能对上 ⇒ -1（宁可不打标） */
+    @Test
+    fun `两个候选都命中：-1 而不是取第一个`() {
+        val names = listOf("李四", "李四", "赵六")
+        val pick = SnsDeletedTagLogic.pickByAuthor(0, names.size, author("李四"), { names[it] }, { true })
+        assertEquals("同作者相邻动态 ⇒ 歧义 ⇒ 不打标（R31h 事故同款）", -1, pick.index)
+        assertEquals(2, pick.hits)
+    }
+
+    /** `idAt` 也必须过：解析不出 snsId 的候选不算命中 */
+    @Test
+    fun `解析不出 snsId 的候选不算命中`() {
+        val names = listOf("李四", "李四", "李四")
+        val withId = SnsDeletedTagLogic.pickByAuthor(
+            0, names.size, author("李四"), { names[it] }, { i -> i == 2 },
         )
+        assertEquals("只有下标 2 同时满足「有 snsId 且作者名对上」", 2, withId.index)
+        assertEquals(1, withId.hits)
+        val noId = SnsDeletedTagLogic.pickByAuthor(
+            0, names.size, author("李四"), { names[it] }, { false },
+        )
+        assertEquals("作者名全对得上、但一个都解析不出 snsId ⇒ 不打标", -1, noId.index)
+        assertEquals(0, noId.hits)
+    }
+
+    /** 认不出作者行 ⇒ 窗口内 0 命中（这一格不打标，且**不**退回全文语料） */
+    @Test
+    fun `认不出作者行：0 命中`() {
+        val names = listOf("李四", "王贝拉")
+        val pick = SnsDeletedTagLogic.pickByAuthor(0, names.size, noAuthor(), { names[it] }, { true })
+        assertEquals(-1, pick.index)
+        assertEquals(0, pick.hits)
+    }
+
+    /** 作者行文本为空（还没渲染）⇒ 0 命中，等调用方延后一拍重试 */
+    @Test
+    fun `作者行文本为空：0 命中`() {
+        val names = listOf("李四", "王贝拉")
+        val pick = SnsDeletedTagLogic.pickByAuthor(0, names.size, author(""), { names[it] }, { true })
+        assertEquals(-1, pick.index)
+        assertEquals(0, pick.hits)
+    }
+
+    /** 名字取不到（null）的候选不算命中 */
+    @Test
+    fun `候选取不到名字：不算命中`() {
+        val pick = SnsDeletedTagLogic.pickByAuthor(0, 3, author("李四"), { null }, { true })
+        assertEquals(-1, pick.index)
+        assertEquals(0, pick.hits)
+    }
+
+    /** 空列表：不访问任何下标 */
+    @Test
+    fun `size 为 0：0 命中`() {
+        val pick = SnsDeletedTagLogic.pickByAuthor(0, 0, author("李四"), { "x" }, { true })
+        assertEquals(-1, pick.index)
+        assertEquals(0, pick.hits)
     }
 
     // ======================================================== pickWindow（R37-1C）

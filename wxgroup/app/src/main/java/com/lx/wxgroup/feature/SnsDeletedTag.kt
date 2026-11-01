@@ -126,6 +126,30 @@ object SnsDeletedTag {
      */
     @Volatile private var lastRecon = ""
 
+    /**
+     * 「子树里**一个作者行都没认出**」的次数（R37-2 新增的可诊断性计数）。
+     *
+     * ## 为什么必须有它
+     * 作者行是靠类名 `AsyncTextView` 认的，而类名是混淆类、会随微信版本漂移。
+     * 一旦被 R8 改名，所有格子的对账都会判不过 ⇒ 表现是「一个标签都不打」，
+     * 与「确实没有已删动态」**在界面上完全一样**，只看 `painted=0` 无法区分
+     * ⇒ 静默失效（本功能最贵的失效形态：没人知道它坏了）。
+     *
+     * ⇒ 这个计数 + `lastRecon=noauthor(seen=… cap=… cls=[...])`，让下一次真机一眼能定性。
+     *   ⚠️ **先看 `seen` 再看 `cls`**（这是 R37-2 复核 P0-2 加的分岔口，`rows==0` 有两种成因）：
+     *    - **`seen >= cap`** ⇒ **采样被截断**：作者行排在 [VIS_TEXT_MAX] 之后，压根没被遍历到
+     *      ⇒ 去抬 [VIS_TEXT_MAX]，⛔ **不许**照抄 `cls=`（截断时那批类名是正文的
+     *      `ImproveTextView`，抄进 [SnsDeletedTagLogic.AUTHOR_VIEW_CLS] ⇒ 正文重新成为语料
+     *      ⇒ 9~16 字短正文提到邻居名字 ⇒ **打错标签**，比不打标糟得多）；
+     *    - **`seen < cap` 且 `cls=` 里没有作者行类名** ⇒ **类名漂了**，这时才能把 `cls=` 里
+     *      的类名抄进 [SnsDeletedTagLogic.AUTHOR_VIEW_CLS]（真机 dump 里长什么样就照抄什么）；
+     *    - `noAuthor=0` 而 `painted=0` ⇒ 判定链路本身没问题，去看清单/时间控件。
+     *
+     * ⚠️ 只在**认不出作者行**时加，不在「作者行存在但文本为空」时加 —— 后者是渲染竞态，
+     *    由 [retryResolve] 延后一拍重试即可，两类原因混在一个计数里就又分不清了。
+     */
+    @Volatile private var missedNoAuthor = 0
+
     /** 自诊断：静默失效全靠这几个数定位（binds>0 才说明钩子活着） */
     @Volatile private var binds = 0
     @Volatile private var snsBinds = 0
@@ -761,6 +785,15 @@ object SnsDeletedTag {
      * `pos, pos+1, pos-1, pos+2, pos-2` 里找作者名能对上 itemView **可见**文本的候选；
      * ③ **唯一命中**：窗口里通过的个数 ≠ 1 ⇒ 返回 null（偏移猜错比不打标糟得多）。
      *
+     * ## R37-2：对账语料只认**作者行**（`AsyncTextView`），不再是「子树所有可见文本」
+     * 长度上界挡不住 9~16 字的短正文（实测 `matchName("李四", ["今天和李四一起吃饭"]) == true`）
+     * ⇒ 正文里提到邻居名字时，邻居候选会成为窗口内唯一命中 ⇒ **这一格被打错标签**（用户看得见）。
+     * ⇒ 判据换成 [SnsDeletedTagLogic.authorCorpusOf] 的类名限定，语料里只剩作者行文本。
+     * ⛔ 认不出作者行时 [SnsDeletedTagLogic.matchName] 判 **false**（不是跳过校验），这里是
+     *    「这一格不打标」+ [missedNoAuthor] 计数 +
+     *    `lastRecon=noauthor(seen=N cap=C cls=[...])` ——
+     *    **绝不**退回「子树全文 + 长度上界」，那等于把洞原样留着。
+     *
      * ⚠️ 作者文本为空串时 [SnsDeletedTagLogic.matchName] 判 **false**，这里因此返回 null
      *    —— **不是**跳过校验。渲染是 suspend 的（时间/昵称都可能一拍之后才填上），
      *     caller 侧有「延后一拍重试」（[retryResolve]）兜底，等文本填上后再判一次。
@@ -771,17 +804,31 @@ object SnsDeletedTag {
     private fun reconcileAt(adapter: Any?, pos: Int, itemView: View): Pair<Int, String>? {
         val list = dataListOf(adapter) ?: return null
         if (pos < 0 || list.isEmpty()) return null
-        val texts = visibleTexts(itemView)
-        val pick = SnsDeletedTagLogic.pickWindow(pos, list.size) { i ->
-            val cand = list[i] ?: return@pickWindow false
-            SnsDeletedTagLogic.snsIdOf(cand) != null &&
-                SnsDeletedTagLogic.matchName(SnsDeletedTagLogic.nameOf(cand), texts)
+        val sample = collectVisTexts(itemView)
+        val corpus = SnsDeletedTagLogic.authorCorpusOf(sample.items, sample.seen)
+        // ⛔ 降级闸门：一个作者行都没认出 ⇒ 这一格不打标。
+        //    类名漂移时这里会 100% 命中，所以必须留痕（计数 + 类名集合），否则真机只看得到
+        //    「一个标签都不打」，分不清是「类名漂了」还是「根本没有已删动态」。
+        //    ⚠️ [SnsDeletedTagLogic.VisSample.seen] 是这两者在现场的分岔口，必须打进日志。
+        if (corpus.rows == 0) {
+            missedNoAuthor++
+            lastRecon = "noauthor(pos=$pos/${list.size} seen=${corpus.seen} " +
+                "cap=$VIS_TEXT_MAX cls=${corpus.classes})"
+            logKeyOnce("noauthor:${corpus.classes}",
+                "SNS_DELTAG: no author TextView cls=${corpus.classes} " +
+                    "pos=$pos/${list.size} count=$missedNoAuthor", warn = true)
+            return null
         }
+        val pick = SnsDeletedTagLogic.pickByAuthor(
+            pos, list.size, corpus,
+            { i -> SnsDeletedTagLogic.nameOf(list[i]) },
+            { i -> SnsDeletedTagLogic.snsIdOf(list[i]) != null },
+        )
         val idx = pick.index
-        // 诊断必须区分「0 命中」与「歧义」：前者多半是渲染还没完成（延后重试即可），
+        // 诊断必须区分「0 命中」与「歧义」：前者是作者行文本还没渲染/备注名不一致（延后重试即可），
         // 后者是同作者相邻动态导致的无解歧义（只能不打标）。混成一条就没法排障。
         lastRecon = if (pick.hits == 0) {
-            "noname(pos=$pos/${list.size} texts=${texts.size})"
+            "noname(pos=$pos/${list.size} authors=${corpus.texts.size})"
         } else if (idx < 0) {
             "ambig${pick.hits}(pos=$pos/${list.size})"
         } else {
@@ -793,22 +840,55 @@ object SnsDeletedTag {
     }
 
     /**
-     * itemView 子树里的**可见非空**文本（给作者名对账用）。
+     * itemView 子树里**可见** TextView 的采样（给作者名对账用）。
      *
-     * ⚠️ 上限 20 条 / 深度 8：作者名 TextView 常常埋在内容区之后，取太少 ⇒ 名字压根不在列表里
-     *    ⇒ 对账恒不过 ⇒ 静默地一个标签都不打（比报错难查得多）。
+     * ⚠️ 上限 [VIS_TEXT_MAX] 条 / 深度 8：作者名 TextView 常常埋在内容区之后，取太少 ⇒
+     *    名字压根不在列表里 ⇒ 对账恒不过 ⇒ 静默地一个标签都不打（比报错难查得多）。
+     *
+     *    ## 为什么是 48 而不是 20（R37-2 复核 P0-1）
+     *    真机 dump（`docs/_r35_sns_tag.md:873`）在**深度 ≤4** 就列了 **37 条叶子路径**，
+     *    而 R37-2 起**空文本的 TextView 也占预算**（要区分「作者行没渲染出字」与
+     *    「压根没有作者行」）⇒ 预算的消耗比改动前快得多（改动前只有非空的才消耗）。
+     *    20 在富条目（点赞/评论昵称都是独立 TextView）上够呛 —— 作者行一旦落在第 20 个可见
+     *    TextView 之后就是 `rows == 0` ⇒ **一个标签都不打**，而且 `retryResolve` 救不回来
+     *    （帧与帧之间「可见 TextView 的个数」不变，截断是永久的，不是渲染竞态）。
+     *    ⇒ 48 = 「深度 ≤4 的 37 条路径」再留一屏富余，热路径上仍是常数级开销。
+     *
      * ⚠️ 只要 `visibility != VISIBLE` 就跳过：GONE 的子树常常留着复用前的旧文本，
      *    拿它去对账会对上**上一条动态**的作者 —— 正是本轮要防的串味。
      *    （不用 `isShown`：绑定期 View 可能还没 attach，`isShown` 恒 false，会把正常绑定误判掉。）
+     *
+     * ⚠️ **文本为空的 TextView 也要采样**：`rows`（作者行个数）与 `texts`（作者行里的非空文本）
+     *    之差正是「认出了作者行但还没渲染出字」与「压根没有作者行」的唯一区分手段，
+     *    而这两种情况的修法完全不同（前者等一拍重试，后者改类名常量）。
+     *    ⇒ 这里只做**哑采集**，判定一律交给 [SnsDeletedTagLogic.authorCorpusOf]。
+     *
+     * ⚠️ [SnsDeletedTagLogic.VisSample.seen] 必须在**采满了也继续计数**：
+     *    它是 `rows == 0` 时区分「采样被截断」与「类名漂了」的唯一信号，
+     *    缺了它就会被引导去照抄 `cls=` 里的类名 —— 而截断时那批类名是正文的
+     *    （`ImproveTextView`）⇒ 抄进去就是**打错标签**。
      */
-    private fun visibleTexts(root: View, max: Int = 20): List<String> {
-        val out = ArrayList<String>(max)
+    private fun collectVisTexts(
+        root: View,
+        max: Int = VIS_TEXT_MAX,
+    ): SnsDeletedTagLogic.VisSample {
+        val out = ArrayList<SnsDeletedTagLogic.VisText>(max)
+        var seen = 0
         fun walk(v: View, d: Int) {
-            if (out.size >= max || d > 8) return
+            if (d > 8) return
             if (v is TextView) {
-                val t = runCatching { v.text?.toString() }.getOrNull()?.trim()
-                if (!t.isNullOrEmpty() && v.visibility == View.VISIBLE) out.add(t)
+                if (v.visibility == View.VISIBLE) {
+                    // ★ 先计数再看收不收：seen 必须能把「溢出的那部分」也算出来
+                    seen++
+                    if (out.size < max) {
+                        val t = runCatching { v.text?.toString() }.getOrNull()?.trim().orEmpty()
+                        out.add(SnsDeletedTagLogic.VisText(t, classChain(v.javaClass)))
+                    }
+                }
+                return
             }
+            // 采满就不再往下钻（同层的兄弟仍会走到这里并计进 seen ⇒ seen 能超过 max）
+            if (out.size >= max) return
             if (v is ViewGroup) {
                 val n = minOf(v.childCount, WALK_KIDS)
                 for (i in 0 until n) {
@@ -818,6 +898,31 @@ object SnsDeletedTag {
             }
         }
         runCatching { walk(root, 0) }
+        return SnsDeletedTagLogic.VisSample(out, seen)
+    }
+
+    /**
+     * 完整类名 → 该类及其父类链的**简单类名**（从自己开始，最多 8 层，碰到 View 为止）。
+     *
+     * 为什么要整条链：[SnsDeletedTagLogic.AUTHOR_VIEW_CLS] 判的是「链上有没有这一层」，
+     * 因为微信常拿它的**子类**去承载不同位置的文本，而子类名可能是混淆名。
+     * ⇒ 按完整类名缓存（与 [timeMethodCache] 同款手法），热路径上只算一次。
+     */
+    private val classChainCache = Collections.synchronizedMap(HashMap<String, List<String>>())
+
+    private fun classChain(c: Class<*>): List<String> {
+        val key = c.name
+        classChainCache[key]?.let { return it }
+        val out = ArrayList<String>(4)
+        var cur: Class<*>? = c
+        var up = 0
+        while (cur != null && up < 8) {
+            out.add(cur.simpleName)
+            if (cur.name == "android.view.View") break
+            cur = cur.superclass
+            up++
+        }
+        classChainCache[key] = out
         return out
     }
 
@@ -1171,6 +1276,15 @@ object SnsDeletedTag {
 
     /** 每个节点最多看几个孩子（防九宫格那种宽树把主线程拖住） */
     private const val WALK_KIDS = 16
+
+    /**
+     * [collectVisTexts] 的采样上限 —— **48**（为什么必须是它，见 [collectVisTexts] 的 KDoc）。
+     *
+     * ⚠️ 它同时被 [SnsDeletedTagLogic.VisSample.seen] 当成「有没有被截断」的分水岭
+     *    （`seen >= VIS_TEXT_MAX` ⇒ 截断），所以 Adjust 这个值时必须同步真机判据文档里的
+     *    `cap=` 字样，别让日志里的 `cap=` 与代码里的实际上限对不上。
+     */
+    private const val VIS_TEXT_MAX = 48
 
     /** View 树 dump 的深度（只打这么多层，够定位）—— 跟着 [WALK_MAX] 抬高，否则 dump 出来看不到时间行 */
     private const val TREE_DEPTH = 9
@@ -1592,8 +1706,14 @@ object SnsDeletedTag {
      *    三个附加字段。`missedTime` 这个名字与位置都保留（真机验收文档已引用），只加不删：
      *    - `mtHit` —— **命中却找不到时间控件**（真故障：该画的没画上，最该盯的就是它）；
      *    - `mtRestore` —— 未命中、仅尝试还原时找不到控件（多为封面/广告卡，属正常探索失败）；
-     *    - `lastRecon` —— 最近一次 View↔数据对账的细粒度原因（`noname` = 作者文本还没渲染
-     *      出来、等下一拍重试即可；`ambig<N>` = 同作者相邻动态导致歧义，只能不打标）。
+     *    - `lastRecon` —— 最近一次 View↔数据对账的细粒度原因（`noname` = 作者行文本还没渲染
+     *      出来、等下一拍重试即可；`ambig<N>` = 同作者相邻动态导致歧义，只能不打标；
+     *      `noauthor(seen=N cap=C cls=[...])` = **作者行一个都没认出**，见 [missedNoAuthor]。
+     *      ⛔ **定性顺序是先 `seen` 后 `cls`**：`seen >= cap` 是**采样被截断**（抬 [VIS_TEXT_MAX]）；
+     *      只有 `seen < cap` 且 `cls=` 里没有作者类名才是**类名漂了**，这时才能照抄 `cls=`
+     *      进 [SnsDeletedTagLogic.AUTHOR_VIEW_CLS]。顺序反了会把正文类名抄成作者类 ⇒ 打错标签）；
+     *    - `noAuthor` —— 认不出作者行的累计次数。**它是「认不出作者行」的唯一信号**：
+     *      持续上涨而 `painted=0` ⇒ 不是没有已删动态，是判据或采样失效了（哪一种看 `seen`）。
      *
      * ⚠️ ④ 为什么改成 `painted`：`hits` 在取时间控件**之前**就自增了（`paint` 第一行），
      * 取不到控件时它照样涨 ⇒ 「`hits` 从 0 变 1 ⇒ 界面上出现了标记」这个判据站不住，
@@ -1605,7 +1725,8 @@ object SnsDeletedTag {
         "binds=$binds sns=$snsBinds resolved=$resolved missed=$missed " +
         "hits=$hits painted=$painted missedTime=$missedTime tv=$tvCached " +
         "paths=${dataPathCache.size} lastMiss=$lastMiss " +
-        "mtHit=$missedTimeHit mtRestore=$missedTimeRestore lastRecon=$lastRecon"
+        "mtHit=$missedTimeHit mtRestore=$missedTimeRestore noAuthor=$missedNoAuthor " +
+        "lastRecon=$lastRecon"
 
     /** 已记住时间 TextView 资源 id 的 item 数：`0` 且 `missedTime>0` ⇒ 三级解析全挂 */
     private val tvCached: Int

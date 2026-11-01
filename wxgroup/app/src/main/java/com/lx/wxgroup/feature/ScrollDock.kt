@@ -59,6 +59,30 @@ object ScrollDock {
     private var pinLogged = 0
     private var blockLogged = 0
 
+    /**
+     * R37 取证用：最近一次**会话列表** `trackMotionScroll` 的时间戳（**纯记录，不参与任何判据**）。
+     *
+     * ⚠️ 只对 [ConvFilter.wraps] 为真的那个 ListView 打戳（钩子挂在 `AbsListView` 基类上，
+     *    全微信的列表都会进钩子）。
+     *
+     * 用途只有一个 —— 让 `ConvFilter` 的性能日志能带上「这一帧是不是滚动态」
+     * （`K7 perf ... scrolling=true/false`），把「46ms ⇒ 掉帧」从时序推断变成
+     * 可对账的事实。见 `docs/_r37_k7_twostage.md` §0.4 / §7。
+     *
+     * ⚠️ 这里必须是 O(1)：这个 hook 在滚动时**逐帧**被调用，多一次分配都不行。
+     */
+    @Volatile
+    private var lastScrollMs = 0L
+
+    /**
+     * 最近 `gapMs` 内有没有发生过滚动位移。
+     *
+     * 150ms 的依据：`trackMotionScroll` 逐帧调，惯性滑动期间每帧都调；
+     * 手指按住不动时**不调** ⇒ 那种停顿会被判成静止（已知偏差，见文档 §6 R2）。
+     */
+    fun scrolling(gapMs: Long = 150L): Boolean =
+        android.os.SystemClock.uptimeMillis() - lastScrollMs < gapMs
+
     /** 小于这个位移就不管，避免 1~2px 抖动把日志和布局搅乱 */
     private const val MIN_OVER = 4
 
@@ -119,7 +143,15 @@ object ScrollDock {
                 Int::class.javaPrimitiveType, Int::class.javaPrimitiveType,
                 object : XC_MethodHook() {
                     override fun afterHookedMethod(param: MethodHookParam) {
-                        pin(param.thisObject as? AbsListView ?: return)
+                        val lv = param.thisObject as? AbsListView ?: return
+                        // R37：滚动位移时间戳（O(1)，纯记录，见 lastScrollMs 的注释）
+                        // ⛔ 必须过 [ConvFilter.wraps] 这道门：本钩子挂在 AbsListView **基类**上，
+                        //    聊天消息列表 / 通讯录 / 朋友圈 / 搜索结果全都会进来。不加这道门，
+                        //    ConvFilter 性能日志里的 `scrolling=true` 就是别的列表制造的
+                        //    **假阳性**，而它存在的唯一理由是「这次 46ms 是不是打在会话列表的
+                        //    滚动帧里」—— 假阳性比没有还糟（会把归因带偏）。
+                        if (ConvFilter.wraps(lv)) lastScrollMs = android.os.SystemClock.uptimeMillis()
+                        pin(lv)
                     }
                 },
             )

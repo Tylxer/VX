@@ -272,6 +272,24 @@ object Keys {
 
     // —— 调试 ——
     const val DEBUG_LOG = "debug.log"
+
+    /**
+     * R37 裁决探针：`readSnaps` 的 46ms 到底花在哪。
+     *
+     * 开着时每次 `rebuild` 的全量读之后会**额外跑 5 段循环**（顺序 `getItem`、
+     * `getItem(0)`、`getItem(n-1)`、纯反射、纯分配），**每段最多 500 次**（n 仍会打进日志），
+     * 打一条 `K7 snapprobe` 把五段耗时 + 真实 n + 钳后上限 + GC 计数 + 是否在滚动全列出来
+     * —— 用来裁决 H1（微信 `getItem` 慢）/ H2（我们反射+装箱）/ H3（GC），顺带判
+     * 容器是不是链表（尾部访问显著慢于顺序遍历 ⇒ O(n²) 候选 D）。
+     *
+     * ⚠️ **默认关**，且只该在取证时开。关着时 `readSnaps` 只多一次 `uptimeMillis` 比较
+     * （Kv 读被挡在 30s 节流窗口之后，不会每次 rebuild 都查一次 SQLite）；
+     * 开着时每次取数仍是主线程同步的几百毫秒开销，且**滚动帧里不取**（丢到静止窗口）。
+     * 开法：`python tools/dev.py probe kvset --key debug.k7_snap_probe --val true`
+     * （不用重启微信）。取完证记得关回 false。
+     * 判读表见 `docs/_r37_k7_twostage.md` §1.4。
+     */
+    const val DEBUG_K7_SNAP_PROBE = "debug.k7_snap_probe"
 }
 
 /** 配置项的元数据总表。遍历它就能渲染出全部设置页 */
@@ -423,7 +441,11 @@ object Prefs {
         PrefSpec(Keys.BROADCAST_TARGETS, PrefKind.ENTER, "[]", "群发", "选择发送目标"),
 
         // 调试
-        PrefSpec(Keys.DEBUG_LOG, PrefKind.SWITCH, "false", "调试", "调试日志")
+        PrefSpec(Keys.DEBUG_LOG, PrefKind.SWITCH, "false", "调试", "调试日志"),
+        PrefSpec(
+            Keys.DEBUG_K7_SNAP_PROBE, PrefKind.SWITCH, "false", "调试",
+            "调试：量会话快照 46ms 花在哪（探针本身很贵，取完证关掉）"
+        )
     )
 
     private val byKey: Map<String, PrefSpec> = ALL.associateBy { it.key }

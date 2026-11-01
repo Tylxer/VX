@@ -95,6 +95,140 @@ object ConvFilter {
      */
     private const val PROBE_WARN_MS = 8L
 
+    /**
+     * R37 裁决探针的节流间隔（毫秒）。
+     *
+     * 探针要在原 `readSnaps` 之后**额外跑 5 段循环**（顺序 `getItem` / `getItem(0)` /
+     * `getItem(n-1)` / 纯反射 / 纯分配），每段最多 [SNAP_PROBE_LIMIT] 次。
+     * 30s 一次既能拿到「滚动中 / 静止时」两种样本，又不会把会话列表卡死。
+     *
+     * ⚠️ 开关默认关（`debug.k7_snap_probe`）。**关着时这里一次 Kv 都不读**：
+     * `Kv.getBool` → `GroupDb.getPref` 是一次 SQLite 查询，而它原本会被塞进 `readSnaps`
+     * ⇒ 每次 rebuild 都白付一次查库，还会把本轮唯一要测的 46ms 基线污染掉（R37-2 复核 P1-4）。
+     * ⇒ [snapProbeDue] 里**先判节流窗口、命中窗口才查开关**，关着时最多 30s 一次查库。
+     */
+    private const val SNAP_PROBE_INTERVAL_MS = 30_000L
+
+    /**
+     * 探针每段循环的**上限**（真实条数 n 仍会打进日志）。
+     *
+     * 为什么要钳：n=3006 时五段全跑一遍是几百毫秒的**主线程**开销，且这段代码在
+     * `rebuild()` 的 `synchronized(lock)` 里面跑（见 `:settle` 那条回路）⇒ 卡顿会被放大。
+     * 更麻烦的是 `tail` 段专门用来验证「容器是不是链表」—— 它真是链表的话，
+     * 这一段的真实成本就是 **O(n²) ≈ 9×10⁶ 次**，取证动作本身会 ANR。
+     * ⇒ 每段只跑 ≤500 次，五段的**比例关系**（这才是裁决 H1/H2/候选 D 要的东西）不失真，
+     *    日志里同时给 `n` 与 `lim`，需要绝对值时乘 `n / lim` 即可（见 [runSnapProbe] KDoc）。
+     */
+    private const val SNAP_PROBE_LIMIT = 500
+
+    private var snapProbeAt = 0L
+
+    /**
+     * 这一轮要不要跑裁决探针（开关开 + 节流窗口到了 + **不在滚动帧里**）。
+     *
+     * 判读表见 `docs/_r37_k7_twostage.md` §1.4：
+     * `seq ≈ full` ⇒ H1（微信 `getItem` 慢）；`refl` 单项 ≈10µs ⇒ H2（反射/装箱被放大）；
+     * 四项之和 ≪ full 且 gc 计数跳变 ⇒ H3（GC）；`tail ≫ seq` ⇒ 容器是链表（候选 D）。
+     *
+     * ⚠️ 三步顺序**不能颠倒**（每一条都是复核里付学费换来的）：
+     *  ① 先判节流窗口 —— 窗口没到就直接 return，热路径上一次都不碰 Kv（SQLite）；
+     *  ② 再判 [ScrollDock.scrolling] —— 探针自己是主线程同步的几百毫秒，
+     *     **别把这笔开销打进正在滚动的帧里**（那会让「46ms ⇒ 掉帧」的因果自己乱掉，
+     *     也会让用户看到一次肉眼可见的冻结）。滚动时不吃掉窗口，下一拍再试；
+     *  ③ 只有窗口真的到了才读开关，并把窗口推走 ⇒ 开关关着时**最多 30s 一次查库**。
+     */
+    private fun snapProbeDue(): Boolean {
+        val now = android.os.SystemClock.uptimeMillis()
+        if (now - snapProbeAt < SNAP_PROBE_INTERVAL_MS) return false
+        if (ScrollDock.scrolling()) return false
+        snapProbeAt = now
+        return runCatching { Kv.getBool(Keys.DEBUG_K7_SNAP_PROBE) }.getOrDefault(false)
+    }
+
+    /**
+     * R37 裁决探针本体：**只计时、只打日志，不碰任何判据，也不改变 `readSnaps` 的产出**。
+     *
+     * 五段各自独立量（口径一致才能横向比）。⚠️ 每段只跑 [SNAP_PROBE_LIMIT] 次，
+     * 而 `full` 是**真实 n 次** `readSnaps` 的耗时 ⇒ **绝对值不可直接比**，
+     * 拿它们的绝对值去减 `full` 之前先乘 `n / lim`（日志里给了 `n`、`lim`、`scale`）。
+     * 裁决用的是**段与段之间的比例**（H1/H2/候选 D 都是比例判据，见 §1.4），比例不受影响。
+     *
+     *  - `seq`  ：顺序 `getItem(0..lim-1)`，丢弃结果 ⇒ 微信侧 `getItem` 的净成本
+     *  - `head` ：`getItem(0)` × lim —— 与 `tail` 对比才有意义（首元素可能有 fast path）
+     *  - `tail` ：`getItem(n-1)` × lim —— **显著大于 seq ⇒ 容器是链表 / O(n²) 随机访问**
+     *  - `refl` ：同一个对象上跑 lim 次 `ConvReader.username + timeMs`（字段缓存全热）
+     *            ⇒ 我们侧的反射 + 装箱 + 可能的解释执行放大
+     *  - `alloc`：lim 次 `new ConvEntry` + `add` ⇒ 纯分配成本
+     *  - `full` ：由调用方传入的真实 `readSnaps` 耗时（n 次，未钳）
+     *
+     * ⚠️ 三段 `getItem` 用平铺 try/catch 而不是 `runCatching`：探针要量的是
+     * `getItem` 本身，包一层 `runCatching`（JVM 上 `Result<R>` 会装箱）会把自己
+     * 的开销算进去，直接毁掉 H1/H2 的分辨力。`refl` 段也一样用 try/catch 平铺，
+     * 理由是它要量的正是 `ConvReader` 真实路径上的成本（`ConvReader` 自己内部才用
+     * `runCatching`，已经算在被测对象里了）。
+     *
+     * ⚠️ `refl=?` 的含义：`adapter.getItem(0)` 没取到对象（null / 抛异常）。
+     *    此时 `ConvReader.username(null)` 会秒返回空串 ⇒ 这一段会退化成 ~0ms，
+     *    看着像「我们侧反射不要钱」⇒ **不要**拿它给 H2 下结论，先把 `getItem(0)` 修能用。
+     */
+    private fun runSnapProbe(adapter: ListAdapter, n: Int, fullMs: Long) {
+        if (n <= 0) return
+        fun gcCount(): String =
+            runCatching { android.os.Debug.getRuntimeStat("art.gc.gc-count") }.getOrDefault("?")
+
+        val lim = minOf(n, SNAP_PROBE_LIMIT)
+        val scale = if (lim > 0) n.toFloat() / lim.toFloat() else 0f
+
+        val gc0 = gcCount()
+        var t = android.os.SystemClock.uptimeMillis()
+        try {
+            for (i in 0 until lim) adapter.getItem(i)
+        } catch (ignored: Throwable) {
+        }
+        val seqMs = android.os.SystemClock.uptimeMillis() - t
+
+        t = android.os.SystemClock.uptimeMillis()
+        try {
+            for (i in 0 until lim) adapter.getItem(0)
+        } catch (ignored: Throwable) {
+        }
+        val headMs = android.os.SystemClock.uptimeMillis() - t
+
+        t = android.os.SystemClock.uptimeMillis()
+        try {
+            for (i in 0 until lim) adapter.getItem(n - 1)
+        } catch (ignored: Throwable) {
+        }
+        val tailMs = android.os.SystemClock.uptimeMillis() - t
+
+        // ⛔ getItem(0) 拿不到对象时必须**跳过**这一段：ConvReader.username(null) 会秒返回
+        //    ⇒ refl ≈ 0ms 是个假数据，会把 H2（我们侧反射慢）误裁成「没事」。
+        val probeItem = runCatching { adapter.getItem(0) }.getOrNull()
+        val reflMs = if (probeItem == null) -1L else {
+            val t0 = android.os.SystemClock.uptimeMillis()
+            try {
+                for (i in 0 until lim) {
+                    ConvReader.username(probeItem)
+                    ConvReader.timeMs(probeItem)
+                }
+            } catch (ignored: Throwable) {
+            }
+            android.os.SystemClock.uptimeMillis() - t0
+        }
+
+        t = android.os.SystemClock.uptimeMillis()
+        val tmp = ArrayList<ConvLayout.ConvEntry>(lim)
+        for (i in 0 until lim) tmp.add(ConvLayout.ConvEntry("", 0L))
+        val allocMs = android.os.SystemClock.uptimeMillis() - t
+        val gc1 = gcCount()
+
+        LogX.i(
+            "K7 snapprobe n=$n lim=$lim scale=$scale full=${fullMs}ms seq=${seqMs}ms" +
+                " head=${headMs}ms tail=${tailMs}ms refl=${if (reflMs < 0) "?" else "${reflMs}ms"}" +
+                " alloc=${allocMs}ms gc=$gc0->$gc1 scrolling=${ScrollDock.scrolling()}"
+        )
+    }
+
     private val mainHandler by lazy { Handler(Looper.getMainLooper()) }
 
     /** R31：扫「置顶聊天」折叠态的节流间隔（布局回调可能密集，100ms 够用且看不出来） */
@@ -1199,11 +1333,20 @@ object ConvFilter {
          *
          * `path` 说明这次走的是哪条分支（short-circuit / light / full），
          * 拿真机日志时能一眼看出耗时花在哪。
+         *
+         * `scrolling` 是 R37 补的第 6 个字段（P0）：这 46ms 到底有没有打在滚动帧里，
+         * 之前**一直是推断**（三条日志没有滚动帧时间戳可对齐）。带上它之后，
+         * 「46ms ⇒ 掉帧」才从「A 推 B」变成可对账的事实：
+         * `scrolling=true` 的命中才是真掉帧，`scrolling=false` 的命中只是静止时的一次顿。
+         * 来源是 [ScrollDock.scrolling]（记录 `trackMotionScroll` 的时间戳，150ms 窗口）。
          */
         private fun probeCost(tStart: Long, snapsCost: Long, n: Int, path: String) {
             val total = android.os.SystemClock.uptimeMillis() - tStart
             if (total < PROBE_WARN_MS && snapsCost < PROBE_WARN_MS) return
-            LogX.i("K7 perf n=$n snaps=${snapsCost}ms total=${total}ms path=$path")
+            LogX.i(
+                "K7 perf n=$n snaps=${snapsCost}ms total=${total}ms path=$path" +
+                    " scrolling=${ScrollDock.scrolling()}"
+            )
         }
 
         /** 收纳态：用给定成员集合重算每个分组行的显示内容（摘要/时间/未读）。 */
@@ -1395,6 +1538,11 @@ object ConvFilter {
          * 所有下标左移，表现就是「点谁都开错人」。
          */
         private fun readSnaps(n: Int): List<ConvLayout.ConvEntry> {
+            // R37 裁决探针：关着时这里只有一次 `uptimeMillis` 比较（Kv 读被挡在节流窗口之后，
+            // 见 [snapProbeDue]）；开着时额外跑 5 段 ≤500 次循环并打一条日志。
+            // ⛔ 产出的 `out` 与探针无关：探针只计时只打日志，删掉也不影响 `readSnaps` 的结果。
+            val probe = snapProbeDue()
+            val t0 = if (probe) android.os.SystemClock.uptimeMillis() else 0L
             val out = ArrayList<ConvLayout.ConvEntry>(n)
             for (i in 0 until n) {
                 val item = runCatching { wrapped.getItem(i) }.getOrNull()
@@ -1406,6 +1554,7 @@ object ConvFilter {
                 }
                 out.add(ConvLayout.ConvEntry(ConvReader.username(item), ConvReader.timeMs(item)))
             }
+            if (probe) runSnapProbe(wrapped, n, android.os.SystemClock.uptimeMillis() - t0)
             return out
         }
 
