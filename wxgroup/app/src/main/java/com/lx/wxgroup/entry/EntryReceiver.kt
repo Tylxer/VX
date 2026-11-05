@@ -351,6 +351,20 @@ object EntryReceiver {
                         io {
                             when (sub) {
                                 "stat" -> LogX.i("SNSG " + com.lx.wxgroup.feature.SnsGuard.stat())
+                                // P0 取证：同步轮次窗口账本 dump / 清零
+                                "win" -> {
+                                    for (l in com.lx.wxgroup.feature.SnsRoundLedger.dump(n)) {
+                                        LogX.i(l)
+                                    }
+                                    // P0-2 覆盖率探针：最近 localFlag=2 可见动态里有多少进过响应账本
+                                    for (l in com.lx.wxgroup.feature.SnsGuard.winCoverage()) {
+                                        LogX.i(l)
+                                    }
+                                }
+                                "winreset" -> {
+                                    com.lx.wxgroup.feature.SnsRoundLedger.reset()
+                                    LogX.i("WIN reset ok")
+                                }
                                 "ls" -> for (l in com.lx.wxgroup.feature.SnsGuard.listArchived(n)) {
                                     LogX.i(l)
                                 }
@@ -588,6 +602,19 @@ object EntryReceiver {
                                     }
                                     for (l in lines) LogX.i(l)
                                 }
+                                // ── R42 路线甲实测：写时拦截 sourceType（见 docs/_r42_block_impl.md）──
+                                // --es sub block --es sub2 on|off   = 切开关（独立于「防止朋友圈动态撤回」）
+                                // --es sub blockstat                = 4 行计数 + 最近 10 个事件（≤16 行）
+                                // --es sub trace --el id <snsId>    = 每 30s 点查一次，最多 30 分钟；id=0 停
+                                "block" -> LogX.i(
+                                    com.lx.wxgroup.feature.SnsBlockProbe.switch(sub2)
+                                )
+                                "blockstat" -> for (l in com.lx.wxgroup.feature.SnsBlockProbe.stat()) {
+                                    LogX.i(l)
+                                }
+                                "trace" -> for (l in com.lx.wxgroup.feature.SnsBlockProbe.trace(
+                                    firstLong(intent, "id")
+                                )) LogX.i(l)
                                 else -> LogX.i("SNSG unknown sub=$sub")
                             }
                         }

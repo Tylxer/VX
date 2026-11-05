@@ -32,6 +32,7 @@ import com.lx.wxgroup.feature.ScrollDock
 import com.lx.wxgroup.feature.SnsAlbumMerge
 import com.lx.wxgroup.feature.SnsGuard
 import com.lx.wxgroup.feature.SnsSqlSpy
+import com.lx.wxgroup.feature.SnsSyncDelProbe
 import com.lx.wxgroup.feature.SnsDeletedTag
 import com.lx.wxgroup.feature.SnsTag
 import com.lx.wxgroup.feature.SnsTimelineSourceFix
@@ -293,6 +294,13 @@ class HookEntry : IXposedHookLoadPackage {
         runCatching {
             SnsTimelineSourceFix.installAlbumSyncTrigger(lpparam)
         }.onFailure { LogX.e("SnsTimelineSourceFix.installAlbumSyncTrigger failed", it) }
+        // ---- R37 U1 取证：旁听同一个 x2 的删除动作（M/N/O/P/Q/U 同族 6 个方法）----
+        // ⛔ **纯日志探针**，只为一件事：裁决「好友删他自己的动态时 x2#U/x2#O 有没有被调用」
+        //    （`docs/_r37_graytag_datasource.md` §2 H3b / §6.1 U1）。
+        //    不写库、不加表、不做判据、不打标签，取证完可整块删除。
+        runCatching {
+            SnsSyncDelProbe.install(lpparam)
+        }.onFailure { LogX.e("SnsSyncDelProbe install failed", it) }
 
         // ---- 聊天·自动加载原图（开关：chat.auto_hd_img）----
         // 借微信自己下压缩图那一脚（t1 构造）起跳，再调下载服务下原图。

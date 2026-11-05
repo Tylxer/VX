@@ -140,6 +140,21 @@ object Keys {
     const val ANTIREVOKE_MSG = "antirevoke.msg"
     const val ANTIREVOKE_SNS = "antirevoke.sns"
     const val ANTIREVOKE_SNS_DELETED_TAG = "antirevoke.sns_deleted_tag"
+
+    /**
+     * R42 路线甲实测：**写时拦截**朋友圈「清可见位」。
+     *
+     * 微信删一条动态时会 `update("SnsInfo", ContentValues{ sourceType = 0, ... })`；
+     * 开启后我们在 `updateWithOnConflict` 的 **before** 钩子里把 `sourceType` 这个键
+     * 从 ContentValues 摘掉，让「清 bit1」这一步**永远不落地**
+     * （机制来源见 `docs/_r42_wechatmagician.md`，WechatMagician 2017 的做法）。
+     *
+     * ⚠️ 与 [ANTIREVOKE_SNS]（事后补位）是**两条独立的路**：
+     * - 本开关只管拦，不管补；关掉就完全恢复原行为；
+     * - 两个都开时拦截先生效 ⇒ 没有位被清 ⇒ 补位空转，这是预期现象，不是故障。
+     * - 实测用的小开关，默认关闭；结论出来后再决定合不合并。
+     */
+    const val ANTIREVOKE_SNS_BLOCK = "antirevoke.sns_block"
     const val ANTIREVOKE_COMMENT = "antirevoke.comment"
     const val ANTIREVOKE_COMMENT_DELETED_TAG = "antirevoke.comment_deleted_tag"
     const val ANTIREVOKE_SHOW_HINT = "antirevoke.show_hint"
@@ -290,6 +305,23 @@ object Keys {
      * 判读表见 `docs/_r37_k7_twostage.md` §1.4。
      */
     const val DEBUG_K7_SNAP_PROBE = "debug.k7_snap_probe"
+
+    /**
+     * R37 灰标判据**取证探针**：挂 `NetSceneSnsSync`（`x2`，scene 256）的同族 6 个方法
+     * （`M/N/O/P/Q/U`，签名 `(Lq54/f95;Lq54/e95;JJLjava/lang/String;Lo3;)Z`），
+     * 只把方法名 + 两个 long 参数打进日志 —— 用来裁决 **U1**：
+     * 「好友删他自己的动态」时 `x2#U`（`updateSnsDel`）/ `x2#O`（`processSnsDelAction`）
+     * 到底有没有被调用（`docs/_r37_graytag_datasource.md` §2 H3b / §6.1 U1）。
+     *
+     * ⚠️ **默认开**（本轮就是要采；与 [DEBUG_K7_SNAP_PROBE] 默认关相反，别照抄）。
+     * 代价：只在朋友圈同步时多几次 `LogX.i`，配了 200ms/方法 节流 + 首次命中额外一行。
+     * 关法：`python tools/dev.py probe kvset --key debug.sns_syncdel_probe --val false`
+     * （不用重启微信，开关有 3s TTL 缓存）。
+     *
+     * ⛔ 这是**纯日志探针**：不写库、不加表、不做判据、不碰 `SnsDeletedTag` / `GroupDb`。
+     * 取完证（U1 定论后）记得关回 false 或整块删除。
+     */
+    const val DEBUG_SNS_SYNCDEL_PROBE = "debug.sns_syncdel_probe"
 }
 
 /** 配置项的元数据总表。遍历它就能渲染出全部设置页 */
@@ -364,6 +396,12 @@ object Prefs {
         PrefSpec(
             Keys.ANTIREVOKE_SNS_DELETED_TAG, PrefKind.SWITCH, "false", "防撤回",
             "显示动态[已删除]标签（需同时开启「防止朋友圈动态撤回」）"
+        ),
+        // R42 路线甲实测开关：在 updateWithOnConflict 的 before 里摘掉 sourceType，
+        // 让「清可见位」不落地。与上一项是两条独立的路（详见 Keys 里的注释）。
+        PrefSpec(
+            Keys.ANTIREVOKE_SNS_BLOCK, PrefKind.SWITCH, "false", "防撤回",
+            "实验：拦截朋友圈删除写库（摘 sourceType，测完关掉）"
         ),
         PrefSpec(Keys.ANTIREVOKE_COMMENT, PrefKind.SWITCH, "false", "防撤回", "防止评论撤回"),
         PrefSpec(Keys.ANTIREVOKE_COMMENT_DELETED_TAG, PrefKind.SWITCH, "false", "防撤回", "显示评论[已删除]标签"),
@@ -445,6 +483,10 @@ object Prefs {
         PrefSpec(
             Keys.DEBUG_K7_SNAP_PROBE, PrefKind.SWITCH, "false", "调试",
             "调试：量会话快照 46ms 花在哪（探针本身很贵，取完证关掉）"
+        ),
+        PrefSpec(
+            Keys.DEBUG_SNS_SYNCDEL_PROBE, PrefKind.SWITCH, "true", "调试",
+            "调试：旁听朋友圈同步的删除动作 x2.M/N/O/P/Q/U（R37 U1 取证，取完证关掉）"
         )
     )
 

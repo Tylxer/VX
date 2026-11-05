@@ -58,6 +58,9 @@ object SnsGuard {
 
     private const val CFG_TTL_MS = 3000L
 
+    /** R41 子步 3：每轮可见位统计最多查几个 id（限行、限开销） */
+    private const val VIS_PROBE_MAX = 10
+
     /**
      * 两次「update 后补位」之间的最小间隔。
      *
@@ -71,10 +74,15 @@ object SnsGuard {
     private data class Config(
         val enabled: Boolean,
         val debugLog: Boolean,
+        /**
+         * R42 路线甲实测：`updateWithOnConflict` **before** 里摘掉 `sourceType`。
+         * 与 [enabled] 完全独立 —— [enabled] 管「事后补位」，本项管「写时拦截」。
+         */
+        val blockEnabled: Boolean,
     )
 
     @Volatile
-    private var config = Config(false, false)
+    private var config = Config(false, false, false)
 
     @Volatile
     private var cfgAt = 0L
@@ -121,6 +129,19 @@ object SnsGuard {
         runCatching { XposedBridge.hookAllMethods(cls, "updateWithOnConflict", snsUpdateGuard) }
             .onSuccess { if (it.isNotEmpty()) ok += "updateWithOnConflict" }
             .onFailure { LogX.e("SNS: hook updateWithOnConflict failed", it) }
+        // ✅ R42 路线甲实测：**同一方法的 before 钩子**（再挂一个回调，Xposed 允许多个）。
+        //    ⛔ 与上面那条 after 钩子互不影响：上面那条只读 values 做补位排程，这条只摘键。
+        runCatching { XposedBridge.hookAllMethods(cls, "updateWithOnConflict", snsBlockGuard) }
+            .onSuccess { if (it.isNotEmpty()) ok += "updateWithOnConflict.before" }
+            .onFailure { LogX.e("SNS: hook updateWithOnConflict before failed", it) }
+        // ✅ R41：新动态首次落库走 INSERT（不走 updateWithOnConflict），账本采样
+        //   必须补插入路径，否则「本轮有新内容」时 subset 恒 false（见 [snsInsertGuard]）。
+        runCatching { XposedBridge.hookAllMethods(cls, "insertWithOnConflict", snsInsertGuard) }
+            .onSuccess { if (it.isNotEmpty()) ok += "insertWithOnConflict" }
+            .onFailure { LogX.e("SNS: hook insertWithOnConflict failed", it) }
+        runCatching { XposedBridge.hookAllMethods(cls, "insert", snsInsertGuard) }
+            .onSuccess { if (it.isNotEmpty()) ok += "insert" }
+            .onFailure { LogX.e("SNS: hook insert failed", it) }
         // ✅ R27 方案 A（Response-Merge）：联网时时间线吃响应对象、不读库，
         //   只补 DB 的 sourceType 不够，还得把本地行注入回 `c3.N` 的响应列表
         //   （见 `docs/_r27_clear_api_forensics.md` §11.4 的联网/断网对照实验）。
@@ -130,9 +151,9 @@ object SnsGuard {
         //   它不是常驻钩子，跟下面「常驻的两个」不是一回事，别按同一把尺子衡量。
         runCatching { installCapture(cls) }
             .onFailure { LogX.w("SNS: capture hook failed: ${it.javaClass.simpleName}") }
-        // ⚠️ **常驻**的只有 delete / execSQL / updateWithOnConflict 三个。insert / query 一律不挂：
-        // 那是微信所有表（message / rcontact …）的写路径，挂上去等于给每次写库都加一层开销，
-        // 而我们要的信息（原 localFlag）用 `| VISIBLE_BIT` 兜底已经够了。
+        // ⚠️ **常驻**的只有 delete / execSQL / updateWithOnConflict / insert(WithOnConflict)
+        // 四个。insert 是 R41 才补的**探针采样**路径（纯内存记账、第一句零反射短路，
+        // 非 SnsInfo 立刻返回），不是业务拦截钩子；query 一律不挂。
         //
         // ⛔ updateWithOnConflict 是 2026-10-26 R27 才加的**唯一例外**：真机取证证明
         //    清 `sourceType` 走的是它、而不是 execSQL（见 [snsUpdateGuard] 的三道闸）。
@@ -154,6 +175,7 @@ object SnsGuard {
         config = Config(
             enabled = Kv.getBool(Keys.ANTIREVOKE_SNS),
             debugLog = Kv.getBool(Keys.DEBUG_LOG),
+            blockEnabled = Kv.getBool(Keys.ANTIREVOKE_SNS_BLOCK),
         )
         cfgAt = SystemClock.elapsedRealtime()
     }
@@ -246,7 +268,196 @@ object SnsGuard {
     }
 
     /**
+     * R41 探针：新动态首次落库走 `insertWithOnConflict`/`insert`（实测 verity 发新帖那轮
+     * 库里查得到 src=2，但 updateWithOnConflict 采不到），账本必须补这条路径。
+     *
+     * 代价控制：与 [snsUpdateGuard] 同款 —— 第一句零反射字符串比较，非 `SnsInfo` 立刻返回。
+     * afterHook 里从 **ContentValues** 取 snsId（不是 whereArgs），取不到打一条节流告警。
+     */
+    private val snsInsertGuard = object : XC_MethodHook() {
+        override fun afterHookedMethod(param: MethodHookParam) {
+            runCatching { onSnsInsertAfter(param) }
+                .onFailure { LogX.w("SNS insert hook err: ${it.javaClass.simpleName}") }
+        }
+    }
+
+    /**
+     * R42 路线甲实测：**写时拦截** `SnsInfo.sourceType`（before）。
+     *
+     * ## 为什么 before 而不是 after
+     * after 里改 values 已经晚了 —— SQL 早就执行完了，位已经清掉。要「让清位不落地」，
+     * 只能在 SQL 执行**之前**把这个键从参数里拿掉（WechatMagician 2017 的做法，
+     * 见 `docs/_r42_wechatmagician.md`）。同一行 `sourceType` 保持旧值，微信的
+     * `sourceType & 2 != 0` 判据继续成立 ⇒ 时间线还能翻到。
+     *
+     * ## 与 [snsUpdateGuard]（after，补位）的关系
+     * 两个回调挂在**同一个方法**上，互不调用：
+     * - after 钩子看到 `sourceType == 0` ⇒ 排补位（现有行为，**本轮一个字不改**）；
+     * - before 钩子把 `sourceType` 摘掉 ⇒ after 钩子读不到值 ⇒ 不排补位（拦截模式下本该如此）。
+     *   ⚠️ 那句「no sourceType … re-fix disabled」在拦截模式下是**误报**，所以
+     *   `onSnsUpdateAfter` 里先按 ContentValues 身份问一次 [SnsBlockProbe.isBlockedValues]。
+     *
+     * ## 代价
+     * ① 第一句零反射字符串比较（微信所有表的 update 都经过这里）；
+     * ② 只有 `SnsInfo` + values 里有 `sourceType` 才反射读值；
+     * ③ 只有 `== 0`（真正的清位）才点查一次库、记账、可能摘键。
+     * ④ 开关关闭时**照样记账**（只计数、不摘键）—— 开/关对照实验必须有同一套计数，
+     *    否则「关的时候没看到」会被误读成「没发生」。
+     */
+    private val snsBlockGuard = object : XC_MethodHook() {
+        override fun beforeHookedMethod(param: MethodHookParam) {
+            runCatching { onSnsUpdateBefore(param) }
+                .onFailure { LogX.w("SNS block hook err: ${it.javaClass.simpleName}") }
+        }
+
+        override fun afterHookedMethod(param: MethodHookParam) {
+            runCatching { onSnsUpdateBlockAfter(param) }
+                .onFailure { LogX.w("SNS block after err: ${it.javaClass.simpleName}") }
+        }
+    }
+
+    /** `ContentValues` 的反射面（wcdb 那份不是 AOSP 类的子类，⛔ 不能强转） */
+    private class CvApi(c: Class<*>) {
+        val get: Method? = runCatching { c.getMethod("get", String::class.java) }.getOrNull()
+        val remove: Method? = runCatching { c.getMethod("remove", String::class.java) }.getOrNull()
+        val size: Method? = runCatching { c.getMethod("size") }.getOrNull()
+        val putInt: Method? =
+            runCatching { c.getMethod("put", String::class.java, Int::class.javaObjectType) }
+                .getOrNull()
+                ?: runCatching { c.getMethod("put", String::class.java, Any::class.java) }.getOrNull()
+    }
+
+    @Volatile
+    private var cvApiCls: Class<*>? = null
+
+    @Volatile
+    private var cvApiCached: CvApi? = null
+
+    /** 按 class 缓存；非 ContentValues 返回 null（= 不是我们要的重载） */
+    private fun cvApiOf(values: Any): CvApi? {
+        val c = values.javaClass
+        if (!c.name.contains("ContentValues")) return null
+        if (cvApiCls === c) return cvApiCached
+        val api = CvApi(c)
+        cvApiCls = c
+        cvApiCached = api
+        return api
+    }
+
+    /** Integer / Long / Short / String 都认（微信不同字段类型不一样，不能赌） */
+    private fun intOfAny(v: Any?): Int? = when (v) {
+        null -> null
+        is Int -> v
+        is Long -> v.toInt()
+        is Short -> v.toInt()
+        is Byte -> v.toInt()
+        is Number -> v.toInt()
+        is String -> v.trim().toIntOrNull()
+        else -> v.toString().trim().toIntOrNull()
+    }
+
+    /** 「sourceType 类型不认识」的告警只打一次 */
+    private val blockParseWarned = java.util.concurrent.atomic.AtomicBoolean(false)
+
+    private fun onSnsUpdateBefore(param: XC_MethodHook.MethodHookParam) {
+        val a = param.args ?: return
+        if (a.size < 2) return
+        // ① 零反射短路：微信所有表的 update 都走这里
+        if ((a[0] as? String) != TABLE) return
+        // ② 上一轮若没跑到 after（方法抛异常/提前返回），残留标记会污染下一次调用 —— 先清
+        SnsBlockProbe.clearPending()
+        val values = a[1] ?: return
+        val api = cvApiOf(values) ?: return
+        val raw = runCatching { api.get?.invoke(values, "sourceType") }.getOrNull()
+        // ② 这次写根本没碰 sourceType（绝大多数）—— 只计数，不打日志
+        if (raw == null) {
+            SnsBlockProbe.noteUpdateNoSrcKey()
+            return
+        }
+        val st = intOfAny(raw)
+        if (st == null) {
+            // ⛔ 不许静默：类型变了 ⇒ 拦截会永久失效，而功能表面上「开着」
+            SnsBlockProbe.noteParseFail()
+            if (blockParseWarned.compareAndSet(false, true)) {
+                LogX.w(
+                    "BLOCK skip: sourceType unparsable " +
+                        "type=${raw.javaClass.name} value=${raw.toString().take(24)}（拦截不可用）"
+                )
+            }
+            return
+        }
+        // ③ 非 0：正常行写 2/10（也包含微信把我们补的位打回 2），不是清位
+        if (st != 0) {
+            SnsBlockProbe.noteUpdateNonZero()
+            return
+        }
+
+        // ---- ④ 命中：微信要把这一条的可见位清掉 ----
+        val id = runCatching { snsIdOf(a) }.getOrDefault(0L)
+        val db = param.thisObject
+        val bits = if (id != 0L) SnsBlockProbe.readBits(db, id) else null
+        val keys = runCatching { api.size?.invoke(values) as? Int ?: -1 }.getOrDefault(-1)
+        val hasContent = runCatching { api.get?.invoke(values, "content") != null }
+            .getOrDefault(false)
+        val hasAttr = runCatching { api.get?.invoke(values, "attrBuf") != null }
+            .getOrDefault(false)
+        if (id == 0L) {
+            // 抠不出 id 不代表不能拦（键在不在才是拦截的全部依据），但要让人看见
+            LogX.w("BLOCK warn: sourceType=0 但 whereArgs 里抠不出 snsId keys=$keys（本条照拦）")
+        }
+
+        if (!cfg().blockEnabled) {
+            SnsBlockProbe.record(id, bits, keys, hasContent, hasAttr, SnsBlockProbe.Outcome.OFF)
+            return
+        }
+
+        val remove = api.remove
+        if (remove == null) {
+            SnsBlockProbe.record(
+                id, bits, keys, hasContent, hasAttr, SnsBlockProbe.Outcome.SKIP_NO_API
+            )
+            LogX.w("BLOCK skip: no ContentValues.remove on ${values.javaClass.name}")
+            return
+        }
+        val ok = runCatching { remove.invoke(values, "sourceType") }.isSuccess
+        if (!ok) {
+            SnsBlockProbe.record(
+                id, bits, keys, hasContent, hasAttr, SnsBlockProbe.Outcome.SKIP_NO_API
+            )
+            LogX.w("BLOCK skip: remove(sourceType) threw on ${values.javaClass.name}")
+            return
+        }
+        // ⑤ 摘完变空 ⇒ SQLite 的 update 会抛 IllegalArgumentException。宁可放回去不拦，也不能崩。
+        val left = runCatching { api.size?.invoke(values) as? Int ?: -1 }.getOrDefault(-1)
+        if (left == 0) {
+            runCatching { api.putInt?.invoke(values, "sourceType", 0) }
+            SnsBlockProbe.noteSkipEmpty(id)
+            SnsBlockProbe.record(
+                id, bits, keys, hasContent, hasAttr, SnsBlockProbe.Outcome.SKIP_EMPTY
+            )
+            return
+        }
+        SnsBlockProbe.record(
+            id, bits, keys, hasContent, hasAttr, SnsBlockProbe.Outcome.BLOCKED, values,
+        )
+    }
+
+    /**
+     * 拦截的 after 半场：**立刻回查**这条的 sourceType，证明「键摘掉后库里没被改成 0」。
+     *
+     * 放 after 是唯一的正确位置：before 里查到的还是写之前的旧值。
+     * 第一句仍是零反射的表名比较，非 `SnsInfo` 直接走。
+     */
+    private fun onSnsUpdateBlockAfter(param: XC_MethodHook.MethodHookParam) {
+        val a = param.args ?: return
+        if ((a.getOrNull(0) as? String) != TABLE) return
+        if (!SnsBlockProbe.hasPending()) return
+        SnsBlockProbe.finishAfterWrite { id -> SnsBlockProbe.readBits(param.thisObject, id) }
+    }
+
+    /**
      * 最近一次「写 0」命中的时刻（`elapsedRealtime`）。
+     *
      * 补位不在这里立刻跑，而是等这一批写完（静默 [UPDATE_FIX_QUIET_MS]）后统一跑，
      * 否则先补的那条会被同批后续的写 0 覆盖（2026-10-26 00:18 真机实测：
      * 一轮写 3 条，只补回 1 条，另两条被节流挡掉后保持 0）。
@@ -306,6 +517,70 @@ object SnsGuard {
         return 0L
     }
 
+    @Volatile
+    private var insCvCls: Class<*>? = null
+
+    @Volatile
+    private var insCvGet: Method? = null
+
+    /** 「INSERT 里取不到 snsId」的告警只打一次（节流，避免刷爆 5000 行环形日志） */
+    private val insCvWarned = java.util.concurrent.atomic.AtomicBoolean(false)
+
+    /**
+     * 从 INSERT 的 `ContentValues` 里抠 snsId（wcdb 的 `com.tencent.wcdb.ContentValues`，
+     * 不是 AOSP 那个类的子类）。`get("snsId")` 返回 Object，兼容 Long/Integer/String 三种装箱，
+     * 取不到返回 0（= 哨兵，调用方放弃，绝不去猜一个 id 记账）。
+     */
+    private fun snsIdOfValues(values: Any): Long {
+        val c = values.javaClass
+        if (insCvCls !== c) {
+            insCvGet = runCatching { c.getMethod("get", String::class.java) }.getOrNull()
+            insCvCls = c
+        }
+        val m = insCvGet ?: return 0L
+        val v = runCatching { m.invoke(values, "snsId") }.getOrNull() ?: return 0L
+        return when (v) {
+            is Long -> v
+            is Int -> v.toLong()
+            is String -> v.toLongOrNull() ?: 0L
+            else -> 0L
+        }
+    }
+
+    private fun onSnsInsertAfter(param: XC_MethodHook.MethodHookParam) {
+        val a = param.args ?: return
+        if (a.size < 2) return
+        // ① 零反射短路：微信所有表的 insert 都走这里，非 SnsInfo 立刻返回
+        if ((a[0] as? String) != "SnsInfo") return
+        // ② values 参数按「类名含 ContentValues」定位，不赌下标（wcdb 有多组重载）
+        val values = a.firstOrNull { it != null && it.javaClass.name.contains("ContentValues") }
+            ?: return
+        // R42 W2：INSERT 通道的 sourceType 分布（清位理论上不走 INSERT，这里再证一次）
+        runCatching { countInsertSource(values) }
+            .onFailure { LogX.w("SNS insert count err: ${it.javaClass.simpleName}") }
+        val id = runCatching { snsIdOfValues(values) }.getOrNull() ?: 0L
+        if (id == 0L) {
+            if (insCvWarned.compareAndSet(false, true)) {
+                LogX.w("SNS insert hook: no snsId on ${values.javaClass.name} (insert sampling skipped)")
+            }
+            return
+        }
+        // 纯内存探针、零 IO
+        SnsRoundLedger.onInsert(id)
+    }
+
+    /**
+     * R42 W2：INSERT 路径上 `sourceType` 的取值（只计数，不写库、不改 values）。
+     *
+     * 新动态首次落库走 INSERT；「清位」如果也走 INSERT，那拦截 before 就漏了一条通道，
+     * 所以这里必须有一份独立数字。
+     */
+    private fun countInsertSource(values: Any) {
+        val api = cvApiOf(values) ?: return
+        val raw = runCatching { api.get?.invoke(values, "sourceType") }.getOrNull()
+        SnsBlockProbe.noteInsert(raw != null, intOfAny(raw))
+    }
+
     private fun onSnsUpdateAfter(param: XC_MethodHook.MethodHookParam) {
         val a = param.args ?: return
         if (a.size < 2) return
@@ -313,15 +588,24 @@ object SnsGuard {
         if ((a[0] as? String) != "SnsInfo") return
         // ② 只有「服务器认为这条不可见」才需要补；正常行微信写的是 2 或 10
         val values = a[1] ?: return
+        // R40 P0-1：集合比对的采样点必须在 sourceType 判定之前 —— 正常行写 2/10 会在下面
+        // 的 `st != 0` 分支提前 return，采样晚一步就只能收到「写 0」的行，subset 恒 false。
+        // 纯内存探针、零 IO、不碰 LogX；snsIdOf(a) 失败/为 0 时静默跳过。
+        runCatching { snsIdOf(a) }.getOrNull()?.let { if (it != 0L) SnsRoundLedger.onUpsert(it) }
         val st = sourceTypeOf(values)
         if (st == null) {
             // ⛔ 绝不允许静默失效：取不到值说明 ContentValues 形态变了，
             // 补位会从此永久不触发，而功能表面上"正常"（只是不生效）。
+            // ⚠️ R42：例外 —— 键是**我们自己**在 before 里摘掉的（拦截模式），
+            //    这不是形态变化、补位也没「失效」（位根本没被清，无需补）。
+            //    按 ContentValues 身份判定，比按时间窗猜准；命中就直接返回、不刷误报。
+            if (SnsBlockProbe.isBlockedValues(values)) return
             if (cvWarned.compareAndSet(false, true)) {
                 LogX.w("SNS update hook: no sourceType on ${values.javaClass.name} (re-fix disabled)")
             }
             return
         }
+        // P0 取证采样点已上移到 sourceType 判定之前（见 :315-318），此处不再采样。
         if (st != 0) {
             // ⭐ R30 §6.2：微信**不是**只写 0 才覆盖我们。好友个人主页同步时它按服务端值
             //    整行 upsert，把补好的 `10`（时间线|相册）打回 `2`（只有时间线位）——
@@ -408,6 +692,12 @@ object SnsGuard {
         if (a.isEmpty()) return
         val table = a[0] as? String
         val id = SnsSql.matchDeleteCall(table, a.getOrNull(1) as? String, a.getOrNull(2) as? Array<*>?)
+        // R42 W2：DELETE 通道独立计数（历史上认为「零 DELETE」，这里再证一次）。
+        // ⚠️ 必须在 `id == null` 早退之前 —— 早期结论错就错在只看「单行删除」。
+        if (table == TABLE) {
+            runCatching { SnsBlockProbe.noteDelete(a.getOrNull(1) as? String, id) }
+                .onFailure { LogX.w("SNS delete count err: ${it.javaClass.simpleName}") }
+        }
         // 不是「删 SnsInfo 的某一行」就直接走（含 `createTime < ?` 这类清理），别去反射拿路径
         if (id == null) return
         val c = cfg()
@@ -448,6 +738,18 @@ object SnsGuard {
                 LogX.i("SNS sns db captured via execSQL (导出扫当前 SnsInfo 已可用)")
                 unhookCapture()
             }
+        }
+        // R42 W2：execSQL 是「清位第二条通道」的头号嫌疑（旧模板 `sourceType & -3`）。
+        // 只在 SQL 里出现 SnsInfo 时才多一次 lowercase（平时零开销）。
+        if (sql != null && sql.contains(TABLE)) {
+            runCatching {
+                SnsBlockProbe.noteSql(
+                    sql,
+                    isSourceWrite = SnsTimelineSrcLogic.looksLikeSourceWrite(sql),
+                    clear = SnsTimelineSrcLogic.isSourceClearSql(sql),
+                    own = SnsTimelineSrcLogic.isOwnFixSql(sql),
+                )
+            }.onFailure { LogX.w("SNS sql count err: ${it.javaClass.simpleName}") }
         }
         // ⚠️ 参数化 SQL（`where snsId=?`）的 id 在第二个参数里，必须一起传进去，
         // 否则 execSQL 形态对参数化写法**完全失效**（第一版就漏了）
@@ -972,6 +1274,88 @@ object SnsGuard {
             }
         }.getOrElse {
             listOf("err ${it.javaClass.simpleName}: ${(it.cause ?: it).message?.take(80)}")
+        }
+    }
+
+    /**
+     * P0-2 覆盖率探针（只读，一行不写）：最近 `localFlag=2` 的可见动态里，有多少曾进过
+     * [SnsRoundLedger] 的响应账本。量化「翻页可见的历史动态有多少从没进过响应」，
+     * 用来支撑「存档 = 看到才存」的范围声明。**它不是 gate，只记录。**
+     */
+    fun winCoverage(limit: Int = 60): List<String> {
+        val db = snsDb ?: return listOf("WIN cover no sns db yet (先让微信刷一次朋友圈)")
+        val m = rawQueryMethod(db) ?: return listOf("WIN cover no rawQuery on ${db.javaClass.name}")
+        return runCatching {
+            val lim = limit.coerceIn(1, 200)
+            val cur = m.invoke(
+                db,
+                "select snsId from $TABLE where localFlag=2 order by createTime desc limit $lim",
+                null,
+            ) ?: return listOf("WIN cover null cursor")
+            val ids = ArrayList<Long>()
+            try {
+                while (XposedHelpers.callMethod(cur, "moveToNext") as? Boolean == true) {
+                    val id = runCatching {
+                        XposedHelpers.callMethod(cur, "getLong", 0) as? Long ?: 0L
+                    }.getOrDefault(0L)
+                    if (id != 0L) ids.add(id)
+                }
+            } finally {
+                runCatching { XposedHelpers.callMethod(cur, "close") }
+            }
+            val hit = ids.count { SnsRoundLedger.seenAny(it) }
+            val pct = if (ids.isEmpty()) 0 else hit * 100 / ids.size
+            listOf("WIN cover recent60=${ids.size} inLedger=$hit pct=$pct%")
+        }.getOrElse { listOf("WIN cover err: ${it.javaClass.simpleName}") }
+    }
+
+    /**
+     * R41 子步 3：每轮 gate 关闭后，统计「这轮 id 现在还剩多少可见位」。
+     *
+     * 为 R41 新主判据（「快照存在 ∧ 当前 `&2==0`」）提供数据。只读、最多查 [VIS_PROBE_MAX]
+     * 个 id，失败打 `WIN src skip: <原因>` 并跳过，⛔ 不阻塞、不重试。
+     *
+     * 由 [SnsRoundLedger] 在 worker 线程调用（不在主链路锁内做 IO）。
+     */
+    fun probeVisibleBits(roundNo: Int, ids: Set<Long>) {
+        val db = snsDb ?: run {
+            LogX.w("WIN src skip: no sns db")
+            return
+        }
+        val m = rawQueryMethod(db) ?: run {
+            LogX.w("WIN src skip: no rawQuery on ${db.javaClass.name}")
+            return
+        }
+        val q = ids.take(VIS_PROBE_MAX)
+        if (q.isEmpty()) {
+            LogX.w("WIN src skip: empty ids")
+            return
+        }
+        val sql = "select snsId,sourceType from $TABLE where snsId in (${q.joinToString(",")})"
+        val cur = runCatching { m.invoke(db, sql, null) }
+            .onFailure {
+                LogX.w("WIN src skip: ${it.javaClass.simpleName}: " +
+                    "${(it.cause ?: it).message?.take(60)}")
+            }
+            .getOrNull() ?: return
+        try {
+            val visible = HashSet<Long>()
+            val zero = ArrayList<Long>(3)
+            while (XposedHelpers.callMethod(cur, "moveToNext") as? Boolean == true) {
+                val id = runCatching { XposedHelpers.callMethod(cur, "getLong", 0) as? Long ?: 0L }
+                    .getOrDefault(0L)
+                val st = runCatching { XposedHelpers.callMethod(cur, "getLong", 1) as? Long ?: 0L }
+                    .getOrDefault(0L).toInt()
+                if (st and 2 != 0) {
+                    visible.add(id)
+                } else if (zero.size < 3) {
+                    zero.add(id)
+                }
+            }
+            val k = q.count { it in visible }
+            LogX.i("WIN src round=$roundNo vis=$k/${q.size} zero=[${zero.joinToString(",")}]")
+        } finally {
+            runCatching { XposedHelpers.callMethod(cur, "close") }
         }
     }
 

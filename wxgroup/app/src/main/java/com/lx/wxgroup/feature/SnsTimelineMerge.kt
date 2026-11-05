@@ -83,6 +83,13 @@ object SnsTimelineMerge {
     /** 首次命中 `c3.N` 时打一条日志（区分「钩子没触发」与「无需注入」） */
     private val firstHit = java.util.concurrent.atomic.AtomicBoolean(false)
 
+    /** R41 子步 2：采样结果（list 也要复用，注入路径 `list.add` 用，不能重新遍历） */
+    private class RoundSample(
+        val list: MutableList<Any>,
+        val respIds: HashSet<Long>,
+        val times: ArrayList<Int>,
+    )
+
     // ------------------------------------------------------------- 安装
 
     // 判据在 [SnsTimelineMergeLogic]（纯 JVM 可测，与 Xposed 隔离）
@@ -120,39 +127,26 @@ object SnsTimelineMerge {
 
     @Suppress("UNCHECKED_CAST")
     private fun onBeforeResp(param: XC_MethodHook.MethodHookParam) {
-        if (!enabled()) return
-        val a = param.args ?: return
-        if (a.size < 4) {
-            LogX.w("$TAG args=${a.size} (expected 4)")
-            return
-        }
-        val resp = a[3] ?: return
-        val list = runCatching { XposedHelpers.getObjectField(resp, "f") }.getOrNull()
-            as? MutableList<Any>
-        if (list == null) {
-            LogX.w("$TAG no list field f on ${resp.javaClass.name}")
-            return
-        }
-        // ① 响应里已有哪些；顺带记下时间序，用于后面按 CreateTime 定位插入位
-        // ⚠️ 两个值**必须各自兜底**：任一抛异常都会让 times 与 list 错位，
-        //    插入下标就会算错（把动态插到错误位置，看起来像排序 bug）
-        val respIds = HashSet<Long>()
-        val times = ArrayList<Int>()
-        for (o in list) {
-            respIds.add(runCatching { XposedHelpers.getLongField(o, "Id") }.getOrDefault(0L))
-            times.add(runCatching { XposedHelpers.getIntField(o, "CreateTime") }.getOrDefault(0))
-        }
-        // ⛔ 空响应不注入。真机实测：进朋友圈后 `c3.N` 会被**每秒一次**地反复调用，
-        //    且传入的 `zb5.f` 是空列表（增量/心跳类请求）。往空列表里塞 4 条会让
-        //    attempt 从 4 涨到 56（52 次无用注入 × 4 次 SQL），白烧 CPU 还可能被写库。
-        //    首屏/刷新的正常响应一定非空，所以这条闸不会误伤主路径。
-        if (list.isEmpty()) {
+        // R41 子步 2：采样必须在 enabled() 之前跑一次（关开关时也要记账本，做开/关对照）。
+        //    结果存局部变量，enabled() 之后的注入主链路复用同一份，不重复遍历。
+        val sample = runCatching { sampleRound(param) }
+            .onFailure { LogX.w("$TAG sample err: ${it.javaClass.simpleName}") }
+            .getOrNull()
+        if (sample == null) return
+        // ⛔ 空响应整轮跳过（不注入、不进账本），语义与旧 list.isEmpty() 分支一致。
+        if (sample.list.isEmpty()) {
             emptyResp.incrementAndGet()
             return
         }
+        // P0 取证：记录独立同步轮次（纯内存账本）。开关关闭时也记（开/关对照）。
+        //    探针自身异常绝不能让主链路崩，只打 w 留痕。
+        runCatching {
+            SnsRoundLedger.onResponse(sample.respIds, sample.times.map { it.toLong() })
+        }.onFailure { LogX.w("$TAG ledger err: ${it.javaClass.simpleName}") }
+        if (!enabled()) return
         // ⛔ 反静默失效：首次命中必须留下痕迹，否则「钩子没触发」和「触发了但无需注入」无法区分
         if (firstHit.compareAndSet(false, true)) {
-            LogX.i("$TAG first hit: respIds=${respIds.size} times=${times.size}")
+            LogX.i("$TAG first hit: respIds=${sample.respIds.size} times=${sample.times.size}")
         }
         // ② 候选 = **物理删除归档**（SnsGuard 拦下的 DELETE）里、这一轮响应没有的
         //
@@ -179,7 +173,7 @@ object SnsTimelineMerge {
                 addAll(all.subList(0, s))
             }
         }
-        val missing = SnsTimelineMergeLogic.pickMissing(rotated, respIds, MAX_PER_ROUND)
+        val missing = SnsTimelineMergeLogic.pickMissing(rotated, sample.respIds, MAX_PER_ROUND)
         if (missing.isEmpty()) return
         if (all.size > MAX_PER_ROUND) {
             archiveCursor = (archiveCursor + missing.size) % all.size
@@ -198,13 +192,13 @@ object SnsTimelineMerge {
             }
             if (buf == null || buf.isEmpty()) {
                 emptyBuf.incrementAndGet()
-                LogX.w("$TAG-FAIL snsId=$id reason=empty-buf size=${list.size}")
+                LogX.w("$TAG-FAIL snsId=$id reason=empty-buf size=${sample.list.size}")
                 continue
             }
             val o = parse(cls, buf)
             if (o == null) {
                 parseFail.incrementAndGet()
-                LogX.w("$TAG-FAIL snsId=$id reason=parse-ex src=$src size=${list.size}")
+                LogX.w("$TAG-FAIL snsId=$id reason=parse-ex src=$src size=${sample.list.size}")
                 continue
             }
             // l5.f 的做法：Id 为空时用 DB 的 snsId 兜底
@@ -222,25 +216,55 @@ object SnsTimelineMerge {
             // 与其插到错误位置，不如放弃这一条并留痕（有 ct 的条目照常注入）。
             if (ct <= 0) {
                 badCt.incrementAndGet()
-                LogX.w("$TAG-FAIL snsId=$id reason=bad-ct src=$src size=${list.size}")
+                LogX.w("$TAG-FAIL snsId=$id reason=bad-ct src=$src size=${sample.list.size}")
                 continue
             }
-            val idx = SnsTimelineMergeLogic.insertIndexDesc(times, ct)
-            val added = runCatching { list.add(idx, o); true }.getOrDefault(false)
+            val idx = SnsTimelineMergeLogic.insertIndexDesc(sample.times, ct)
+            val added = runCatching { sample.list.add(idx, o); true }.getOrDefault(false)
             if (!added) {
-                LogX.w("$TAG-FAIL snsId=$id reason=add-false size=${list.size}")
+                LogX.w("$TAG-FAIL snsId=$id reason=add-false size=${sample.list.size}")
                 continue
             }
-            times.add(idx, ct)
+            sample.times.add(idx, ct)
             ok.incrementAndGet()
-            LogX.i("$TAG snsId=$id parse=ok src=$src buf=${buf.size} ct=$ct idx=$idx size=${list.size}")
+            LogX.i("$TAG snsId=$id parse=ok src=$src buf=${buf.size} ct=$ct idx=$idx size=${sample.list.size}")
         }
         LogX.i(
             "$TAG-STAT attempt=${attempt.get()} ok=${ok.get()} parseFail=${parseFail.get()} " +
                 "emptyBuf=${emptyBuf.get()} badCt=${badCt.get()} emptyResp=${emptyResp.get()} " +
-                "noDb=${noDb.get()} resp=${respIds.size}"
+                "noDb=${noDb.get()} resp=${sample.respIds.size}"
         )
     }
+
+    /**
+     * R41 子步 2：采样「取 a[3] → 取响应对象 → 遍历 Id/CreateTime」。
+     *
+     * 整体 [runCatching] 包住，异常只打 `LogX.w`，绝不让探针把主链路弄崩。
+     * ⚠️ Id / CreateTime **必须各自兜底**：任一抛异常都会让 times 与 list 错位。
+     */
+    @Suppress("UNCHECKED_CAST")
+    private fun sampleRound(param: XC_MethodHook.MethodHookParam): RoundSample? = runCatching {
+        val a = param.args ?: return@runCatching null
+        if (a.size < 4) {
+            LogX.w("$TAG args=${a.size} (expected 4)")
+            return@runCatching null
+        }
+        val resp = a[3] ?: return@runCatching null
+        val list = runCatching { XposedHelpers.getObjectField(resp, "f") }.getOrNull()
+            as? MutableList<Any>
+        if (list == null) {
+            LogX.w("$TAG no list field f on ${resp.javaClass.name}")
+            return@runCatching null
+        }
+        val respIds = HashSet<Long>()
+        val times = ArrayList<Int>()
+        for (o in list) {
+            respIds.add(runCatching { XposedHelpers.getLongField(o, "Id") }.getOrDefault(0L))
+            times.add(runCatching { XposedHelpers.getIntField(o, "CreateTime") }.getOrDefault(0))
+        }
+        RoundSample(list, respIds, times)
+    }.onFailure { LogX.w("$TAG sample ex: ${it.javaClass.simpleName}") }
+        .getOrNull()
 
     /** `SELECT attrBuf FROM SnsInfo WHERE snsId=?` —— 走 wcdb 的 rawQuery，反射兼容 wcdb Cursor */
     private fun readAttrBuf(db: Any, snsId: Long): ByteArray? {
