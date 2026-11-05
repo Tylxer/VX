@@ -29,13 +29,7 @@ import com.lx.wxgroup.feature.ForceForward
 import com.lx.wxgroup.feature.GroupBar
 import com.lx.wxgroup.feature.HintBadge
 import com.lx.wxgroup.feature.ScrollDock
-import com.lx.wxgroup.feature.SnsAlbumMerge
 import com.lx.wxgroup.feature.SnsGuard
-import com.lx.wxgroup.feature.SnsSqlSpy
-import com.lx.wxgroup.feature.SnsSyncDelProbe
-import com.lx.wxgroup.feature.SnsDeletedTag
-import com.lx.wxgroup.feature.SnsTag
-import com.lx.wxgroup.feature.SnsTimelineSourceFix
 import com.lx.wxgroup.feature.VoiceFileGuard
 import com.lx.wxgroup.feature.VoiceGuard
 import com.lx.wxgroup.feature.MomentsAuto
@@ -235,72 +229,13 @@ class HookEntry : IXposedHookLoadPackage {
             VoiceFileGuard.install()
         }.onFailure { LogX.e("VoiceFileGuard install failed", it) }
 
-        // ---- 防撤回·朋友圈动态防删除（6.2 第二项）：拦住 DELETE FROM SnsInfo 并归档整行 ----
+        // ---- 防撤回·朋友圈动态防删除（6.2 第二项，R42 路线甲：写时拦截）----
         // ⚠️ 朋友圈是**独立的库** SnsMicroMsg.db，不是 EnMicroMsg.db。
-        // 删动态是物理 DELETE 整行（不是改标记），所以策略是「拦 + 归档」而不是「拦 + 改写」。
+        // 微信清时间线可见位走 `updateWithOnConflict("SnsInfo", {sourceType=0})`，
+        // 在 before 里摘掉 sourceType 键，让清位不落地（事后补位/归档已随乙方案删除）。
         runCatching {
             SnsGuard.install(lpparam)
         }.onFailure { LogX.e("SnsGuard install failed", it) }
-
-        // ---- 防撤回·朋友圈动态「[已删除]」标签（6.2 第三项）----
-        // 落点：新版时间线 ImproveSnsTimelineUI → WxRecyclerAdapter.onBindViewHolder（**类名未混淆**）
-        // + adapter.getData() 的 ImproveInfo(name=…, snsID='无符号十进制')。
-        // ⚠️ 老版那条 View.setTag → TimeLineObject.Id 链在新版**不存在**（四轮真机取证结论）。
-        // 只往「被我们救下来的动态」上打标，清单来自 sns_archive。
-        runCatching {
-            SnsTag.install(lpparam)
-        }.onFailure { LogX.e("SnsTag install failed", it) }
-
-        // R35-1：「已删除动态打灰标」（灰标 = 灰底的「删除已拦截」角标）。
-        // 与上面 SnsTag 是**两件事**：SnsTag 决定「哪些动态算被删」，本模块负责「把它画到 itemView 上」。
-        // 挂载点从 `WxRecyclerAdapter.onBindViewHolder`（2 参，dex 反汇编证明是**死钩**）
-        // 改为 `c1/d1/a1/b1/l0/n0/k0`（一次拿到 View + snsId，不再靠 pos↔getData 下标对账）。
-        // ⚠️ 不加这行也不致死：`SnsDeletedTag.apply()` 被 SnsTag 首次调用时会用
-        //    `itemView.javaClass.classLoader` 懒装；加了只是把安装时机提前到启动，
-        //    排障时 `SNS_DELTAG installed` 能与其它模块并列出现，更容易判断「装没装上」。
-        runCatching {
-            SnsDeletedTag.install(lpparam)
-        }.onFailure { LogX.e("SnsDeletedTag install failed", it) }
-
-        // ---- R30 §6.2 取证：SQL 旁听（默认关闭，`op=snsg sub=sqlspy sub2=on` 才记）----
-        // 目的：让微信自己把相册 `getUserMediaSql` 的 **真 SQL** 说出来。
-        // 静态反汇编读出的 `sourceType in (64)` 与真机数据矛盾（最新 50 行无一条等于 64，
-        // 且 10/130 组合值普遍存在 ⇒ 位掩码语义），不再靠猜。
-        runCatching {
-            SnsSqlSpy.install(lpparam.classLoader)
-        }.onFailure { LogX.e("SnsSqlSpy install failed", it) }
-
-        // ---- R30 §6.2/6.3：好友个人相册页也显示被删动态 ----
-        // ⛔ **暂不启用**（2026-10-27 21:2x）。原因：取证发现相册 UI 是**读库渲染**
-        //    （`qg3/i` 的 `d:List` 元素是 `SnsInfo` 存储实体），SQL 由
-        //    `SnsInfoStorage.getUserMediaSql` 生成：
-        //      `select *,rowid from SnsInfo WHERE <d2.x> AND type in (1, 15)`
-        //    其中 `d2.x` 是运行时按 `d2.E` 排除清单拼出的 sourceType 条件。
-        //    ⇒ 若该条件实际拦住的正是 `sourceType=0`，那**方案 B（补 sourceType=2）已经够**，
-        //      再往 `h3.N` 注入等于「先写库、再从库里读回来」，纯属绕路且会重复写行。
-        //    必须先在真机确认「进相册首屏到底有没有那 4 条已补位的动态」，再决定是否打开。
-        //    静态追 `d2.x` 的拼接链成本已超过收益（`<clinit>` 859 units + `Q0` 多层分发）。
-        // runCatching {
-        //     SnsAlbumMerge.install(lpparam)   // 响应注入方案：相册是读库渲染，注入 jc5.f 对 UI 无增量
-        // }.onFailure { LogX.e("SnsAlbumMerge install failed", it) }
-
-        // ⭐ R30 §6.2 改用「写库补相册位」：h3.N 的 after（写库后、读库前）把被删动态
-        //    的 sourceType 补上 bit3(8)，让它们满足相册 SQL 的 `sourceType in (…)` 白名单。
-        //    只补 `fixed_orig` 窄台账里的十几条，绝不扫全表（17.6 万条正常 src=2 会被误补）。
-        runCatching {
-            SnsTimelineSourceFix.installAlbumTrigger(lpparam)
-        }.onFailure { LogX.e("SnsTimelineSourceFix.installAlbumTrigger failed", it) }
-        // ⭐ 补位守不住：微信同步会把 10 打回 2 ⇒ 必须在同步结束（x2.onGYNetEnd）后再补一次
-        runCatching {
-            SnsTimelineSourceFix.installAlbumSyncTrigger(lpparam)
-        }.onFailure { LogX.e("SnsTimelineSourceFix.installAlbumSyncTrigger failed", it) }
-        // ---- R37 U1 取证：旁听同一个 x2 的删除动作（M/N/O/P/Q/U 同族 6 个方法）----
-        // ⛔ **纯日志探针**，只为一件事：裁决「好友删他自己的动态时 x2#U/x2#O 有没有被调用」
-        //    （`docs/_r37_graytag_datasource.md` §2 H3b / §6.1 U1）。
-        //    不写库、不加表、不做判据、不打标签，取证完可整块删除。
-        runCatching {
-            SnsSyncDelProbe.install(lpparam)
-        }.onFailure { LogX.e("SnsSyncDelProbe install failed", it) }
 
         // ---- 聊天·自动加载原图（开关：chat.auto_hd_img）----
         // 借微信自己下压缩图那一脚（t1 构造）起跳，再调下载服务下原图。
@@ -386,7 +321,7 @@ class HookEntry : IXposedHookLoadPackage {
         //    整条路从不触发；朋友圈图片已改道「SNS 缓存索引直扫」（见 `docs/_r26_img_export_真机验证.md`）。
         //    ⛔ 勿按 git 历史恢复：开门后走的是微信非默认代码路径（流量/风控/崩溃三个面），且通路实测无效。
 
-        // ---- 6.4 朋友圈：自动导出（sns_archive → 文本文件；图片规则未取证，只留探针）----
+        // ---- 6.4 朋友圈：自动导出（扫当前 SnsInfo → 文本文件；图片规则未取证，只留探针）----
         // 没有任何 hook：后台 5 分钟一拍，导出间隔 10 分钟，单航班后台线程。
         runCatching {
             MomentsExport.install(lpparam)

@@ -452,9 +452,9 @@ object SnsBlockProbe {
     /**
      * `op=snsg sub=block --es sub2 on|off`
      *
-     * 独立于「防朋友圈动态撤回」主开关：主开关负责**事后补位**（[SnsGuard] 现有行为，
-     * 本轮一个字都不改），本开关负责**写时拦截**。两个都开时拦截先生效 ⇒ 没有位被清，
-     * 补位自然空转（`blockstat` 里 `blocked` 增长、`SNS srcguard` 不再出现）。
+     * R42 路线甲的**调试覆盖开关**：主开关 [Keys.ANTIREVOKE_SNS] 负责**写时拦截**，
+     * 本开关在未显式设置时跟随主开关（`SnsGuard.blockEnabled =
+     * Kv.getBool(ANTIREVOKE_SNS) || Kv.getBool(ANTIREVOKE_SNS_BLOCK)`）。
      */
     fun switch(arg: String?): String {
         val a = arg?.trim()?.lowercase()

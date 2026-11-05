@@ -1,3 +1,22 @@
+> ## ⛔ R42 订正（2026-11-05）—— 先读这一段再往下看
+>
+> 朋友圈防撤回**已改为「写时拦截」**（路线甲）：hook wcdb `updateWithOnConflict` 的 **before**，
+> `SnsInfo` 的 `ContentValues` 里 `sourceType==0` 时 `remove("sourceType")`，让删除写不进库。
+> 真机已验：两次命中全部拦住，`sourceType` 保持 2，动态仍可见。见 `docs/_r42_block_result.md`。
+>
+> **因此本文件下列内容已废弃，对应代码已删除（勿按 git 历史恢复）**：
+> - 事后补位 `SnsTimelineSourceFix` / `SnsTimelineSrcLogic`（srcfix）
+> - 响应注入 `SnsTimelineMerge` / `SnsAlbumMerge`（方案 A）
+> - `[已删除]` 灰标 `SnsTag` / `SnsDeletedTag`
+> - 归档恢复 `sns_archive` / `SnsRestoreLogic`
+> - R41 判据取证 `SnsRoundLedger` / `SnsSqlSpy` / `SnsSyncDelProbe`
+>
+> 原因是甲生效后 `sourceType` 永不为 0，所有以「库里出现 0」为前提的子系统同时失去触发条件。
+> **仍然有效、可继续引用的部分**：库结构与列名、`sourceType` 位语义（2/4/8）、
+> 时间线查询白名单、adapter 绑定回调落点等**取证事实**。
+>
+> 复盘（为什么绕了 4 轮）：`docs/_r42_retro.md`。
+
 ## 朋友圈（SnsGuard 防删除 / SnsTag 标签）—— 已真机全链路通过（2026-10-16）
 1. **独立库** `MicroMsg/<md5>/SnsMicroMsg.db`（不是 EnMicroMsg.db）。`SnsInfo` 18 列 / `SnsComment` 16 列。模块库 `wxgroup.db` 表 `sns_archive`。
 2. **删动态 = 物理 DELETE，两步**：① `update SnsInfo` 清 `localFlag` 可见位（bit4=16，落成 2）② `DELETE`。只拦②行还在但查不出 → **必须拦完写回 `localFlag |= 16`**（2→18）。时间线查询是白名单枚举（`localFlag in (16,2064,18,2066,24,…)`），每个值都置了 bit4。

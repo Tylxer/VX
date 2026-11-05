@@ -2,9 +2,7 @@ package com.lx.wxgroup.feature
 
 import com.lx.wxgroup.feature.SnsScanCursor.Src
 import org.junit.Assert.assertEquals
-import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNull
-import org.junit.Assert.assertTrue
 import org.junit.Test
 
 /**
@@ -112,8 +110,8 @@ class MomentsBackfillCursorTest {
     @Test
     fun seekRestoresPositionAndSource() {
         val cur = SnsScanCursor()
-        cur.seek(Src.ARCHIVE, REAL_CT, REAL_SNS)
-        assertEquals(Src.ARCHIVE, cur.src)
+        cur.seek(Src.CURRENT, REAL_CT, REAL_SNS)
+        assertEquals(Src.CURRENT, cur.src)
         assertEquals(REAL_CT, cur.ct)
         assertEquals(REAL_SNS, cur.sid)
     }
@@ -122,29 +120,8 @@ class MomentsBackfillCursorTest {
     fun seekIgnoresNonPositiveCt() {
         // ⛔ 变异靶子：去掉 `ct <= 0` 的守门 ⇒ 这里红（游标被脏值钉在原地）
         val cur = SnsScanCursor()
-        cur.seek(Src.ARCHIVE, 0L, REAL_SNS)
+        cur.seek(Src.CURRENT, 0L, REAL_SNS)
         assertEquals(Src.CURRENT, cur.src)
-        assertEquals(Long.MAX_VALUE, cur.ct)
-        assertEquals(Long.MAX_VALUE, cur.sid)
-    }
-
-    @Test
-    fun seekToArchiveDoesNotSwitchBackToCurrent() {
-        // 恢复到归档位置后，归档扫完必须**结束本轮**（nextSource=false），
-        // 否则会切回「当前源最新一页」⇒ 本轮重扫最新窗口，轮转断在这里。
-        val cur = SnsScanCursor()
-        cur.seek(Src.ARCHIVE, REAL_CT, REAL_SNS)
-        assertFalse(cur.nextSource())
-        assertEquals(Src.ARCHIVE, cur.src)
-    }
-
-    @Test
-    fun seekToCurrentStillSwitchesToArchiveFromItsNewest() {
-        // 从当前源的中段恢复 ⇒ 切源时归档仍要**从最新**开始（不能把 ct 带过去，否则归档大半漏扫）
-        val cur = SnsScanCursor()
-        cur.seek(Src.CURRENT, REAL_CT, REAL_SNS)
-        assertTrue(cur.nextSource())
-        assertEquals(Src.ARCHIVE, cur.src)
         assertEquals(Long.MAX_VALUE, cur.ct)
         assertEquals(Long.MAX_VALUE, cur.sid)
     }

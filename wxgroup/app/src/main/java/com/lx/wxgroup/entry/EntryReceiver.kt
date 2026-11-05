@@ -181,8 +181,6 @@ object EntryReceiver {
                         // 改完立刻重读，不用重启微信（防撤回的开关走这条）
                         runCatching { com.lx.wxgroup.feature.AntiRevoke.refresh() }
                         runCatching { com.lx.wxgroup.feature.SnsGuard.refresh() }
-                        // 「显示动态[已删除]标签」也是开关，改完要让缓存立刻失效
-                        runCatching { com.lx.wxgroup.feature.SnsTag.refresh() }
                         // 「显示未读」是分组行角标的开关：改完必须让会话列表 rebuild，
                         // 否则开关改了但列表不重绘 → 验收会得出「开关无效」的**假阴性**。
                         // （rebuild() 里的重建指纹已包含该开关值，不会被「指纹相同」短路。）
@@ -319,12 +317,11 @@ object EntryReceiver {
                             )
                         }
                     }
-                    // 朋友圈动态防删除（SnsGuard）
+                    // 朋友圈动态防删除（SnsGuard，R42 路线甲：写时拦截）
                     // ⚠️ sub 是**唯一的**子命令参数，本分支不存在路由/子命令混用的问题
                     //    （同文件 op=quiet 那个是例外，见那里关于 sub2 的说明）
-                    // --es sub ls = 归档清单；stat = 状态；dump = 微信库里还有几条
-                    // --es sub del --es id <snsId> = 绕过拦截真删（**连归档一起删**，清理前先 one）
-                    //    ⚠️ 批量恢复回滚半途失败时日志里的 `⚠️ UNDONE snsId=...`，就先用 one 看清再来
+                    // --es sub stat = 状态；cmts = 评论表取证；mid/mpath/hit = A4 图片缓存取证
+                    // --es sub block/blockstat/trace = 写时拦截账本（见 SnsBlockProbe）
                     // 朋友圈界面 View 结构取证（为「[已删除]标签」做准备）
                     // --es sub tree = 完整树；tagged = 只打带 snsId 的节点
                     "snsv" -> {
@@ -345,79 +342,13 @@ object EntryReceiver {
                     "snsg" -> {
                         val sub = intent.getStringExtra("sub") ?: "stat"
                         val n = intent.getIntExtra("n", 20)
-                        // R27 srcfix 的子命令参数。与 op=quiet 同一套约定（sub 只路由、
-                        // sub2 才是功能自己的子命令），所以 `sub=srcfix sub2=rollback`。
+                        // sub=block 的开关参数（sub2=on|off）
                         val sub2 = intent.getStringExtra(EXTRA_SUB2)
                         io {
                             when (sub) {
                                 "stat" -> LogX.i("SNSG " + com.lx.wxgroup.feature.SnsGuard.stat())
-                                // P0 取证：同步轮次窗口账本 dump / 清零
-                                "win" -> {
-                                    for (l in com.lx.wxgroup.feature.SnsRoundLedger.dump(n)) {
-                                        LogX.i(l)
-                                    }
-                                    // P0-2 覆盖率探针：最近 localFlag=2 可见动态里有多少进过响应账本
-                                    for (l in com.lx.wxgroup.feature.SnsGuard.winCoverage()) {
-                                        LogX.i(l)
-                                    }
-                                }
-                                "winreset" -> {
-                                    com.lx.wxgroup.feature.SnsRoundLedger.reset()
-                                    LogX.i("WIN reset ok")
-                                }
-                                "ls" -> for (l in com.lx.wxgroup.feature.SnsGuard.listArchived(n)) {
-                                    LogX.i(l)
-                                }
-                                "dump" -> for (l in com.lx.wxgroup.feature.SnsGuard.dump(n)) {
-                                    LogX.i(l)
-                                }
-                                // R30 §6.2 取证：全表 sourceType 分布 + 候选谓词计数 + 是否多行
-                                // ⛔ 调试：直接改一行的 sourceType（"snsId:值"），只写显式指定的那一行
-                                "setsrc" -> {
-                                    val p = intent.getStringExtra("val").orEmpty().split(":")
-                                    val id = p.getOrNull(0)?.trim()?.toLongOrNull()
-                                    val v = p.getOrNull(1)?.trim()?.toIntOrNull()
-                                    if (id == null || v == null) {
-                                        LogX.w("SNS setsrc bad val (want '<snsId>:<value>')")
-                                    } else {
-                                        for (l in com.lx.wxgroup.feature.SnsGuard.setSrc(id, v)) LogX.i(l)
-                                    }
-                                }
-                                // --es sub srcmap [--es val "wxid_xxx"]：不带 val = 全表分布，带 val = 按作者查
-                                "srcmap" -> for (l in com.lx.wxgroup.feature.SnsGuard.srcMap(
-                                    intent.getStringExtra("val").orEmpty()
-                                )) {
-                                    LogX.i(l)
-                                }
-                                // R30 §6.2 取证：旁听 rawQuery，把含 SnsInfo 的真 SQL 打出来
-                                // `--es sub sqlspy --es sub2 on|off`，不带 sub2 只报状态
-                                "sqlspy" -> LogX.i(
-                                    if (sub2 == null) {
-                                        com.lx.wxgroup.feature.SnsSqlSpy.state()
-                                    } else {
-                                        com.lx.wxgroup.feature.SnsSqlSpy.enable(
-                                            sub2.equals("on", true),
-                                        )
-                                    },
-                                )
-                                "one" -> {
-                                    val id = firstLong(intent, "id")
-                                    for (l in com.lx.wxgroup.feature.SnsGuard.one(id)) LogX.i(l)
-                                }
-                                "show" -> {
-                                    val id = firstLong(intent, "id")
-                                    LogX.i("SNSG show " + com.lx.wxgroup.feature.SnsGuard.show(id))
-                                }
-                                "del" -> {
-                                    val id = firstLong(intent, "id")
-                                    LogX.i("SNSG del " + com.lx.wxgroup.feature.SnsGuard.forceDelete(id))
-                                }
                                 // 评论表取证（列名 + 最近几行）
                                 "cmts" -> for (l in com.lx.wxgroup.feature.SnsGuard.comments(n)) {
-                                    LogX.i(l)
-                                }
-                                // R27 方案 A：Response-Merge 注入统计
-                                "merge" -> for (l in com.lx.wxgroup.feature.SnsTimelineMerge.stat()) {
                                     LogX.i(l)
                                 }
                                 // **A4 取证（R19）**：扫**当前 SnsInfo** 的 content 抽 mediaId 数字串候选。
@@ -436,171 +367,6 @@ object EntryReceiver {
                                 // --es sub hit --ei n 10
                                 "hit" -> for (l in com.lx.wxgroup.feature.SnsGuard.probeHit(n)) {
                                     LogX.i(l)
-                                }
-                                // 归档里每条的**当前** localFlag（dump 里的 flag 是快照，别当依据）
-                                "flags" -> for (l in com.lx.wxgroup.feature.SnsGuard.flags()) {
-                                    LogX.i("SNSG $l")
-                                }
-                                // 把归档里已不可见的动态批量恢复可见（修早期版本的历史遗留）
-                                "fixall" -> LogX.i(
-                                    "SNSG " + com.lx.wxgroup.feature.SnsGuard.restoreAll()
-                                )
-                                // 从归档反插回 SnsInfo（需求 6.4「从归档恢复」）：
-                                // 幂等判定 —— 行在且可见=SKIP / 行在但被清位=补位 / 行没了=整行 INSERT。
-                                // ⚠️ 这是写对方数据库，一次只恢复一条，先跑 --check 看清归档
-                                "restore" -> {
-                                    val id = firstLong(intent, "id")
-                                    LogX.i(
-                                        "SNSG restore " +
-                                            com.lx.wxgroup.feature.SnsGuard.restore(id)
-                                    )
-                                }
-                                // 批量恢复：--ei n <条数> --ez dry true(默认，只看计划)|false(真写)
-                                // 失败即停 + 倒序回滚；幂等，可以重跑
-                                "restoreall" -> for (l in com.lx.wxgroup.feature.SnsGuard
-                                    .restoreBatch(n, intent.getBooleanExtra("dry", true))
-                                ) LogX.i("SNSG $l")
-                                // 取证：SnsInfo 列清单 + 「没写的列里有没有 NOT NULL 无默认值」
-                                // （INSERT 只给部分列，这是唯一的硬风险，只读不写）
-                                "cols" -> for (l in com.lx.wxgroup.feature.SnsGuard
-                                    .snsInfoColumns()
-                                ) LogX.i("SNSG $l")
-                                // ── 「从归档恢复」的正式入口（上面三个的老名字仍在，等价）──
-                                // plan   = 只算计划、打印，不写库（安全，第一次先跑这个）
-                                // apply  = 真反插（--ei n 条数，钳到 MAX_BATCH=50）
-                                // pragma = 打印 pragma table_info(SnsInfo)，定位那 5 个未知列
-                                // 三者都不吃 id：恢复是**按归档批量**的，单条用 sub=restore
-                                "plan" -> for (l in com.lx.wxgroup.feature.SnsGuard
-                                    .restoreBatch(n, dry = true)
-                                ) LogX.i("SNSG $l")
-                                "apply" -> for (l in com.lx.wxgroup.feature.SnsGuard
-                                    .restoreBatch(n, dry = false)
-                                ) LogX.i("SNSG $l")
-                                "pragma" -> for (l in com.lx.wxgroup.feature.SnsGuard
-                                    .snsInfoColumns()
-                                ) LogX.i("SNSG $l")
-                                // 模拟微信真实两步删除（update 清可见位 → delete 行），
-                                // 走真实的拦截路径，用来验证「拦下 + 恢复可见 + 归档 + 贴标」
-                                "simdel" -> {
-                                    val id = firstLong(intent, "id")
-                                    LogX.i("SNSG " + com.lx.wxgroup.feature.SnsGuard.simulateDelete(id))
-                                }
-                                // ── R27-3 朋友圈时间线来源位修复（srcfix）──
-                                // 微信删动态只清 sourceType 的 bit1（`& -3`），行还在。
-                                // srcstat = 只读：台账行数 / 曾经可见数 / 当前可补候选数
-                                // srcfix  = 执行一轮「快照 + 补位」（写微信库的 sourceType | 2）
-                                // srcfix + sub2=rollback = 按台账 fixed_orig 反向还原
-                                // ⚠️ 明细日志内部限流 50 行，最后一行是聚合结果
-                                "srcstat" -> {
-                                    for (l in com.lx.wxgroup.feature.SnsTimelineSourceFix.stat()) LogX.i(l)
-                                    // R30 §6.2：写库瞬间补相册位的命中数（>0 才说明新路径活着）
-                                    LogX.i(com.lx.wxgroup.feature.SnsTimelineSourceFix.albumPatchStat())
-                                }
-                                "srcfix" -> {
-                                    val lines = when (sub2?.lowercase()) {
-                                        // ⛔ 只读：只批量 probe 台账里的行并打统计，**不写库、不写台账**。
-                                        //    必须显式列出 —— 缺了它 `sub2=stat` 会掉进最后的
-                                        //    `else -> run()`，而 `run()` 第一步就是 `snapshot()`
-                                        //    写可见台账、之后还会补位写微信库。R31 整晚我把它当
-                                        //    只读统计反复跑，等于反复重放「快照 + 补位」，
-                                        //    229 条 held 里有一部分就是这么来的。
-                                        "stat" ->
-                                            com.lx.wxgroup.feature.SnsTimelineSourceFix.stat()
-                                        "rollback" ->
-                                            com.lx.wxgroup.feature.SnsTimelineSourceFix.rollback()
-                                        // R30 §6.2：只给「被删又救回」的行补相册位(bit3)
-                                        "album" ->
-                                            com.lx.wxgroup.feature.SnsTimelineSourceFix.fixAlbum()
-                                        // R30 §6.2 补丁：把历史漏登记的救回行手动塞进窄台账
-                                        // （只登记不写库；--es val "id1,id2"）
-                                        "hold" -> {
-                                            val raw = intent.getStringExtra("val").orEmpty()
-                                            val ids = raw.split(',', ' ', '\n')
-                                                .mapNotNull { it.trim().toLongOrNull() }
-                                            for (l in com.lx.wxgroup.feature.SnsTimelineSourceFix
-                                                .hold(ids)
-                                            ) LogX.i(l)
-                                            emptyList<String>()
-                                        }
-                                        // 2026-10-28 事故善后：清掉「误登记」的 fixed_orig。
-                                        // 判据 `fixed_orig & 8 != 0`（合法补位的原值必然缺 bit8）。
-                                        // 不清的话正常动态会一直显示 `[删除已拦截]`。
-                                        "clean" -> {
-                                            val gdb = com.lx.wxgroup.data.GroupDb.current()
-                                            if (gdb == null) {
-                                                LogX.i("SNS clean: no module db")
-                                            } else {
-                                                val bad = gdb.countSrcFixedWithAlbumBit()
-                                                val n = gdb.cleanSrcFixedWithAlbumBit()
-                                                com.lx.wxgroup.feature.SnsTimelineSourceFix
-                                                    .invalidateAlbumIds()
-                                                com.lx.wxgroup.feature.SnsTag.invalidateIds()
-                                                LogX.i(
-                                                    "SNS clean bad=$bad cleared=$n " +
-                                                        "remaining=${gdb.countSrcFixed()}"
-                                                )
-                                            }
-                                            emptyList<String>()
-                                        }
-                                        // 只读诊断：拿微信自己那条 SQL 放大 limit 复现返回顺序，
-                                        // 看已删动态是否被 `limit 11` 挤出窗口（--ei n 放大到多少，默认 40）
-                                        "rank" -> {
-                                            val n = intent.getIntExtra("n", 40)
-                                            for (l in com.lx.wxgroup.feature.SnsGuard.rankSql(n)) {
-                                                LogX.i(l)
-                                            }
-                                            emptyList<String>()
-                                        }
-                                        // 只读诊断：打 sns.db 全部表结构（表名/行数/列名）
-                                        "sch" -> {
-                                            for (l in com.lx.wxgroup.feature
-                                                .SnsTimelineSourceFix.schema()) {
-                                                LogX.i(l)
-                                            }
-                                            emptyList<String>()
-                                        }
-                                        // 只读诊断：扫 sns.db 所有表，看一组 snsId 在哪些表里有行
-                                        // （正文不在 SnsInfo ⇒ 找承载正文的表；--es val "id1,id2"）
-                                        "tbl" -> {
-                                            val raw = intent.getStringExtra("val").orEmpty()
-                                            val ids = raw.split(',', ' ', '\n')
-                                                .mapNotNull { it.trim().toLongOrNull() }
-                                            for (l in com.lx.wxgroup.feature
-                                                .SnsTimelineSourceFix.scanTables(ids)) {
-                                                LogX.i(l)
-                                            }
-                                            emptyList<String>()
-                                        }
-                                        // 只读诊断：打一行的**全部列**（对比两条同构动态的差异；
-                                        // --es val "<snsId>"）
-                                        "cols" -> {
-                                            val id = intent.getStringExtra("val").orEmpty()
-                                                .trim().toLongOrNull()
-                                            if (id == null) {
-                                                LogX.i("SNSCOL bad val (--es val <snsId>)")
-                                            } else {
-                                                for (l in com.lx.wxgroup.feature
-                                                    .SnsTimelineSourceFix.dumpAllCols(id)) {
-                                                    LogX.i(l)
-                                                }
-                                            }
-                                            emptyList<String>()
-                                        }
-                                        // 只读诊断：一次打全 snsId 的 sourceType / localFlag
-                                        // （§6.2「补了位还是不显示」定位用；--es val "id1,id2"）
-                                        "dump" -> {
-                                            val raw = intent.getStringExtra("val").orEmpty()
-                                            val ids = raw.split(',', ' ', '\n')
-                                                .mapNotNull { it.trim().toLongOrNull() }
-                                            for (l in com.lx.wxgroup.feature.SnsTimelineSourceFix
-                                                .dumpRows(ids)
-                                            ) LogX.i(l)
-                                            emptyList<String>()
-                                        }
-                                        else ->
-                                            com.lx.wxgroup.feature.SnsTimelineSourceFix.run()
-                                    }
-                                    for (l in lines) LogX.i(l)
                                 }
                                 // ── R42 路线甲实测：写时拦截 sourceType（见 docs/_r42_block_impl.md）──
                                 // --es sub block --es sub2 on|off   = 切开关（独立于「防止朋友圈动态撤回」）
@@ -621,24 +387,6 @@ object EntryReceiver {
                     }
                     // ⛔ op=cdn 已删（2026-10-27）：整条朋友圈图片 CDN 通路判死并整块删除，
                     //    探针随 `probe/SnsCdnProbe.kt` 一并移除。⛔ 勿按 git 历史恢复，理由见 HookEntry.kt。
-                    // 朋友圈动态「[已删除]」标签（SnsTag）
-                    // --es sub stat = 状态；hit = 当前界面上打过标的 snsId 清单
-                    "snstag" -> {
-                        val sub = intent.getStringExtra("sub") ?: "stat"
-                        when (sub) {
-                            "stat" -> LogX.i("SNSTAG " + com.lx.wxgroup.feature.SnsTag.stat())
-                            "dump" -> LogX.i("SNSTAG\n" + com.lx.wxgroup.feature.SnsTag.dump())
-                            // 强制给当前屏幕上解析出来的动态打标（验证整条链路通不通）
-                            "mark" -> LogX.i("SNSTAG " + com.lx.wxgroup.feature.SnsTag.markVisible())
-                            "unmark" -> LogX.i("SNSTAG " + com.lx.wxgroup.feature.SnsTag.unmark())
-                            // --es id <dump 里的无符号 id> → 精确模拟「这条被删了」
-                            "fake" -> LogX.i(
-                                "SNSTAG " + com.lx.wxgroup.feature.SnsTag
-                                    .fakeMark(intent.getStringExtra("id").orEmpty())
-                            )
-                            else -> LogX.i("SNSTAG unknown sub=$sub")
-                        }
-                    }
                     // ---- 6.2 防撤回：朋友圈**评论**防删除 + 评论 [已删除] 标签 ----
                     // ⛔ 2026-10-24 用户决定物理删除评论域代码（SnsCommentGuard / SnsCommentTag /
                     //    SnsCommentLogic / SnsCommentLabelLogic + 两个测试）。

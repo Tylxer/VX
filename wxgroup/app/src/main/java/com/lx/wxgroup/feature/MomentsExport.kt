@@ -22,26 +22,20 @@ import java.util.concurrent.atomic.AtomicLong
  * 在动态**当前还看得见**的时候就把它的图留存下来（**预防性留存**），
  * **不是**等动态被删了再从归档里抢救。
  *
- * ⇒ 数据源因此必须是**微信库里当前的 `SnsInfo`**（[SnsGuard.listCurrentSns]），
- * 不是模块自己的归档表 `sns_archive`。这不是口味问题，是被实测逼出来的：
+ * ⇒ 数据源因此必须是**微信库里当前的 `SnsInfo`**（[SnsGuard.listCurrentSns]）。
  * 朋友圈的图存在 sns 磁盘缓存 `…/cache/<hash32>/sns/…/snst_xxx`，放的是
- * **当前可见**动态的图；而 `sns_archive` 里是**已经被删掉**的动态 ——
- * R19 实测归档的 7 个 mediaId 在设备 72 个缓存文件里 **0 命中**，
- * 扫归档时 `imgCopied` 恒为 0 是数据源选错了，不是取图链路坏了。
+ * **当前可见**动态的图（R19 实测：只有当前动态的 mediaId 才可能在缓存文件名里命中）。
  *
  * ## 数据链
  * ```
- * ① 微信库 SnsInfo（不按 localFlag 筛，仅按键集分页 —— R26 已证 bit16 不是可见位）  ← 主数据源（防撤回语义）
+ * 微信库 SnsInfo（不按 localFlag 筛，仅按键集分页 —— R26 已证 bit16 不是可见位）
  *      → SnsGuard.listCurrentSns 键集分页（一次一页，不把 BLOB 全读进内存）
- * ② 模块库 sns_archive（SnsGuard 拦 DELETE 时归档的整行快照）  ← 补扫（已删的也要）
- *      → GroupDb.listSnsArchiveBefore 键集分页
- * 两者按 snsId 去重（[SnsScanCursor.first]），①扫完才走②
- *   → MomentsLogic.renderText 渲染 text 文本
- *   → MomentsLogic.exportDir 拼 <root>/昵称(wxid)/yyyy-MM-dd-HHmm/
- *   → <snsId>.txt（tmp + rename 原子落盘）
+ *      → MomentsLogic.renderText 渲染 text 文本
+ *      → MomentsLogic.exportDir 拼 <root>/昵称(wxid)/yyyy-MM-dd-HHmm/
+ *      → <snsId>.txt（tmp + rename 原子落盘）
  * ```
- * ⚠️ ①拿不到（微信这次启动还没碰过朋友圈库 ⇒ 句柄未捕获）**不是故障**：
- * 优雅降级成只扫②（= 2026-10-25 之前的行为），只打日志、不弹窗。
+ * ⚠️ 拿不到微信库句柄（这次启动还没碰过朋友圈库）**不是故障**：
+ * 本轮导出为空，只打日志、不弹窗。
  *
  * 去重靠扫导出目录里已存在的 `<snsId>.txt`（[MomentsLogic.parseExportedId]）；
  * 名单命中靠 [MomentsLogic.listHit]；空间下限靠 [MomentsLogic.MIN_FREE_BYTES]。
@@ -60,7 +54,7 @@ import java.util.concurrent.atomic.AtomicLong
  * R19 文件名是 20 位数字串不含 md5）。正解见 docs/_r19_a4_probe.md，
  * 证据见 docs/_r20_a8_del.md。
  *
- * 新链路见 [buildSnsIndex] / [copyImagesForRow] / [probeSnsCache]：
+ * 新链路见 [buildSnsIndex] / [copyImagesForRow]：
  * 建文件名索引 → [MomentsLogic.snsNameCandidates] 出候选名 → [MomentsLogic.matchSnsFileName] 查表。
  *
  * [Keys.MOMENTS_COPY_IMAGES] 于 R26 起是**用户开关**（默认关，UI 文案已写明只能取缓存里的图）。
@@ -69,8 +63,8 @@ import java.util.concurrent.atomic.AtomicLong
  * - 回填轮（[backfillImages]）：txt 已存在但图缺的，单独补 —— 主循环在去重处就 `continue` 了，
  *   永远走不到拷贝，**只开开关不做回填 = 已导出的动态永远没图**。
  *
- * ⚠️ 能力边界（真机三次实测）：图只能来自微信本地 `sns/` 缓存 ⇒ 已删动态的图基本取不回
- * （R19 归档 7 条 `hit=0`；2026-10-26 复测仍 `hit=0`），冷启还可能清空该缓存。
+ * ⚠️ 能力边界（真机实测）：图只能来自微信本地 `sns/` 缓存 ⇒ 已删动态的图基本取不回，
+ * 冷启还可能清空该缓存。
  * 所以这是「顺手把刚看过的图存一份」，**不是图片备份**。UI/stat 都必须写清楚。
  *
  * ## 失败策略（需求 6.4「失败只弹窗」+ 决策 #11，2026-10-24 定案）
@@ -93,22 +87,22 @@ import java.util.concurrent.atomic.AtomicLong
  * - 手动探针 `sub=export`（诊断触发，走 [runBlocking]）：只回摘要，不弹。
  */
 /**
- * 一轮导出的**扫行游标**：先扫「当前 SnsInfo」，扫完再补扫「归档」。
+ * 一轮导出的**扫行游标**：扫「当前 SnsInfo」（R42 起单源，归档随乙方案删除）。
  *
  * ⛔ 刻意做成**纯逻辑类**（不碰 Android / 不碰数据库 / 不碰 [GroupDb]）：
  * 本文件里唯一能进 JVM 单测的就是它。[MomentsExport] 自己是 object，
  * 静态初始化带着 Handler / Kv / Prefs 一串 Android 依赖，单元测试碰不得。
  *
- * ⚠️ 它管的两件事都是**真机跑满一轮才暴露**的错：
- * - 跨源去重漏了 ⇒ 同一条动态导出两遍（归档里也有同一条）；
- * - 切源写错 ⇒ 当前源扫完就 `break`，归档永远不扫（等于把已删动态的导出丢了）。
+ * ⚠️ 它管的都是**真机跑满一轮才暴露**的错：
+ * - 去重漏了 ⇒ 同一条动态导出两遍；
+ * - 去重跳过时不推进游标 ⇒ 键集分页原地打转 ⇒ 死循环，一轮导出永远不结束。
  *
  * 见 `MomentsExportScanTest`。
  */
 internal class SnsScanCursor {
 
-    /** 行来源：① 当前 SnsInfo（主）② 归档（补） */
-    enum class Src { CURRENT, ARCHIVE }
+    /** 行来源：当前 SnsInfo（R42 起单源 —— 归档随乙方案删除） */
+    enum class Src { CURRENT }
 
     var src: Src = Src.CURRENT
         private set
@@ -151,24 +145,17 @@ internal class SnsScanCursor {
      * 这个 snsId 本轮该处理吗（`false` = 磁盘上已导出过 / 本轮已处理过）。
      *
      * ⚠️ snsId 是 **Long 且可能为负**（真机 `-3447438253133393222`）。
-     * 任何 `toInt()` 都会把不同的动态截断成同一个 key，其中一条被静默吞掉
-     * （归档那边的老坑，见 `SnsGuard.readRow` 的 KDoc）。
+     * 任何 `toInt()` 都会把不同的动态截断成同一个 key，其中一条被静默吞掉。
      */
     fun first(snsId: Long, exported: Set<Long>): Boolean =
         snsId !in exported && seen.add(snsId)
 
     /**
-     * 当前源这一页**空了**或**拿不到**（[Src.CURRENT] 拿不到微信库句柄也算）→ 换下一个源。
+     * 当前源这一页**空了**或**拿不到**（拿不到微信库句柄也算）→ 本轮结束。
      *
-     * @return true = 还有下一个源（游标已复位到该源最新一页）；false = 两个源都扫完了
+     * @return 恒 false（归档随乙方案删除后只剩「当前 SnsInfo」一个源）
      */
-    fun nextSource(): Boolean {
-        if (src != Src.CURRENT) return false
-        src = Src.ARCHIVE
-        ct = Long.MAX_VALUE
-        sid = Long.MAX_VALUE
-        return true
-    }
+    fun nextSource(): Boolean = false
 }
 
 object MomentsExport {
@@ -586,7 +573,7 @@ object MomentsExport {
      * 语义是**「不限制」** ⇒ 导出循环会命中**全部**朋友圈。
      *
      * 手动点「导出」时这是合理行为（用户明确要全量）。但**自动**路径上它是一台电风扇：
-     * 每 3 小时把整个归档扫一遍并持续产 txt，而需求要的是
+     * 每 3 小时把整个朋友圈扫一遍并持续产 txt，而需求要的是
      * 「名单里好友的新动态被捕捉到才保存」—— **方向正好相反**。
      *
      * ⚠️ R26 真机就踩到过一次：验收时为省时间把名单临时收窄，文档与日志两处记载
@@ -666,7 +653,6 @@ object MomentsExport {
             notifyGate.abortRound()
             return msg
         }
-        val db = GroupDb.current() ?: return bail("$TAG export skip: db not ready")
         val c = cfg()
         val root = c.root
         val rootDir = File(root)
@@ -726,53 +712,36 @@ object MomentsExport {
         var ad = 0
         var sinceSpace = 0
         var stop = false
-        // 对账用：两个源各扫到多少行 / 当前源降级过几次（真机一眼看出数据源对不对）
-        var curRows = 0
-        var archRows = 0
-        var curNoDb = 0
 
         while (rows < MAX_ROWS_PER_RUN && !stop) {
-            // ① 当前 SnsInfo（防撤回语义的主数据源）→ 扫完/拿不到 → ② 归档
+            // 当前 SnsInfo（防撤回语义的数据源；R42 起单源，归档随乙方案删除）
             // ⛔ R20b（复核 §1-8）：这里原本是 `runCatching{...}.getOrNull()`，把
             //    「正常降级（返回 null）」与「反射/查询抛异常」混成同一个 null，且异常
             //    **零日志**。而下面 `page == null` 分支打的日志写死成
             //    `sns db not captured` —— 若 null 其实来自异常，这条日志就是**误导**
             //    （把「查询坏了」说成「句柄没拿到」），现场会往完全错的方向排查。
             //    ⇒ 补 `.onFailure` 留痕，两种 null 来源从此在日志里可区分。
-            //    仍保留 `.getOrNull()` 的降级语义（异常 → 退回扫归档，不中断本轮）。
-            val page: List<GroupDb.SnsRow>? = when (cur.src) {
-                SnsScanCursor.Src.CURRENT ->
-                    runCatching { SnsGuard.listCurrentSns(cur.ct, cur.sid, PAGE) }
-                        .onFailure {
-                            LogX.w(
-                                "$TAG export source=current THREW ${it.javaClass.simpleName}: " +
-                                    "${(it.cause ?: it).message?.take(80)} -> archive only"
-                            )
-                        }
-                        .getOrNull()
-                SnsScanCursor.Src.ARCHIVE ->
-                    runCatching { db.listSnsArchiveBefore(cur.ct, cur.sid, PAGE) }.getOrNull()
-            }
+            val page: List<GroupDb.SnsRow>? =
+                runCatching { SnsGuard.listCurrentSns(cur.ct, cur.sid, PAGE) }
+                    .onFailure {
+                        LogX.w(
+                            "$TAG export source=current THREW ${it.javaClass.simpleName}: " +
+                                "${(it.cause ?: it).message?.take(80)}"
+                        )
+                    }
+                    .getOrNull()
             if (page == null) {
-                // 只有 CURRENT 源会返回 null：微信这次启动还没碰过朋友圈库（句柄未捕获）。
+                // 微信这次启动还没碰过朋友圈库（句柄未捕获）⇒ 本轮拿不到数据。
                 // ⚠️ 这是**预期内的降级**，不是故障 —— 只打日志、不弹窗、不判本轮失败。
-                curNoDb++
-                if (curNoDb <= 1) {
-                    LogX.i("$TAG export source=current UNAVAILABLE (sns db not captured) -> archive only")
-                }
-                if (!cur.nextSource()) break
-                continue
+                LogX.i("$TAG export source=current UNAVAILABLE (sns db not captured)")
+                break
             }
-            if (page.isEmpty()) {
-                if (!cur.nextSource()) break
-                continue
-            }
-            if (cur.src == SnsScanCursor.Src.CURRENT) curRows += page.size else archRows += page.size
+            if (page.isEmpty()) break
             for (row in page) {
                 rows++
                 // ⚠️ 游标必须在任何 continue 之前推进（去重跳过也要推，否则死循环）
                 cur.advanceTo(row.createTime, row.snsId)
-                // 去重：磁盘已导出 + 本轮已处理（含跨源：归档里可能有同一条）
+                // 去重：磁盘已导出 + 本轮已处理
                 if (!cur.first(row.snsId, exported)) {
                     sk++
                     continue
@@ -1298,10 +1267,10 @@ object MomentsExport {
      * 每轮最多 [MAX_BACKFILL_PER_RUN] 条动态（冷启后一次性补几千条会把后台线程占满）。
      *
      * ⛔ R26 之前这里是「每轮从最新重扫」，于是 `MAX_BACKFILL_PER_RUN` 之下的行**永远轮不到**
-     * （R26 复核 §8(b) 的队头阻塞：最新 200 条每轮都占满配额，归档每轮徒劳重试）。
+     * （R26 复核 §8(b) 的队头阻塞：最新 200 条每轮都占满配额，更旧的每轮徒劳重试）。
      * R27 起把扫到哪儿**落盘**（[Keys.MOMENTS_FILL_CURSOR]，格式见 [MomentsLogic.FillCursor]）：
      * - 本轮被配额截断 ⇒ 记住最后一条**已处理**行，下轮从它之后（键集严格更旧）继续；
-     * - 两个源都扫到底 ⇒ 清空游标，回绕到最新（[MomentsLogic.fillCursorAfterRound]）。
+     * - 单源扫到底 ⇒ 清空游标，回绕到最新（[MomentsLogic.fillCursorAfterRound]）。
      * 于是「补不完的下一轮继续」这句从空话变成真话，且每轮代价仍有界。
      *
      * ⚠️ 游标只有**一份**，主循环不写它（主循环每轮都从最新开始 —— 新动态必须优先）。
@@ -1310,7 +1279,6 @@ object MomentsExport {
      * @return 聚合日志行（探针 `sub=imgfill` 直接把它打出来）
      */
     private fun backfillImages(root: String, idx: SnsIndex): String {
-        val db = GroupDb.current() ?: return "$TAG img backfill no db"
         val st = ImgRoundStat()
         val nickCache = HashMap<String, String>()
         val seen = HashSet<Long>()
@@ -1322,22 +1290,15 @@ object MomentsExport {
         if (saved != null) cur.seek(fillSrc(saved.src), saved.ct, saved.sid)
         var filledRows = 0
         var noTxt = 0
-        // true = 两个源都扫到底（本轮不是被配额截断）⇒ 游标回绕到最新
+        // true = 单源（当前 SnsInfo）扫到底（本轮不是被配额截断）⇒ 游标回绕到最新
         var wrapped = false
 
         scan@ while (st.rows < MAX_BACKFILL_PER_RUN) {
-            val page: List<GroupDb.SnsRow>? = when (cur.src) {
-                SnsScanCursor.Src.CURRENT ->
-                    runCatching { SnsGuard.listCurrentSns(cur.ct, cur.sid, PAGE) }.getOrNull()
-                SnsScanCursor.Src.ARCHIVE ->
-                    runCatching { db.listSnsArchiveBefore(cur.ct, cur.sid, PAGE) }.getOrNull()
-            }
+            val page: List<GroupDb.SnsRow>? =
+                runCatching { SnsGuard.listCurrentSns(cur.ct, cur.sid, PAGE) }.getOrNull()
             if (page == null || page.isEmpty()) {
-                if (!cur.nextSource()) {
-                    wrapped = true
-                    break
-                }
-                continue
+                wrapped = true
+                break
             }
             for (row in page) {
                 // ⛔ 配额判定必须在 `advanceTo` **之前**：游标若停在一条没处理的行上，
@@ -1362,7 +1323,7 @@ object MomentsExport {
                 copyRowImages(idx, row, dir, detail = false, st = st)
                 if (st.copied > before) filledRows++
             }
-            if (page.size < PAGE && !cur.nextSource()) {
+            if (page.size < PAGE) {
                 wrapped = true
                 break
             }
@@ -1391,395 +1352,19 @@ object MomentsExport {
         return line
     }
 
-    /** 回填游标的源编号 ↔ [SnsScanCursor.Src]（[MomentsLogic] 不许 import 本文件的 enum，故在此转换） */
-    private fun fillSrcCode(src: SnsScanCursor.Src): Int =
-        if (src == SnsScanCursor.Src.ARCHIVE) MomentsLogic.FILL_SRC_ARCHIVE
-        else MomentsLogic.FILL_SRC_CURRENT
+    /** 回填游标的源编号（R42 起单源，恒为 [MomentsLogic.FILL_SRC_CURRENT]） */
+    private fun fillSrcCode(src: SnsScanCursor.Src): Int = MomentsLogic.FILL_SRC_CURRENT
 
-    /** 落盘编号 → 源。越界值只可能来自 `parseFillCursor` 已拦掉的脏数据，这里兜 CURRENT */
-    private fun fillSrc(code: Int): SnsScanCursor.Src =
-        if (code == MomentsLogic.FILL_SRC_ARCHIVE) SnsScanCursor.Src.ARCHIVE
-        else SnsScanCursor.Src.CURRENT
+    /** 落盘编号 → 源（R42 起单源，恒为 CURRENT） */
+    private fun fillSrc(code: Int): SnsScanCursor.Src = SnsScanCursor.Src.CURRENT
 
-    /** 游标源编号的单字符展示（`C` = 当前 SnsInfo，`A` = 归档，`NEW` = 从最新开始） */
-    private fun fillSrcName(c: MomentsLogic.FillCursor?): String = when {
-        c == null -> "NEW"
-        c.src == MomentsLogic.FILL_SRC_ARCHIVE -> "A"
-        else -> "C"
-    }
+    /** 游标源编号的单字符展示（`C` = 当前 SnsInfo，`NEW` = 从最新开始） */
+    private fun fillSrcName(c: MomentsLogic.FillCursor?): String = if (c == null) "NEW" else "C"
 
     // ⛔ 已删于 R20（A8 收敛）：tryCopyImages() —— 旧 md5 路线已三次真机证伪
     //    （R15 分桶 0.68% / R16 全盘 find 零结果 / R19 文件名是 20 位数字串不含 md5）。
     //    正解见 docs/_r19_a4_probe.md。证据见 docs/_r20_a8_del.md。
-    //    原 `op=moments sub=imgtry` 探针一并下架；新链路对账请用 `sub=snsprobe`。
-
-    /**
-     * **新链路探针**：`sub=snsprobe` 专用，**完全不依赖图片开关**（`moments.copy_images`）。
-     *
-     * 存在的理由：图片开关必须等真机验完才敢开，但「验」本身不能依赖那个开关 ——
-     * 否则 `false` 时 [copyImagesForRow] 根本不跑，protobuf 与索引匹配无从验证。
-     * 本探针对最近 n 条归档跑一遍**只读**的完整链路，把每步结果打出来：
-     *
-     * ```
-     * MOMENT snsprobe idx rootFound=.. names=..
-     * MOMENT snsprobe snsId=.. ids=.. raw=.. pre=.. cand0=.. hit=..
-     * MOMENT snsprobe sum rows=.. noMedia=.. withIds=.. hit=.. miss=..
-     * ```
-     *
-     * ⚠️ 只读：**不拷贝任何文件**（`hit` 只表示「索引里匹配到了文件名」）。
-     * 判据：
-     * - `ids=0` 且 `noMedia` 接近 `rows` ⇒ **字段号错**（改 `MomentsLogic.PROTO_FIELD_*`）
-     * - `ids>0` 但 `hit=NONE` ⇒ mediaId 拿到了但文件名不匹配（看 `raw`/`pre` 与真机文件名对比）
-     * - `hit=<name>` ⇒ **链路通**，可以开图片开关（`moments.copy_images`）
-     */
-    /** 探针专用：content 头部 hex（判字段号用，不参与业务路径） */
-    private fun hexHead(b: ByteArray, n: Int): String {
-        val m = minOf(n, b.size)
-        val sb = StringBuilder(m * 2)
-        for (i in 0 until m) sb.append("%02x".format(b[i].toInt() and 0xff))
-        return sb.toString()
-    }
-
-    /**
-     * 探针专用：枚举 **顶层** protobuf 字段号（只扫一层，不递归）。
-     *
-     * 为什么要有它：判断「字段号错」必须知道 content 顶层**实际有哪些字段**，
-     * 而不是猜 `PROTO_FIELD_CONTENT_OBJ=6` 对不对。格式 `6:2,10:2` = 字段号:wiretype。
-     */
-    private fun topFieldNums(b: ByteArray, maxOut: Int = 40): String {
-        val seen = LinkedHashSet<String>()
-        var i = 0
-        var guard = 0
-        while (i < b.size && guard++ < 400 && seen.size < maxOut) {
-            val t = MomentsLogic.readVarintPublic(b, i) ?: break
-            var pos = t.second
-            val tag = t.first
-            if (tag == 0L) break
-            val f = (tag ushr 3).toInt()
-            val wt = (tag and 0x07L).toInt()
-            seen.add("$f:$wt")
-            when (wt) {
-                0 -> pos = (MomentsLogic.readVarintPublic(b, pos) ?: break).second
-                1 -> pos += 8
-                2 -> {
-                    val lv = MomentsLogic.readVarintPublic(b, pos) ?: break
-                    pos = lv.second
-                    val len = lv.first
-                    if (len < 0 || len > (b.size - pos).toLong()) break
-                    pos += len.toInt()
-                }
-                5 -> pos += 4
-                else -> break
-            }
-            if (pos > b.size) break
-            i = pos
-        }
-        return seen.joinToString(",")
-    }
-
-    /**
-     * 探针专用：完整扫一遍线格式，报告**扫描终止位置与原因**。
-     *
-     * 为什么要有它：`protoSegments` 结构断裂时 `return emptyList()`，
-     * 从外部看不出是「扫完了但没这个字段」还是「中途断了」。
-     * 输出 `ok=扫完 / break@偏移量` 可区分这两种。
-     */
-    private fun scanEnd(b: ByteArray): String {
-        var i = 0
-        var guard = 0
-        while (i < b.size && guard++ < 4000) {
-            val t = MomentsLogic.readVarintPublic(b, i) ?: return "varintFail@$i"
-            var pos = t.second
-            val tag = t.first
-            if (tag == 0L) return "tag0@$i"
-            val wt = (tag and 0x07L).toInt()
-            when (wt) {
-                0 -> pos = (MomentsLogic.readVarintPublic(b, pos) ?: return "varintFail@$pos").second
-                1 -> pos += 8
-                2 -> {
-                    val lv = MomentsLogic.readVarintPublic(b, pos) ?: return "lenVarintFail@$pos"
-                    pos = lv.second
-                    val len = lv.first
-                    if (len < 0 || len > (b.size - pos).toLong()) return "lenOverrun@$pos(len=$len)"
-                    pos += len.toInt()
-                }
-                5 -> pos += 4
-                else -> return "badWiretype$wt@$i"
-            }
-            if (pos > b.size) return "overrun@$pos"
-            i = pos
-        }
-        return if (i >= b.size) "ok(${b.size})" else "guardOut@$i"
-    }
-
-    /**
-     * 探针专用：取 `b` 里字段 [field] 的第一个段，**输出它内部的顶层字段号**（只一层）。
-     *
-     * 用来定位「mediaList 到底在哪一层」：R19 实测 content 顶层就有字段 8，
-     * 而 `mediaIdsFromContent` 是在字段 6 内部找字段 8 —— 两者必须实测区分。
-     *
-     * @return `-` = 该字段不存在；`[]` = 存在但内部扫不出字段。
-     */
-    private fun nestedTop(b: ByteArray, field: Int): String {
-        val seg = MomentsLogic.protoSegments(b, field).firstOrNull() ?: return "-"
-        return "[" + topFieldNums(seg, 10) + "]"
-    }
-
-    /**
-     * 探针专用：字段 6 内各 wiretype=2 字段的**内容预览**（找 mediaId 在哪）。
-     *
-     * R19 实测：字段 6 内部是 `1:5,2:5,3:2,4:2,5:2,6:2,7:0,9:0,10:0,11:0`
-     * —— **没有字段 8**，所以 `PROTO_FIELD_MEDIA_LIST=8` 恒取不到（这就是 ids=0 的真因）。
-     * mediaId 的特征是 20~28 位字符串 ⇒ 用预览逐个认。
-     *
-     * 输出形如 `3=len20:15033764437568787118;4=len12:(非文本)`。
-     */
-    private fun in6dump(content: ByteArray): String {
-        val obj = MomentsLogic.protoSegments(content, 6).firstOrNull() ?: return "-"
-        val sb = StringBuilder()
-        for (f in intArrayOf(3, 4, 5, 6, 9, 10, 11)) {
-            val seg = MomentsLogic.protoSegments(obj, f).firstOrNull() ?: continue
-            val s = runCatching { String(seg, Charsets.UTF_8) }.getOrNull()
-            val printable = s != null && s.all { it.code in 32..126 }
-            val prev = if (printable) s!!.take(22) else "bin:" + hexHead(seg, 6)
-            if (sb.isNotBlank()) sb.append(';')
-            sb.append("$f=len${seg.size}:$prev")
-            if (sb.length > 150) break
-        }
-        return if (sb.isEmpty()) "empty" else sb.toString()
-    }
-
-    private fun probeSnsCache(limit: Int): List<String> {
-        val out = ArrayList<String>(limit + 3)
-        val idx = buildSnsIndex()
-        out.add(
-            "$TAG snsprobe idx rootFound=${idx.rootFound} names=${idx.names.size} " +
-                "files=${idx.files.size}"
-        )
-        val db = GroupDb.current()
-        if (db == null) {
-            out.add("$TAG snsprobe no db")
-            return out
-        }
-        val rows = runCatching { db.listSnsArchive(limit) }.getOrElse {
-            out.add("$TAG snsprobe listArchive failed ${it.javaClass.simpleName}")
-            return out
-        }
-        if (rows.isEmpty()) {
-            out.add("$TAG snsprobe no archived rows")
-            return out
-        }
-
-        var noMedia = 0
-        var withIds = 0
-        var hitRows = 0
-        for (row in rows) {
-            val ids = mediaIdsOf(row)
-            if (ids.isEmpty()) {
-                noMedia++
-                // content 非空却解不出 ⇒ 最可能是字段号错。
-                // ⛔ 只打长度**不足以**判断字段号（R19 真机实测：7 条全长 841~3122B
-                //    却一条 mediaId 都解不出，光看长度无法区分「字段号错」与「样本无图」）。
-                //    ⇒ 追加**头部 hex + 顶层字段号枚举**，让判据可自证。
-                val cb = row.content
-                // ⛔ seg6 / scan 是判断根因的关键（R19）：
-                //    `protoSegments` 结构断裂时 **return emptyList()**（整段作废，含已收集到的字段6），
-                //    而 `topFieldNums` 是 **break**（保留已收集）。两者不一致 ⇒
-                //    「topFields 里有 6」但「protoSegments(6) 为空」是完全可能的，
-                //    症状就是 ids=0 且看起来字段号没错。
-                // ⛔ 单行日志有 295 字符硬上限（R19 实测），`head`/`topFields` 会把
-                //    真正关键的 `in6`/`top8` 挤掉 ⇒ 本轮只留关键字段，次要的先去掉。
-                out.add(
-                    "$TAG snsprobe snsId=${row.snsId} ids=0 content=${cb?.size ?: -1}B " +
-                        "seg6=${if (cb == null) "-" else MomentsLogic.protoSegments(cb, 6).size} " +
-                        "scan=${if (cb == null) "-" else scanEnd(cb)} " +
-                        // ⛔ 层级取证（R19 核心疑点）：content **顶层就有字段 8**，
-                        //    而 mediaIdsFromContent 是在**字段6 内部**找字段8。
-                        //    若 mediaList 实际在顶层 ⇒ 层级错了，这才是 ids=0 的真因。
-                        "in6=${if (cb == null) "-" else nestedTop(cb, 6)} " +
-                        "d6=${if (cb == null) "-" else in6dump(cb)}"
-                )
-                continue
-            }
-            withIds++
-            var rowHit = false
-            for ((slot, mid) in ids.withIndex()) {
-                val pre = MomentsLogic.fliterPre(mid)
-                val cand0 = MomentsLogic.snsNameCandidates(mid).firstOrNull() ?: "NONE"
-                val hitName = MomentsLogic.matchSnsFileName(idx.names, cand0)
-                    ?: MomentsLogic.snsNameCandidates(mid)
-                        .firstNotNullOfOrNull { MomentsLogic.matchSnsFileName(idx.names, it) }
-                if (hitName != null) rowHit = true
-                out.add(
-                    "$TAG snsprobe snsId=${row.snsId} ids=${ids.size} #$slot " +
-                        "raw=$mid pre=$pre cand0=$cand0 hit=${hitName ?: "NONE"}"
-                )
-            }
-            if (rowHit) hitRows++
-        }
-        out.add(
-            "$TAG snsprobe sum rows=${rows.size} noMedia=$noMedia withIds=$withIds hit=$hitRows"
-        )
-        return out
-    }
-
-    // ------------------------------------------------------------------ 原图下载
-
-    /**
-     * 从 content 里的 CDN url **直接下载**原图（探针 `sub=imgdl`）。
-     *
-     * 为什么不再找本地缓存：见 [MomentsLogic.imageRootCandidates] —— 2026-10-18 设备实测
-     * 4 个 md5 全盘 find 都搜不到，朋友圈的图**从未落盘**，`picked=NONE` 是必然结果，
-     * 继续调目录规则是白费。
-     *
-     * ⚠️ url 带 `token` / `sign` / `svrnonce` ⇒ **有时效**。这里读的是 `sns_archive`
-     * 归档里的老 url，**下载失败是预期结果，不是 bug**（新鲜 url 已 curl 验过 HTTP 200）。
-     * 真要长期用，得在动态刚抓到时就下 —— 那是 [COPY_IMAGES] 打开时的事。
-     */
-    private fun downloadMedia(limit: Int): String {
-        val db = GroupDb.current() ?: return "$TAG imgdl no db"
-        val rows = runCatching { db.listSnsArchive(limit) }.getOrDefault(emptyList())
-        if (rows.isEmpty()) return "$TAG imgdl no archived rows"
-
-        val outDir = File(cfg().root, "_imgdl")
-        if (!outDir.exists() && !outDir.mkdirs()) return "$TAG imgdl mkdirs failed: ${outDir.path}"
-        if (outDir.usableSpace < MomentsLogic.MIN_FREE_BYTES) {
-            return "$TAG imgdl abort: free=${outDir.usableSpace} < ${MomentsLogic.MIN_FREE_BYTES}"
-        }
-
-        var rowsHit = 0
-        var tried = 0
-        var ok = 0
-        var bytes = 0L
-        for (row in rows) {
-            val urls = MomentsLogic.mediaUrls(MomentsLogic.extractUrls(row.content))
-            if (urls.isEmpty()) continue
-            var rowOk = 0
-            for ((i, u) in urls.withIndex()) {
-                tried++
-                val tmp = File(outDir, "tmp_${row.snsId}_$i")
-                val r = downloadOne(u, tmp)
-                // ⚠️ 别加「https 失败降级 http 重试」：2026-10-18 实测无效。
-                // 同一条动态里 `251/20302/stodownload`(http) → 200 / 2.8MB，
-                // 而 `251/20304/stodownload` 的 https 与 http **都是 000 或 400**。
-                // ⇒ 失败的是资源本身（另一路编号 / 已过期），不是协议，重试白费一次超时。
-                if (r.size <= 0) {
-                    runCatching { tmp.delete() }
-                    LogX.w("$TAG imgdl fail snsId=${row.snsId} #$i reason=${r.size} code=${r.code}")
-                    continue
-                }
-                val kind = MomentsLogic.kindOfUrl(u)
-                val dst = File(outDir, MomentsLogic.fileNameFor(row.snsId, i, kind, r.type))
-                // dst 已存在时 renameTo 会失败（真机踩过「删了才成功」），先删
-                if (dst.exists() && !dst.delete()) {
-                    runCatching { tmp.delete() }
-                    LogX.w("$TAG imgdl cannot replace dst=${dst.name}")
-                    continue
-                }
-                if (!tmp.renameTo(dst)) {
-                    runCatching { tmp.delete() }
-                    LogX.w("$TAG imgdl rename failed dst=${dst.name}")
-                    continue
-                }
-                ok++
-                rowOk++
-                bytes += r.size
-            }
-            if (rowOk > 0) rowsHit++
-        }
-        return "$TAG imgdl rows=${rows.size} rowsHit=$rowsHit tried=$tried ok=$ok " +
-            "bytes=$bytes out=${outDir.path}"
-    }
-
-    /** 单个媒体的下载结果。`size<=0` 表示失败，取值即失败原因（见下方注释） */
-    private class Dl(val size: Long, val type: String?, val code: Int)
-
-    /**
-     * 下一个 url 到临时文件。
-     *
-     * @return [Dl]，失败时 `size` 为负：`-1`=HTTP 非 2xx、`-2`=超过 [MAX_MEDIA_BYTES]、
-     *         `-3`=抛异常（超时 / DNS / SSL）。失败时**调用方**负责删半成品。
-     */
-    private fun downloadOne(url: String, tmp: File): Dl {
-        // 非 http(s) 一律别试：真机踩过 `ProtocolException`（BLOB 里会抽出非 http 的串），
-        // 既浪费一次超时又污染日志
-        if (!url.startsWith("http://") && !url.startsWith("https://")) return Dl(-4, null, -1)
-        var conn: java.net.HttpURLConnection? = null
-        return try {
-            conn = (java.net.URL(url).openConnection() as java.net.HttpURLConnection).apply {
-                connectTimeout = DL_CONNECT_MS
-                readTimeout = DL_READ_MS
-                instanceFollowRedirects = true
-                // 实测：对 shmmsns 图片无效（照样 400），但对 stodownload 类无害，
-                // 留着是为了换 CDN 时少一轮取证
-                setRequestProperty("User-Agent", DL_UA)
-                setRequestProperty("Referer", "http://weixin.qq.com/")
-            }
-            val code = conn.responseCode
-            if (code !in 200..299) return Dl(-1, null, code)
-
-            val ct = conn.contentType
-            // 先按声明长度挡一道；声明为 -1（分块传输）时只能边下边数
-            val declared = conn.contentLengthLong
-            if (declared > MAX_MEDIA_BYTES) return Dl(-2, ct, code)
-
-            var n = 0L
-            conn.inputStream.use { input ->
-                tmp.outputStream().use { out ->
-                    val buf = ByteArray(DL_BUF)
-                    while (true) {
-                        val r = input.read(buf)
-                        if (r < 0) break
-                        out.write(buf, 0, r)
-                        n += r
-                        if (n > MAX_MEDIA_BYTES) return Dl(-2, ct, code)
-                    }
-                }
-            }
-            Dl(n, ct, code)
-        } catch (t: Throwable) {
-            LogX.w("$TAG imgdl threw ${t.javaClass.simpleName}")
-            Dl(-3, null, -1)
-        } finally {
-            runCatching { conn?.disconnect() }
-        }
-    }
-
-    // ------------------------------------------------------------------ 诊断
-
-    /**
-     * 把最近 n 条归档的**完整** CDN url 打出来（探针 `sub=imgurl`，只读不下载）。
-     *
-     * 为什么需要单独一条：已删的旧探针 `logImgProbe` 里的 url 被 `take(48)` 截断，只看得到
-     * `http://wxapp.tc.qq.com/251/20302/stodownload?enc` 这种半截，
-     * **无法判断整条地址还能不能直接用**（后半段才是鉴权参数）。
-     * 而 md5 那条路已被实测证伪（图没落盘），下载 url 成了唯一可行方向。
-     *
-     * 输出刻意分成三行，避免一行太长被日志环形缓冲截断：
-     * 1. 汇总：几条动态 / 几个非头像 url / 几个头像 url
-     * 2. 完整 url（可能是 `&` 连接的超长串，这里**不截断**，改由 n 控制条数）
-     */
-    private fun logImgUrls(limit: Int): String {
-        val rows = GroupDb.current()?.listSnsArchive(limit).orEmpty()
-        if (rows.isEmpty()) return "$TAG imgurl no archived rows"
-
-        var all = 0
-        var keep = 0
-        var avatar = 0
-        for (row in rows) {
-            val urls = MomentsLogic.extractUrls(row.content)
-            val real = urls.filterNot { MomentsLogic.isAvatarUrl(it) }
-            all += urls.size
-            keep += real.size
-            avatar += urls.size - real.size
-            // 每条动态打一行：snsId + 完整地址（多条用空格隔开，便于直接复制去 curl）
-            LogX.i(
-                "$TAG imgurl snsId=${row.snsId} total=${urls.size} real=${real.size} " +
-                    "urls=[${real.joinToString(" ")}]"
-            )
-        }
-        return "$TAG imgurl rows=${rows.size} urls=$all real=$keep avatar=$avatar"
-    }
+    //    原 `op=moments sub=imgtry` 探针一并下架。
 
     fun stat(): String = runCatching {
         val c = cfg()
@@ -1799,7 +1384,7 @@ object MomentsExport {
      * 探针入口（`op=moments`）：
      * - `stat` 状态；`path` 当前路径与可写性/剩余空间
      * - `export` 立刻起一轮（绕过最小间隔；开关只挡自动轮，不挡手动诊断）
-     * - `snsprobe` 新链路只读对账（原 `img` / `imgtry` 两个旧 md5 探针已于 R20 删除）
+     * - `snsidx` 只读诊断：索引能不能建起来、建了多少条
      * - `imgfill` R26 图片回填（给已导出但缺图的补图，受 `moments.copy_images` 约束）
      * - `scan` 重扫导出目录，报告已导出条数
      */
@@ -1833,21 +1418,14 @@ object MomentsExport {
             // ⛔ 已删于 R20（A8 收敛）：`img` / `imgtry` 两个旧 md5 路线探针分支
             //    （R15 分桶 0.68% / R16 全盘 find 零结果 / R19 文件名是 20 位数字串不含 md5）。
             //    正解见 docs/_r19_a4_probe.md。证据见 docs/_r20_a8_del.md。
-            // R15-M1：**新链路只读探针**，不依赖 COPY_IMAGES（`false` 时也能验 protobuf + 索引匹配）
-            "snsprobe" -> probeSnsCache(MomentsLogic.clampProbeN(n)).joinToString("\n")
+            // ⛔ 已删于 R42（乙方案拆除）：`snsprobe` / `imgurl` / `imgdl` 三个探针
+            //    依赖 `sns_archive` 归档表，随归档表一并删除。图片对账只剩 `snsidx`。
             // R15：只读诊断 —— 索引能不能建起来、建了多少条（不取图、不写盘）
             "snsidx" -> {
                 val idx = buildSnsIndex()
                 "$TAG snsidx rootFound=${idx.rootFound} names=${idx.names.size} " +
                     "sample=${idx.names.take(3)}"
             }
-            // ⚠️ 2026-10-18 实测：md5 找本地缓存全 NONE，图根本没下载到本机。
-            // 所以加这条**只读**探针，把 content 里的完整 CDN url 原样打出来
-            // （已删的旧探针 `logImgProbe` 里的 url 被 take(48) 截断了，看不出能不能直接 GET）。
-            // 下一轮据此判断「下载原图」方案是否可行，不用改代码。
-            "imgurl" -> logImgUrls(MomentsLogic.clampProbeN(n))
-            // 真下载（联网）。n 建议小一点（默认 3），别一口气把几十条都下了
-            "imgdl" -> downloadMedia(MomentsLogic.clampProbeN(n))
             // R26：**图片回填**（给「txt 已导出但图缺」的补图）。手动触发，不用等下一轮导出。
             // ⚠️ 仍受配置开关约束（单闸原则，不做隐藏旁路）；没开就明确告诉你该怎么开。
             // 与主循环共用 running 单航班 —— 每写这么多个文件查一次空间的那套状态不能并发。
@@ -1871,7 +1449,7 @@ object MomentsExport {
                 val ids = scanExportedIds(File(cfg().root))
                 "$TAG scan exported=${ids.size} sample=${ids.take(5)}"
             }
-            else -> "$TAG export subs=estat|path|export|snsidx|snsprobe|imgfill|imgurl|imgdl|scan"
+            else -> "$TAG export subs=estat|path|export|snsidx|imgfill|scan"
         }
     }.getOrElse { "$TAG export probe error=${it.javaClass.simpleName}" }
 }

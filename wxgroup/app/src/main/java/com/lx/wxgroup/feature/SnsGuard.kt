@@ -1,8 +1,5 @@
 package com.lx.wxgroup.feature
 
-import android.content.ContentValues
-import android.os.Handler
-import android.os.HandlerThread
 import android.os.SystemClock
 import com.lx.wxgroup.data.GroupDb
 import com.lx.wxgroup.data.Keys
@@ -33,11 +30,14 @@ import java.util.concurrent.atomic.AtomicInteger
  *   thread=[D]#worker
  * ```
  *
- * ## 所以策略是「拦 + 归档」，不是「拦 + 改写」
- * - 拦住 `DELETE`，行留在 `SnsInfo` 里 → 朋友圈界面上它照常显示；
- * - 同时把整行（含 `content` / `attrBuf` / `postBuf` 三个 BLOB）**复制一份进我们自己的库**。
- *   因为拦得住这一次，拦不住微信后续的清理或重装 —— 归档才是内容真正的保险，
- *   也是 6.4「自动导出朋友圈动态」的数据源。
+ * ## 所以策略是「写时拦截」（R42 路线甲），不再做「拦 + 归档」
+ * - 微信清时间线可见位（`sourceType` bit1 置 0）的**真实通道**是
+ *   `update("SnsInfo", {sourceType=0})` → `updateWithOnConflict`，**不是** `DELETE`；
+ * - 在 `updateWithOnConflict` 的 **before** 里把 `sourceType` 这个键摘掉，清位不落地，
+ *   行留在库里、`sourceType` 保持旧值 → 朋友圈界面上它照常显示；
+ * - 同一行 `sourceType` 永远不会落成 0，因此一切以「库里出现 0」为触发条件的
+ *   事后补位/归档恢复子系统都随乙方案删除，不再存在。
+ * - 6.4「自动导出朋友圈动态」改为**预防性留存**：动态还看得见时就把图留存下来（扫当前表）。
  *
  * ## ⚠️ 作用域的现实情况（跟消息撤回不一样，别套用）
  * 消息撤回能靠 `isSend` / 文案区分「自己撤回 / 他人撤回」，然后只拦他人的。
@@ -58,47 +58,20 @@ object SnsGuard {
 
     private const val CFG_TTL_MS = 3000L
 
-    /** R41 子步 3：每轮可见位统计最多查几个 id（限行、限开销） */
-    private const val VIS_PROBE_MAX = 10
-
-    /**
-     * 两次「update 后补位」之间的最小间隔。
-     *
-     * 实测一轮首屏同步会连写多条 `sourceType=0`（4 条、间隔 10ms），而
-     * [SnsTimelineSourceFix.reFixAfterClear] 扫的是整张台账 ⇒ 补一次就把这一轮
-     * 全部覆盖，重复触发纯属浪费（每次 7 块 count + 7 块 UPDATE SQL）。
-     */
-    private const val UPDATE_FIX_QUIET_MS = 350L
-    private const val UPDATE_FIX_MAX_WAIT_MS = 2000L
-
     private data class Config(
-        val enabled: Boolean,
-        val debugLog: Boolean,
-        /**
-         * R42 路线甲实测：`updateWithOnConflict` **before** 里摘掉 `sourceType`。
-         * 与 [enabled] 完全独立 —— [enabled] 管「事后补位」，本项管「写时拦截」。
-         */
+        /** R42 路线甲：`updateWithOnConflict` **before** 里摘掉 `sourceType`（写时拦截）。 */
         val blockEnabled: Boolean,
     )
 
     @Volatile
-    private var config = Config(false, false, false)
+    private var config = Config(false)
 
     @Volatile
     private var cfgAt = 0L
 
-    /**
-     * 「这次删除是我们自己发的」标记。
-     * 目前只有诊断用的 `snsdel` 会走，真删必须绕过拦截，否则永远删不掉。
-     */
-    internal val bypass = ThreadLocal<Boolean>()
-
-    /** 朋友圈库实例，诊断（snsdump）要用；只在命中删/execSQL 时顺手记下 */
+    /** 朋友圈库实例，扫当前 SnsInfo（导出）要用；只在命中 execSQL/rawQuery 时顺手记下 */
     @Volatile
     private var snsDb: Any? = null
-
-    private val blocked = AtomicInteger(0)
-    private val archived = AtomicInteger(0)
 
     // ------------------------------------------------------------------ 安装
 
@@ -142,40 +115,26 @@ object SnsGuard {
         runCatching { XposedBridge.hookAllMethods(cls, "insert", snsInsertGuard) }
             .onSuccess { if (it.isNotEmpty()) ok += "insert" }
             .onFailure { LogX.e("SNS: hook insert failed", it) }
-        // ✅ R27 方案 A（Response-Merge）：联网时时间线吃响应对象、不读库，
-        //   只补 DB 的 sourceType 不够，还得把本地行注入回 `c3.N` 的响应列表
-        //   （见 `docs/_r27_clear_api_forensics.md` §11.4 的联网/断网对照实验）。
-        runCatching { SnsTimelineMerge.install(lpparam) }
-            .onFailure { LogX.e("SNS: merge install failed", it) }
         // ✅ R20：**句柄捕获钩子**（拿到即自我卸载，见 [installCapture]）。
-        //   它不是常驻钩子，跟下面「常驻的两个」不是一回事，别按同一把尺子衡量。
+        //   它不是常驻钩子，跟下面「常驻的」不是一回事，别按同一把尺子衡量。
         runCatching { installCapture(cls) }
             .onFailure { LogX.w("SNS: capture hook failed: ${it.javaClass.simpleName}") }
         // ⚠️ **常驻**的只有 delete / execSQL / updateWithOnConflict / insert(WithOnConflict)
-        // 四个。insert 是 R41 才补的**探针采样**路径（纯内存记账、第一句零反射短路，
-        // 非 SnsInfo 立刻返回），不是业务拦截钩子；query 一律不挂。
-        //
-        // ⛔ updateWithOnConflict 是 2026-10-26 R27 才加的**唯一例外**：真机取证证明
-        //    清 `sourceType` 走的是它、而不是 execSQL（见 [snsUpdateGuard] 的三道闸）。
-        //    不加这一条，方案 B 的补位永远等不到触发。
-        //
-        // ⛔ 唯一例外是上面的 [installCapture]（`rawQuery`）：需求 6.4 的导出要扫
-        // **当前** SnsInfo（防撤回 = 在动态还看得见时留图，见 [listCurrentSns]），
-        // 而句柄只在「删」的路径上才会被记下来 —— 定时刷新朋友圈只会 INSERT/REPLACE，
-        // 永远触发不到 DELETE ⇒ 句柄恒为 null ⇒ 导出恒 0 行。
-        // 所以必须补一条捕获路径，且**拿到就卸载**（把常驻开销压成 0）。
+        // 六个（R42 甲：delete/execSQL 是「是否有裸 SQL 绕过」的旁证计数，update/insert 是
+        // 写时拦截 + 通道计数）。非 SnsInfo 全部第一句零反射短路，query 一律不挂。
         if (ok.isEmpty()) {
             LogX.w("SNS: no hook installed, sns guard disabled")
             return
         }
-        LogX.i("SNS installed hooks=${ok.joinToString(",")} enabled=${config.enabled}")
+        LogX.i("SNS installed hooks=${ok.joinToString(",")} blockEnabled=${config.blockEnabled}")
     }
 
     fun refresh() {
+        // R42 路线甲：写时拦截跟随主开关「防止朋友圈动态撤回」（Keys.ANTIREVOKE_SNS）。
+        // Keys.ANTIREVOKE_SNS_BLOCK 作为调试覆盖：true 强制开启；false（默认）= 不覆盖、跟随主开关。
         config = Config(
-            enabled = Kv.getBool(Keys.ANTIREVOKE_SNS),
-            debugLog = Kv.getBool(Keys.DEBUG_LOG),
-            blockEnabled = Kv.getBool(Keys.ANTIREVOKE_SNS_BLOCK),
+            blockEnabled = Kv.getBool(Keys.ANTIREVOKE_SNS) ||
+                Kv.getBool(Keys.ANTIREVOKE_SNS_BLOCK),
         )
         cfgAt = SystemClock.elapsedRealtime()
     }
@@ -199,66 +158,14 @@ object SnsGuard {
             runCatching { onExecSql(param) }
                 .onFailure { LogX.w("SNS execSQL hook err: ${it.javaClass.simpleName}") }
         }
-
-        /**
-         * ⚠️ **必须挂在 after**：微信清 `sourceType` 的 bit1 是
-         * `UPDATE SnsInfo SET sourceType = sourceType & -3 ...`，在 before 里补位会被
-         * 同一条 SQL 立刻清掉（顺序反过来）。
-         */
-        override fun afterHookedMethod(param: MethodHookParam) {
-            runCatching { onExecSqlAfter(param) }
-                .onFailure { LogX.w("SNS execSQL after hook err: ${it.javaClass.simpleName}") }
-        }
     }
 
     /**
-     * `execSQL` 执行**之后**：如果这条 SQL 是微信在「批量清时间线来源位」，
-     * 立刻把台账里「曾经可见」的行补回去（方案 B，见 `docs/_r27_srcfix_design.md`）。
+     * `updateWithOnConflict` 的 after 半场（R42：补位随乙方案删除，此钩子仅保留注册）。
      *
-     * 为什么不能省：真机实测清位每轮 sync 都跑一次（`updateFilterTimeLine`），
-     * 一次性补位活不过一轮。补位必须跟在清位后面走。
-     *
-     * 代价：这条 SQL 只在朋友圈同步时出现，字符串匹配在 `& -3` 那步就短路返回，
-     * 平时零成本（不做反射、不碰库）。
-     */
-    private fun onExecSqlAfter(param: XC_MethodHook.MethodHookParam) {
-        val sql = param.args?.firstOrNull() as? String ?: return
-        if (!SnsTimelineSrcLogic.isSourceClearSql(sql)) {
-            // 微信换写法时这里会打出真实 SQL —— 否则补位静默失效，只能靠猜。
-            // ⚠️ 必须排除我们自己补位/回滚写的 SQL，否则每次 sync 都被自己刷一条噪音。
-            if (SnsTimelineSrcLogic.looksLikeSourceWrite(sql) &&
-                !SnsTimelineSrcLogic.isOwnFixSql(sql)
-            ) {
-                SnsTimelineSourceFix.noteUnmatchedSourceWrite(sql)
-            }
-            return
-        }
-        if (bypass.get() == true) return
-        val db = param.thisObject ?: return
-        val t0 = android.os.SystemClock.elapsedRealtime()
-        val fixed = SnsTimelineSourceFix.reFixAfterClear(db)
-        val cost = android.os.SystemClock.elapsedRealtime() - t0
-        // fixed=-1 = 上一轮还在跑（重入保护），不算异常，但要让排查的人看见
-        LogX.i("SNS srcguard re-fix after clear fixed=$fixed cost=${cost}ms")
-    }
-
-
-    /**
-     * 微信清时间线可见位（`sourceType` bit1）的**真实通道**。
-     *
-     * ⚠️ 2026-10-26 R27 真机取证（`docs/_r27_clear_api_forensics.md`）：微信落库是
-     * 「服务器对象整行 upsert」，清位表现为
-     * `update("SnsInfo", ContentValues{... sourceType=0 ...})` → `updateWithOnConflict`，
-     * **每轮首屏同步都会跑**（实测 4 条、间隔 10ms），`execSQL` 一次都不出现。
-     * ⇒ 原来挂在 `execSQL` 上的 [onExecSqlAfter] 一直是空挂，必须补这一条。
-     *
-     * 挂 `updateWithOnConflict` 而不是 `update`：后者内部必走前者，挂前者不会漏。
-     *
-     * 代价控制三闸：`updateWithOnConflict` 是**全表**热路径（微信所有表的 update 都经过），
-     * ① 第一句就是零反射的字符串比较，非 `SnsInfo` 立刻返回；
-     * ② 命中后看 values 里 `sourceType` 是否为 0（正常行写 2/10，只有清位写 0）；
-     * ③ 命中后**不立刻补**，而是等这一批写完（静默 350ms）在 [FixWorker] 里统一补一次
-     * —— 立刻补会被同批后面的写 0 覆盖（真机实测一轮清 3 条只补回 1 条）。
+     * 微信清时间线可见位（`sourceType` bit1）的**真实通道**是
+     * `update("SnsInfo", ContentValues{... sourceType=0 ...})` → `updateWithOnConflict`。
+     * 甲（写时拦截）在 **before** 里把 `sourceType` 这个键摘掉，让清位不落地。
      */
     private val snsUpdateGuard = object : XC_MethodHook() {
         override fun afterHookedMethod(param: MethodHookParam) {
@@ -268,11 +175,10 @@ object SnsGuard {
     }
 
     /**
-     * R41 探针：新动态首次落库走 `insertWithOnConflict`/`insert`（实测 verity 发新帖那轮
-     * 库里查得到 src=2，但 updateWithOnConflict 采不到），账本必须补这条路径。
+     * R42 W2：INSERT 通道计数（新动态首次落库走 `insertWithOnConflict`/`insert`）。
      *
-     * 代价控制：与 [snsUpdateGuard] 同款 —— 第一句零反射字符串比较，非 `SnsInfo` 立刻返回。
-     * afterHook 里从 **ContentValues** 取 snsId（不是 whereArgs），取不到打一条节流告警。
+     * 代价控制：第一句零反射字符串比较，非 `SnsInfo` 立刻返回。
+     * afterHook 里从 **ContentValues** 取 sourceType 计数（只记账、不写库、不改 values）。
      */
     private val snsInsertGuard = object : XC_MethodHook() {
         override fun afterHookedMethod(param: MethodHookParam) {
@@ -290,12 +196,11 @@ object SnsGuard {
      * 见 `docs/_r42_wechatmagician.md`）。同一行 `sourceType` 保持旧值，微信的
      * `sourceType & 2 != 0` 判据继续成立 ⇒ 时间线还能翻到。
      *
-     * ## 与 [snsUpdateGuard]（after，补位）的关系
+     * ## 与 [snsUpdateGuard]（after）的关系
      * 两个回调挂在**同一个方法**上，互不调用：
-     * - after 钩子看到 `sourceType == 0` ⇒ 排补位（现有行为，**本轮一个字不改**）；
-     * - before 钩子把 `sourceType` 摘掉 ⇒ after 钩子读不到值 ⇒ 不排补位（拦截模式下本该如此）。
-     *   ⚠️ 那句「no sourceType … re-fix disabled」在拦截模式下是**误报**，所以
-     *   `onSnsUpdateAfter` 里先按 ContentValues 身份问一次 [SnsBlockProbe.isBlockedValues]。
+     * - after 钩子（补位）已随乙方案删除，现在只剩「读不到 sourceType 时是否被我们摘键」的形态观察；
+     * - before 钩子把 `sourceType` 摘掉 ⇒ after 钩子读不到值 ⇒ 按 [SnsBlockProbe.isBlockedValues]
+     *   判定为「甲已生效」而不报形态告警。
      *
      * ## 代价
      * ① 第一句零反射字符串比较（微信所有表的 update 都经过这里）；
@@ -456,50 +361,6 @@ object SnsGuard {
     }
 
     /**
-     * 最近一次「写 0」命中的时刻（`elapsedRealtime`）。
-     *
-     * 补位不在这里立刻跑，而是等这一批写完（静默 [UPDATE_FIX_QUIET_MS]）后统一跑，
-     * 否则先补的那条会被同批后续的写 0 覆盖（2026-10-26 00:18 真机实测：
-     * 一轮写 3 条，只补回 1 条，另两条被节流挡掉后保持 0）。
-     */
-    private val lastUpdateZeroAt = java.util.concurrent.atomic.AtomicLong(0L)
-
-    /** 是否已排了一个待执行的补位任务（合并同一批连写） */
-    private val fixScheduled = java.util.concurrent.atomic.AtomicBoolean(false)
-
-    /** 补位专用单线程：`object` 的初始化是线程安全的，懒加载且全局唯一 */
-    private object FixWorker {
-        val handler: Handler = Handler(HandlerThread("sns-srcfix").apply { start() }.looper)
-    }
-
-    /**
-     * 读 `ContentValues.sourceType`，返回 `null` 表示取不到。
-     *
-     * ⚠️ 必须走反射、不能 `as? android.content.ContentValues`：微信用的是 wcdb 自己
-     * copy 的一份 `com.tencent.wcdb.ContentValues`（不是 AOSP 那个类的子类）。
-     * 直接强转在真机上会恒为 null ⇒ 整个钩子静默失效，而日志上什么异常都没有。
-     * Method 缓存按 class 存，避免每条 update 都 getMethod。
-     */
-    private fun sourceTypeOf(values: Any): Int? {
-        val c = values.javaClass
-        if (cvCls !== c) {
-            cvGetInteger = runCatching { c.getMethod("getAsInteger", String::class.java) }.getOrNull()
-            cvCls = c
-        }
-        val m = cvGetInteger ?: return null
-        return runCatching { m.invoke(values, "sourceType") as? Int }.getOrNull()
-    }
-
-    @Volatile
-    private var cvCls: Class<*>? = null
-
-    @Volatile
-    private var cvGetInteger: Method? = null
-
-    /** 「取不到 sourceType」的告警只打一次，避免刷屏 */
-    private val cvWarned = java.util.concurrent.atomic.AtomicBoolean(false)
-
-    /**
      * 从 `updateWithOnConflict` 的参数里抠 snsId。
      *
      * 签名是 `(table, values, whereClause, whereArgs, conflictAlgorithm)`，但 wcdb 有多个
@@ -517,36 +378,6 @@ object SnsGuard {
         return 0L
     }
 
-    @Volatile
-    private var insCvCls: Class<*>? = null
-
-    @Volatile
-    private var insCvGet: Method? = null
-
-    /** 「INSERT 里取不到 snsId」的告警只打一次（节流，避免刷爆 5000 行环形日志） */
-    private val insCvWarned = java.util.concurrent.atomic.AtomicBoolean(false)
-
-    /**
-     * 从 INSERT 的 `ContentValues` 里抠 snsId（wcdb 的 `com.tencent.wcdb.ContentValues`，
-     * 不是 AOSP 那个类的子类）。`get("snsId")` 返回 Object，兼容 Long/Integer/String 三种装箱，
-     * 取不到返回 0（= 哨兵，调用方放弃，绝不去猜一个 id 记账）。
-     */
-    private fun snsIdOfValues(values: Any): Long {
-        val c = values.javaClass
-        if (insCvCls !== c) {
-            insCvGet = runCatching { c.getMethod("get", String::class.java) }.getOrNull()
-            insCvCls = c
-        }
-        val m = insCvGet ?: return 0L
-        val v = runCatching { m.invoke(values, "snsId") }.getOrNull() ?: return 0L
-        return when (v) {
-            is Long -> v
-            is Int -> v.toLong()
-            is String -> v.toLongOrNull() ?: 0L
-            else -> 0L
-        }
-    }
-
     private fun onSnsInsertAfter(param: XC_MethodHook.MethodHookParam) {
         val a = param.args ?: return
         if (a.size < 2) return
@@ -558,15 +389,6 @@ object SnsGuard {
         // R42 W2：INSERT 通道的 sourceType 分布（清位理论上不走 INSERT，这里再证一次）
         runCatching { countInsertSource(values) }
             .onFailure { LogX.w("SNS insert count err: ${it.javaClass.simpleName}") }
-        val id = runCatching { snsIdOfValues(values) }.getOrNull() ?: 0L
-        if (id == 0L) {
-            if (insCvWarned.compareAndSet(false, true)) {
-                LogX.w("SNS insert hook: no snsId on ${values.javaClass.name} (insert sampling skipped)")
-            }
-            return
-        }
-        // 纯内存探针、零 IO
-        SnsRoundLedger.onInsert(id)
     }
 
     /**
@@ -582,104 +404,8 @@ object SnsGuard {
     }
 
     private fun onSnsUpdateAfter(param: XC_MethodHook.MethodHookParam) {
-        val a = param.args ?: return
-        if (a.size < 2) return
-        // ① 零反射短路：微信所有表的 update 都走这里，这句必须是第一个判断
-        if ((a[0] as? String) != "SnsInfo") return
-        // ② 只有「服务器认为这条不可见」才需要补；正常行微信写的是 2 或 10
-        val values = a[1] ?: return
-        // R40 P0-1：集合比对的采样点必须在 sourceType 判定之前 —— 正常行写 2/10 会在下面
-        // 的 `st != 0` 分支提前 return，采样晚一步就只能收到「写 0」的行，subset 恒 false。
-        // 纯内存探针、零 IO、不碰 LogX；snsIdOf(a) 失败/为 0 时静默跳过。
-        runCatching { snsIdOf(a) }.getOrNull()?.let { if (it != 0L) SnsRoundLedger.onUpsert(it) }
-        val st = sourceTypeOf(values)
-        if (st == null) {
-            // ⛔ 绝不允许静默失效：取不到值说明 ContentValues 形态变了，
-            // 补位会从此永久不触发，而功能表面上"正常"（只是不生效）。
-            // ⚠️ R42：例外 —— 键是**我们自己**在 before 里摘掉的（拦截模式），
-            //    这不是形态变化、补位也没「失效」（位根本没被清，无需补）。
-            //    按 ContentValues 身份判定，比按时间窗猜准；命中就直接返回、不刷误报。
-            if (SnsBlockProbe.isBlockedValues(values)) return
-            if (cvWarned.compareAndSet(false, true)) {
-                LogX.w("SNS update hook: no sourceType on ${values.javaClass.name} (re-fix disabled)")
-            }
-            return
-        }
-        // P0 取证采样点已上移到 sourceType 判定之前（见 :315-318），此处不再采样。
-        if (st != 0) {
-            // ⭐ R30 §6.2：微信**不是**只写 0 才覆盖我们。好友个人主页同步时它按服务端值
-            //    整行 upsert，把补好的 `10`（时间线|相册）打回 `2`（只有时间线位）——
-            //    `st != 0` 的老闸门会直接放过这种写，于是「进好友朋友圈，已删动态闪一下
-            //    就没了」（首屏吃旧内存数据看得见，刷新一读库就没了）。
-            // ⇒ 缺 bit8 且 snsId 在**窄台账**里时，必须在这里**同步**补回去。
-            //    ⛔ 判据必须窄：全库 17.6 万行正常动态就是 `sourceType=2`，广谱即事故。
-            if ((st and SnsTimelineSrcLogic.ALBUM_BIT) == 0 && bypass.get() != true) {
-                val id = snsIdOf(a)
-                if (id != 0L && SnsTimelineSourceFix.isAlbumTarget(id)) {
-                    val db = param.thisObject
-                    if (db != null) {
-                        bypass.set(true)   // 补位自己那次 update 不许再进本钩子
-                        try {
-                            SnsTimelineSourceFix.patchAlbumBit(db, id, st)
-                        } catch (t: Throwable) {
-                            LogX.w("SNS albumpatch err: ${t.javaClass.simpleName}")
-                        } finally {
-                            bypass.set(false)
-                        }
-                    }
-                }
-            }
-            return
-        }
-        // ⛔ 我们自己的写库（补位 / 伪装）不许再触发补位
-        if (bypass.get() == true) return
-        // ③ 不立刻补：只记时刻 + 排一个「静默后统一补」的任务。
-        //    立刻补会被同一批里后面的写 0 覆盖（真机实测 fixed=1 而实际有 3 条被清）。
-        lastUpdateZeroAt.set(SystemClock.elapsedRealtime())
-        if (!fixScheduled.compareAndSet(false, true)) return
-        val db = param.thisObject ?: run {
-            fixScheduled.set(false)
-            return
-        }
-        // ⛔ 排程失败必须回滚单航班标记：否则 fixScheduled 永久为 true，
-        //    补位从此彻底静默失效（正是本轮要防的失效模式）。
-        runCatching {
-            FixWorker.handler.postDelayed({ runDeferredFix(db, 0L) }, UPDATE_FIX_QUIET_MS)
-        }.onFailure {
-            fixScheduled.set(false)
-            LogX.w("SNS srcguard schedule failed: ${it.javaClass.simpleName}")
-        }
-    }
-
-    /**
-     * 等这一批写 0 静默 [UPDATE_FIX_QUIET_MS] 后，跑一次 [SnsTimelineSourceFix.reFixAfterClear]。
-     *
-     * 三层保护：
-     * 1. **静默判定**：每 [UPDATE_FIX_QUIET_MS] 复查一次 `lastUpdateZeroAt`，还在写就继续等，
-     *    最长等 [UPDATE_FIX_MAX_WAIT_MS]（防止有持续写入把补位无限推迟）。
-     * 2. **补位后自检**：补位期间若又有写 0（`lastUpdateZeroAt` 晚于补位开始时刻），再排一轮。
-     * 3. **单航班**：`fixScheduled` 保证同一时刻只有一个补位任务在跑/在排队。
-     */
-    private fun runDeferredFix(db: Any, waited: Long) {
-        val quiet = SystemClock.elapsedRealtime() - lastUpdateZeroAt.get()
-        if (quiet < UPDATE_FIX_QUIET_MS && waited < UPDATE_FIX_MAX_WAIT_MS) {
-            FixWorker.handler.postDelayed(
-                { runDeferredFix(db, waited + UPDATE_FIX_QUIET_MS) },
-                UPDATE_FIX_QUIET_MS
-            )
-            return
-        }
-        val startedAt = SystemClock.elapsedRealtime()
-        val fixed = runCatching { SnsTimelineSourceFix.reFixAfterClear(db) }
-            .onFailure { LogX.e("SNS srcguard re-fix failed", it) }
-            .getOrDefault(0)
-        val cost = SystemClock.elapsedRealtime() - startedAt
-        LogX.i("SNS srcguard re-fix after burst fixed=$fixed waited=${waited}ms cost=${cost}ms")
-        fixScheduled.set(false)
-        // 补位期间又发生了写 0 ⇒ 再补一轮（真机上一批可能跨 100ms 以上）
-        if (lastUpdateZeroAt.get() > startedAt && fixScheduled.compareAndSet(false, true)) {
-            FixWorker.handler.postDelayed({ runDeferredFix(db, 0L) }, UPDATE_FIX_QUIET_MS)
-        }
+        // R42 路线甲：写时拦截在 before 里完成，补位已随乙方案删除。
+        // after 半场仅保留注册（甲依赖的 6 钩子之一），不再做任何事。
     }
 
 
@@ -694,33 +420,11 @@ object SnsGuard {
         val id = SnsSql.matchDeleteCall(table, a.getOrNull(1) as? String, a.getOrNull(2) as? Array<*>?)
         // R42 W2：DELETE 通道独立计数（历史上认为「零 DELETE」，这里再证一次）。
         // ⚠️ 必须在 `id == null` 早退之前 —— 早期结论错就错在只看「单行删除」。
+        // R42 路线甲：物理 DELETE 拦截与归档随乙方案删除，此钩子只保留通道计数（甲的旁证）。
         if (table == TABLE) {
             runCatching { SnsBlockProbe.noteDelete(a.getOrNull(1) as? String, id) }
                 .onFailure { LogX.w("SNS delete count err: ${it.javaClass.simpleName}") }
         }
-        // 不是「删 SnsInfo 的某一行」就直接走（含 `createTime < ?` 这类清理），别去反射拿路径
-        if (id == null) return
-        val c = cfg()
-        if (bypass.get() == true) return
-        val db = param.thisObject ?: return
-        if (!isSnsDb(db)) return
-        if (!c.enabled) {
-            LogX.i("SNS delete seen (off) snsId=$id")
-            return
-        }
-        // ⚠️ 快照必须**同步**取：只在拦截之前这一刻能确定行还在。
-        // 放到后台读会有漏档窗口（库被关 / 进程被杀 / 微信另起一条清理抢先删掉），
-        // 而漏档是永久的，比多花一两毫秒严重得多。这只是一次主键点查，不是扫表。
-        val row = runCatching { readRow(db, id) }.getOrNull()
-        // 拦下来：返回 1 让微信以为删掉了（不这么做微信可能重试或报错）
-        param.result = 1
-        blocked.incrementAndGet()
-        // ⚠️ 光拦 DELETE 不够：微信删动态是**两步** —— 先把 localFlag 的可见位清掉、
-        // 再删行。我们只拦了第二步，行虽然还在，但时间线查询要求 localFlag 在白名单里，
-        // 结果就是「库里有、界面没有」。所以拦完必须把可见位写回去。
-        val flag = restoreVisibility(db, id, row?.localFlag ?: 0)
-        LogX.i("SNS blocked delete snsId=$id snap=${row != null} flag=$flag total=${blocked.get()}")
-        saveAsync(row)
     }
 
     /** `execSQL(String sql)` / `execSQL(String sql, Object[] bindArgs)` */
@@ -745,56 +449,45 @@ object SnsGuard {
             runCatching {
                 SnsBlockProbe.noteSql(
                     sql,
-                    isSourceWrite = SnsTimelineSrcLogic.looksLikeSourceWrite(sql),
-                    clear = SnsTimelineSrcLogic.isSourceClearSql(sql),
-                    own = SnsTimelineSrcLogic.isOwnFixSql(sql),
+                    isSourceWrite = looksLikeSourceWrite(sql),
+                    clear = isSourceClearSql(sql),
+                    own = isOwnFixSql(sql),
                 )
             }.onFailure { LogX.w("SNS sql count err: ${it.javaClass.simpleName}") }
         }
-        // ⚠️ 参数化 SQL（`where snsId=?`）的 id 在第二个参数里，必须一起传进去，
-        // 否则 execSQL 形态对参数化写法**完全失效**（第一版就漏了）
-        val id = SnsSql.matchDeleteSql(sql, a.getOrNull(1) as? Array<*>?)
-        if (id == null) return
-        val c = cfg()
-        if (bypass.get() == true) return
-        val db = param.thisObject ?: return
-        if (!isSnsDb(db)) return
-        if (!c.enabled) {
-            LogX.i("SNS delete seen (off) snsId=$id")
-            return
-        }
-        val row = runCatching { readRow(db, id) }.getOrNull()
-        // execSQL 返回 void：置 null 即 returnEarly，跳过原方法体
-        param.result = null
-        blocked.incrementAndGet()
-        val flag = restoreVisibility(db, id, row?.localFlag ?: 0)
-        LogX.i("SNS blocked delete-sql snsId=$id snap=${row != null} flag=$flag total=${blocked.get()}")
-        saveAsync(row)
     }
 
-    /**
-     * 把可见位写回去。
-     *
-     * 时间线的查询是 `select *,rowid from SnsInfo where (localFlag in (16,2064,18,2066,…))`
-     * —— 白名单里每个值都置了 bit4（16）。微信删动态时把这一位清掉（实测落成 2），
-     * 所以我们把它置回去即可。**优先用记住的原值**（能保住 2048 之类其它位），
-     * 记不住就退 `原值 | 16`（2 → 18，也在白名单里）。
-     *
-     * 用 `原值 | 16`（2 → 18）而不是去查「原来是多少」：查原值得挂 update/insert 钩子，
-     * 那是微信**所有表**的写路径（message / rcontact …），为这点信息给每次写库加开销不值当。
-     *
-     * @return 实际写进去的 localFlag；0 = 没写（已可见 / 方法没找到 / 写失败 / 没命中行）
-     */
-    private fun restoreVisibility(db: Any, snsId: Long, curFlag: Int): Int {
-        if (curFlag and VISIBLE_BIT != 0) return 0 // 本来就可见，不用动
-        val target = curFlag or VISIBLE_BIT
-        // ⚠️ 只有真的改动到行才算数：行没了的时候 update 返回 0 行，
-        // 以前这里照样返回 target，日志看上去是「补可见位成功」，其实一条都没改 ——
-        // 「拦了删除但界面还是不显示」这种问题查起来全靠这条日志，不能说谎。
-        val n = updateFlag(db, snsId, target)
-        if (n <= 0) return 0
-        LogX.i("SNS visibility restored snsId=$snsId $curFlag -> $target rows=$n")
-        return target
+    // ------------------------------------------------------------------ execSQL 计数判据（随 SnsTimelineSrcLogic 删除内联到这里）
+
+    /** 微信「批量清时间线来源位」那条 UPDATE 的形态：`sourceType = sourceType & -3` */
+    private val CLEAR_SQL_RE =
+        Regex("""sourcetype\s*=\s*\(?\s*sourcetype\s*&\s*\(?\s*-3\b""")
+
+    /** 这条 SQL 是不是「微信在清 bit1」 */
+    private fun isSourceClearSql(sql: String?): Boolean {
+        if (sql.isNullOrBlank()) return false
+        val s = sql.lowercase()
+        if (!s.contains("snsinfo")) return false
+        return CLEAR_SQL_RE.containsMatchIn(s)
+    }
+
+    /** 这条 SQL 看起来像「改 `SnsInfo.sourceType`」，但没被 [isSourceClearSql] 认出来 */
+    private fun looksLikeSourceWrite(sql: String?): Boolean {
+        if (sql.isNullOrBlank()) return false
+        val s = sql.lowercase()
+        return s.contains("snsinfo") && s.contains("sourcetype") &&
+            (s.contains("update") || s.contains(" set "))
+    }
+
+    /** 我们自己补位/回滚写的 SQL（`sourceType = sourceType | 10`）—— 采样时要排除 */
+    private val OWN_FIX_SQL_RE =
+        Regex("""sourcetype\s*=\s*\(?\s*sourcetype\s*\|\s*\(?\s*(?:10|2)\b""")
+
+    private fun isOwnFixSql(sql: String?): Boolean {
+        if (sql.isNullOrBlank()) return false
+        val s = sql.lowercase()
+        if (!s.contains("snsinfo")) return false
+        return OWN_FIX_SQL_RE.containsMatchIn(s)
     }
 
     /**
@@ -831,17 +524,6 @@ object SnsGuard {
     @Volatile
     private var pathWarned = false
 
-    /**
-     * bit4(16)：**只用于「拦下删除后把行补回可见」**（[restoreVisibility]），
-     * ⛔ **不再用于查询筛选** —— 理由见 [`listCurrentSns`] 的 KDoc 与
-     * `docs/_r26_bit16_rootcause.md`。
-     *
-     * 8.0.48 实测：新落库的动态是 `localFlag=2`、**不含** bit16，而它们在朋友圈界面里正常显示。
-     * 旧结论「时间线白名单里每个值都置 bit4 ⇒ bit4 = 可见位」把「删除会清这一位」
-     * 偷换成了「可见必须置这一位」，第一步从未在 8.0.48 上验证过。
-     */
-    private const val VISIBLE_BIT = 16
-
     // ------------------------------------------------------------------ 句柄捕获（R20）
 
     /**
@@ -851,7 +533,7 @@ object SnsGuard {
      * [snsDb] 原来只在「DELETE 命中 SnsInfo」时被记下来（[isSnsDb]）。而需求 6.4 的
      * 导出要扫**当前** SnsInfo（防撤回语义：动态还看得见的时候就把图留存下来，
      * 见 [listCurrentSns]），定时刷新朋友圈走的是 INSERT/REPLACE —— **不产生 DELETE**。
-     * 于是句柄恒为 null，导出恒 0 行，且日志里只会看到「归档也没几条」，
+     * 于是句柄恒为 null，导出恒 0 行，且日志里只会看到「扫不到当前 SnsInfo」，
      * 根本看不出真因是「句柄没拿到」。
      *
      * ## 为什么可以接受它的开销
@@ -926,117 +608,12 @@ object SnsGuard {
     fun snsReady(): Boolean = snsDb != null
 
     /**
-     * 只读暴露微信朋友圈库句柄，给 [SnsTimelineSourceFix]（R27 srcfix）复用。
+     * 只读暴露微信朋友圈库句柄，给 [SnsBlockProbe]（甲的 readBits 取证）复用。
      *
      * ⚠️ 仍然只在 `execSQL` / `rawQuery` 捕获钩子里被赋值（见 [installCapture]），
      *  **本轮没有新增任何常驻钩子**。调用方必须容忍 null（= 这次启动微信还没碰过朋友圈库）。
      */
     internal fun snsDbHandle(): Any? = snsDb
-
-    // ------------------------------------------------------------------ 归档
-
-    /**
-     * 把快照写进模块库（丢后台线程：三个 BLOB 的序列化和写库不该占着主线程）。
-     *
-     * ⚠️ **必须整个包 runCatching**：后台线程里逃逸出去的异常没人接，
-     * 会走默认的 UncaughtExceptionHandler —— 那是要把微信杀掉的。
-     */
-    private fun saveAsync(row: GroupDb.SnsRow?) {
-        if (row == null) {
-            LogX.w("SNS archive skipped: no snapshot")
-            return
-        }
-        Thread {
-            runCatching {
-                val ok = GroupDb.current()?.archiveSns(row) ?: false
-                if (ok) archived.incrementAndGet()
-                LogX.i("SNS archived snsId=${row.snsId} ok=$ok")
-            }.onFailure {
-                LogX.w("SNS archive failed: ${it.javaClass.simpleName}: " +
-                    "${(it.cause ?: it).message?.take(80)}")
-            }
-        }.start()
-    }
-
-    /**
-     * 读整行。
-     *
-     * ⚠️ 用 `select *` + **按列名取**，不要按 select 列表的下标取：
-     * 只要有一列名对不上（`withTaHasOther` / `serverExtFlag` / `pravited` 这些都可能），
-     * rawQuery 直接抛异常、被外层吞掉，结果是**归档永久静默失败**，日志里只有一行警告。
-     *
-     * ⚠️ `snsId` / `createTime` 必须按 **Long** 读：真机的 snsId 是
-     * `-3447438253133393222` 这种 64 位值，先 `toInt()` 会截断成 32 位 ——
-     * 归档主键全错、去重对不上、清理删不掉，而且截断后还会撞主键，
-     * 让第二条归档被 CONFLICT_IGNORE 静默吞掉。
-     *
-     * ⚠️ rawQuery 的 Method **绝不能跨库缓存**：AOSP 的 Method 拿去调 wcdb 实例会抛
-     * `IllegalArgumentException: Expected receiver of type android.database.sqlite.SQLiteDatabase`。
-     * 所以每次都按 `db.javaClass` 现找（探针阶段踩过，静默失败白跑一轮）。
-     */
-    private fun readRow(db: Any, snsId: Long): GroupDb.SnsRow? {
-        val m = rawQueryMethod(db) ?: return null
-        val args: Any = if (m.parameterTypes[1] == Array<String>::class.java) {
-            arrayOf(snsId.toString())
-        } else {
-            arrayOf<Any>(snsId.toString())
-        }
-        val cur = runCatching { m.invoke(db, "select * from $TABLE where snsId=?", args) }
-            .onFailure {
-                LogX.w("SNS read err ${it.javaClass.simpleName}: ${(it.cause ?: it).message?.take(80)}")
-            }
-            .getOrNull() ?: return null
-        return try {
-            if (XposedHelpers.callMethod(cur, "moveToFirst") as? Boolean != true) return null
-            fun col(name: String): Int =
-                runCatching { XposedHelpers.callMethod(cur, "getColumnIndex", name) as? Int ?: -1 }
-                    .getOrDefault(-1)
-            fun longOf(name: String): Long {
-                val i = col(name)
-                if (i < 0) return 0L
-                return runCatching { XposedHelpers.callMethod(cur, "getLong", i) as? Long ?: 0L }
-                    .getOrDefault(0L)
-            }
-            fun intOf(name: String): Int = longOf(name).toInt()
-            fun textOf(name: String): String? {
-                val i = col(name)
-                if (i < 0) return null
-                return runCatching { XposedHelpers.callMethod(cur, "getString", i) as? String }
-                    .getOrNull()
-            }
-            fun blobOf(name: String): ByteArray? {
-                val i = col(name)
-                if (i < 0) return null
-                return runCatching { XposedHelpers.callMethod(cur, "getBlob", i) as? ByteArray }
-                    .getOrNull()
-            }
-            val gotId = longOf("snsId")
-            // ⚠️ 拿到手的 id 对不上就**拒绝归档**，别写残档进去：
-            // 残档会占着主键，之后真想归档这条也写不进去了（首条为准 + CONFLICT_IGNORE）。
-            // 对不上只有两种可能：列名变了（schema 变了）或游标读错了，两种情况都得留证重查。
-            if (gotId != snsId) {
-                LogX.w("SNS read mismatch: want=$snsId got=$gotId -> refuse archive")
-                return null
-            }
-            GroupDb.SnsRow(
-                snsId = gotId,
-                localFlag = intOf("localFlag"),
-                createTime = longOf("createTime"),
-                type = intOf("type"),
-                sourceType = intOf("sourceType"),
-                subType = intOf("subType"),
-                serverExtFlag = intOf("serverExtFlag"),
-                userName = textOf("userName"),
-                head = textOf("head"),
-                stringSeq = textOf("stringSeq"),
-                content = blobOf("content"),
-                attrBuf = blobOf("attrBuf"),
-                postBuf = blobOf("postBuf"),
-            )
-        } finally {
-            runCatching { XposedHelpers.callMethod(cur, "close") }
-        }
-    }
 
     private fun rawQueryMethod(db: Any): Method? =
         runCatching {
@@ -1057,10 +634,8 @@ object SnsGuard {
      *
      * ## ⚠️ 语义：这是「防撤回」，不是「删除后抢救」
      * 用户定案（2026-10-25）：本导出是**搭配定时刷新朋友圈**用的 —— 在动态**还看得见**
-     * 的时候就把它的图留存下来（**预防性留存**），而不是等它被删了再从 `sns_archive`
-     * 抢救。而微信的 sns 磁盘缓存 `…/cache/<hash32>/sns/<hex1>/<hex2>/snst_xxx`
-     * 里放的正是**当前可见**动态的图：R19 实测归档那 7 个 mediaId 在 72 个缓存文件里
-     * **0 命中** —— 扫归档时 `imgCopied` 恒为 0 是数据源选错了，不是取图链路坏了。
+     * 的时候就把它的图留存下来（**预防性留存**）。微信的 sns 磁盘缓存
+     * `…/cache/<hash32>/sns/<hex1>/<hex2>/snst_xxx` 里放的正是**当前可见**动态的图。
      *
      * ## 可见性过滤 —— ⛔ R26 起**故意不加**
      * 旧实现按 `(localFlag & 16) != 0` 筛，依据是「时间线白名单 `localFlag in (16,2064,18,…)`
@@ -1078,24 +653,18 @@ object SnsGuard {
      * **不做黑名单**：定不死就黑名单，只会再次误杀真动态。
      * 详见 `docs/_r26_bit16_rootcause.md`。
      *
-     * ⚠️ [VISIBLE_BIT] 仍然保留给「拦下删除后补回可见位」（[restoreVisibility]），
-     * 那条路径的语义是「微信自己清过这一位，我们照原样补回去」，与查询筛选无关。
-     *
      * ## ⚠️ 返回的是**半行**，只取导出需要的 7 列
      * `attrBuf` / `postBuf` / `head` / `stringSeq` / `subType` / `serverExtFlag` **不读**
      * （**显式**填 0/null —— `SnsRow` 对这几个字段没有默认值，不填编译不过，见 `liveRows`）。
      * 朋友圈 `content` 动辄几十 KB，一页 100 行再搭两个 BLOB 就是几百 MB，
-     * 后台线程 OOM 会把微信带走（[GroupDb.listSnsArchiveBefore] 那边的同一条理由）。
-     *
-     * ⛔ **不要拿这里的行去归档**（`GroupDb.archiveSns`）：那是用一个残缺快照
-     * 覆盖掉 [readRow] 存下来的完整快照，而 archiveSns 是「首条为准」，覆盖不回来。
+     * 后台线程 OOM 会把微信带走。
      *
      * @param createTime 上一页最后一行的 `createTime`；首轮传 `Long.MAX_VALUE`
      * @param snsId 上一页最后一行的 `snsId`；首轮传 `Long.MAX_VALUE`。
      *              ⚠️ 复合游标：只按 `createTime <` 会在页边界丢掉同一秒的行
      * @return 一页行（`createTime desc, snsId desc`）；
      *         **null = 拿不到微信库句柄**（[snsDb] 还没捕获到 —— 这次启动微信还没碰过
-     *         朋友圈库）。这不是错误，调用方必须**优雅降级**（退回扫归档），别弹窗。
+     *         朋友圈库）。这不是错误，调用方必须**优雅降级**（本页导出为空，别弹窗）。
      */
     fun listCurrentSns(createTime: Long, snsId: Long, limit: Int): List<GroupDb.SnsRow>? {
         val db = snsDb ?: return null
@@ -1212,380 +781,6 @@ object SnsGuard {
             }
             .getOrNull()
 
-    // ------------------------------------------------------------------ 诊断
-
-    /** 归档清单（读我们自己的库，不碰微信库） */
-    fun listArchived(limit: Int = 20): List<String> {
-        // ⚠️ limit 来自广播 --ei n（外人可控），直进 listSnsArchive 的 SQL LIMIT 会把
-        // content/attr_buf/post_buf 三个 BLOB 全捞进内存（真机 OOM）。入口钳位，
-        // 一并覆盖将来新增的调用方（与 MomentsExport.probe img 分支同一防护命题）。
-        val lim = MomentsLogic.clampProbeN(limit)
-        val list = runCatching { GroupDb.current()?.listSnsArchive(lim) }
-            .getOrNull().orEmpty()
-        if (list.isEmpty()) return listOf("(empty) 还没有归档过任何动态")
-        return listOf("SNSLS archived=${list.size} limit=$lim") + list.map { r ->
-            "SNSLS snsId=${r.snsId} user=${r.userName?.take(12)} t=${r.createTime} " +
-                "type=${r.type} src=${r.sourceType} " +
-                "content=${r.content?.size ?: 0}B attr=${r.attrBuf?.size ?: 0}B " +
-                "post=${r.postBuf?.size ?: 0}B"
-        }
-    }
-
-    /**
-     * 精确查一条：拦下来之后这行到底还在不在、`localFlag` 是多少。
-     *
-     * 用来区分两种情况：
-     * - 行还在 → 微信只是**内存里/UI 上**把它摘掉了，重新进朋友圈或下拉刷新就该回来；
-     * - 行没了 → 微信还有别的删除路径（execSQL 之外的），我们没拦住。
-     */
-    fun one(snsId: Long): List<String> {
-        val db = snsDb ?: return listOf("no sns db yet")
-        val m = rawQueryMethod(db) ?: return listOf("no rawQuery on ${db.javaClass.name}")
-        return runCatching {
-            val args: Any = if (m.parameterTypes[1] == Array<String>::class.java) {
-                arrayOf(snsId.toString())
-            } else {
-                arrayOf<Any>(snsId.toString())
-            }
-            val cur = m.invoke(
-                db,
-                "select snsId,userName,createTime,type,sourceType,localFlag," +
-                    "length(ifnull(content,x'')),length(ifnull(attrBuf,x''))," +
-                    "length(ifnull(postBuf,x'')) from $TABLE where snsId=?",
-                args,
-            ) ?: return listOf("null cursor")
-            try {
-                if (XposedHelpers.callMethod(cur, "moveToFirst") as? Boolean != true) {
-                    return listOf("SNS1 snsId=$snsId GONE (库里已经没有这一行)")
-                }
-                fun l(i: Int): Long =
-                    runCatching { XposedHelpers.callMethod(cur, "getLong", i) as? Long ?: 0L }
-                        .getOrDefault(0L)
-                fun s(i: Int): String? =
-                    runCatching { XposedHelpers.callMethod(cur, "getString", i) as? String }
-                        .getOrNull()
-                listOf(
-                    "SNS1 snsId=${l(0)} EXISTS user=${s(1)?.take(12)} t=${l(2)} " +
-                        "type=${l(3)} src=${l(4)} localFlag=${l(5)} " +
-                        "content=${l(6)}B attr=${l(7)}B post=${l(8)}B"
-                )
-            } finally {
-                runCatching { XposedHelpers.callMethod(cur, "close") }
-            }
-        }.getOrElse {
-            listOf("err ${it.javaClass.simpleName}: ${(it.cause ?: it).message?.take(80)}")
-        }
-    }
-
-    /**
-     * P0-2 覆盖率探针（只读，一行不写）：最近 `localFlag=2` 的可见动态里，有多少曾进过
-     * [SnsRoundLedger] 的响应账本。量化「翻页可见的历史动态有多少从没进过响应」，
-     * 用来支撑「存档 = 看到才存」的范围声明。**它不是 gate，只记录。**
-     */
-    fun winCoverage(limit: Int = 60): List<String> {
-        val db = snsDb ?: return listOf("WIN cover no sns db yet (先让微信刷一次朋友圈)")
-        val m = rawQueryMethod(db) ?: return listOf("WIN cover no rawQuery on ${db.javaClass.name}")
-        return runCatching {
-            val lim = limit.coerceIn(1, 200)
-            val cur = m.invoke(
-                db,
-                "select snsId from $TABLE where localFlag=2 order by createTime desc limit $lim",
-                null,
-            ) ?: return listOf("WIN cover null cursor")
-            val ids = ArrayList<Long>()
-            try {
-                while (XposedHelpers.callMethod(cur, "moveToNext") as? Boolean == true) {
-                    val id = runCatching {
-                        XposedHelpers.callMethod(cur, "getLong", 0) as? Long ?: 0L
-                    }.getOrDefault(0L)
-                    if (id != 0L) ids.add(id)
-                }
-            } finally {
-                runCatching { XposedHelpers.callMethod(cur, "close") }
-            }
-            val hit = ids.count { SnsRoundLedger.seenAny(it) }
-            val pct = if (ids.isEmpty()) 0 else hit * 100 / ids.size
-            listOf("WIN cover recent60=${ids.size} inLedger=$hit pct=$pct%")
-        }.getOrElse { listOf("WIN cover err: ${it.javaClass.simpleName}") }
-    }
-
-    /**
-     * R41 子步 3：每轮 gate 关闭后，统计「这轮 id 现在还剩多少可见位」。
-     *
-     * 为 R41 新主判据（「快照存在 ∧ 当前 `&2==0`」）提供数据。只读、最多查 [VIS_PROBE_MAX]
-     * 个 id，失败打 `WIN src skip: <原因>` 并跳过，⛔ 不阻塞、不重试。
-     *
-     * 由 [SnsRoundLedger] 在 worker 线程调用（不在主链路锁内做 IO）。
-     */
-    fun probeVisibleBits(roundNo: Int, ids: Set<Long>) {
-        val db = snsDb ?: run {
-            LogX.w("WIN src skip: no sns db")
-            return
-        }
-        val m = rawQueryMethod(db) ?: run {
-            LogX.w("WIN src skip: no rawQuery on ${db.javaClass.name}")
-            return
-        }
-        val q = ids.take(VIS_PROBE_MAX)
-        if (q.isEmpty()) {
-            LogX.w("WIN src skip: empty ids")
-            return
-        }
-        val sql = "select snsId,sourceType from $TABLE where snsId in (${q.joinToString(",")})"
-        val cur = runCatching { m.invoke(db, sql, null) }
-            .onFailure {
-                LogX.w("WIN src skip: ${it.javaClass.simpleName}: " +
-                    "${(it.cause ?: it).message?.take(60)}")
-            }
-            .getOrNull() ?: return
-        try {
-            val visible = HashSet<Long>()
-            val zero = ArrayList<Long>(3)
-            while (XposedHelpers.callMethod(cur, "moveToNext") as? Boolean == true) {
-                val id = runCatching { XposedHelpers.callMethod(cur, "getLong", 0) as? Long ?: 0L }
-                    .getOrDefault(0L)
-                val st = runCatching { XposedHelpers.callMethod(cur, "getLong", 1) as? Long ?: 0L }
-                    .getOrDefault(0L).toInt()
-                if (st and 2 != 0) {
-                    visible.add(id)
-                } else if (zero.size < 3) {
-                    zero.add(id)
-                }
-            }
-            val k = q.count { it in visible }
-            LogX.i("WIN src round=$roundNo vis=$k/${q.size} zero=[${zero.joinToString(",")}]")
-        } finally {
-            runCatching { XposedHelpers.callMethod(cur, "close") }
-        }
-    }
-
-    /**
-     * `op=snsg sub=srcmap` —— **只读**，一行都不写。R30 §6.2 取证专用。
-     *
-     * 回答的是「相册谓词到底是什么」这个被判死的问题：
-     * - `dist`：**全表** `sourceType` 分布（上一轮只看到`createTime desc` 的最新 50 行，
-     *   覆盖不到历史行，无法证明 64 在库里根本不存在）
-     * - `pred`：把几种候选谓词各数一遍，直接比大小
-     *   （`in(64)` 若真为相册谓词，它必然是最大的那个；实测最新 50 行 0 条等于 64）
-     * - `dup`：同一 `snsId` 是否**多行**（多行 ⇒ 「给相册多插一行 64」可行；单行 ⇒ 只能改值）
-     * - `tagged`：被我们标记的那批动态**当前**在库里的 `sourceType`/`type`
-     */
-    fun srcMap(user: String = ""): List<String> {
-        val db = snsDb ?: return listOf("SRCMAP no sns db yet (先让微信刷一次朋友圈)")
-        val m = rawQueryMethod(db) ?: return listOf("SRCMAP no rawQuery on ${db.javaClass.name}")
-        return runCatching {
-            val out = ArrayList<String>(48)
-            // ⭐ 按作者查：验证「相册只收 type ∈ {1,15}」—— 看该用户**正常可见**的动态 type 是什么
-            //    （若他的可见动态也全是 type=2，说明微信确实按 type 收，与个人相册无关）
-            if (user.isNotBlank()) {
-                val u = user.trim()
-                out += "SRCMAP user=$u dist (type -> 行数):"
-                out += rows(
-                    db, m,
-                    "select type, count(*) from $TABLE where userName='$u' group by type order by 2 desc limit 20",
-                )
-                out += "SRCMAP user=$u 可见(type∈1/15) 行数=" +
-                    scalar(
-                        db, m,
-                        "select count(*) from $TABLE where userName='$u' and type in (1,15)",
-                    )
-                out += "SRCMAP user=$u 明细 (snsId src type head localFlag):"
-                out += rows(
-                    db, m,
-                    "select snsId, sourceType, type, head, localFlag from $TABLE " +
-                        "where userName='$u' order by head desc limit 40",
-                )
-                return@runCatching out
-            }
-            out += "SRCMAP total=" + scalar(db, m, "select count(*) from $TABLE")
-            out += "SRCMAP dist (sourceType -> 行数):"
-            out += rows(db, m, "select sourceType, count(*) from $TABLE group by sourceType order by 2 desc limit 30")
-            out += "SRCMAP pred: in64=" + scalar(db, m, "select count(*) from $TABLE where sourceType in (64)") +
-                " and64=" + scalar(db, m, "select count(*) from $TABLE where (sourceType & 64) != 0") +
-                " and8=" + scalar(db, m, "select count(*) from $TABLE where (sourceType & 8) != 0") +
-                " and2=" + scalar(db, m, "select count(*) from $TABLE where (sourceType & 2) != 0") +
-                " t1_15=" + scalar(db, m, "select count(*) from $TABLE where type in (1,15)")
-            out += "SRCMAP dup (同 snsId 多行):"
-            out += rows(
-                db, m,
-                "select snsId, count(*) from $TABLE group by snsId having count(*) > 1 limit 8",
-            )
-            val ids = runCatching { GroupDb.current()?.snsTagIds() }.getOrNull().orEmpty()
-            if (ids.isEmpty()) {
-                out += "SRCMAP tagged: (空 —— 台账没有已删动态，先复现一条)"
-            } else {
-                val csv = ids.take(30).joinToString(",")
-                val alive = scalar(db, m, "select count(*) from $TABLE where snsId in ($csv)")
-                out += "SRCMAP tagged n=${ids.size} 库里有行=$alive 无行(物理删除)=${ids.size - (alive.toLongOrNull() ?: 0)}"
-                // ⭐ 相册按 userName 过滤 —— 看不到被删动态时，先看它到底属于谁
-                out += "SRCMAP tagged (snsId userName src type head localFlag):"
-                out += rows(
-                    db, m,
-                    "select snsId, userName, sourceType, type, head, localFlag from $TABLE " +
-                        "where snsId in ($csv) order by head desc",
-                )
-                out += "SRCMAP album-ok (含 bit8 且 type 在相册白名单):" +
-                    scalar(
-                        db, m,
-                        "select count(*) from $TABLE where snsId in ($csv) and (sourceType & 8) != 0",
-                    )
-            }
-            out
-        }.getOrElse { e -> listOf("SRCMAP err ${e.javaClass.simpleName}: ${(e.cause ?: e).message?.take(100)}") }
-    }
-
-    /**
-     * ⛔ **调试专用**：直接改一行的 `sourceType`（`op=snsg sub=setsrc --es val "<snsId>:<值>"`）。
-     *
-     * 存在的理由：一条「当天发、当天删」的动态，在「发布 → 被删」之间**没被任何一轮快照
-     * 记进台账**（`sns_visible_src`），于是补位判据永远轮不到它 —— 真机实测过一次
-     * （`snsId=-3404957496863878648`，`src=0`，`run()` 报 `new=0 fixed=0`）。
-     * 台账缺口只能靠事后定向补，不能靠等（它已经不可能再变回可见）。
-     *
-     * ⚠️ 只写**显式指定**的那一行，不扫表 —— 广谱扫表在几分钟内就能污染几十万行
-     * （00:20 事故的教训）。
-     */
-    fun setSrc(snsId: Long, value: Int): List<String> {
-        if (snsId == 0L) return listOf("SNS setsrc bad snsId")
-        val db = snsDb ?: return listOf("SNS setsrc no sns db")
-        val m = rawQueryMethod(db) ?: return listOf("SNS setsrc no rawQuery")
-        val before = scalar(db, m, "select sourceType from $TABLE where snsId=$snsId")
-        return runCatching {
-            // ⛔ 别自己按签名找：wcdb 的 `execSQL` 重载参数是 `(String, Object[])` 而不是
-            //    单参 `String`，照单参找会落空（真机实测报 "no execSQL"）。交给 Xposed 按实参匹配。
-            XposedHelpers.callMethod(
-                db, "execSQL",
-                "update $TABLE set sourceType=$value where snsId=$snsId",
-            )
-            val after = scalar(db, m, "select sourceType from $TABLE where snsId=$snsId")
-            // 顺手把它记进台账，否则下次同步又会被清掉且没人管
-            runCatching { GroupDb.current()?.upsertVisibleSrc(listOf(snsId to value)) }
-            // ⭐ 带相册位（bit8）的行还要进**窄台账**：微信下一次同步会按服务端值把它打回 2，
-            //    只有窄台账里的行才会在**写库瞬间**被 [SnsTimelineSourceFix.patchAlbumBit]
-            //    补回来（否则就是「点进去闪一下又消失」）。
-            if (SnsTimelineSrcLogic.isAlbumVisible(value)) {
-                val orig = before.toIntOrNull() ?: value
-                runCatching { GroupDb.current()?.markSrcFixed(snsId, orig) }
-                SnsTimelineSourceFix.invalidateAlbumIds()
-            }
-            listOf("SNS setsrc snsId=$snsId $before -> $after (台账已补登)")
-        }.getOrElse { e ->
-            listOf("SNS setsrc err ${e.javaClass.simpleName}: ${(e.cause ?: e).message?.take(80)}")
-        }
-    }
-
-    /** 跑一条单值 SQL，取第一行第一列（拿不到就给 `?`，绝不抛） */
-    private fun scalar(db: Any, m: Method, sql: String): String =
-        runCatching { rows(db, m, sql).firstOrNull() ?: "?" }.getOrDefault("?")
-
-    /** 跑一条 SQL，每行用空格拼起来；`getString` 对整数列同样可用 */
-    private fun rows(db: Any, m: Method, sql: String): List<String> {
-        val out = ArrayList<String>(16)
-        val cur = m.invoke(db, sql, null) ?: return listOf("?null cursor")
-        try {
-            val n = XposedHelpers.callMethod(cur, "getColumnCount") as? Int ?: 0
-            while (XposedHelpers.callMethod(cur, "moveToNext") as? Boolean == true) {
-                val sb = StringBuilder(32)
-                for (i in 0 until n) {
-                    if (i > 0) sb.append(' ')
-                    sb.append(XposedHelpers.callMethod(cur, "getString", i) ?: "null")
-                }
-                out += sb.toString()
-            }
-        } finally {
-            runCatching { XposedHelpers.callMethod(cur, "close") }
-        }
-        return out
-    }
-
-    /** 微信库里现在还有多少条 SnsInfo（验证「拦下来后行还在」） */
-    fun dump(limit: Int = 5): List<String> {
-        // ⚠️ limit 来自广播 --ei n，拼进 SQL 字符串，入口钳位防全表拖库
-        val lim = MomentsLogic.clampProbeN(limit)
-        val db = snsDb ?: return listOf("no sns db yet (先删一条动态，或让微信刷一次朋友圈)")
-        val m = rawQueryMethod(db) ?: return listOf("no rawQuery on ${db.javaClass.name}")
-        return runCatching {
-            // 这个查询没有占位参数，两个重载都直接给 null
-            val args: Any? = null
-            val out = mutableListOf<String>()
-            val cur = m.invoke(
-                db,
-                "select snsId,userName,createTime,type,sourceType,localFlag from $TABLE " +
-                    "order by createTime desc limit $lim",
-                args,
-            ) ?: return listOf("null cursor")
-            try {
-                var n = 0
-                while (XposedHelpers.callMethod(cur, "moveToNext") as? Boolean == true) {
-                    val id = XposedHelpers.callMethod(cur, "getLong", 0) as? Long ?: 0
-                    val u = XposedHelpers.callMethod(cur, "getString", 1) as? String
-                    val t = XposedHelpers.callMethod(cur, "getLong", 2) as? Long ?: 0
-                    val ty = XposedHelpers.callMethod(cur, "getLong", 3) as? Long ?: 0
-                    val src = XposedHelpers.callMethod(cur, "getLong", 4) as? Long ?: 0
-                    val fl = XposedHelpers.callMethod(cur, "getLong", 5) as? Long ?: 0
-                    out += "SNSDMP snsId=$id user=${u?.take(12)} t=$t type=$ty src=$src flag=$fl"
-                    n++
-                }
-                out.add(0, "SNSDMP rows=$n (limit=$lim)")
-            } finally {
-                runCatching { XposedHelpers.callMethod(cur, "close") }
-            }
-            out
-        }.getOrElse { listOf("err ${it.javaClass.simpleName}: ${(it.cause ?: it).message?.take(80)}") }
-    }
-
-    /**
-     * **6.2 取证探针（R31c）**：判断「已删动态是不是被好友主页的 `limit 11` 挤出窗口」。
-     *
-     * 做法：拿 [SnsSqlSpy.lastUserSql]（微信**自己**查该用户朋友圈的那句 SQL 原文），
-     * 只把 `limit N` 放大成 `limit expand`，其余字节不动地执行一遍。
-     * **返回顺序就是微信的取数顺序** ⇒ 这 5 条在序列里排第几，一目了然。
-     *
-     * ⛔ 不手拼 WHERE：那句里 sourceType 白名单有 32 个常量、type 白名单 40+ 个，
-     *    抄错一个就得到相反结论（这个课题上已经栽过两次）。
-     */
-    fun rankSql(expand: Int = 40): List<String> {
-        val raw = SnsSqlSpy.lastUserSql ?: return listOf(
-            "SRCRANK 还没抓到微信的 userName SQL：" +
-                "① op=snsg sub=sqlspy sub2=on ② 进出一次好友主页 ③ 重跑本探针"
-        )
-        val n = MomentsLogic.clampProbeN(expand)
-        val sql = Regex("(?i)\\blimit\\s+\\d+").replace(raw, "limit $n")
-        val db = snsDb ?: return listOf("SRCRANK no sns db yet")
-        val m = rawQueryMethod(db) ?: return listOf("SRCRANK no rawQuery on ${db.javaClass.name}")
-        return runCatching {
-            // ⚠️ 不用 rows()：那个 helper 在按列名/参数重载上有坑（`srcmap` 的按作者查询
-            //    一直是空结果，根因是 `SnsInfo` 的 DB 列名是 `user_name` 不是 `userName`）。
-            //    这里自己走 cursor，跟 `dumpRows` 同一套已验证的调用方式。
-            val cur = m.invoke(db, sql, null) ?: return listOf("SRCRANK null cursor")
-            val ids = ArrayList<String>(n)
-            try {
-                while (XposedHelpers.callMethod(cur, "moveToNext") as? Boolean == true) {
-                    ids += (XposedHelpers.callMethod(cur, "getString", 0) as? String).orEmpty()
-                }
-            } finally {
-                runCatching { XposedHelpers.callMethod(cur, "close") }
-            }
-            val tagged = runCatching { GroupDb.current()?.snsTagIds() }.getOrNull().orEmpty()
-            val out = ArrayList<String>(ids.size + 6)
-            out += "SRCRANK expand=$n got=${ids.size} tagged=${tagged.size}"
-            // 微信页面实际只吃前 WINDOW 条；边界画出来，「第 12 条起」就是被窗口挤掉的部分
-            val win = if (n >= WINDOW) WINDOW else n
-            ids.forEachIndexed { i, id ->
-                val num = id.toLongOrNull()
-                val inTag = num != null && num in tagged
-                if (i < win || inTag) {
-                    out += "SRCRANK #" + (i + 1).toString().padStart(2) +
-                        (if (i < win) " IN  " else " OUT ") + "snsId=$id" +
-                        (if (inTag) " [已删台账]" else "")
-                }
-            }
-            if (ids.size > win) out += "SRCRANK … 窗口外还有 ${ids.size - win} 条"
-            out
-        }.getOrElse {
-            listOf("SRCRANK err ${it.javaClass.simpleName}: ${(it.cause ?: it).message?.take(100)}")
-        }
-    }
 
     /** 允许**带参数**的 pragma（列举型，纯读） */
     private val PRAGMA_WITH_ARG = setOf(
@@ -1707,17 +902,14 @@ object SnsGuard {
         }.getOrNull() ?: "<null>"
     }
 
-    /** 好友主页那条 SQL 的 `limit`（微信写死 11，见 `_r30_62_album_gate.md`） */
-    private const val WINDOW = 11
 
     /**
      * **A4 取证探针（R19）**：扫**当前** `SnsInfo`（不是归档表！）的 `content`，
      * 抽出里面所有「连续 ASCII 数字 ≥15 位」的串作为 mediaId 候选。
      *
      * ## 为什么必须扫当前表而不是归档表
-     * `MomentsExport.probeSnsCache()` 扫的是 `GroupDb.listSnsArchive()` =
-     * **防撤回归档表**（历史**已被删除**的动态），而 sns 磁盘缓存里放的却是
-     * **当前朋友圈可见动态**的图 —— 两者**根本不重叠**。实测：归档的 7 个 mediaId
+     * 旧版 `snsprobe` 探针扫的是**归档表**（历史**已被删除**的动态），而 sns 磁盘缓存里
+     * 放的却是**当前朋友圈可见动态**的图 —— 两者**根本不重叠**。实测：归档的 7 个 mediaId
      * 候选在设备 72 个缓存文件名里 **0 命中**。
      * ⇒ 要验证「mediaId ↔ 缓存文件名」的对应关系，样本源必须换成当前 `SnsInfo`。
      *
@@ -1815,8 +1007,8 @@ object SnsGuard {
      * 解 mediaId → 与磁盘缓存文件名对账，报 `hit`。
      *
      * ## 这是 A4 的正式判据（`hit>0` 才算通过）
-     * `op=moments sub=snsprobe` 报 `hit=0` 有两个叠加原因，本探针两个都绕开：
-     * ① 它扫**归档表**（历史被删动态），缓存里是**当前**动态的图 ⇒ 样本根本不重叠；
+     * 旧版 `snsprobe` 报 `hit=0` 有两个叠加原因，本探针两个都绕开：
+     * ① 它扫的是**历史被删动态**，缓存里是**当前**动态的图 ⇒ 样本根本不重叠；
      * ② 它用的字段号是旧的 `6>8>1` ⇒ `ids=0`。
      * 本探针扫当前表 + 用 R19 实测修正后的 `8>5>1`。
      *
@@ -2010,819 +1202,6 @@ object SnsGuard {
         return out
     }
 
-    /**
-     * 一行在微信库里的**当前**状态：`localFlag` + 存在性三态。
-     *
-     * 必须是三态：`Int?` 压不出「查不出来」和「确实没有这一行」的区别，
-     * 而回滚能不能按 snsId 删行，完全建立在这个区别上（见 [undoInsert]）。
-     */
-    private class FlagState(val flag: Int?, val presence: SnsRestoreLogic.Presence)
-
-    /**
-     * 只读：查某条当前的 localFlag（不修改）。
-     *
-     * ⚠️ **null 有两种含义**（行没了 / 查不出来），需要区分时请用 [readFlag]，别拿这里当依据。
-     */
-    private fun queryFlag(db: Any, snsId: Long): Int? = readFlag(db, snsId).flag
-
-    /**
-     * 查一行当前的 `localFlag`，并**明确区分「确认没有这一行」和「查不出来」**。
-     *
-     * ⚠️ 这个区分以前不存在（两种情况都返回 null），而它是批量回滚能不能做的前提：
-     * 「查不出来」时后面接一个 INSERT，插出来的行没法证明是新行，回滚就不能按 snsId 删它
-     * —— 否则可能连用户本来就有的那条一起删掉（详见 [SnsRestoreLogic.undoableInserts]）。
-     */
-    private fun readFlag(db: Any, snsId: Long): FlagState {
-        val m = rawQueryMethod(db)
-            ?: return FlagState(null, SnsRestoreLogic.Presence.UNKNOWN)
-        return runCatching {
-            val args: Any = if (m.parameterTypes[1] == Array<String>::class.java) {
-                arrayOf(snsId.toString())
-            } else {
-                arrayOf<Any>(snsId.toString())
-            }
-            val c = m.invoke(db, "select localFlag from $TABLE where snsId=?", args)
-                ?: return@runCatching FlagState(null, SnsRestoreLogic.Presence.UNKNOWN)
-            try {
-                if (XposedHelpers.callMethod(c, "moveToFirst") as? Boolean != true) {
-                    FlagState(null, SnsRestoreLogic.Presence.ABSENT)
-                } else {
-                    FlagState(
-                        (XposedHelpers.callMethod(c, "getLong", 0) as? Long ?: 0L).toInt(),
-                        SnsRestoreLogic.Presence.PRESENT,
-                    )
-                }
-            } finally {
-                runCatching { XposedHelpers.callMethod(c, "close") }
-            }
-        }.getOrElse {
-            FlagState(null, SnsRestoreLogic.Presence.UNKNOWN)
-        }
-    }
-
-    /**
-     * 插后复查：同一个 snsId 现在有几行。
-     *
-     * ⚠️ 为什么要这个：真机 DDL 实证 `SnsInfo` 上 **snsId 既不是 PRIMARY KEY 也没有 UNIQUE**
-     * （`CREATE TABLE SnsInfo ( snsId LONG, ...)`，6 个索引 `unique` 全为 0），
-     * 所以 `CONFLICT_IGNORE` **拦不住重复插入** —— 它只在撞到唯一约束时才退。
-     * 主防线是「写之前 [readFlag] 查成 ABSENT 才插」，这里数一遍是为了兜住 TOCTOU
-     * （查与插之间微信自己插了一条同 snsId）。
-     */
-    private fun countRows(db: Any, snsId: Long): Int? {
-        val m = rawQueryMethod(db) ?: return null
-        return runCatching {
-            val args: Any = if (m.parameterTypes[1] == Array<String>::class.java) {
-                arrayOf(snsId.toString())
-            } else {
-                arrayOf<Any>(snsId.toString())
-            }
-            val c = m.invoke(db, "select count(*) from $TABLE where snsId=?", args)
-                ?: return@runCatching null
-            try {
-                if (XposedHelpers.callMethod(c, "moveToFirst") as? Boolean != true) {
-                    null
-                } else {
-                    (XposedHelpers.callMethod(c, "getLong", 0) as? Long ?: 0L).toInt()
-                }
-            } finally {
-                runCatching { XposedHelpers.callMethod(c, "close") }
-            }
-        }.getOrNull()
-    }
-
-    /**
-     * 诊断：列出归档里每条的**当前** localFlag。
-     * ⚠️ 不要拿 [dump] 里的 flag 当依据 —— 那是**归档快照**，恒为微信清位后的值（2），
-     * 不代表现在库里是多少。
-     */
-    fun flags(): List<String> {
-        val ids = runCatching { GroupDb.current()?.snsArchivedIds() }.getOrNull()
-            ?: return listOf("no wxgroup db")
-        val db = snsDb ?: return listOf("no sns db yet")
-        val out = ArrayList<String>(ids.size + 1)
-        var hidden = 0
-        for (id in ids) {
-            val cur = queryFlag(db, id)
-            if (cur == null) {
-                out += "snsId=$id MISSING(row gone)"
-                continue
-            }
-            if (cur and VISIBLE_BIT == 0) hidden++
-            out += "snsId=$id localFlag=$cur visible=${cur and VISIBLE_BIT != 0}"
-        }
-        out.add(0, "SNSFLAGS total=${ids.size} hidden=$hidden")
-        return out
-    }
-
-    /**
-     * 批量把归档里**已不可见**的动态恢复可见（修历史遗留）。
-     *
-     * 为什么需要：早期版本的拦截没把可见位写回去（或写回失败），那些行虽然还在库里，
-     * 但时间线查询要求 localFlag 含 bit4 → 界面上根本看不到 → 「防删除」形同没生效
-     * （用户反馈的「以前删除的没有回来」就是这个）。这里一次性补齐。
-     */
-    fun restoreAll(): String {
-        val ids = runCatching { GroupDb.current()?.snsArchivedIds() }.getOrNull()
-            ?: return "no wxgroup db"
-        val db = snsDb ?: return "no sns db yet"
-        var fixed = 0
-        var visible = 0
-        var missing = 0
-        for (id in ids) {
-            val cur = queryFlag(db, id)
-            if (cur == null) {
-                missing++
-                continue
-            }
-            if (cur and VISIBLE_BIT != 0) {
-                visible++
-                continue
-            }
-            if (restoreVisibility(db, id, cur) != 0) fixed++
-        }
-        return "restoreAll total=${ids.size} visible=$visible fixed=$fixed missing=$missing"
-    }
-
-    /**
-     * 从归档**反插回**微信的 `SnsInfo`（需求 6.4「从归档恢复」，诊断入口，不自动执行）。
-     *
-     * 三种入口状态由 [SnsRestoreLogic.classify] 判定（纯逻辑，已单测锁住）：
-     * - 行在且已可见 → [SnsRestoreLogic.Action.SKIP]，**什么都不写**（幂等的关键）；
-     * - 行在但可见位被清了 → 只 [writeFlag]，不动内容；
-     * - 行**没了**（拦之前就删了 / 早期版本没拦到）→ 整行 INSERT 回去，并补可见位。
-     *
-     * ⚠️ INSERT 只提供 [SnsRestoreLogic.KNOWN] 那 13 列（见 [readRow]），`SnsInfo` 共 18 列，
-     * 剩下 5 列（`localPrivate`/`likeFlag`/`pravited`/`withTa`/`withTaHasOther`）
-     * 归档里没存，**故意不写**，由 SQLite 填默认/NULL。
-     * 2026-10-18 真机 `snsg sub=cols` 实测 18 列 `notNull` 全为 false（BLOCKING none），
-     * 所以「缺列导致 INSERT 失败」这条已经排除；万一这里还是报错，
-     * 异常消息会原样带回来，那就是微信改了表结构，靠 [snsInfoColumns] 重新取证，不猜。
-     */
-    fun restore(snsId: Long): String {
-        val db = snsDb ?: return "no sns db yet (先进一次朋友圈，或删一条动态)"
-        val row = runCatching { GroupDb.current()?.snsArchived(snsId) }.getOrNull()
-            ?: return "no archive for snsId=$snsId"
-        val cur = queryFlag(db, snsId)
-        return when (val a = SnsRestoreLogic.classify(cur)) {
-            SnsRestoreLogic.Action.SKIP ->
-                "snsId=$snsId already in SnsInfo localFlag=$cur (visible already, no write)"
-            SnsRestoreLogic.Action.SET_FLAG -> {
-                val t = SnsRestoreLogic.withVisible(cur ?: 0)
-                if (writeFlag(db, snsId, t)) "snsId=$snsId unhidden localFlag $cur -> $t"
-                else "snsId=$snsId set flag FAILED (没写坏，库没动)"
-            }
-            SnsRestoreLogic.Action.INSERT -> {
-                val r = runCatching { insertRow(db, row.toLogic()) }.getOrElse {
-                    return "restore err ${it.javaClass.simpleName}: " +
-                        "${(it.cause ?: it).message?.take(120)}"
-                }
-                if (r == null || r < 0) return "restore failed ret=$r (可能撞主键/约束)"
-                // ⚠️ 真机实证：SnsInfo 上 snsId **没有唯一约束**（6 个索引 unique 全 0），
-                // 所以 CONFLICT_IGNORE 这道保险是失效的 —— 重复插入不会报错也不会被拦。
-                // 主防线是「写之前查到 ABSENT 才插」，这里再数一遍兜住 TOCTOU。
-                val n = countRows(db, snsId)
-                if (n != null && n > 1) {
-                    LogX.w("SNS ⚠️ 插重了 snsId=$snsId count=$n（表上无唯一约束，IGNORE 拦不住）")
-                }
-                val after = queryFlag(db, snsId)
-                "restored snsId=$snsId rowid=$r localFlag=${row.localFlag}" +
-                    "->${row.localFlag or VISIBLE_BIT} now=$after"
-            }
-            else -> "snsId=$snsId unexpected action=$a"
-        }
-    }
-
-    /**
-     * **批量**从归档恢复（幂等 + 失败即停 + 倒序回滚）。
-     *
-     * 幂等靠 [SnsRestoreLogic.plan]：同一批跑第二次计划是空的（行在且可见 → 跳过），
-     * 所以可以放心重跑。
-     *
-     * 失败策略：**一步失败就停**，然后把这一步之前**已成功**的步骤按倒序撤回
-     * （[SnsRestoreLogic.rollbackOrder]）。理由：写微信的库宁可一个字不写，
-     * 也不能留下一半 —— 半恢复的 SnsInfo 比不恢复更难查（界面上会出现"有内容但状态不对"的行）。
-     *
-     * ⚠️ **回滚只撤「本次确认新插入」的行**：写库之前逐条记录该行的存在性三态
-     * （[readFlag] → [SnsRestoreLogic.Presence]），只有查成 `ABSENT` 的 snsId 才准按主键删。
-     * 查不出来的（`UNKNOWN`）宁可在微信库里留一行，**也不会**去删 ——
-     * `SnsInfo.snsId` 有没有唯一约束未取证，瞎删可能连带删掉用户自己的那条动态。
-     * 回滚失败的会收进失败清单打进日志和返回值，供人工兜底。
-     * ⚠️ 人工清理别直接 `snsg sub=del` —— 它连归档那一行一起删（[forceDelete]），
-     *    先用 `snsg sub=one <id>` 看清楚这一行的来源再说。
-     *
-     * @param dry true = 只打印计划不写库（探针默认，先看清楚再动手）
-     */
-    fun restoreBatch(limit: Int = SnsRestoreLogic.MAX_BATCH, dry: Boolean = true): List<String> {
-        val out = ArrayList<String>()
-        val db = snsDb
-            ?: return listOf("no sns db yet (先进一次朋友圈，或删一条动态)")
-        val n = SnsRestoreLogic.clampBatch(limit)
-        // ⚠️ 这里会读出 content/attrBuf/postBuf 三个 BLOB，n 必须钳过（广播 --ei n 外人可控）
-        val rows = runCatching { GroupDb.current()?.listSnsArchive(n) }.getOrNull()
-            ?: return listOf("no wxgroup db")
-        if (rows.isEmpty()) return listOf("archive empty")
-
-        // ⚠️ 存在性三态必须**在写库之前**逐条查清楚：只有「确认不在」的那些 snsId，
-        //    后面失败时才允许按主键回滚删除（判据见 SnsRestoreLogic.undoableInserts）。
-        //    写完之后再查就晚了 —— 那时候所有行都在，分不清谁是我们插的。
-        val live = HashMap<Long, Int>()
-        val pre = HashMap<Long, SnsRestoreLogic.Presence>()
-        var gone = 0
-        var unknown = 0
-        for (r in rows) {
-            val st = readFlag(db, r.snsId)
-            pre[r.snsId] = st.presence
-            when (st.presence) {
-                SnsRestoreLogic.Presence.PRESENT -> live[r.snsId] = st.flag ?: 0
-                SnsRestoreLogic.Presence.ABSENT -> gone++
-                SnsRestoreLogic.Presence.UNKNOWN -> unknown++
-            }
-        }
-        // ⚠️ 必须把 UNKNOWN 的 id 传进去：它们不在 live 里，plan 会误判成「行没了」→ INSERT
-        //    → 撞主键 → IGNORE 静默不写，那条动态永远恢复不了（详见 SnsRestoreLogic.plan 的 KDoc）
-        val unknownIds = pre.filterValues { it == SnsRestoreLogic.Presence.UNKNOWN }.keys
-        val plan = SnsRestoreLogic.plan(rows.map { it.toLogic() }, live, n, unknownIds)
-        if (unknown > 0) {
-            LogX.w("SNS restore: $unknown/${rows.size} 行预检查询失败(UNKNOWN)，已跳过不写，" +
-                "下一批预查恢复后会自动重试")
-        }
-        val skipped = (rows.size - gone - unknown - plan.size).coerceAtLeast(0)
-        // ⚠️ 能回滚删除的白名单，必须在写之前算好（见 restoreBatch 的 KDoc）
-        val undoable = SnsRestoreLogic.undoableInserts(plan, pre)
-        out += "snsRestore archive=${rows.size} gone=$gone unknown=$unknown visible=$skipped " +
-            SnsRestoreLogic.planSummary(plan)
-        if (dry) {
-            for (s in plan) {
-                out += "  ${s.snsId} ${s.action}" +
-                    if (s.fromFlag != null) " ${s.fromFlag} -> ${s.toFlag}" else ""
-            }
-            out += "(dry-run; 加 --ez dry false 才真的写库)"
-            return out
-        }
-
-        var tally = SnsRestoreLogic.Tally(total = plan.size, skipped = skipped)
-        val done = ArrayList<SnsRestoreLogic.Step>(plan.size)
-        var err = ""
-        for (s in plan) {
-            val ok = runCatching {
-                when (s.action) {
-                    SnsRestoreLogic.Action.INSERT -> {
-                        val row = runCatching { GroupDb.current()?.snsArchived(s.snsId) }
-                            .getOrNull()?.toLogic() ?: return@runCatching false
-                        (insertRow(db, row) ?: -1L) >= 0
-                    }
-                    SnsRestoreLogic.Action.SET_FLAG -> writeFlag(db, s.snsId, s.toFlag ?: VISIBLE_BIT)
-                    else -> false
-                }
-            }.getOrElse { e ->
-                err = "${e.javaClass.simpleName}: ${(e.cause ?: e).message?.take(80)}"
-                false
-            }
-            if (!ok) {
-                if (err.isEmpty()) err = "write returned false (${s.action})"
-                break
-            }
-            done += s
-            tally = if (s.action == SnsRestoreLogic.Action.INSERT) {
-                tally.copy(inserted = tally.inserted + 1)
-            } else {
-                tally.copy(unhidden = tally.unhidden + 1)
-            }
-            out += "ok ${s.snsId} ${s.action}"
-        }
-        if (done.size < plan.size) {
-            // rollbackOrder 已经是倒序：后写的先撤
-            val back = SnsRestoreLogic.rollbackOrder(done)
-            var rb = 0
-            val undone = ArrayList<Long>(back.size)
-            for (b in back) {
-                val ok = runCatching { rollbackStep(db, b, undoable) }
-                    .onFailure {
-                        LogX.w("SNS undo threw ${b.action} snsId=${b.snsId}: " +
-                            "${it.javaClass.simpleName}: ${(it.cause ?: it).message?.take(80)}")
-                    }
-                    .getOrDefault(false)
-                if (ok) rb++ else undone += b.snsId
-            }
-            tally = tally.copy(failed = 1, rolledBack = rb)
-            out += "FAILED $err -> rolled back $rb/${back.size}"
-            LogX.w("SNS restore batch failed: $err")
-            // ⚠️ 回滚失败**绝不能吞**：没撤回去的行此刻正躺在微信的 SnsInfo 里，
-            // 对用户就是「朋友圈里出现一半莫名恢复出来的动态」。必须把清单打出来，
-            // 让人还能拿着这批 snsId 去核对。
-            if (undone.isNotEmpty()) {
-                val ids = undone.joinToString(",")
-                out += "⚠️ UNDONE ${undone.size}/${back.size} snsId=$ids " +
-                    "(仍在 SnsInfo 里，需人工清理)"
-                LogX.w("SNS restore rollback incomplete, left in SnsInfo: $ids")
-            }
-        }
-        out += "snsRestore " + SnsRestoreLogic.summary(tally)
-        LogX.i("SNS ${out.last()}")
-        return out
-    }
-
-    /**
-     * 撤一个**已成功执行**的步骤。
-     *
-     * @param undoable 本次允许按 snsId 从 `SnsInfo` 删除的清单（[SnsRestoreLogic.undoableInserts]），
-     *                 只约束 [SnsRestoreLogic.Action.ROLLBACK_DELETE]；SET_FLAG 的逆操作写回
-     *                 原值，怎么都不会删行，不受它限制。
-     */
-    private fun rollbackStep(
-        db: Any,
-        b: SnsRestoreLogic.Step,
-        undoable: Set<Long>,
-    ): Boolean = when (b.action) {
-        SnsRestoreLogic.Action.ROLLBACK_DELETE -> undoInsert(db, b.snsId, undoable)
-        // 回滚 SET_FLAG = 写回原值
-        SnsRestoreLogic.Action.ROLLBACK_FLAG -> writeFlag(db, b.snsId, b.fromFlag ?: 0)
-        else -> false
-    }
-
-    /**
-     * 取证：`pragma table_info(SnsInfo)`。只读，不写任何东西。
-     *
-     * 回答三个问题，每个都直接决定反插敢不敢上真机：
-     * - 我们写的 13 列在真机上**还在不在**（[SnsRestoreLogic.missingColumns]）；
-     * - 我们**没写**的列里有没有 NOT NULL 且无默认值的（[SnsRestoreLogic.blockingColumns]，
-     *   有则 INSERT 必挂）。2026-10-18 实测 18 列 `notNull` **全为 false** → `BLOCKING none`，
-     *   这条路已经**排除**，这里留着是当护栏（微信哪天加列会立刻点名）；
-     * - 有没有**我们不认识的新列**（[SnsRestoreLogic.alienColumns]）= 微信改了表结构。
-     *
-     * ⚠️ 那 5 列「已知但不写入」的（`localPrivate`/`likeFlag`/`pravited`/`withTa`/
-     * `withTaHasOther`）在输出里标 `known-unwritten`，**不是异常** —— 归档里没存这些值，
-     * 写进去等于编数据，由 SQLite 填默认/NULL。只有不在名单上的新列才标 ⚠️。
-     */
-    fun snsInfoColumns(): List<String> {
-        val db = snsDb ?: return listOf("no sns db yet")
-        val info = tableInfo(db) ?: return listOf("no pragma result")
-        val out = ArrayList<String>(info.size + 5)
-        val names = info.map { it.name }
-        for (c in info) {
-            val tag = when {
-                SnsRestoreLogic.isKnown(c.name) -> ""
-                SnsRestoreLogic.isUnarchived(c.name) -> "  <- known-unwritten(归档没存,不写)"
-                else -> "  <- ⚠️ NEW(名单外的新列,微信改表了?)"
-            }
-            out += "${c.name} notNull=${c.notNull} default=${if (c.hasDefault) "yes" else "-"}$tag"
-        }
-        val missing = SnsRestoreLogic.missingColumns(names)
-        if (missing.isNotEmpty()) out += "⚠️ 白名单里有列在真机不存在: $missing"
-        out += "COLS total=${info.size} known=${SnsRestoreLogic.KNOWN.size} " +
-            "unwritten=${SnsRestoreLogic.unknownColumns(names)}"
-        val alien = SnsRestoreLogic.alienColumns(names)
-        if (alien.isNotEmpty()) out += "⚠️ ALIEN $alien (既不在写入白名单也不在已知未写列 -> 回去重新取证)"
-        val blocking = SnsRestoreLogic.blockingColumns(info)
-        out += if (blocking.isEmpty()) {
-            "BLOCKING none (未写入的列都可空或有默认值 → INSERT 不会因为缺列失败)"
-        } else {
-            "⚠️ BLOCKING $blocking (NOT NULL 且无默认值且不写 → INSERT 必挂，需补列)"
-        }
-        return out
-    }
-
-    /** `pragma table_info($TABLE)` 的原始行（只读；失败返回 null，不抛） */
-    private fun tableInfo(db: Any): List<SnsRestoreLogic.ColInfo>? {
-        val m = rawQueryMethod(db) ?: return null
-        return runCatching {
-            val args: Any = if (m.parameterTypes[1] == Array<String>::class.java) {
-                arrayOf<String>()
-            } else {
-                arrayOf<Any>()
-            }
-            val c = m.invoke(db, "pragma table_info($TABLE)", args) ?: return null
-            val out = ArrayList<SnsRestoreLogic.ColInfo>()
-            try {
-                if (XposedHelpers.callMethod(c, "moveToFirst") as? Boolean != true) return emptyList()
-                do {
-                    val name = runCatching {
-                        XposedHelpers.callMethod(c, "getString", 1) as? String
-                    }.getOrNull() ?: continue
-                    val notNull = runCatching {
-                        (XposedHelpers.callMethod(c, "getLong", 3) as? Long ?: 0L) != 0L
-                    }.getOrDefault(false)
-                    val def = runCatching {
-                        XposedHelpers.callMethod(c, "getString", 4) as? String
-                    }.getOrNull()
-                    out += SnsRestoreLogic.ColInfo(name, notNull, def != null)
-                } while (XposedHelpers.callMethod(c, "moveToNext") as? Boolean == true)
-            } finally {
-                runCatching { XposedHelpers.callMethod(c, "close") }
-            }
-            out
-        }.onFailure {
-            LogX.w("SNS pragma failed: ${it.javaClass.simpleName}")
-        }.getOrNull()
-    }
-
-    // ------------------------------------------------------------------ 写微信库（全部 runCatching 保护）
-
-    /** 归档行 → 纯逻辑行（[SnsRestoreLogic] 零 Android 依赖，进得了对单测） */
-    private fun GroupDb.SnsRow.toLogic(): SnsRestoreLogic.ArchiveRow = SnsRestoreLogic.ArchiveRow(
-        snsId = snsId,
-        userName = userName,
-        createTime = createTime,
-        type = type,
-        sourceType = sourceType,
-        localFlag = localFlag,
-        subType = subType,
-        serverExtFlag = serverExtFlag,
-        head = head,
-        stringSeq = stringSeq,
-        content = content,
-        attrBuf = attrBuf,
-        postBuf = postBuf,
-    )
-
-    /**
-     * 归档行 → ContentValues。**列名与类型的唯一出处是 [SnsRestoreLogic.insertPuts]**，
-     * 这里只做机械搬运 —— 以后补列改纯逻辑类 + 单测，不用碰这里。
-     */
-    private fun contentValuesOf(row: SnsRestoreLogic.ArchiveRow): ContentValues =
-        ContentValues().apply {
-            for (p in SnsRestoreLogic.insertPuts(row)) {
-                when (p.kind) {
-                    SnsRestoreLogic.Kind.INT -> when (val v = p.v) {
-                        null -> putNull(p.col)
-                        is Long -> put(p.col, v)
-                        is Int -> put(p.col, v)
-                        else -> put(p.col, (v as Number).toLong())
-                    }
-                    SnsRestoreLogic.Kind.TEXT ->
-                        if (p.v == null) putNull(p.col) else put(p.col, p.v as String)
-                    SnsRestoreLogic.Kind.BLOB ->
-                        if (p.v == null) putNull(p.col) else put(p.col, p.v as ByteArray)
-                }
-            }
-        }
-
-    /**
-     * 整行 INSERT 回 `SnsInfo`。
-     *
-     * ⚠️ **冲突算法必须带进去**：只有 4 参的
-     * `insertWithOnConflict(table, nullColumnHack, values, conflictAlgorithm)` 收这个参数
-     * （[insertMethod] 已改成优先它），传的是 [CONFLICT_IGNORE]（=4）。
-     *
-     * ## `execSQL` 退路（2026-10-19 R6 补）
-     * wcdb 上 `insertMethod` 可能**一个都选不上**（见它的日志），旧代码此时直接 `return null`
-     * → [restoreBatch] 判 `ok=false` → 整批中止并回滚。也就是说「wcdb 少一个方法」这一个原因
-     * 就能让「从归档恢复」整体不可用 —— 而 `SnsSql.insertSql` 早就写好了却**零调用点**（死代码）。
-     *
-     * 现在：`insertWithOnConflict`/`insert` 都拿不到、或拿到了但 invoke 失败/返回 null 时，
-     * 退一次 `execSQL(sql, bindArgs)`。
-     *
-     * ⚠️ **`execSQL` 必须先二阶确认**：它返回 void，`INSERT OR IGNORE` 撞主键时**静默不写**
-     * 且不抛异常。只看"没抛异常"会把没插进去的行算进 `inserted`，
-     * 用户看到「恢复了 n 条」但朋友圈里啥都没有 —— 比直接失败更难查。所以写完必须回查一次。
-     *
-     * @return rowid；null/-1 = 失败（**库不会被写坏**，SQLite 单条 INSERT 是原子的）
-     */
-    private fun insertRow(db: Any, row: SnsRestoreLogic.ArchiveRow): Long? {
-        val m = insertMethod(db)
-        if (m != null) {
-            val args: Array<Any?> = if (m.name == "insertWithOnConflict") {
-                arrayOf(TABLE, null, contentValuesOf(row), CONFLICT_IGNORE)
-            } else {
-                arrayOf(TABLE, null, contentValuesOf(row))
-            }
-            val ret = runCatching { m.invoke(db, *args) as? Long }
-                .onFailure {
-                    LogX.w("SNS insert via ${m.name} threw snsId=${row.snsId}: " +
-                        "${it.javaClass.simpleName}: ${(it.cause ?: it).message?.take(120)}")
-                }
-                .getOrNull()
-            if (ret != null) {
-                LogX.i("SNS insert via ${m.name} snsId=${row.snsId} rowid=$ret")
-                return ret
-            }
-            // 走到这里：方法拿到了但没写成功 —— 退路值得一试（不要直接判死）
-            LogX.w("SNS insert via ${m.name} returned $ret, trying execSQL fallback snsId=${row.snsId}")
-        } else {
-            LogX.w("SNS insertMethod NONE on ${db.javaClass.name}, trying execSQL fallback snsId=${row.snsId}")
-        }
-
-        val ok = insertViaExecSql(db, row)
-        if (!ok) return null
-        // ⚠️ execSQL 没有 rowid 返回（**也不能**再查一次 rowid 冒充：那行可能是别人早就有的，
-        //    因为 OR IGNORE 撞主键时不会写）。回查只用来判"行在不在"，成功就返回一个恒 >= 0 的值。
-        return 0L
-    }
-
-    /**
-     * `execSQL` 退路的实现。成功 = **SQL 不抛异常** 且 **回查确认该行存在**。
-     *
-     * ⚠️ 实参数组的静态类型必须跟着形参走：`arrayOf(...)` 编出来是 `Object[]`，
-     * 形参若是 `String[]` 就会 `IllegalArgumentException` —— 跟 [updateFlag] 里
-     * 那个「补可见位静默失效」的坑是同一个，但这里多了更阴的一层：
-     * 异常被 `runCatching` 吞掉后如果不再回查，就会伪装成"成功"。
-     */
-    private fun insertViaExecSql(db: Any, row: SnsRestoreLogic.ArchiveRow): Boolean {
-        val puts = SnsRestoreLogic.insertPuts(row)
-        val sql = SnsSql.insertSql(TABLE, puts.map { it.col }, CONFLICT_IGNORE)
-        if (sql.isEmpty()) {
-            LogX.w("SNS execSQL fallback: empty sql snsId=${row.snsId}")
-            return false
-        }
-        val binds = SnsRestoreLogic.toBindArgs(puts)
-        val m = execSqlMethod(db)
-        if (m == null) {
-            LogX.w("SNS execSQL not found on ${db.javaClass.name} snsId=${row.snsId}")
-            return false
-        }
-        val threw = runCatching {
-            val args: Any = if (m.parameterTypes.size == 1) {
-                sql
-            } else if (m.parameterTypes[1] == Array<String>::class.java) {
-                // 形参是 String[]：bindArgs 只能是字符串（BLOB 传进来会 ClassCastException）
-                Array(binds.size) { i -> binds[i]?.toString() ?: "" }
-            } else {
-                binds
-            }
-            if (m.parameterTypes.size == 1) m.invoke(db, sql) else m.invoke(db, sql, args)
-        }.onFailure {
-            LogX.w("SNS execSQL fallback threw snsId=${row.snsId}: " +
-                "${it.javaClass.simpleName}: ${(it.cause ?: it).message?.take(120)}")
-        }.isFailure
-        if (threw) return false
-
-        // ── 二阶确认：`INSERT OR IGNORE` 撞主键时静默不写，必须回查 ──
-        // 注意这里只能证明"行在"，不能证明"是我们写的"。所以调用方（restoreBatch）
-        // 才必须在写之前用 Presence 三态区分 ABSENT / PRESENT —— 那一层已经做了。
-        val present = runCatching { readFlag(db, row.snsId).presence != SnsRestoreLogic.Presence.ABSENT }
-            .getOrDefault(false)
-        if (!present) {
-            LogX.w("SNS execSQL fallback: row STILL ABSENT after insert snsId=${row.snsId}" +
-                " (OR IGNORE 静默没写？)")
-            return false
-        }
-        LogX.i("SNS insert via execSQL fallback snsId=${row.snsId} (verified present)")
-        return true
-    }
-
-    /** `execSQL` 的几种形态，优先 2 参（带 bindArgs）/ 1 参 */
-    private fun execSqlMethod(db: Any): Method? = runCatching {
-        val ms = db.javaClass.methods.filter { it.name == "execSQL" }
-        ms.firstOrNull { it.parameterTypes.size == 2 && it.parameterTypes[0] == String::class.java }
-            ?: ms.firstOrNull { it.parameterTypes.size == 1 && it.parameterTypes[0] == String::class.java }
-    }.getOrNull()
-
-
-    /**
-     * `update SnsInfo set localFlag=? where snsId=?` —— 所有改可见位的路径都走这里。
-     *
-     * ⚠️ **whereArgs 的静态类型必须跟着签名走**：wcdb 跟 AOSP 一样存在
-     * `update(..., String[])` 与 `update(..., Object[])` 两个重载，而 [updateMethod] 是
-     * `firstOrNull` 抓的，命中的是哪一个**不确定**。以前这里写死传 `Array<String>`，
-     * 一旦命中 `Object[]` 那个重载，反射抛 `IllegalArgumentException`、被 runCatching 吞掉，
-     * 表现为「补可见位静默失效」—— 库没动、日志只有一行警告，正是
-     * 「删了之后拦住了但朋友圈里看不到」最难查的那种。
-     * 跟 [readFlag] / [undoInsert] 保持同一套分流写法：按 `parameterTypes[3]` 决定数组类型。
-     *
-     * @return 受影响行数；**-1 = 失败**（异常已记日志），0 = 没命中行
-     */
-    private fun updateFlag(db: Any, snsId: Long, flag: Int): Int {
-        val m = updateMethod(db) ?: return -1
-        return runCatching {
-            val args: Any = if (m.parameterTypes[3] == Array<String>::class.java) {
-                arrayOf(snsId.toString())
-            } else {
-                arrayOf<Any>(snsId.toString())
-            }
-            val cv = ContentValues().apply { put("localFlag", flag) }
-            m.invoke(db, TABLE, cv, "snsId=?", args) as? Int ?: -1
-        }.onFailure {
-            LogX.w("SNS update flag failed snsId=$snsId flag=$flag: " +
-                "${it.javaClass.simpleName}: ${(it.cause ?: it).message?.take(120)}")
-        }.getOrDefault(-1)
-    }
-
-    /** 显式写 localFlag（SET_FLAG / 回滚都用它；跟 [restoreVisibility] 的区别是不跳过"已可见"） */
-    private fun writeFlag(db: Any, snsId: Long, flag: Int): Boolean = updateFlag(db, snsId, flag) > 0
-
-    /**
-     * **真正的 undo**：把本次 INSERT 进去的那一行从微信的 `SnsInfo` 里删掉
-     * （`delete from SnsInfo where snsId=?` —— 表名/列名来自 [readRow] 的真机实证，不猜）。
-     *
-     * ⚠️ **准入条件：snsId 必须在 [undoable] 里。** 那是批量开始前逐条查过的
-     * 「**确认不在 SnsInfo 里**」的清单（[SnsRestoreLogic.undoableInserts]）。为什么要卡：
-     * `SnsInfo.snsId` **有没有唯一约束没有实证**（docs/取证结论.md 里没这一条）。
-     * 若它不是唯一键，同一个 snsId 可以并存多行，而按 `snsId=?` 删会
-     * **把用户本来就有的那一行一起删掉** —— 那不是回滚，是直接删掉用户看得见的动态，
-     * 比恢复失败严重得多。清单外的 id 一律不删，留着等人清理。
-     *
-     * ⚠️ 必须 [bypass]：我们自己的 delete 钩子会把对 `SnsInfo` 的删除拦下来，
-     *    不 bypass 的话回滚**静默失效** —— 没删掉还返回 0 行改动，看上去像成功了。
-     *
-     * ⚠️ 全程 runCatching：这里已经在失败处理路径上，一旦抛出去就把整批回滚打断，
-     *    剩下的行再也撤不回来，所以异常在这儿收住、转成 false。
-     *
-     * @return true = 确认已删除；false = **没删**（调用方必须收进失败清单并告警，
-     *         不能当成"已经回滚干净了"）
-     */
-    private fun undoInsert(db: Any, snsId: Long, undoable: Set<Long>): Boolean {
-        if (!undoable.contains(snsId)) {
-            LogX.w("SNS undo refused snsId=$snsId: 不在「本次确认新插入」清单里，" +
-                "删它可能连带删掉用户自己的动态 -> 保留现场等人工处理")
-            return false
-        }
-        val m = runCatching {
-            db.javaClass.methods.firstOrNull {
-                it.name == "delete" && it.parameterTypes.size == 3 &&
-                    it.parameterTypes[0] == String::class.java &&
-                    it.parameterTypes[1] == String::class.java
-            }
-        }.getOrNull() ?: return false
-        return runCatching {
-            val args: Any = if (m.parameterTypes[2] == Array<String>::class.java) {
-                arrayOf(snsId.toString())
-            } else {
-                arrayOf<Any>(snsId.toString())
-            }
-            bypass.set(true)
-            try {
-                (m.invoke(db, TABLE, "snsId=?", args) as? Int ?: 0) > 0
-            } finally {
-                bypass.remove()
-            }
-        }.onFailure {
-            LogX.w("SNS undo delete failed snsId=$snsId: ${it.javaClass.simpleName}")
-        }.getOrDefault(false)
-    }
-
-    private fun updateMethod(db: Any): Method? = runCatching {
-        db.javaClass.methods.firstOrNull {
-            it.name == "update" && it.parameterTypes.size == 4 &&
-                it.parameterTypes[0] == String::class.java &&
-                it.parameterTypes[1] == ContentValues::class.java
-        }
-    }.getOrNull()
-
-    /**
-     * 冲突算法常量：**CONFLICT_IGNORE = 4**。
-     *
-     * ⚠️ **4 = CONFLICT_IGNORE**，对照组是同仓库已上过真机的 `RevokeRescue.kt:52`
-     * （`private const val CONFLICT_IGNORE = 4`）。全表：
-     * `0=NONE 1=ROLLBACK 2=ABORT 3=FAIL 4=IGNORE 5=REPLACE`
-     * （AOSP `android.database.sqlite.SQLiteDatabase` 的定义，wcdb 同值）。
-     *
-     * ⚠️ 这里早先写成 **1**，那是 **CONFLICT_ROLLBACK**：撞主键时它会**回滚整条语句所在的
-     * 整个事务**，在批量恢复里表现为「第 N 条撞主键 → 前 N-1 条已经成功的 INSERT 一起被撤销」，
-     * 而外层只看 rowid/-1，日志里完全看不出来被回滚过。
-     *
-     * ⚠️ 为什么不能用 REPLACE(5)：INSERT 只在预检查出「行没了」时才走，
-     * 而那个判定有可能因为**查询失败**而落空（见 [readFlag] 的 [SnsRestoreLogic.Presence]），
-     * 那种情况下行其实还在，REPLACE 会把 13 列覆盖成归档值、另外 5 列打成默认值
-     * —— **把活行写坏**。IGNORE 撞主键就返回 -1，什么都不动，宁可报失败也不冒险。
-     *
-     * ── 合并须知（跨 lane 改同一个坑，别把两份都留下）────────────────────────
-     * 本文件**只有这一个**冲突算法常量，它只服务 [insertRow]（写**微信的 SnsInfo**）。
-     * main 与其它 lane 的旧版本里，同一个位置叫 **`CONFLICT_REPLACE = 5`**，
-     * 它也是同一个 `insertRow` 的实参（旧版 `restore()` 里内联写的），**用途相同、值是错的**。
-     * 合并时应当**用这里的 `4` 顶掉那个 `5`**，而不是两个常量并存：
-     *   - 留 `5` → 写微信 SnsInfo 变成 REPLACE，覆盖用户的活行（最坏结局）；
-     *   - 留 `1` → ROLLBACK，撞主键回滚整批；
-     *   - 两个都留 → 那个 `5` 会变成没人调用的死常量，谁下次顺手接上就是线上事故。
-     * 写**自己归档表**（`sns_archive`）的那条路径跟这里无关，它在
-     * `GroupDb.insertSnsArchive` 里用框架常量 `SQLiteDatabase.CONFLICT_IGNORE`
-     * （首条为准，**故意**不去覆盖），不要把它和这里的值串味。
-     */
-    private const val CONFLICT_IGNORE = 4
-
-    /**
-     * 找 INSERT 方法：**必须优先带冲突算法参数的 4 参版**
-     * `insertWithOnConflict(table, nullColumnHack, values, conflictAlgorithm)`。
-     *
-     * ⚠️ 顺序反了之前踩过坑：早先**先找 3 参 `insert`**，而它在 AOSP/wcdb 上一定有，
-     * 于是 4 参版永远选不上 —— [CONFLICT_IGNORE] 这个参数等于白写，
-     * 冲突时走的是 `insert` 默认的 ABORT/ROLLBACK 行为。**只能 4 参优先。**
-     *
-     * 3 参 `insert` **只在 4 参版不存在时**（极老的 wcdb）兜底，且兜底要留一行警告：
-     * 那条路径传不了冲突算法，撞主键会抛异常，只能靠 [insertRow] 外层的 runCatching 兜住。
-     */
-    private fun insertMethod(db: Any): Method? {
-        val conflict = runCatching {
-            db.javaClass.methods.firstOrNull {
-                it.name == "insertWithOnConflict" && it.parameterTypes.size == 4 &&
-                    it.parameterTypes[0] == String::class.java &&
-                    it.parameterTypes[1] == String::class.java &&
-                    it.parameterTypes[2] == ContentValues::class.java
-            }
-        }.getOrNull()
-        if (conflict != null) return conflict
-        val plain = runCatching {
-            db.javaClass.methods.firstOrNull {
-                it.name == "insert" && it.parameterTypes.size == 3 &&
-                    it.parameterTypes[0] == String::class.java &&
-                    it.parameterTypes[1] == String::class.java &&
-                    it.parameterTypes[2] == ContentValues::class.java
-            }
-        }.getOrNull()
-        LogX.w("SNS insertWithOnConflict not found on ${db.javaClass.name}" +
-            " -> fallback insert (冲突算法传不进去，撞主键会抛异常)")
-        return plain
-    }
-
-    /** 手动把某条恢复成可见（补拦：修复之前拦下来的那些 localFlag 已经被清掉了） */
-    fun show(snsId: Long): String {
-        val db = snsDb ?: return "no sns db yet"
-        val m = runCatching {
-            db.javaClass.methods.firstOrNull {
-                it.name == "rawQuery" &&
-                    it.parameterTypes.size == 2 &&
-                    it.parameterTypes[0] == String::class.java
-            }
-        }.getOrNull() ?: return "no rawQuery"
-        val cur = runCatching {
-            val args: Any = if (m.parameterTypes[1] == Array<String>::class.java) {
-                arrayOf(snsId.toString())
-            } else {
-                arrayOf<Any>(snsId.toString())
-            }
-            val c = m.invoke(db, "select localFlag from $TABLE where snsId=?", args)
-                ?: return "null cursor"
-            try {
-                if (XposedHelpers.callMethod(c, "moveToFirst") as? Boolean != true) return "row gone"
-                (XposedHelpers.callMethod(c, "getLong", 0) as? Long ?: 0L).toInt()
-            } finally {
-                runCatching { XposedHelpers.callMethod(c, "close") }
-            }
-        }.getOrElse { return "err ${it.javaClass.simpleName}" }
-        // ⚠️ 这里**不要**再判 `cur is String`：上面的 lambda 里三个 `return "..."` 都是非局部返回
-        // （`runCatching` 是 inline，`return` 直接返出 `restore()`），`getOrElse` 又兜住异常，
-        // 所以 `cur` 到这儿 100% 是 Int。旧代码留着 `if (cur is String) return cur` ——
-        // 编译器报 "Check for instance is always false"，纯死代码，已删。
-        val curFlag = cur as Int
-        val now = restoreVisibility(db, snsId, curFlag)
-        return "snsId=$snsId localFlag $curFlag -> $now"
-    }
-
-    /** 诊断用真删：绕过拦截，同时把归档也清掉 */
-    fun forceDelete(snsId: Long): String {
-        val db = snsDb ?: return "no sns db yet"
-        val m = runCatching {
-            db.javaClass.methods.firstOrNull {
-                it.name == "delete" &&
-                    it.parameterTypes.size == 3 &&
-                    it.parameterTypes[0] == String::class.java &&
-                    it.parameterTypes[1] == String::class.java
-            }
-        }.getOrNull() ?: return "no delete method"
-        return runCatching {
-            val args: Any = if (m.parameterTypes[2] == Array<String>::class.java) {
-                arrayOf(snsId.toString())
-            } else {
-                arrayOf<Any>(snsId.toString())
-            }
-            bypass.set(true)
-            val n = try {
-                m.invoke(db, TABLE, "snsId=?", args)
-            } finally {
-                // ⚠️ 用 remove 而不是 set(false)：ThreadLocal 会一直挂在线程上，
-                // 微信的 DB 线程是复用的一直不回收，残留的 false 虽然不影响判断，
-                // 但会在内存里白留一份（DB 线程池常驻）
-                bypass.remove()
-            }
-            runCatching { GroupDb.current()?.deleteSnsArchive(snsId) }
-            "deleted=$n snsId=$snsId"
-        }.getOrElse { "err ${it.javaClass.simpleName}: ${(it.cause ?: it).message?.take(80)}" }
-    }
-
-    /**
-     * **模拟微信真实的两步删除**（诊断用，不复用 [forceDelete] 的 bypass）：
-     * ① `update SnsInfo set localFlag=2` 清掉可见位（微信删动态第一步）
-     * ② `delete from SnsInfo where snsId=?`（第二步，**必须**走到 onDelete 拦截里）
-     *
-     * 这样能一次性验证三件事：
-     * - 拦截是否生效（行还在）
-     * - `restoreVisibility` 在 delete 钩子内部调用是否真的落库（这是最容易静默失效的：
-     *   在 delete 的 before 里同步调 update，wcdb 连接状态可能异常）
-     * - 归档 + SnsTag 的 delSet 刷新 + sweep 自动贴标
-     */
-    fun simulateDelete(snsId: Long): String {
-        val db = snsDb ?: return "no sns db yet"
-        // 走 [updateFlag]（跟微信清可见位的写法完全一致），不在这里另起一套反射：
-        // 另起一套就会漏掉 whereArgs 的重载分流，模拟器自己挂了会让人误判成「拦截没生效」
-        val step1 = updateFlag(db, snsId, 2)
-        val dm = runCatching {
-            db.javaClass.methods.firstOrNull {
-                it.name == "delete" && it.parameterTypes.size == 3 &&
-                    it.parameterTypes[0] == String::class.java &&
-                    it.parameterTypes[1] == String::class.java
-            }
-        }.getOrNull() ?: return "flag=$step1 no delete method"
-        val args: Any = if (dm.parameterTypes[2] == Array<String>::class.java) {
-            arrayOf(snsId.toString())
-        } else {
-            arrayOf<Any>(snsId.toString())
-        }
-        val step2 = runCatching { dm.invoke(db, TABLE, "snsId=?", args) }
-            .getOrElse { "err:${it.javaClass.simpleName}" }
-        return "simdel snsId=$snsId clearFlag=$step1 deleteRet=$step2"
-    }
-
     fun stat(): String =
-        "SNS stat enabled=${cfg().enabled} blocked=${blocked.get()} archived=${archived.get()} " +
-            "snsDb=${snsDb != null}"
+        "SNS stat blockEnabled=${cfg().blockEnabled} snsDb=${snsDb != null}"
 }

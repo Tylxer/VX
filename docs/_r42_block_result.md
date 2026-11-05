@@ -29,14 +29,26 @@
 
 ## 2. 核心证据
 
-### 2.1 拦截命中（两次）
+### 2.1 拦截命中（四次，跨 9 分钟）
 
 ```
-21:52:15.512 #worker BLOCK hit snsId=-3398534434663755253 before=2 keys=18 hasContent=true hasAttr=true
-21:52:15.517 #worker BLOCK after snsId=-3398534434663755253 before=2 after=2 (键已摘)
-21:53:02.271 #worker BLOCK hit snsId=-3398534434663755253 before=2 keys=18 hasContent=true hasAttr=true
-21:53:02.279 #worker BLOCK after snsId=-3398534434663755253 before=2 after=2 (键已摘)
+21:52:15.512 BLOCK hit snsId=-3398534434663755253 before=2 keys=18 hasContent=true hasAttr=true
+21:52:15.517 BLOCK after snsId=... before=2 after=2 (键已摘)
+21:53:02.271 BLOCK hit ...  21:53:02.279 BLOCK after ... before=2 after=2
+21:56:07     BLOCK hit ...  （第三次，同样 blk=1 after=2）
+22:01:30     BLOCK hit ...  （第四次，同样 blk=1 after=2）
 ```
+
+四次事件的完整记录（`blockstat` 汇总行，按时间）：
+
+```
+BLOCK ev id=-3398534434663755253 at=21:52:15 before=2 keys=18 C=1 A=1 blk=1 after=2 lf=2 sef=1
+BLOCK ev id=-3398534434663755253 at=21:53:02 before=2 keys=18 C=1 A=1 blk=1 after=2 lf=2 sef=1
+BLOCK ev id=-3398534434663755253 at=21:56:07 before=2 keys=18 C=1 A=1 blk=1 after=2 lf=2 sef=1
+BLOCK ev id=-3398534434663755253 at=22:01:30 before=2 keys=18 C=1 A=1 blk=1 after=2 lf=2 sef=1
+```
+
+追踪（每 30 秒一次）从 21:50:40 到 22:05:15 全部 `src=2 lf=2 sef=1`，**14 分钟零漂移**。
 
 字段含义（源码 `SnsBlockProbe.kt:137-139`，**非推测**）：
 
@@ -79,7 +91,7 @@
 
 | 编号 | 问题 | 结论 | 证据 |
 |---|---|---|---|
-| **W1** | 微信被拦后会不会重新校正？ | **会重试，但每次都被拦**。47 秒内两次，原因待定（可能 sync 双阶段），均 `blk=1 after=2` | §2.1 |
+| **W1** | 微信被拦后会不会重新校正？ | **会反复重试，但改不回去**。9 分钟内 4 次（21:52:15 / 21:53:02 / 21:56:07 / 22:01:30），每次 `blk=1 after=2`；14 分钟追踪零漂移 ⇒ 甲不是「临时保全」，是**持续有效** | §2.1 |
 | **W2** | 是否只有一条清位通道？ | ⛔ **不是**。存在一条**未被接管**的裸 SQL 批量通道，见 §4 | §4 |
 | **W3** | `ContentValues` 是整行还是部分列？ | **整行**（`keys=18`，含 `content`/`attrBuf`）⇒ WechatMagician 的 `remove("sourceType")` 做法在本版本安全，摘掉一个键还剩 17 个，不会撞 `SKIP_EMPTY` | §2.1 |
 
@@ -116,8 +128,7 @@ SQL，路线甲会静默失效，且我们连"被绕过"都看不出来（现在
 
 ## 6. 尚未闭环
 
-1. **30 分钟观察窗**（trace `every=30s max=60`，起于 21:50:40）：微信是否会在更晚
-   （如再次进入朋友圈、或 5 分钟节流后）把这条重新写回 0。**待测**。
+1. ~~**30 分钟观察窗**~~ **已闭环**：4 次重试全部拦住，14 分钟零漂移（§2.1）。
 2. **冷启后是否仍为 2**：进程重启后微信会不会重新拉一次全量并纠正。**待测**。
 3. raw SQL 通道的接管（§4）。**待实现**。
 4. `content` 列虽在 `values` 里，但未被改动 —— 尚未逐字节确认内容与删除前完全一致

@@ -47,8 +47,6 @@ class GroupDb private constructor(context: Context) :
         private const val T_DND = "auto_dnd_done"
         private const val T_SEEN = "group_seen"
         private const val T_RESCUED = "rescued"
-        private const val T_SNS = "sns_archive"
-        private const val T_SRC = "sns_visible_src"
 
         @Volatile
         private var instance: GroupDb? = null
@@ -98,9 +96,7 @@ class GroupDb private constructor(context: Context) :
         createKvTable(db)
         createDndTable(db)
         createRescuedTable(db)
-        createSnsTable(db)
         createSeenTable(db)
-        createSrcTable(db)
     }
 
     override fun onUpgrade(db: SQLiteDatabase, oldVersion: Int, newVersion: Int) {
@@ -157,16 +153,8 @@ class GroupDb private constructor(context: Context) :
                 db.execSQL("ALTER TABLE $T_RESCUED ADD COLUMN orig_extra TEXT")
             }
         }
-        if (oldVersion < 7) {
-            createSnsTable(db)
-        }
         if (oldVersion < 8) {
             createSeenTable(db)
-        }
-        if (oldVersion < 9) {
-            // R27：朋友圈「曾经可见」台账。纯新增表，老库直接补建即可（CREATE IF NOT EXISTS，
-            // 重复执行无害）。**没有** ALTER 老表 ⇒ 不存在丢列/重建风险。
-            createSrcTable(db)
         }
     }
 
@@ -200,65 +188,6 @@ class GroupDb private constructor(context: Context) :
         db.execSQL("CREATE INDEX IF NOT EXISTS idx_rescued_at ON $T_RESCUED(at)")
     }
 
-    /**
-     * 朋友圈动态归档（[com.lx.wxgroup.feature.SnsGuard]）。
-     *
-     * 微信删动态是**物理 DELETE 整行**，拦住只能保住「微信库里这行还在」；
-     * 一旦微信换条路清理掉、或者模块被卸掉，内容就没了。
-     * 所以拦的同时把整行（含 content / attrBuf / postBuf 三个 BLOB）复制一份到这里。
-     * 这也是 6.4「自动导出朋友圈动态」的数据源。
-     */
-    private fun createSnsTable(db: SQLiteDatabase) {
-        db.execSQL(
-            """
-            CREATE TABLE IF NOT EXISTS $T_SNS (
-                sns_id          INTEGER NOT NULL PRIMARY KEY,
-                user_name       TEXT,
-                create_time     INTEGER NOT NULL DEFAULT 0,
-                type            INTEGER NOT NULL DEFAULT 0,
-                source_type     INTEGER NOT NULL DEFAULT 0,
-                local_flag      INTEGER NOT NULL DEFAULT 0,
-                sub_type        INTEGER NOT NULL DEFAULT 0,
-                server_ext_flag INTEGER NOT NULL DEFAULT 0,
-                head            TEXT,
-                string_seq      TEXT,
-                content         BLOB,
-                attr_buf        BLOB,
-                post_buf        BLOB,
-                at              INTEGER NOT NULL
-            )
-            """.trimIndent()
-        )
-        db.execSQL("CREATE INDEX IF NOT EXISTS idx_sns_time ON $T_SNS(create_time)")
-    }
-
-    /**
-     * 朋友圈「曾经时间线可见」台账（[com.lx.wxgroup.feature.SnsTimelineSourceFix]）。
-     *
-     * 为什么需要它：好友删动态时微信只把 `SnsInfo.sourceType` 的 bit1 清掉（`& -3`），
-     * 行还在、`content`/`localFlag` 全不变。要区分「被清成 0」与「本来就不是 2」，
-     * 唯一可信的信号是「这行**曾经** `& 2 != 0`」—— 那就得跨轮、跨重启记下来。
-     *
-     * 列语义：
-     * - `source_type`：**最近一次**亲眼见到它可见时的值（不是当前库里的值，当前值要现查微信库）
-     * - `first_seen` / `last_seen`：首次 / 最近一次见到可见的毫秒时间戳
-     * - `fixed_orig`：最近一次补位**之前**的原值（回滚用）；null = 没补过 / 已回滚
-     *
-     * ⚠️ 这是**模块自己的库**（AOSP SQLite），写它不触发挂在微信库上的任何钩子。
-     */
-    private fun createSrcTable(db: SQLiteDatabase) {
-        db.execSQL(
-            """
-            CREATE TABLE IF NOT EXISTS $T_SRC (
-                sns_id      INTEGER NOT NULL PRIMARY KEY,
-                source_type INTEGER NOT NULL DEFAULT 0,
-                first_seen  INTEGER NOT NULL DEFAULT 0,
-                last_seen   INTEGER NOT NULL DEFAULT 0,
-                fixed_orig  INTEGER
-            )
-            """.trimIndent()
-        )
-    }
 
     // ---------------------------------------------------------------- 防撤回：被救下的消息
 
@@ -373,7 +302,7 @@ class GroupDb private constructor(context: Context) :
         writableDatabase.delete(T_RESCUED, "msg_id=?", arrayOf(msgId.toString()))
     }
 
-    // ---------------------------------------------------------------- 朋友圈动态归档
+    // ---------------------------------------------------------------- 朋友圈动态（当前 SnsInfo 导出）
 
     /**
      * 一条朋友圈动态的完整快照（含三个 BLOB）。
@@ -388,8 +317,7 @@ class GroupDb private constructor(context: Context) :
      * 属两个 lane 接口脱节（`docs/_r20_sample_src.md` §7 有记录）。
      *
      * ⛔ 也别指望用 `copy()` 补：`copy()` 只能改已有实例的字段，
-     * 而「缺列的完整快照」根本不该被造出来 —— 拿半行去 `archiveSns` 会用残缺快照
-     * 覆盖掉 `readRow` 存下的完整快照，而 `archiveSns` 是「首条为准」，覆盖不回来。
+     * 而「缺列的完整快照」根本不该被造出来（读法本来就不碰缺的那些列）。
      */
     data class SnsRow(
         val snsId: Long,
@@ -408,425 +336,6 @@ class GroupDb private constructor(context: Context) :
         val at: Long = System.currentTimeMillis(),
     )
 
-    /**
-     * 归档一条动态。
-     *
-     * ⚠️ **首条为准**：已经有就不覆盖。理由跟 `recordRescued` 一样 ——
-     * 覆盖会把「删之前那一版」冲掉，而删之前的才是我们要留的原文。
-     */
-    fun archiveSns(row: SnsRow): Boolean {
-        if (row.snsId == 0L) return false
-        if (hasSns(row.snsId)) return true
-        val values = ContentValues().apply {
-            put("sns_id", row.snsId)
-            put("user_name", row.userName)
-            put("create_time", row.createTime)
-            put("type", row.type)
-            put("source_type", row.sourceType)
-            put("local_flag", row.localFlag)
-            put("sub_type", row.subType)
-            put("server_ext_flag", row.serverExtFlag)
-            put("head", row.head)
-            put("string_seq", row.stringSeq)
-            put("content", row.content)
-            put("attr_buf", row.attrBuf)
-            put("post_buf", row.postBuf)
-            put("at", row.at)
-        }
-        // CONFLICT_IGNORE：并发下撞主键就放弃，绝不覆盖已有归档
-        return writableDatabase.insertWithOnConflict(
-            T_SNS, null, values, SQLiteDatabase.CONFLICT_IGNORE
-        ) != -1L
-    }
-
-    private fun hasSns(snsId: Long): Boolean {
-        readableDatabase.query(
-            T_SNS, arrayOf("sns_id"), "sns_id=?", arrayOf(snsId.toString()), null, null, null
-        ).use { c -> return c.moveToFirst() }
-    }
-
-    /** 按 snsId 读一条归档（反插恢复用；读整行含三个 BLOB，后台线程调） */
-    fun snsArchived(snsId: Long): SnsRow? {
-        readableDatabase.query(
-            T_SNS, null, "sns_id=?", arrayOf(snsId.toString()), null, null, null, "1"
-        ).use { c -> return if (c.moveToFirst()) c.toSnsRow() else null }
-    }
-
-    fun listSnsArchive(limit: Int = 20): List<SnsRow> {
-        val out = mutableListOf<SnsRow>()
-        readableDatabase.query(
-            T_SNS, null, null, null, null, null, "create_time DESC", limit.toString()
-        ).use { c ->
-            while (c.moveToNext()) {
-                out += c.toSnsRow()
-            }
-        }
-        return out
-    }
-
-    /**
-     * 朋友圈归档的**键集分页**（自动导出的遍历方式）。
-     *
-     * 为什么不能直接 `listSnsArchive(大 limit)` 一把梭：它把 `content` / `attrBuf` /
-     * `post_buf` 三个 BLOB 一起读进内存（朋友圈 content 动辄几十 KB），归档一多就是
-     * 几百 MB —— 后台线程 OOM 会把微信带走。这里一次只读一页。
-     *
-     * 游标是 `(create_time, sns_id)` 复合键：createTime 相同的相邻行不会漏
-     * （单纯 `create_time < ?` 会在页边界丢掉同一秒的行）。首次调用传
-     * `(Long.MAX_VALUE, Long.MAX_VALUE)` 即从最新一页开始。
-     */
-    fun listSnsArchiveBefore(createTime: Long, snsId: Long, limit: Int = 100): List<SnsRow> {
-        val out = mutableListOf<SnsRow>()
-        readableDatabase.query(
-            T_SNS, null,
-            "create_time < ? OR (create_time = ? AND sns_id < ?)",
-            arrayOf(createTime.toString(), createTime.toString(), snsId.toString()),
-            null, null, "create_time DESC, sns_id DESC", limit.toString()
-        ).use { c ->
-            while (c.moveToNext()) {
-                out += c.toSnsRow()
-            }
-        }
-        return out
-    }
-
-    /**
-     * 已归档动态的 snsId 全集（给「[已删除]标签」判定用）。
-     *
-     * ⚠️ **绝不能**用 [listSnsArchive] 代替：它把 `content` / `attr_buf` / `post_buf`
-     * 三个 BLOB 一起读出来（朋友圈 content 动辄几十 KB），而这里只需要一个 id 集合，
-     * 而且调用方跑在**主线程**（View.setTag 钩子里 / 滚动过程中）。
-     * 不 ORDER BY：只需覆盖索引扫一遍，不必排序。
-     */
-    fun snsArchivedIds(): Set<Long> {
-        val out = HashSet<Long>(256)
-        // ⚠️ 不加 LIMIT：无 ORDER BY 时 LIMIT 取的是「任意 N 行」，归档一多就会
-        // 静默漏掉早期被删的动态（标签凭空消失且没有任何日志）。这里只读一个
-        // INTEGER 列，全量扫的代价远小于漏标。
-        readableDatabase.query(
-            T_SNS, arrayOf("sns_id"), null, null, null, null, null
-        ).use { c ->
-            val i = c.getColumnIndexOrThrow("sns_id")
-            while (c.moveToNext()) out.add(c.getLong(i))
-        }
-        return out
-    }
-
-    /**
-     * 「已删动态」判据 —— **只认物理删除归档 [T_SNS]**（R31h 方案 A 收窄）。
-     *
-     * ⛔⛔ **这里有一起真实事故，改回并集前必读。**
-     * R30 时这里写的是 `T_SNS ∪ (T_SRC WHERE fixed_orig IS NOT NULL)`，理由是「微信删动态有两条
-     * 互斥路径，只查一边会漏标」。当时 `fixed_orig` 只有 4 条，所以「补过位」≈「被删过」碰巧成立。
-     * 但 R31 把补位范围扩到全量可见动态后，`fixed_orig` 涨到 **3447 条**，而它**只写不删**：
-     * ⇒ 3447 条**正常动态**全部被判成「已删除」，正常朋友圈被插上「已阻止删除」灰标，误伤真实用户。
-     *
-     * 根因不是 SQL 写错，而是 **`fixed_orig` 这一个字段背了两个语义**：
-     * ① 补位台账（「这条我动过 sourceType」，每条可见动态都会写，量级 = 全部动态）；
-     * ② 已删判据（「这条被删了」，应该只有个位数）。
-     * 只要两者共用一个字段，下游任何一处「顺手记一笔」都会污染判据。
-     *
-     * ⇒ 现在拆成两个方法，语义分开：
-     * - **本方法 [snsTagIds]**：已删判据，只查 [T_SNS]（`SnsGuard` 拦住的物理 DELETE）。
-     * - **[snsLedgerIds]**：补位台账并集，只给「按台账回捞动态」这类用途（`SnsAlbumMerge`）。
-     *
-     * ⚠️ 代价（已知并接受）：走 `UPDATE sourceType=0` 那条路径被删的动态不再有灰标。
-     * 想补回来必须按 R31h 方案 B 做 —— 给 [T_SRC] 加一列记录「该 snsId 在不在最近一次
-     * 服务端回包里」，只有**不在**的才算真删，**绝不能再拿 `fixed_orig` 当判据**。
-     */
-    fun snsTagIds(): Set<Long> = runCatching {
-        val out = HashSet<Long>(64)
-        readableDatabase.query(
-            T_SNS, arrayOf("sns_id"), null, null, null, null, null,
-        ).use { c ->
-            val i = c.getColumnIndexOrThrow("sns_id")
-            while (c.moveToNext()) out.add(c.getLong(i))
-        }
-        out
-    }.onFailure { LogX.w("GroupDb snsTagIds failed: ${it.javaClass.simpleName}") }
-        .getOrDefault(emptySet())
-
-    /**
-     * 朋友圈时间线注入的候选 snsId（新的在前）。
-     *
-     * ⛔ **只能用这个，绝不能用 [listSrcFixedIds]。** R31h 真机铁证：
-     * 用补位台账当候选时 `SNS-INJECT-STAT attempt=24 ok=24 emptyBuf=0` ——
-     * 24 条全部能从微信 `SnsInfo` 里读回 attrBuf，说明它们**全是还好好存在的正常动态**，
-     * 没有一条被删。根因：时间线**分页**（一页 10 条），台账 200 条里必然有 190 条
-     * 不在当前页 ⇒ 「不在响应里」被判成「被删」⇒ 每轮往列表底部重复注入 12 条。
-     *
-     * 本方法只取 [T_SNS]（`SnsGuard` 拦下的物理 `DELETE`），那才是真被删的。
-     */
-    fun listArchiveIds(limit: Int = 200): List<Long> = runCatching {
-        val out = ArrayList<Long>(limit.coerceAtMost(256))
-        readableDatabase.query(
-            T_SNS, arrayOf("sns_id"), null, null, null, null, "create_time DESC", limit.toString()
-        ).use { c ->
-            val i = c.getColumnIndexOrThrow("sns_id")
-            while (c.moveToNext()) out.add(c.getLong(i))
-        }
-        out
-    }.onFailure { LogX.w("GroupDb listArchiveIds failed: ${it.javaClass.simpleName}") }
-        .getOrDefault(emptyList())
-
-    /**
-     * 按 snsId 读归档的 `attr_buf`（时间线注入用）。
-     *
-     * 为什么不复用 [snsArchived]：那个读整行，`content` / `post_buf` 一起出来（动辄几十 KB），
-     * 而注入每轮最多 12 条、跑在 worker 上，只需要这一个 BLOB。
-     *
-     * ⚠️ **BLOB 必须 `getType()==4` + `getBlob`**：`getString` 读 BLOB 返回 null，
-     * 本项目为此误判过两次（以为「正文永久丢失」，其实是取值方式错）。
-     */
-    fun snsArchivedAttrBuf(snsId: Long): ByteArray? = runCatching {
-        readableDatabase.query(
-            T_SNS, arrayOf("attr_buf"), "sns_id=?", arrayOf(snsId.toString()),
-            null, null, null, "1",
-        ).use { c -> if (c.moveToFirst() && c.getType(0) == 4) c.getBlob(0) else null }
-    }.onFailure { LogX.w("GroupDb snsArchivedAttrBuf failed: ${it.javaClass.simpleName}") }
-        .getOrNull()
-
-    /**
-     * 补位台账的**并集清单**（[T_SNS] ∪ `T_SRC WHERE fixed_orig IS NOT NULL`）。
-     *
-     * ⛔ **绝不能拿它当「已删除」判据**（见 [snsTagIds] 的事故说明）——它包含**所有补过位
-     * 的正常动态**，量级是全部可见动态。
-     *
-     * 唯一合法用途：按台账把「微信本地已经不返回、但我们有记录」的动态回捞出来（相册注入）。
-     * 目前只有 `SnsAlbumMerge`（**默认停用**）用它。
-     *
-     * ⚠️ **不加 LIMIT**：`UNION` 没有 `ORDER BY` 时 LIMIT 取的是「任意 N 行」，
-     * 会让早期记录**静默漏掉**（与 [snsArchivedIds] 同一理由）。这里只读一个
-     * INTEGER 列，全量扫的代价远小于漏。
-     */
-    fun snsLedgerIds(): Set<Long> = runCatching {
-        val out = HashSet<Long>(4096)
-        readableDatabase.rawQuery(
-            "SELECT sns_id FROM $T_SNS UNION SELECT sns_id FROM $T_SRC WHERE fixed_orig IS NOT NULL",
-            null,
-        ).use { c ->
-            val i = c.getColumnIndexOrThrow("sns_id")
-            while (c.moveToNext()) out.add(c.getLong(i))
-        }
-        out
-    }.onFailure { LogX.w("GroupDb snsLedgerIds failed: ${it.javaClass.simpleName}") }
-        .getOrDefault(emptySet())
-
-    fun deleteSnsArchive(snsId: Long) {
-        writableDatabase.delete(T_SNS, "sns_id=?", arrayOf(snsId.toString()))
-    }
-
-    // ---------------------------------------------------------------- 朋友圈「曾经可见」台账
-
-    /**
-     * 台账一行（[T_SRC]）。`source_type` 是**最近一次见到可见时**的值，
-     * 不是库里当前的值 —— 后者每次都要现查微信库，别混。
-     */
-    data class VisibleSrc(
-        val snsId: Long,
-        val sourceType: Int,
-        val firstSeen: Long,
-        val lastSeen: Long,
-        /** 最近一次补位前的原值；null = 没补过 / 已回滚 */
-        val fixedOrig: Int?,
-    )
-
-    /**
-     * 批量登记「见过它可见」。
-     *
-     * 语义与 `recordRescued` 的「首条为准」不同，这里要**更新** `source_type` / `last_seen`：
-     * 台账答的是「它最近一次可见时是什么值」，用旧值会让补位回滚写出过期数值。
-     * 但 `first_seen` **不覆盖**（它答的是「第一次见到它的时间」，覆盖等于丢失历史）。
-     *
-     * 主键是 `sns_id` ⇒ 先 `CONFLICT_IGNORE` 插入，插不进（已存在）再 update 一次。
-     * 走单事务：一轮快照几千行，逐条提交会产生几千次 journal。
-     *
-     * @return 新增（此前不在台账里）的行数
-     */
-    fun upsertVisibleSrc(rows: Collection<Pair<Long, Int>>, now: Long = System.currentTimeMillis()): Int {
-        if (rows.isEmpty()) return 0
-        return runCatching {
-            writableDatabase.run {
-                beginTransaction()
-                try {
-                    val values = ContentValues()
-                    var added = 0
-                    for ((snsId, src) in rows) {
-                        if (snsId == 0L) continue
-                        values.clear()
-                        values.put("sns_id", snsId)
-                        values.put("source_type", src)
-                        values.put("first_seen", now)
-                        values.put("last_seen", now)
-                        if (insertWithOnConflict(T_SRC, null, values, SQLiteDatabase.CONFLICT_IGNORE) > 0) {
-                            added++
-                        } else {
-                            values.clear()
-                            values.put("source_type", src)
-                            values.put("last_seen", now)
-                            update(T_SRC, values, "sns_id=?", arrayOf(snsId.toString()))
-                        }
-                    }
-                    setTransactionSuccessful()
-                    added
-                } finally {
-                    endTransaction()
-                }
-            }
-        }.onFailure { LogX.w("GroupDb upsertVisibleSrc failed: ${it.javaClass.simpleName}") }
-            .getOrDefault(0)
-    }
-
-    /**
-     * 台账全量（`last_seen DESC` = 最近还看得见的排前面）。
-     *
-     * ⚠️ 有 `LIMIT`：台账会随「见过多少条可见动态」线性增长，探针不该把它一把拖出来。
-     * 默认 5000 与 `listRescued` 同一个量级口径。
-     */
-    fun listVisibleSrc(limit: Int = 5000): List<VisibleSrc> {
-        val out = ArrayList<VisibleSrc>()
-        readableDatabase.query(
-            T_SRC, null, null, null, null, null, "last_seen DESC, sns_id DESC", limit.toString()
-        ).use { c ->
-            while (c.moveToNext()) {
-                val origIdx = c.getColumnIndexOrThrow("fixed_orig")
-                out.add(
-                    VisibleSrc(
-                        snsId = c.getLong(c.getColumnIndexOrThrow("sns_id")),
-                        sourceType = c.getInt(c.getColumnIndexOrThrow("source_type")),
-                        firstSeen = c.getLong(c.getColumnIndexOrThrow("first_seen")),
-                        lastSeen = c.getLong(c.getColumnIndexOrThrow("last_seen")),
-                        fixedOrig = if (c.isNull(origIdx)) null else c.getInt(origIdx),
-                    )
-                )
-            }
-        }
-        return out
-    }
-
-    fun visibleSrc(snsId: Long): VisibleSrc? {
-        if (snsId == 0L) return null
-        readableDatabase.query(
-            T_SRC, null, "sns_id=?", arrayOf(snsId.toString()), null, null, null
-        ).use { c ->
-            if (!c.moveToFirst()) return null
-            val origIdx = c.getColumnIndexOrThrow("fixed_orig")
-            return VisibleSrc(
-                snsId = c.getLong(c.getColumnIndexOrThrow("sns_id")),
-                sourceType = c.getInt(c.getColumnIndexOrThrow("source_type")),
-                firstSeen = c.getLong(c.getColumnIndexOrThrow("first_seen")),
-                lastSeen = c.getLong(c.getColumnIndexOrThrow("last_seen")),
-                fixedOrig = if (c.isNull(origIdx)) null else c.getInt(origIdx),
-            )
-        }
-    }
-
-    /** 记下本次补位前的原值（回滚依据）。只在真的写成功了才调 */
-    fun markSrcFixed(snsId: Long, orig: Int) {
-        val values = ContentValues().apply { put("fixed_orig", orig) }
-        runCatching { writableDatabase.update(T_SRC, values, "sns_id=?", arrayOf(snsId.toString())) }
-            .onFailure { LogX.w("GroupDb markSrcFixed failed: ${it.javaClass.simpleName}") }
-    }
-
-    /**
-     * 回滚成功后把 `fixed_orig` 清空。
-     *
-     * 必须清：不清的话下一轮 `srcstat/fix` 会把「已经回滚过的行」当成「补过位的行」，
-     * 反复出现在回滚清单里。
-     */
-    fun clearSrcFixed(snsId: Long) {
-        val values = ContentValues().apply { putNull("fixed_orig") }
-        runCatching { writableDatabase.update(T_SRC, values, "sns_id=?", arrayOf(snsId.toString())) }
-            .onFailure { LogX.w("GroupDb clearSrcFixed failed: ${it.javaClass.simpleName}") }
-    }
-
-    /**
-     * 清洗「误登记」的 `fixed_orig`（2026-10-28 事故善后）。
-     *
-     * ## 为什么可以用 `fixed_orig & 8` 当判据
-     * `fixed_orig` 的**合法语义**只有一个：`fixAlbum` 真的执行了 `UPDATE sourceType = src|8`
-     * 时记下的「补位前原值」。既然原值都需要补 bit8，那它**必然不含 bit8**
-     * （含了就不需要补，走的是 already 分支、不记账）。
-     *
-     * ⇒ `(fixed_orig & 8) != 0` 的行在合法流程下**不存在**，只可能来自
-     *   2026-10-27 晚那次「already 分支也 markSrcFixed」的错误改动。
-     *
-     * ## 为什么必须清
-     * `fixed_orig IS NOT NULL` 在 R31h 之前同时是「已删除」判据（当时见 [snsTagIds]，现已收窄）。
-     * 被误登记的正常动态会被 SnsTag 当成已删，在时间线/好友主页上被标 `[删除已拦截]`（真机报障原样）。
-     * ⚠️ 判据收窄后误标已止血，但**台账里的污染行仍在**（计入 [snsLedgerIds]，会虚增注入候选），
-     * 所以清洗仍必须保留、且事后要复跑一次。
-     *
-     * @return 清掉的行数；-1 = 写库失败
-     */
-    fun cleanSrcFixedWithAlbumBit(): Int = runCatching {
-        writableDatabase.update(
-            T_SRC,
-            ContentValues().apply { putNull("fixed_orig") },
-            "fixed_orig IS NOT NULL AND (fixed_orig & 8) != 0",
-            null
-        )
-    }.onFailure { LogX.w("GroupDb cleanSrcFixedWithAlbumBit failed: ${it.javaClass.simpleName}") }
-        .getOrDefault(-1)
-
-    /** 诊断用：当前有多少行 `fixed_orig` 含 bit8（= 待清洗的误登记） */
-    fun countSrcFixedWithAlbumBit(): Int = runCatching {
-        readableDatabase.rawQuery(
-            "SELECT COUNT(*) FROM $T_SRC WHERE fixed_orig IS NOT NULL AND (fixed_orig & 8) != 0",
-            null
-        ).use { c -> if (c.moveToFirst()) c.getInt(0) else 0 }
-    }.onFailure { 0 }.getOrDefault(0)
-
-    fun countVisibleSrc(): Int = runCatching {
-        readableDatabase.rawQuery("SELECT COUNT(*) FROM $T_SRC", null).use { c ->
-            if (c.moveToFirst()) c.getInt(0) else 0
-        }
-    }.onFailure { 0 }.getOrDefault(0)
-
-    /** 台账里「曾经可见」（`source_type & 2 != 0`）的行数 */
-    fun countEverVisibleSrc(): Int = runCatching {
-        readableDatabase.rawQuery(
-            "SELECT COUNT(*) FROM $T_SRC WHERE (source_type & 2) != 0", null
-        ).use { c -> if (c.moveToFirst()) c.getInt(0) else 0 }
-    }.onFailure { 0 }.getOrDefault(0)
-
-    /** 台账里「补过位且还没回滚」的行数（`fixed_orig IS NOT NULL`） */
-    fun countSrcFixed(): Int = runCatching {
-        readableDatabase.rawQuery(
-            "SELECT COUNT(*) FROM $T_SRC WHERE fixed_orig IS NOT NULL", null
-        ).use { c -> if (c.moveToFirst()) c.getInt(0) else 0 }
-    }.onFailure { 0 }.getOrDefault(0)
-
-    /**
-     * 「被微信清过位、我们补回来过」的 snsId（`fixed_orig IS NOT NULL`，最近补的在前）。
-     *
-     * ## 合法用途只有两个，都跟「补位」本身有关
-     * ① `SnsTimelineSourceFix` 自己的补位目标表；
-     * ② 人工 `setsrc` 复核。
-     *
-     * ## ⛔ 绝不能当「已删除」或「注入候选」用（R31h 事故）
-     * 老 KDoc 曾写「这些条目服务端已经不返回」—— **这句是错的，且代价很大**：
-     * 时间线是**分页**的，台账 200 条里绝大部分只是「不在当前这一页」，
-     * 拿它当「被删/缺失」判据会做两件坏事：
-     * - 灰标：把正常动态标成「已阻止删除」（用户真实报障）；
-     * - 注入：把正常动态重复塞回时间线底部（`attempt=24 ok=24 emptyBuf=0` 铁证）。
-     *
-     * ⇒ 已删判据用 [snsTagIds]，注入候选用 [listArchiveIds]，两者都只认 [T_SNS]。
-     *
-     * @param limit 上限，防止台账变大后每轮同步都拖一大把 id 出来
-     */
-    fun listSrcFixedIds(limit: Int = 200): List<Long> = runCatching {
-        val out = ArrayList<Long>()
-        readableDatabase.rawQuery(
-            "SELECT sns_id FROM $T_SRC WHERE fixed_orig IS NOT NULL ORDER BY last_seen DESC LIMIT ?",
-            arrayOf(limit.toString()),
-        ).use { c ->
-            val i = c.getColumnIndexOrThrow("sns_id")
-            while (c.moveToNext()) out.add(c.getLong(i))
-        }
-        out
-    }.onFailure { LogX.w("GroupDb listSrcFixedIds failed: ${it.javaClass.simpleName}") }
-        .getOrDefault(emptyList())
 
     /**
      * 已自动设过免打扰的群。
@@ -1476,22 +985,6 @@ class GroupDb private constructor(context: Context) :
         type = getInt(getColumnIndexOrThrow("wxid_type")),
     )
 
-    private fun Cursor.toSnsRow(): SnsRow = SnsRow(
-        snsId = getLong(getColumnIndexOrThrow("sns_id")),
-        userName = getString(getColumnIndexOrThrow("user_name")),
-        createTime = getLong(getColumnIndexOrThrow("create_time")),
-        type = getInt(getColumnIndexOrThrow("type")),
-        sourceType = getInt(getColumnIndexOrThrow("source_type")),
-        localFlag = getInt(getColumnIndexOrThrow("local_flag")),
-        subType = getInt(getColumnIndexOrThrow("sub_type")),
-        serverExtFlag = getInt(getColumnIndexOrThrow("server_ext_flag")),
-        head = getString(getColumnIndexOrThrow("head")),
-        stringSeq = getString(getColumnIndexOrThrow("string_seq")),
-        content = getBlob(getColumnIndexOrThrow("content")),
-        attrBuf = getBlob(getColumnIndexOrThrow("attr_buf")),
-        postBuf = getBlob(getColumnIndexOrThrow("post_buf")),
-        at = getLong(getColumnIndexOrThrow("at")),
-    )
 
     object WxidType {
         const val FRIEND = 0

@@ -1,6 +1,5 @@
 package com.lx.wxgroup.feature
 
-import com.lx.wxgroup.feature.SnsScanCursor.Src
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
@@ -10,86 +9,18 @@ import org.junit.Test
  * [SnsScanCursor] 的判据回归测试 —— `MomentsExport.kt` 的 KDoc 一直引着本类，
  * 但 R20 之前它并不存在（`grep MomentsExportScanTest` 零命中）。
  *
- * 测的是**一轮导出**里游标的四件事：跨源去重、切源、游标推进、负 snsId 保真。
- * 这四件写错了都只在真机跑满一整轮才暴露：
+ * 测的是**一轮导出**里游标的三件事：去重、游标推进、负 snsId 保真。
+ * 这三件写错了都只在真机跑满一整轮才暴露：
  *
  * | 写错 | 真机症状 |
  * |---|---|
- * | 跨源去重漏了 | 同一条动态导出两遍（归档里也有同一条） |
- * | 切源写错 / 复位漏了 | 当前源扫完就 `break`，归档永远不扫（已删动态全丢） |
+ * | 去重漏了 | 同一条动态导出两遍 |
  * | 去重跳过时不推进游标 | 键集分页原地打转 ⇒ 死循环，一轮导出永远不结束 |
  * | 拿 `toInt()` 存 snsId | 两条不同的负 id 撞成同一个 key，其中一条被静默吞掉 |
  *
  * ⛔ 纯 JVM 测试：`SnsScanCursor` 刻意不碰 Android / 数据库，正是为了能在这里跑。
  */
 class MomentsExportScanTest {
-
-    // ------------------------------------------------------------ 跨源去重
-
-    /**
-     * 跨源去重：同一条动态在当前源处理过，切到归档再遇到就必须跳过。
-     *
-     * 真机故障：`SnsGuard` 拦 DELETE 时会把整行快照写进 `sns_archive`，
-     * 所以一条**刚发就被删、且当前源先扫到**的动态两个源里都有。
-     * 去重只在单源内做 ⇒ 导出两遍，同一目录下白写一次（且 `sk` 计数失真）。
-     *
-     * 同时锁住「游标是**每轮新建**的」：换一个游标（= 下一轮导出）同一条该重新算
-     * `true` —— 磁盘已导出由 `exported` 集合管，不该被上一轮的 `seen` 粘住。
-     */
-    @Test
-    fun sameSnsIdIsDedupedAcrossSources() {
-        val id = -3447438253133393222L
-
-        val cur = SnsScanCursor()
-        assertTrue("当前源第一次出现必须处理", cur.first(id, emptySet()))
-        assertTrue("当前源扫完应切到归档", cur.nextSource())
-        assertEquals(Src.ARCHIVE, cur.src)
-        assertFalse("⛔ 归档里的同一条必须被跨源去重挡掉", cur.first(id, emptySet()))
-        assertFalse("同一游标内再出现仍然是 false", cur.first(id, emptySet()))
-
-        val next = SnsScanCursor()
-        assertTrue("下一轮是新游标，seen 不该跨轮继承", next.first(id, emptySet()))
-    }
-
-    // ------------------------------------------------------------ 切源
-
-    /**
-     * 当前源扫完 ⇒ `nextSource()` 返回 true，且 `(ct, sid)` 都复位成 `MAX_VALUE`。
-     *
-     * 真机故障：归档是**另一张表**，它自己的最新一页也从 `(MAX_VALUE, MAX_VALUE)` 开始。
-     * 切源时忘了复位 ⇒ 归档第一页用当前源最后一行（很旧的时间戳）当上界 ⇒
-     * 归档里比它新的全部漏扫，日志上看还是「归档扫了 N 行」，纯粹静默丢数据。
-     */
-    @Test
-    fun nextSourceSwitchesToArchiveAndResetsCursor() {
-        val cur = SnsScanCursor()
-        assertEquals(Src.CURRENT, cur.src)
-        cur.advanceTo(createTime = 1_700_000_000L, snsId = -123L)
-
-        assertTrue(cur.nextSource())
-        assertEquals("应切到归档源", Src.ARCHIVE, cur.src)
-        assertEquals("⛔ 切源必须复位 createTime，否则归档第一页被旧上界截掉", Long.MAX_VALUE, cur.ct)
-        assertEquals("⛔ 切源必须复位 snsId", Long.MAX_VALUE, cur.sid)
-    }
-
-    /**
-     * 归档是**最后一个**源：`src == ARCHIVE` 时 `nextSource()` 返回 false 且 `src` 不变。
-     *
-     * 真机故障：这里返回 true 就会拿归档游标再扫一遍归档（重复页 / 原地循环）；
-     * 而 `src` 被改成某个第三态更糟 —— `runBlocking` 的 `when` 只认两个分支，
-     * 扫行逻辑彻底走空，整轮导出静默变成 0 行。
-     */
-    @Test
-    fun archiveIsLastSourceAndSwitchReturnsFalse() {
-        val cur = SnsScanCursor()
-        assertTrue(cur.nextSource())
-        cur.advanceTo(createTime = 1_600_000_000L, snsId = 42L)
-
-        assertFalse("⛔ 归档之后再没有源了，必须返回 false 让主循环 break", cur.nextSource())
-        assertEquals("src 不许再变", Src.ARCHIVE, cur.src)
-        assertEquals("返回 false 时不该偷偷复位游标", 1_600_000_000L, cur.ct)
-        assertEquals(42L, cur.sid)
-    }
 
     // ------------------------------------------------------------ 游标推进
 
@@ -145,7 +76,7 @@ class MomentsExportScanTest {
     /**
      * 真机 snsId 是 **Long 且为负**（实测 `-3447438253133393222`）。
      *
-     * 真机故障：老代码在归档那边用 `snsId.toInt()` 当 key，两个不同的负 Long
+     * 真机故障：老代码用 `snsId.toInt()` 当 key，两个不同的负 Long
      * 会被截断成同一个 int ⇒ 后一条被当成「已处理」静默吞掉。
      * 本测试用两个高 32 位不同、低 32 位相同的 Long 精确复现这个坑：
      * 若 `seen` 是 `HashSet<Int>`，第二条必然返回 false。
