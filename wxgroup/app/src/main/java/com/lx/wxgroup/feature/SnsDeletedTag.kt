@@ -500,14 +500,38 @@ object SnsDeletedTag {
     }
 
     /**
-     * adapter 类 → 已校准的「封面头导致的全局固定错位常数」。
+     * adapter 类 → 已校准的「封面头导致的全局固定错位常数」及其可信度。
      *
      * ⛔ key 只按 adapter 类、**不含 list.size**：错位是封面头占位造成的常数，与列表长度无关。
      * 旧版用 `"类名#list.size"`，新发一条动态使 size 变化就把校准值冲掉，逼得每次绑定都重新
      * 「0 优先」猜偏移，正是「相邻同名串位」误报的放大器（见 docs/_r42_deltag_false_positive.md A5）。
-     * 值只在「窗口非歧义（恰好一个候选通过护栏）」时写入/更新。
+     *
+     * 值从裸 `Int` 升级为 [SnsDeletedTagLogic.Learned]：`offset` 是错位常数（**0 是合法值**，N6），
+     * `headerSig` 是采样时的头部签名（头部项数 H），`votes` 是无歧义采样票数。头部构成变化 ⇒
+     * `headerSig` 变化 ⇒ [SnsDeletedTagLogic.reconcile] 判失效 ⇒ 旧常数不复用（N1）。
+     *
+     * ⛔ **该 map 里的条目只增改、不删除**：`newStored == null` 只表示「本次不更新」，绝不 remove。
+     * 陈旧条目永不误用 —— [SnsDeletedTagLogic.reconcile] 已用 `headerSig` 把关（签名不符即拒）；
+     * 签名回到旧值时期旧常数本来就重新有效。删除只会制造「滚回顶部再滚回来」时校准被物理清除、
+     * 灰标先消失再补回的可见闪烁（B1）。
+     *
+     * ⛔ 该 map 的「读-算-写」必须整段在 `synchronized(offsets)` 内（见 [resolve]），
+     * 否则 `Collections.synchronizedMap` 只保证单次 get/put 原子、不保证 check-then-act 原子。
+     * [firstDataPos] 与 `offsets` 用**同一把** `synchronized(offsets)` 锁保护。
      */
-    private val offsets = Collections.synchronizedMap(HashMap<String, Int>())
+    private val offsets = Collections.synchronizedMap(HashMap<String, SnsDeletedTagLogic.Learned>())
+
+    /**
+     * adapter 类 → 头部占位签名观测值（首个数据项 adapter position = 头部项数 H = -O）。
+     * `-1` = 尚未观测到任何数据项（签名未知，此时任何偏移都不被采信）。
+     *
+     * ⛔ **必须按 adapter 类分键**（与 [offsets] 同 key、同一把 `synchronized(offsets)` 锁保护）：
+     * [install] 挂在通用 `WxRecyclerAdapter.onBindViewHolder` 上，聊天列表等其它 adapter 也会进来；
+     * 它们的 `getData()` 不含 SnsInfo ⇒ `passing` 恒空 ⇒ 被当成「头部」，若签名是全局单例就会被
+     * 改坏 ⇒ `consistent(-1, 2)=false` ⇒ 正确采样全被 [SnsDeletedTagLogic.vote] 拒掉 ⇒ 整个会话
+     * 永久漏标（B2）。分键后各 adapter 的签名互不污染。
+     */
+    private val firstDataPos = HashMap<String, Int>()
 
     /**
      * pos → 数据元素。封面头让 pos 与 getData() 下标存在【全局固定错位】O。
@@ -516,9 +540,9 @@ object SnsDeletedTag {
      * 作者名，同一好友连续两条动态时 `d=0`（错位后恰指向相邻那条）与 `d=O`（本条自己）都通过
      * ⇒ 新发未删动态被锚到相邻「已删除」动态的 snsId ⇒ 误挂灰标（2026-11-07 真机）。
      *
-     * 新逻辑：收集窗口里通过护栏的偏移，交 [SnsDeletedTagLogic.anchorOffset] 决策 ——
-     * 已校准时**沿用错位常数**（抵御 `d=0` 假命中），未校准且窗口歧义时**保守返回 null**（不打标）。
-     * nameOk 仍是防「标到别人动态上」的护栏，只是不再拿它区分同一人两条动态（本就做不到）。
+     * 新逻辑：收集窗口里通过护栏的偏移，交 [SnsDeletedTagLogic.calibrate] 决策 ——
+     * 已校准且头部签名一致时**沿用错位常数**（抵御 `d=0` 假命中）；头部签名变化（N1）或未校准
+     * 且窗口歧义时**保守返回 null**（不打标）。nameOk 仍是防「标到别人动态上」的护栏。
      */
     private fun resolve(adapter: Any, pos: Int, itemView: View): SnsDeletedTagLogic.Info? {
         val list = dataList(adapter) ?: run {
@@ -531,7 +555,6 @@ object SnsDeletedTag {
         }
         val texts = textsOf(itemView)
         val key = adapter.javaClass.name
-        val learned = offsets[key]
         val order = intArrayOf(0, 1, -1, 2, -2)
         val passing = ArrayList<Int>(order.size)
         val byOffset = HashMap<Int, SnsDeletedTagLogic.Info>(order.size)
@@ -540,24 +563,34 @@ object SnsDeletedTag {
             byOffset[d] = info
             if (SnsDeletedTagLogic.nameOk(info.name, texts)) passing += d
         }
-        val d = SnsDeletedTagLogic.anchorOffset(passing, learned) ?: run {
-            lastMiss = "ambig(pos=$pos/${list.size} passing=$passing learned=$learned " +
+        // ⛔ 原子「读-算-写」：offsets 是 synchronizedMap，但 check-then-act 必须整段锁住，
+        // 否则 UI 线程与探针线程（setStyle/purge → resweep → resolve）并发会丢失更新/读脏值。
+        // 头部签名观测（firstDataPos，按 adapter key 分键）与 offsets 同一把锁保护（B2）。
+        var headerSig = -1
+        val cal = synchronized(offsets) {
+            headerSig = SnsDeletedTagLogic.observeHeader(
+                firstDataPos[key] ?: -1, pos, passing.isNotEmpty(),
+            )
+            firstDataPos[key] = headerSig
+            val stored = offsets[key]
+            val c = SnsDeletedTagLogic.calibrate(passing, stored, headerSig)
+            // ⛔ newStored==null 只许「不更新」，不许 remove：offsets 条目只增改、不删除（见 KDoc）。
+            //    失效靠 reconcile 的 headerSig 把关（签名不符即拒），删除只会制造灰标闪烁（B1）。
+            if (c.newStored != null) offsets[key] = c.newStored
+            c
+        }
+        if (cal.d == null) {
+            lastMiss = "ambig(pos=$pos/${list.size} passing=$passing headerSig=$headerSig " +
                 "texts=[${texts.take(3).joinToString("|") { it.take(10) }}]"
             return null
         }
-        // 校准：只有「非歧义唯一通过」才更新错位常数；d==0 不必缓存（沿用原语义）。
-        // 歧义且沿用 learned 成功时 passing.size>1，不动缓存。
-        if (passing.size == 1) {
-            if (d != 0) offsets[key] = d else offsets.remove(key)
-        }
-        // B1：本次绑定把错位常数首次从 null 校准成非零值 ⇒ 本轮之前被保守放弃（HIDE、pending）的
-        // 同屏 item 有救了，重扫补标。⛔ 用纯判据与 d 解耦：d==0 不缓存 ⇒ after 仍 null ⇒ 不触发。
-        // 防重入由 resweep 内的 resweeping 布尔兜底（此处不判，保持纯判据单一职责）。
-        if (SnsDeletedTagLogic.shouldResweep(learned, offsets[key])) {
+        // B1：错位常数首次可用 ⇒ 本轮之前被保守放弃（HIDE、pending）的同屏 item 有救，重扫补标。
+        // 触发与 d 解耦、由 cal.resweep 判据决定（0 也触发，N6）。防重入由 resweep 内 resweeping 布尔兜底。
+        if (cal.resweep) {
             resweep()
         }
-        logOnce("SNSDEL offset=$d (pos=$pos/${list.size} learned=$learned passing=$passing)")
-        return byOffset[d]
+        logOnce("SNSDEL offset=${cal.d} (pos=$pos/${list.size} headerSig=$headerSig passing=$passing)")
+        return byOffset[cal.d]
     }
 
     private fun infoAt(list: List<*>, p: Int): SnsDeletedTagLogic.Info? {

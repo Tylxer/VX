@@ -175,13 +175,99 @@ object SnsDeletedTagLogic {
         return null
     }
 
+    // ------------------------------------------------------------------ 错位常数可信度（N1+N6 合并治理，纯函数，供单测）
+
+    /**
+     * 一次绑定的错位常数状态。
+     *
+     * - `offset` = 已校准的「封面头导致的全局固定错位常数」O；
+     * - `votes` = 无歧义采样的票数（同偏移同签名才累加，封顶 2）；
+     * - `headerSig` = 采样当时的头部占位签名 = 头部项数 H（满足 `O = -H`）。
+     */
+    data class Learned(val offset: Int, val votes: Int, val headerSig: Int)
+
+    /**
+     * 错位常数与头部签名的一致性判据：`O == -H`。
+     *
+     * ⛔ 这是「毒样本」的唯一闸门：O=-1 的机器上（H=1）若某窗口采样到 `passing=[0]`，
+     * `0 != -1` ⇒ 该采样被判为不一致、被 [vote] 拒绝、绝不落票 ⇒ 不会把 0 升为可信。
+     */
+    fun consistent(offset: Int, headerSig: Int): Boolean = offset == -headerSig
+
+    /**
+     * 头部占位签名观测（纯函数，供 JVM 单测）。`prev` = 上一次观测到的「首个数据位」adapter position
+     * （= 头部项数 H = -O），`-1` = 尚未观测到任何数据项（签名未知）。
+     *
+     * - 数据项（`isData=true`）⇒ 取单调最小 pos（首绑即 pos，其后 `min`）；
+     * - 头部项（`isData=false`）：
+     *   - 未知（`prev=-1`）⇒ 保持未知 `-1`（别把「从来就是头部」的位置当成观测起点）；
+     *   - `pos == prev` ⇒ 原先的首个数据位现在成了头部 ⇒ 头部变多，前移成 `pos + 1`
+     *     （正向已知值，可立刻参与 [consistent] 校验，**绝不退化成 -1 失明**）；
+     *   - 其它 ⇒ 保持不变。
+     *
+     * ⛔ 复位判据必须是 `pos == prev`（**不是 `<=`**）：真机 H=1 时封面项在 pos=0，用户滚回顶部
+     * 重绑封面（`pos=0 < prev=1`）不能把签名复位 —— 否则 [reconcile] 判签名不一致 ⇒ 校准被误判失效，
+     * 调用侧若因此 remove 条目就会制造「滚回顶部再滚回来」灰标先消失再补回的可见闪烁（B1）。
+     */
+    fun observeHeader(prev: Int, pos: Int, isData: Boolean): Int {
+        if (isData) {
+            return if (prev < 0) pos else minOf(prev, pos)
+        }
+        if (prev < 0) return prev
+        return if (pos == prev) pos + 1 else prev
+    }
+
+    /**
+     * 当前头部结构（`headerSig`）下，`stored` 是否仍可信。
+     *
+     * 头部构成变化 ⇒ `headerSig` 变化 ⇒ 返回 null ⇒ 旧常数立即失效（N1）。
+     * 这是「可信度显式建模」：可信 = 签名一致，**不是「非 null 即可信」**。
+     */
+    fun reconcile(stored: Learned?, headerSig: Int): Learned? =
+        if (stored != null && stored.headerSig == headerSig) stored else null
+
+    /**
+     * 投票更新。
+     *
+     * - 只接受与头部签名一致的偏移（毒样本被拒，`0` 是合法值但必须与 `headerSig` 一致）；
+     * - 同偏移同签名累票（封顶 2），偏移或签名不同则重置为 1 票（重置 = 旧票作废）。
+     */
+    fun vote(stored: Learned?, offset: Int, headerSig: Int): Learned? {
+        if (!consistent(offset, headerSig)) return stored
+        if (stored == null || stored.offset != offset || stored.headerSig != headerSig) {
+            return Learned(offset, 1, headerSig)
+        }
+        return Learned(offset, minOf(stored.votes + 1, 2), headerSig)
+    }
+
+    /**
+     * 一次绑定的完整校准决策（`resolve()` 在 `synchronized(offsets)` 内调用，原子读-算-写）。
+     *
+     * - `d` = 本格该用的偏移（null = 保守放弃）；
+     * - `newStored` = 写回 `offsets[key]` 的新状态（**null = 本次不更新，保持现状**）；
+     * - `resweep` = 是否触发重扫（错位常数「首次可用」）。
+     */
+    class Calibration(val d: Int?, val newStored: Learned?, val resweep: Boolean)
+
+    /**
+     * 校准决策纯函数：先 [reconcile] 校验头部签名（N1 失效），再 [anchorOffset] 锚定，
+     * 无歧义窗口落 [vote]，最后 [shouldResweep] 判是否重扫。
+     */
+    fun calibrate(passing: List<Int>, stored: Learned?, headerSig: Int): Calibration {
+        val learned = reconcile(stored, headerSig)
+        val d = anchorOffset(passing, learned)
+        if (d == null) return Calibration(null, learned, false)
+        val after = if (passing.size == 1) vote(learned, d, headerSig) else learned
+        return Calibration(d, after, shouldResweep(learned, after))
+    }
+
     // ------------------------------------------------------------------ 窗口锚定 / 渲染决策（误报修复，纯函数，供单测）
 
     /**
      * 一次绑定的窗口锚定决策（修「相邻同名动态串位」）。
      *
      * - `passing` = 按 `0,1,-1,2,-2` 顺序排列的、通过身份护栏（[nameOk]）的偏移列表；
-     * - `learned` = 已校准的「封面头导致的全局固定错位常数」（`null` = 尚未校准）。
+     * - `learned` = 已通过 [reconcile] 校验（头部签名一致）的错位常数，`null` = 无可信常数。
      *
      * 返回这一格该用的偏移；`null` = 无法可靠锚定（保守，不打标）。
      *
@@ -191,31 +277,34 @@ object SnsDeletedTagLogic {
      * `0` 排在前面 ⇒ 新发未删动态被锚到相邻「已删除」动态的 snsId ⇒ 查表命中 ⇒ 误挂灰标。
      *
      * 互斥三分支（顺序即优先级，不并列）：
-     * 1. `learned` 非空且本次仍通过护栏 ⇒ 沿用 `learned`（同名相邻窗口里抵御 `d=0` 的假命中）；
+     * 1. `learned` 非空且本次仍通过护栏 ⇒ 沿用 `learned.offset`（同名相邻窗口里抵御 `d=0` 的假命中）；
+     *    ⛔ 收紧（N1）：这里的 `learned` 必须是**已 reconcile 过**的，即头部签名一致；过期常数
+     *    在 reconcile 一步已被置 null，根本到不了分支 1。
      * 2. 否则 `passing` 恰好一个 ⇒ 采信它（非歧义，可拿来校准错位常数）；
      * 3. 否则（歧义且无 `learned`）⇒ `null`（漏标好过打错标）。
      */
-    fun anchorOffset(passing: List<Int>, learned: Int?): Int? {
-        if (learned != null && learned in passing) return learned
+    fun anchorOffset(passing: List<Int>, learned: Learned?): Int? {
+        if (learned != null && learned.offset in passing) return learned.offset
         return passing.singleOrNull()
     }
 
     /**
      * 一次绑定「是否触发 resweep 重扫」的纯判据（B1 冷启首屏灰标补标修复）。
      *
-     * - `before` = 校准前的错位常数（`resolve()` 里读到的 `learned`，null = 尚未校准）；
-     * - `after`  = 校准后的错位常数（`offsets[key]`；`d==0` 时校准块 `remove` ⇒ 仍为 null）。
+     * - `before` = 校准前的错位常数（`reconcile` 后、`vote` 前，null = 无可信常数）；
+     * - `after`  = 校准后的错位常数（`offsets[key]` 的新状态，null = 无条目）。
      *
-     * 只有「本次绑定把错位常数**首次**从 null 校准成**非零**值」才触发重扫，让本轮之前被
+     * 只有「本次绑定把错位常数**首次**从 null 变成可用值」才触发重扫，让本轮之前被
      * 保守放弃（HIDE）的同屏 item 有机会在 `resweep` 里重新 `resolve` 补标。
-     * 其余（已校准 / 校准出 0 / 校准失败）都不触发 —— 避免无谓重绘，也避免 `resweep` 里
+     * 其余（已校准 / 校准失败 / 退化）都不触发 —— 避免无谓重绘，也避免 `resweep` 里
      * `resolve` 再触发 `resweep` 造成递归（真正的防重入由 `resweeping` 布尔兜底）。
      *
-     * ⛔ `after != 0` 是刻意的：`d==0` 不缓存（校准块 `remove`），「把 0 当错位常数缓存」是
-     * 旧误报放大器，绝不能因 `after=0` 就触发重扫扩散成新错标。
+     * ⛔ N6 修复：`0` 现在是**合法值**，`null → Learned(0,*,0)` 照常触发重扫（O=0 设备不再退化）。
+     * 旧版的 `after != 0` 把「0 当未知哨兵」的做法已废弃 —— 那正是 O=0 设备 resweep 永不触发的根因。
+     * 0 是否可信由 [reconcile]/[consistent] 的头部签名校验兜底，不靠「不缓存 0」来兜底。
      */
-    fun shouldResweep(before: Int?, after: Int?): Boolean =
-        before == null && after != null && after != 0
+    fun shouldResweep(before: Learned?, after: Learned?): Boolean =
+        before == null && after != null
 
     /** 一次绑定的渲染决策：要么插灰标（SHOW），要么把灰标摘掉（HIDE）。 */
     enum class MarkAction {
