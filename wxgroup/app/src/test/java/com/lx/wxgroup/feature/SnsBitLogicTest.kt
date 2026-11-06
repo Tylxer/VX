@@ -2,6 +2,7 @@ package com.lx.wxgroup.feature
 
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
+import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Test
 
@@ -237,5 +238,199 @@ class SnsBitLogicTest {
         assertFalse(
             SnsBitLogic.looksLikeSourceWrite("UPDATE Message SET sourceType = 2")
         )
+    }
+
+    // ------------------------------------------------------------------ 写回值（R42 bit3 缺口）
+    // 判据写错的代价是静默的（主页消失 / 把不可见动态复活），且变异方向多，故逐条钉死。
+
+    private fun keep(old: Int?) = SnsBitLogic.keepAliveSource(old)
+
+    @Test
+    fun visible_mask_is_the_union_of_the_two_bits() {
+        assertEquals(
+            "VISIBLE_MASK 必须正好是 bit1|bit3",
+            SnsBitLogic.BIT_TIMELINE or SnsBitLogic.BIT_ALBUM,
+            SnsBitLogic.VISIBLE_MASK,
+        )
+        assertEquals(10, SnsBitLogic.VISIBLE_MASK)
+    }
+
+    @Test
+    fun keep_alive_typical_four_values() {
+        // team-lead 点名的四个 src：0 不复活、2/8 补成 10、10 幂等
+        assertNull("old=0 死来源，不许复活", keep(0))
+        assertEquals("⭐ 缺口场景 2 → 10", 10, keep(2)!!)
+        assertEquals("old=8 只补 bit3 不够，要连 bit1 一起补", 10, keep(8)!!)
+        assertEquals("old=10 已可见，写回是幂等 no-op", 10, keep(10)!!)
+    }
+
+    @Test
+    fun keep_alive_degrades_when_bits_unreadable() {
+        // 硬约束 2：bits 读不到时绝不凭空造位
+        assertNull(keep(null))
+    }
+
+    @Test
+    fun keep_alive_does_not_resurrect_fully_invisible_values() {
+        // 两个可见位都没有 ⇒ 不写回（不制造可见性）
+        for (v in intArrayOf(0, 4, 32, 128, 256, 512, 1, 64)) {
+            assertNull("old=$v 两个可见位皆无，不许复活", keep(v))
+        }
+    }
+
+    @Test
+    fun keep_alive_preserves_high_bits() {
+        // ⛔ 不是常量 10：高位必须原样保留
+        assertEquals(138, keep(130)!!)  // 130=128|2 → 138=128|8|2
+        assertEquals(266, keep(264)!!)  // 264=8|256 → 266=8|256|2
+        assertEquals(266, keep(266)!!)  // 已含两位 ⇒ 幂等
+        assertEquals(14, keep(6)!!)     // 6=2|4 私密位也保留
+    }
+
+    @Test
+    fun keep_alive_is_not_a_constant() {
+        assertTrue("写死 10 会抹掉 264 的 256 位", keep(264)!! != 10)
+    }
+
+    @Test
+    fun keep_alive_only_adding_bit3_is_wrong() {
+        // ⛔ `old or 8` 会把「只在相册」的 8 留在「时间线仍不可见」
+        assertTrue(
+            "old=8 只补 bit3 得 8，bit1 仍缺",
+            keep(8)!! != (8 or SnsBitLogic.BIT_ALBUM),
+        )
+        assertEquals("old=8 必须连 bit1 一起补 ⇒ 10", 10, keep(8)!!)
+    }
+
+    @Test
+    fun keep_alive_is_idempotent_and_only_adds_bits() {
+        for (old in intArrayOf(2, 8, 10, 130, 138, 264, 266, 6, 14)) {
+            val k = keep(old)!!
+            // 幂等：再跑一次值不变（微信重试删除不会越写越大）
+            assertEquals("old=$old 二次写回必须收敛", k, keep(k)!!)
+            // 只加位、不删位：old 是 k 的子集
+            assertEquals("old=$old 写回不许丢掉任何旧位", 0, old and k.inv())
+            // 两个可见位都在
+            assertEquals(SnsBitLogic.VISIBLE_MASK, k and SnsBitLogic.VISIBLE_MASK)
+        }
+    }
+
+    @Test
+    fun rewrite_path_keep_is_always_distinct_from_want() {
+        // 会被拦的写入：want 是 0 或纯降位（缺至少一个可见位）；keep 必含两可见位 ⇒ 必不等。
+        // 这条是 afterShape 第 2 类「keep != want」成立的前提，不能只靠口头约定。
+        val pairs = listOf(
+            0 to 2, 0 to 8, 0 to 10,   // 写 0 路径（want=0，old 含可见位）
+            8 to 10, 2 to 10,          // 纯降位路径：10→8 清 bit1 / 10→2 清 bit3
+        )
+        for ((w, old) in pairs) {
+            val k = keep(old)!!
+            assertTrue("want=$w old=$old ⇒ keep=$k 必须与 want 不同", k != w)
+            assertEquals(
+                "want=$w keep=$k observed=$k 必须判为「拦住了·写回」",
+                SnsBitLogic.AfterShape.BLOCKED_BY_REWRITE,
+                SnsBitLogic.afterShape(w, k, k),
+            )
+        }
+    }
+
+    // ------------------------------------------------------------------ after 互斥形态判据
+
+    @Test
+    fun after_shape_removed_path_is_blocked() {
+        // 降级 / 不复活路径：键被摘掉 ⇒ observed=null ⇒ 拦住了
+        assertEquals(
+            SnsBitLogic.AfterShape.BLOCKED_BY_REMOVE,
+            SnsBitLogic.afterShape(want = 0, keep = null, observed = null),
+        )
+        // 即使本来算出了 keep，只要 after 读不到键就按「摘键」算（互斥优先）
+        assertEquals(
+            SnsBitLogic.AfterShape.BLOCKED_BY_REMOVE,
+            SnsBitLogic.afterShape(want = 2, keep = 10, observed = null),
+        )
+    }
+
+    @Test
+    fun after_shape_rewrite_path_is_blocked() {
+        assertEquals(
+            SnsBitLogic.AfterShape.BLOCKED_BY_REWRITE,
+            SnsBitLogic.afterShape(want = 0, keep = 10, observed = 10),
+        )
+        assertEquals(
+            SnsBitLogic.AfterShape.BLOCKED_BY_REWRITE,
+            SnsBitLogic.afterShape(want = 8, keep = 10, observed = 10),
+        )
+        assertEquals(
+            SnsBitLogic.AfterShape.BLOCKED_BY_REWRITE,
+            SnsBitLogic.afterShape(want = 2, keep = 10, observed = 10),
+        )
+    }
+
+    @Test
+    fun after_shape_not_blocked_when_want_still_present() {
+        // 防御性守门：记了 BLOCKED 但 ContentValues 里仍是微信原值 ⇒ 没拦住（不许误报成功）
+        assertEquals(
+            SnsBitLogic.AfterShape.NOT_BLOCKED,
+            SnsBitLogic.afterShape(want = 0, keep = null, observed = 0),
+        )
+        assertEquals(
+            SnsBitLogic.AfterShape.NOT_BLOCKED,
+            SnsBitLogic.afterShape(want = 8, keep = 10, observed = 8),
+        )
+    }
+
+    @Test
+    fun after_shape_unknown_is_not_silently_swallowed() {
+        // 形态异常：值既不是 want 也不是 keep ⇒ 单独一类，不许归到拦住/没拦住
+        assertEquals(
+            SnsBitLogic.AfterShape.UNKNOWN,
+            SnsBitLogic.afterShape(want = 0, keep = 10, observed = 6),
+        )
+        assertEquals(
+            SnsBitLogic.AfterShape.UNKNOWN,
+            SnsBitLogic.afterShape(want = 8, keep = null, observed = 10),
+        )
+    }
+
+    @Test
+    fun after_shape_keep_equals_want_is_not_rewritten() {
+        // ⭐ 互斥前提：keep==want 时第 2 类不得命中，否则与 NOT_BLOCKED 同时为真。
+        // 这是「keep != want」守卫的专用反例（变异 M5 会把它变红）。
+        assertEquals(
+            SnsBitLogic.AfterShape.NOT_BLOCKED,
+            SnsBitLogic.afterShape(want = 10, keep = 10, observed = 10),
+        )
+        assertEquals(
+            SnsBitLogic.AfterShape.NOT_BLOCKED,
+            SnsBitLogic.afterShape(want = 2, keep = 2, observed = 2),
+        )
+    }
+
+    @Test
+    fun after_shape_is_mutually_exclusive_and_total() {
+        // 穷举一组输入：每个组合恰好落一类，且三个「证据」不能有两个同时为真
+        val wants = intArrayOf(0, 2, 8, 10, 130)
+        val keeps = arrayOf<Int?>(null, 2, 8, 10, 130, 138)
+        val observed = arrayOf<Int?>(null, 0, 2, 8, 10, 130, 138, 6)
+        var blocked = 0
+        var notBlocked = 0
+        var unknown = 0
+        for (w in wants) for (k in keeps) for (ob in observed) {
+            val s = SnsBitLogic.afterShape(w, k, ob)
+            val eRemove = ob == null
+            val eRewrite = k != null && k != w && ob == k
+            val eIntact = ob != null && ob == w
+            val evidence = listOf(eRemove, eRewrite, eIntact).count { it }
+            assertTrue("want=$w keep=$k observed=$ob 出现两个以上证据", evidence <= 1)
+            when (s) {
+                SnsBitLogic.AfterShape.BLOCKED_BY_REMOVE,
+                SnsBitLogic.AfterShape.BLOCKED_BY_REWRITE -> blocked++
+                SnsBitLogic.AfterShape.NOT_BLOCKED -> notBlocked++
+                SnsBitLogic.AfterShape.UNKNOWN -> unknown++
+            }
+        }
+        assertTrue("拦住了的样本必须存在", blocked > 0)
+        assertTrue("没拦住的样本必须存在", notBlocked > 0)
+        assertTrue("异常样本必须存在（说明补集非空、不是死分支）", unknown > 0)
     }
 }

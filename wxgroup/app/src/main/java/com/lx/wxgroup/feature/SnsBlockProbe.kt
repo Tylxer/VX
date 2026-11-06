@@ -143,9 +143,17 @@ object SnsBlockProbe {
     /** 区间表上限：分页区间是长尾的，不能无界增长（进程内只做判据，丢新 key 可接受） */
     private const val RANGE_MAX = 64
 
-    // 拦截后立刻回查（证明摘键真的生效：写完之后库里还是原值）
+    // 拦截后 after 校验（R42 bit3 交叉复核后收敛）：
+    // ⛔ afterOk / afterFail **严格保持 HEAD 旧语义** —— 只由 readBits 是否取到 bits 决定，
+    //    一个自增条件都没动。它们是历史报告与反向对照里判断成败的唯一依据，不许被覆盖。
+    // R42 bit3 新增的四个 shape 计数是与它**正交的额外维度**（ContentValues 形态互斥分类），
+    //    独立表达，绝不碰上面两个计数器。见 [finishAfterWrite]。
     private val afterOk = AtomicInteger()
     private val afterFail = AtomicInteger()
+    private val shapeRemoved = AtomicInteger()
+    private val shapeRewritten = AtomicInteger()
+    private val shapeNotBlocked = AtomicInteger()
+    private val shapeUnknown = AtomicInteger()
 
     // ------------------------------------------------------------------ 事件账本
 
@@ -156,6 +164,10 @@ object SnsBlockProbe {
         val before: String,
         /** 微信这次**想写入**的值（`0` = 旧的「清位」路径；`2`/`8` = 新增的降位路径） */
         val want: String,
+        /** [want] 的 Int 形态 —— [SnsBitLogic.afterShape] 的入参，避免 after 里再解析字符串 */
+        val wantInt: Int,
+        /** 本次写回 ContentValues 的保底值；`null` = 没走写回路径（降级 / 不复活） */
+        val keep: Int?,
         /** ContentValues 的 key 数量 —— W3 的核心证据（2~5 个 ⇒ 只带改动列；十几二十个 ⇒ 整行 upsert） */
         val keys: Int,
         val hasContent: Boolean,
@@ -170,37 +182,35 @@ object SnsBlockProbe {
         @Volatile
         var after: String = "?"
 
+        /** after 半场 [SnsBitLogic.afterShape] 的互斥分类结果（`?` = 还没跑） */
+        @Volatile
+        var afterShape: String = "?"
+
         fun line(): String =
-            "BLOCK ev id=$snsId at=$clock before=$before want=$want keys=$keys " +
+            "BLOCK ev id=$snsId at=$clock before=$before want=$want keep=${keep ?: "-"} keys=$keys " +
                 "C=${if (hasContent) 1 else 0} A=${if (hasAttr) 1 else 0} " +
-                "blk=${if (blocked) 1 else 0} after=$after lf=$lf sef=$sef ct=$ct"
+                "blk=${if (blocked) 1 else 0} after=$after shape=$afterShape lf=$lf sef=$sef ct=$ct"
     }
 
     private val events = ArrayList<Event>(RING + 1)
 
-    /** 本次 update 里被我们摘了键的 ContentValues（只用于让 after 钩子回查一次） */
-    private val pending = ThreadLocal<Event?>()
-
     /**
-     * 最近被我们摘过键的 ContentValues 身份。
+     * 本次 update 里被我们拦下的事件（只用于让 after 钩子回查一次）。
      *
-     * 用途：`SnsGuard.onSnsUpdateAfter` 里 `sourceTypeOf(values) == null` 原本要打一条
-     * 「形态变了、补位停用」的告警 —— 拦截模式下这句是**误报**（键是我们自己摘的）。
-     * 用身份比对把它排除掉，比按时间窗猜更准。
+     * ⚠️ **R42 bit3 写回改造 / 前提更正**：旁边原来还有一份 `blockedCvs` 身份集合 +
+     * `isBlockedValues(cv)`，配套旧 KDoc 里的「读不到 sourceType ⇒ 甲已生效」形态观察
+     * （`docs/_r42_block_impl.md` §2 偏差 2）。它们**全项目零调用点**、`onSnsUpdateAfter()`
+     * 也是空函数 ⇒ 死代码，本轮删除（不是因为它们被写回「弄坏」了）。
+     *
+     * ⚠️ **写回值不会让 after 校验链路失效**：[pending] 是 ThreadLocal 事件对象，
+     * [hasPending] / [finishAfterWrite] 与 ContentValues 里有没有 `sourceType` 键**完全无关**。
+     * 真正的 after 校验仍是 `finishAfterWrite` 回查 `readBits`，且 `afterOk`/`afterFail`
+     * 严格保持 HEAD 旧语义（只由 `bits != null` 决定）。
+     *
+     * 额外新增 [SnsBitLogic.afterShape] 互斥形态判据（四个独立新计数器）用于**自证**与
+     * 订正旧日志口径，与回查维度正交、互不覆盖。见 `docs/_r42_bit3_impl.md` §2。
      */
-    private val blockedCvs = ArrayList<Any>(8)
-
-    private fun rememberBlockedCv(cv: Any) {
-        synchronized(blockedCvs) {
-            blockedCvs.add(cv)
-            while (blockedCvs.size > 8) blockedCvs.removeAt(0)
-        }
-    }
-
-    /** 这个 ContentValues 是不是刚被本钩子摘掉过 `sourceType` */
-    fun isBlockedValues(cv: Any): Boolean = synchronized(blockedCvs) {
-        blockedCvs.any { it === cv }
-    }
+    private val pending = ThreadLocal<Event?>()
 
     private val lastHitMs = AtomicLong(0L)
     private val lastStatEl = AtomicLong(0L)
@@ -284,8 +294,12 @@ object SnsBlockProbe {
     /**
      * 记录一次命中的现场。
      *
-     * @param cv 被摘键的 ContentValues（只有 [Outcome.BLOCKED] 时非空，用于事后回查配对）
+     * @param cv 本次被拦的 ContentValues（只有 [Outcome.BLOCKED] 时非空，用于给 after 配对；
+     *           ⚠️ 身份集合已随写回改造删除，这里只借它判「非空」来 set [pending]）
      * @param newValue 微信想写入的值；`null` = 写 0 路径（旧语义），`!= 0` = 降位路径
+     * @param keep 本次写回 ContentValues 的保底值；`null` = 没走写回路径（降级 / 不复活）。
+     *             ⚠️ 由 [SnsGuard.applyBlock] 用 [SnsBitLogic.keepAliveSource] 算出后传入，
+     *             after 的 [SnsBitLogic.afterShape] 靠它区分「写回生效」与「没拦住」
      * @return 记进账本的事件
      */
     fun record(
@@ -297,6 +311,7 @@ object SnsBlockProbe {
         outcome: Outcome,
         cv: Any? = null,
         newValue: Int? = null,
+        keep: Int? = null,
     ): Event {
         val isDrop = newValue != null && newValue != 0
         if (isDrop) {
@@ -313,6 +328,8 @@ object SnsBlockProbe {
             snsId = snsId,
             before = bits?.src?.toString() ?: "?",
             want = (newValue ?: 0).toString(),
+            wantInt = newValue ?: 0,
+            keep = keep,
             keys = keys,
             hasContent = hasContent,
             hasAttr = hasAttr,
@@ -326,10 +343,7 @@ object SnsBlockProbe {
             Outcome.BLOCKED -> {
                 if (isDrop) dropBlocked.incrementAndGet() else blocked.incrementAndGet()
                 if (snsId == 0L) skipNoId.incrementAndGet()
-                if (cv != null) {
-                    rememberBlockedCv(cv)
-                    pending.set(e)
-                }
+                if (cv != null) pending.set(e)
                 logBlockedThrottled(e, isDrop)
             }
             Outcome.OFF -> if (isDrop) dropOff.incrementAndGet() else skipOff.incrementAndGet()
@@ -346,27 +360,82 @@ object SnsBlockProbe {
     }
 
     /**
-     * 拦截的 after 钩子：立刻回查这条的 `sourceType`，证明「键摘掉后库里没被改成 0」。
+     * 拦截的 after 半场：**回查库里值（HEAD 旧语义）** + **互斥形态判定（新增正交维度）**。
      *
-     * ⚠️ 必须在 after 里做，不能放 before：before 里查到的还是这次写之前的旧值，
-     * 证明不了「清位没落地」。
+     * ## 两个正交维度，谁都不覆盖谁（交叉复核底线）
+     * 1. **回查维度**：`bits == null` ⇒ `afterFail++` / `e.after="?"`；`bits != null` ⇒
+     *    `afterOk++` / `e.after=bits.src`。**与 HEAD 逐字一致**，自增条件与位置一个都没动。
+     * 2. **形态维度**：纯函数 [SnsBitLogic.afterShape] 把 ContentValues 现值分四类，
+     *    用 `shapeRemoved / shapeRewritten / shapeNotBlocked / shapeUnknown` 四个**新**计数器
+     *    独立表达，⛔ 绝不碰 `afterOk/afterFail`。
+     *
+     * ## 为什么写回值**不会**让 after 校验链路失效（team-lead 前提更正）
+     * `pending` 是 ThreadLocal 事件对象，[hasPending] / 本函数与 ContentValues 里有没有
+     * `sourceType` 键**完全无关**；`onSnsUpdateAfter` 是空函数、`isBlockedValues`/`blockedCvs`
+     * 全项目零调用点（死代码）。所以这里不需要「修好」任何被写回破坏的东西 ——
+     * 旧 KDoc（`SnsGuard.kt:218`）和旧日志「(键已摘)」是**过时口径**，本轮一并订正：
+     * 写回路径日志报 `act=writeback`（降级路径 `act=remove`），并带 `shape=` 自证分类。
+     *
+     * 四类两两互斥（证明见 `docs/_r42_bit3_impl.md` §2）：`observed==null` 与其余天然互斥；
+     * 第 2 类显式要求 `keep != want`，排除与第 3 类重叠；第 4 类是补集 ⇒ 不误报、不漏报。
+     * `NOT_BLOCKED` 是**防御性守门**：before 记了 BLOCKED 却没真改 ContentValues 时命中，单列告警。
+     *
+     * @param observedSrc after 时从 ContentValues 读到的 `sourceType`；`null` = 键读不到
      */
-    fun finishAfterWrite(reader: (Long) -> Bits?) {
+    fun finishAfterWrite(observedSrc: Int?, reader: (Long) -> Bits?) {
         val e = pending.get() ?: return
         pending.remove()
+        val shape = SnsBitLogic.afterShape(e.wantInt, e.keep, observedSrc)
+        e.afterShape = shape.name
         val bits = runCatching { reader(e.snsId) }.getOrNull()
+        // 一次事件只消耗一次节流额度：回查日志 / readback 告警 / 形态日志共用，
+        // 避免互相把对方挤掉（沿用 HEAD 的 5s/id 节流，只作用于日志、不作用于计数）
+        val canLog = allowLog(afterLogAt, e.snsId)
+        val act = if (e.keep != null) "writeback" else "remove"
+
+        // ---- ① 回查维度：afterOk/afterFail 严格保持 HEAD 旧语义（只由 bits 决定）----
         if (bits == null) {
             afterFail.incrementAndGet()
             e.after = "?"
-            // ⚠️ 同样要节流：snsId=0 的行必然查不到，重试风暴下不能每轮刷一行
-            if (allowLog(afterLogAt, e.snsId)) {
-                LogX.w("BLOCK after snsId=${e.snsId} readback failed (src=?)")
+            // ⚠️ 节流：snsId=0 的行必然查不到，重试风暴下不能每轮刷一行
+            if (canLog) {
+                LogX.w(
+                    "BLOCK after snsId=${e.snsId} shape=$shape act=$act readback failed (src=?)"
+                )
             }
         } else {
             afterOk.incrementAndGet()
             e.after = bits.src.toString()
-            if (allowLog(afterLogAt, e.snsId)) {
-                LogX.i("BLOCK after snsId=${e.snsId} before=${e.before} after=${bits.src} (键已摘)")
+            // 旧日志写「(键已摘)」—— 写回路径下这是假话，改成按真实动作报 act=
+            if (canLog) {
+                LogX.i(
+                    "BLOCK after snsId=${e.snsId} before=${e.before} after=${bits.src} " +
+                        "keep=${e.keep ?: "-"} act=$act shape=$shape (写回保位 / 摘键降级)"
+                )
+            }
+        }
+
+        // ---- ② 形态维度：四个新计数器独立表达，绝不碰 afterOk/afterFail ----
+        when (shape) {
+            SnsBitLogic.AfterShape.BLOCKED_BY_REMOVE -> shapeRemoved.incrementAndGet()
+            SnsBitLogic.AfterShape.BLOCKED_BY_REWRITE -> shapeRewritten.incrementAndGet()
+            SnsBitLogic.AfterShape.NOT_BLOCKED -> {
+                shapeNotBlocked.incrementAndGet()
+                if (canLog) {
+                    LogX.w(
+                        "BLOCK after MISMATCH snsId=${e.snsId} shape=$shape 没拦住：want=${e.want} " +
+                            "keep=${e.keep ?: "-"} observed=$observedSrc（ContentValues 仍是微信原值）"
+                    )
+                }
+            }
+            SnsBitLogic.AfterShape.UNKNOWN -> {
+                shapeUnknown.incrementAndGet()
+                if (canLog) {
+                    LogX.w(
+                        "BLOCK after UNKNOWN snsId=${e.snsId} shape=$shape want=${e.want} " +
+                            "keep=${e.keep ?: "-"} observed=$observedSrc（形态异常，未归到任一边）"
+                    )
+                }
             }
         }
     }
@@ -538,8 +607,14 @@ object SnsBlockProbe {
 
     // ------------------------------------------------------------------ 读回查
 
-    /** 一行的可见位快照 */
-    class Bits(val src: Int, val lf: Int, val sef: Int, val createTime: Long)
+    /** 一行的可见位快照（R42 灰标起多带 `userName`，用于「排除自己」零成本拿作者） */
+    class Bits(
+        val src: Int,
+        val lf: Int,
+        val sef: Int,
+        val createTime: Long,
+        val userName: String?,
+    )
 
     /**
      * 点查一条的 `sourceType / localFlag / serverExtFlag / createTime`。
@@ -554,7 +629,7 @@ object SnsBlockProbe {
             warnOnce("BLOCK read: no rawQuery on ${db.javaClass.name}")
             return null
         }
-        val sql = "select sourceType,localFlag,serverExtFlag,createTime from $TABLE where snsId=$snsId"
+        val sql = "select sourceType,localFlag,serverExtFlag,createTime,userName from $TABLE where snsId=$snsId"
         val cur = runCatching { m.invoke(db, sql, null) }.getOrNull() ?: return null
         return try {
             if (XposedHelpers.callMethod(cur, "moveToFirst") as? Boolean != true) return null
@@ -563,6 +638,7 @@ object SnsBlockProbe {
                 lf = longAt(cur, 1).toInt(),
                 sef = longAt(cur, 2).toInt(),
                 createTime = longAt(cur, 3),
+                userName = textAt(cur, 4),
             )
         } catch (t: Throwable) {
             warnOnce("BLOCK read err: ${t.javaClass.simpleName}")
@@ -574,6 +650,9 @@ object SnsBlockProbe {
 
     private fun longAt(cur: Any, i: Int): Long =
         runCatching { XposedHelpers.callMethod(cur, "getLong", i) as? Long ?: 0L }.getOrDefault(0L)
+
+    private fun textAt(cur: Any, i: Int): String? =
+        runCatching { XposedHelpers.callMethod(cur, "getString", i) as? String }.getOrNull()
 
     private fun rawQueryMethod(db: Any): Method? = runCatching {
         db.javaClass.methods.firstOrNull {
@@ -619,7 +698,9 @@ object SnsBlockProbe {
         out += "BLOCK stat hit=${hit.get()} blocked=${blocked.get()} nonZero=${nonZero.get()} " +
             "skipOff=${skipOff.get()} last=${lastHitText()}"
         out += "BLOCK skip empty=${skipEmpty.get()} noApi=${skipNoApi.get()} noId=${skipNoId.get()} " +
-            "parseFail=${parseFail.get()} afterOk=${afterOk.get()} afterFail=${afterFail.get()}"
+            "parseFail=${parseFail.get()} afterOk=${afterOk.get()} afterFail=${afterFail.get()} " +
+            "shape=rm:${shapeRemoved.get()} rw:${shapeRewritten.get()} " +
+            "nb:${shapeNotBlocked.get()} un:${shapeUnknown.get()}"
         out += "BLOCK drop seen=${dropSeen.get()} blocked=${dropBlocked.get()} " +
             "off=${dropOff.get()} allow=${dropAllowed.get()} unknown=${dropUnknown.get()} " +
             "empty=${dropEmpty.get()} noApi=${dropNoApi.get()}"

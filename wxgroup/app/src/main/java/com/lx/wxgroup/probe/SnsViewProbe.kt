@@ -22,7 +22,7 @@ import java.lang.reflect.Field
  */
 object SnsViewProbe {
 
-    private const val MAX_DEPTH = 26
+    private const val MAX_DEPTH = 44
 
     fun tree(maxLines: Int) {
         val act = runCatching { HostContext.activity() }.getOrNull()

@@ -1,0 +1,17 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!--
+      灰标 View 的「带 key 的 tag」键。
+
+      ⛔ 不能用 `View.generateViewId()`：它只产出 1..0xFFFFFF，
+         而 `View.setTag(int, Object)` 第一行就是
+         `if ((key >>> 24) < 2) throw new IllegalArgumentException(
+              "The key must be an application-specific resource id.")`
+         ⇒ 真机表现为 bind 抛 IllegalArgumentException、一条灰标都插不进去
+         （2026-11-06 实测，日志 `SNSDEL bind err: IllegalArgumentException`）。
+
+      用本模块自己的 R.id（资源表 id 高字节 0x7f）即满足该契约；
+      取值本身不要求被真正 inflate，但声明成资源可保证落在本包 id 段内。
+    -->
+    <item name="wxgroup_sns_mark" type="id" />
+</resources>

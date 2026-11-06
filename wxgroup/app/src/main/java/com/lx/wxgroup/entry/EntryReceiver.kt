@@ -385,6 +385,30 @@ object EntryReceiver {
                             }
                         }
                     }
+                    // ---- R42 朋友圈「已删除」灰标（line 样式）----
+                    // --es sub style --es val line|off   = 切样式（line 唯一实现；off 关闭对照）
+                    // --es sub stat                       = 表内条数 + 最近 5 条 + 当前样式 + self 状态
+                    // --es sub who                        = self 来源诊断（取没取到登录 wxid）
+                    // --es sub purge                      = 清空台账（便于重测）
+                    // ⚠️ 不包 io{}：style/purge 要 resweep 当前屏幕的 View，必须主线程。
+                    //    GroupDb 是本模块自己的小表，count/recent/purge 都快，手动探针可主线程直读。
+                    "snsdel" -> {
+                        val sub = intent.getStringExtra("sub") ?: "stat"
+                        when (sub.lowercase()) {
+                            "style" -> LogX.i(
+                                com.lx.wxgroup.feature.SnsDeletedTag.setStyle(
+                                    intent.getStringExtra("val")
+                                )
+                            )
+                            "stat" -> LogX.i(com.lx.wxgroup.feature.SnsDeletedTag.stat())
+                            "home" -> for (l in com.lx.wxgroup.feature.SnsDeletedTag.home()) {
+                                LogX.i(l)
+                            }
+                            "who" -> LogX.i(com.lx.wxgroup.feature.SnsDeletedTag.who())
+                            "purge" -> LogX.i(com.lx.wxgroup.feature.SnsDeletedTag.purge())
+                            else -> LogX.i("SNSDEL unknown sub=$sub")
+                        }
+                    }
                     // ⛔ op=cdn 已删（2026-10-27）：整条朋友圈图片 CDN 通路判死并整块删除，
                     //    探针随 `probe/SnsCdnProbe.kt` 一并移除。⛔ 勿按 git 历史恢复，理由见 HookEntry.kt。
                     // ---- 6.2 防撤回：朋友圈**评论**防删除 + 评论 [已删除] 标签 ----

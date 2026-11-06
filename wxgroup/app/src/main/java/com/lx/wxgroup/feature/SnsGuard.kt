@@ -33,8 +33,9 @@ import java.util.concurrent.atomic.AtomicInteger
  * ## 所以策略是「写时拦截」（R42 路线甲），不再做「拦 + 归档」
  * - 微信清时间线可见位（`sourceType` bit1 置 0）的**真实通道**是
  *   `update("SnsInfo", {sourceType=0})` → `updateWithOnConflict`，**不是** `DELETE`；
- * - 在 `updateWithOnConflict` 的 **before** 里把 `sourceType` 这个键摘掉，清位不落地，
- *   行留在库里、`sourceType` 保持旧值 → 朋友圈界面上它照常显示；
+ * - 在 `updateWithOnConflict` 的 **before** 里把 `sourceType` 写回「旧值补齐 bit1+bit3」的
+ *   保底值（bits 读不到时降级为摘键），清位不落地，行留在库里、两个可见位都在 →
+ *   时间线与好友主页都照常显示（R42 bit3，见 `docs/_r42_bit3_impl.md`）；
  * - 同一行 `sourceType` 永远不会落成 0，因此一切以「库里出现 0」为触发条件的
  *   事后补位/归档恢复子系统都随乙方案删除，不再存在。
  * - 6.4「自动导出朋友圈动态」改为**预防性留存**：动态还看得见时就把图留存下来（扫当前表）。
@@ -64,6 +65,20 @@ object SnsGuard {
 
     private const val CFG_TTL_MS = 3000L
 
+    /**
+     * R42 bit3 · A/B 反向对照**调试覆盖**键（off 语义）。
+     *
+     * ⚠️ 这是 A/B 对照用的调试覆盖，**正式开关仍是 [Keys.ANTIREVOKE_SNS]**。
+     * 关掉它只停「写回补位」、把行为降级回纯摘键，A（写时拦截）与 B（`&-9`→`-1`）两层
+     * **完全不动** —— 反向对照的自变量必须唯一；用主开关关会一次停掉三层，证明不了
+     * 「主页出现」是补位带来的。
+     *
+     * `Kv.getBool` 没有默认值参数、未设置即 false ⇒ `!false = true` ⇒ **补位默认开启**。
+     * ⚠️ 键**不登记 PrefSpec**：`PrefsVisibilityTest` 只遍历 `Prefs.ALL`，未登记的键不受约束；
+     * 沿用 `antirevoke.` 前缀便于 `op=kvset` 直接改。`kvset` 探针结尾已调 [refresh]，热切换生效。
+     */
+    private const val ALBUM_FIX_OFF_KEY = "antirevoke.sns_album_fix_off"
+
     private data class Config(
         /** R42 路线甲：`updateWithOnConflict` **before** 里摘掉 `sourceType`（写时拦截）。 */
         val blockEnabled: Boolean,
@@ -74,10 +89,19 @@ object SnsGuard {
          * 写时拦截关掉时位型根本到不了 `10`，单独开它没有意义（见 [Keys.ANTIREVOKE_SNS_SQLBLOCK_OFF]）。
          */
         val sqlBlockEnabled: Boolean,
+        /**
+         * R42 bit3：拦截成功那次把 `sourceType` 写回「旧值补齐两个可见位」的保底值。
+         *
+         * ⚠️ 这是 **A/B 对照专用的调试覆盖**，正式开关仍是 [Keys.ANTIREVOKE_SNS]。
+         * 关掉它只停「写回」、把行为降级回纯摘键，A（写时拦截）与 B（`&-9`→`-1`）两层
+         * **完全不动** —— 反向对照的自变量必须唯一，用主开关关会一次停掉三层。
+         * 键名：`antirevoke.sns_album_fix_off`（off 语义，未设置 = false = 补位开启）。
+         */
+        val albumFixEnabled: Boolean,
     )
 
     @Volatile
-    private var config = Config(false, false)
+    private var config = Config(false, false, true)
 
     @Volatile
     private var cfgAt = 0L
@@ -151,6 +175,9 @@ object SnsGuard {
             blockEnabled = block,
             // 方案 B：写时拦截开启时默认一起拦；调试键置 true 则只关这一层（A/B 对照用）
             sqlBlockEnabled = block && !Kv.getBool(Keys.ANTIREVOKE_SNS_SQLBLOCK_OFF),
+            // R42 bit3：off 语义调试键，未设置即 false ⇒ 补位默认开启；
+            // 只停补位、A/B 两层照旧（反向对照自变量唯一）
+            albumFixEnabled = !Kv.getBool(ALBUM_FIX_OFF_KEY),
         )
         cfgAt = SystemClock.elapsedRealtime()
     }
@@ -181,7 +208,8 @@ object SnsGuard {
      *
      * 微信清时间线可见位（`sourceType` bit1）的**真实通道**是
      * `update("SnsInfo", ContentValues{... sourceType=0 ...})` → `updateWithOnConflict`。
-     * 甲（写时拦截）在 **before** 里把 `sourceType` 这个键摘掉，让清位不落地。
+     * 甲（写时拦截）在 **before** 里把 `sourceType` 写回保底值或摘键，让清位不落地
+     * （R42 bit3 起不再只是摘键，见 [applyBlock]）。
      */
     private val snsUpdateGuard = object : XC_MethodHook() {
         override fun afterHookedMethod(param: MethodHookParam) {
@@ -213,10 +241,19 @@ object SnsGuard {
      * `sourceType & 2 != 0` 判据继续成立 ⇒ 时间线还能翻到。
      *
      * ## 与 [snsUpdateGuard]（after）的关系
-     * 两个回调挂在**同一个方法**上，互不调用：
-     * - after 钩子（补位）已随乙方案删除，现在只剩「读不到 sourceType 时是否被我们摘键」的形态观察；
-     * - before 钩子把 `sourceType` 摘掉 ⇒ after 钩子读不到值 ⇒ 按 [SnsBlockProbe.isBlockedValues]
-     *   判定为「甲已生效」而不报形态告警。
+     * 两个回调挂在**同一个方法**上，互不调用。`snsUpdateGuard` 的 after 半场（补位）
+     * 已随乙方案删除、是空函数；旧 KDoc 提到的 `SnsBlockProbe.isBlockedValues` /
+     * `blockedCvs` **全项目零调用点**（死代码）。
+     *
+     * ⚠️ **真正的 after 校验链路是本钩子自己的 after 半场**：[onSnsUpdateBlockAfter]
+     * → `SnsBlockProbe.hasPending()`（ThreadLocal 事件对象，与 ContentValues 里有没有
+     * `sourceType` 键**完全无关**）→ `SnsBlockProbe.finishAfterWrite` 回查 `readBits`。
+     * ⇒ 把 `sourceType` 写回 ContentValues **不会**让这条链路失效，不需要「修好」什么。
+     *
+     * R42 bit3 仍额外引入 [SnsBitLogic.afterShape] 互斥形态判据（after 里读 cv 现值分类
+     * 「拦住了 / 没拦住 / 异常」），目的是**自证**与订正旧日志口径（旧日志写「(键已摘)」，
+     * 写回路径下是假话）。⛔ `afterOk`/`afterFail` 严格保持 HEAD 旧语义（只由 `bits != null`
+     * 决定），形态分类走四个独立新计数器，两个维度正交、互不覆盖。
      *
      * ## 两个拦截点（R42 方案 A）
      * 1. **写 0**（`2→0` / `8→0`）—— 旧行为，逐字保留，不查旧值也拦；
@@ -379,7 +416,33 @@ object SnsGuard {
     }
 
     /**
-     * 真正的「摘 `sourceType` 键」动作 —— 写 0 与非 0 降位**共用**这一份。
+     * 真正的拦截动作 —— 写 0 与非 0 降位**共用**这一份。
+     *
+     * ## R42 bit3：拦截不再只是「摘键」，而是把 `sourceType` 写回保底值
+     * 只摘键时库里停在 `old`；若删除前从没进过好友主页，`old=2`（只有 bit1）⇒
+     * 时间线在、但主页相册查询（`IN (8,264,10,...)` 全含 bit3）不命中 ⇒ 主页整条消失。
+     * ⇒ 拦下的这一次直接 `put("sourceType", keep)`，`keep = old | (2|8)`，
+     * 让这一列顺带补齐 bit3（典型 `2 → 10`）。**零额外 IO、无竞态**：值在这一次 UPDATE
+     * 里落地，没有第二条 UPDATE、没有注入表、没有定时扫描。
+     *
+     * ## 两条路径
+     * - **写回路径**（`keepAliveSource(bits?.src) != null`）：只 `put` 覆盖、**不 remove**。
+     *   ContentValues 恒有 `sourceType` 键 ⇒ `size()==0` 不可能发生 ⇒ SKIP_EMPTY 分支
+     *   在这条路径**消失**（不是死代码，是根本不可达）。
+     * - **降级路径**（keep == null：`albumFixEnabled == false` / bits 读不到 / old 彻底不可见 /
+     *   put 不可用或抛异常）：与 R42 现状逐字一致 —— 只 `remove`，并**保留** `left==0` 的
+     *   SKIP_EMPTY（放回原值、不吞异常）。这条路径仍会摘空 cv，所以该分支必须留着。
+     *
+     * ## 硬约束
+     * - 开关关闭（`cfg().blockEnabled == false`）在第一行就 `record(OFF); return`，
+     *   keep 计算 / put / remove 全在其后 ⇒ **一个字节都不写**（约束 1）。
+     * - 写回值完全由 [SnsBitLogic.keepAliveSource] 决定，`newValue` 绝不参与；
+     *   `bits == null` ⇒ 返回 null ⇒ 降级只摘键（约束 2）。公式与边界见其 KDoc。
+     * - A/B 反向对照：`cfg().albumFixEnabled == false` ⇒ keep 直接置 null ⇒ 只摘键，
+     *   A 层（写时拦截）与 B 层（`&-9 → -1`）**完全不动**，自变量唯一（见 [ALBUM_FIX_OFF_KEY]）；
+     *   `SNS stat` 会显示 `albumFix=<true|false>` 便于确认开关读回。
+     * - [SnsDeletedTag.onBlocked] 仍在 BLOCKED 分支调用、参数不变（约束 5）；
+     *   方案 B 的 `& -9 → -1` 一行未动（约束 5）。
      *
      * @param newValue 微信这次想写入的值；`null` = 写 0 路径（与旧实现逐字一致）
      */
@@ -393,8 +456,10 @@ object SnsGuard {
         hasAttr: Boolean,
         newValue: Int?,
     ) {
+        val want = newValue ?: 0
+
+        // 约束 1：开关关闭 ⇒ 只记账，绝不写任何字节（keep 计算 / put / remove 全在其后）
         if (!cfg().blockEnabled) {
-            // 开关关闭时**照旧记账**（开/关对照实验必须有同一套计数）
             SnsBlockProbe.record(
                 id, bits, keys, hasContent, hasAttr, SnsBlockProbe.Outcome.OFF,
                 newValue = newValue,
@@ -402,6 +467,39 @@ object SnsGuard {
             return
         }
 
+        // 写回值：纯判据。bits 读不到 / old 彻底不可见 ⇒ null（降级为只摘键）
+        // ⚠️ A/B 反向对照：关掉 ALBUM_FIX_OFF_KEY ⇒ keep 直接置 null ⇒ 只摘键，
+        //    A 层（写时拦截）与 B 层（&-9→-1）**完全不动**，自变量只有「补位」这一项。
+        var keep = if (cfg().albumFixEnabled) SnsBitLogic.keepAliveSource(bits?.src) else null
+        if (keep != null && api.putInt == null) {
+            // wcdb 形态异常：没有 put(String,Integer) 就写不回 ⇒ 降级，绝不吞
+            LogX.w(
+                "BLOCK degrade: no ContentValues.put(String,Integer) on " +
+                    "${values.javaClass.name}，写回降级为只摘键"
+            )
+            keep = null
+        }
+
+        if (keep != null) {
+            // ⭐ 写回路径：一次 put 覆盖微信想写的值（不 remove ⇒ cv 不会变空）
+            val putOk = runCatching { api.putInt!!.invoke(values, "sourceType", keep) }.isSuccess
+            if (putOk) {
+                SnsBlockProbe.record(
+                    id, bits, keys, hasContent, hasAttr, SnsBlockProbe.Outcome.BLOCKED,
+                    cv = values, newValue = newValue, keep = keep,
+                )
+                // 约束 5：灰标台账参数与旧实现逐字一致（want = newValue ?: 0）
+                SnsDeletedTag.onBlocked(id, bits, want)
+                return
+            }
+            // ⛔ 不吞异常：put 抛了要能看见，并降级为只摘键（此时 cv 未被改动）
+            LogX.w(
+                "BLOCK degrade: put(sourceType,$keep) threw on " +
+                    "${values.javaClass.name}，降级只摘键"
+            )
+        }
+
+        // ---- 降级：只摘键（与 R42 现状逐字一致）----
         val remove = api.remove
         if (remove == null) {
             SnsBlockProbe.record(
@@ -420,11 +518,18 @@ object SnsGuard {
             LogX.w("BLOCK skip: remove(sourceType) threw on ${values.javaClass.name}")
             return
         }
-        // ⑤ 摘完变空 ⇒ SQLite 的 update 会抛 IllegalArgumentException。宁可放回去不拦，也不能崩。
+        // 摘完变空 ⇒ SQLite 的 update 会抛 IllegalArgumentException。宁可放回去不拦，也不能崩。
+        // ⚠️ 这条分支**只在降级路径可达**：写回路径不 remove，cv 恒有 sourceType 键。
         val left = runCatching { api.size?.invoke(values) as? Int ?: -1 }.getOrDefault(-1)
         if (left == 0) {
-            // 放回的必须是**微信原本要写的值**：写 0 路径是 0，降位路径是 2/8 —— 放错值等于替微信改库
-            runCatching { api.putInt?.invoke(values, "sourceType", newValue ?: 0) }
+            // 放回的必须是**微信原本要写的值**（want）：放错值等于替微信改库。
+            // ⛔ 不许吞：放回失败会让 update 抛异常，必须留一行告警（约束 4）。
+            val put = api.putInt
+            val restored = put != null &&
+                runCatching { put.invoke(values, "sourceType", want) }.isSuccess
+            if (!restored) {
+                LogX.w("BLOCK skip: empty values 且放回失败（put 不可用/抛异常），update 可能抛异常")
+            }
             SnsBlockProbe.noteSkipEmpty(id, isDrop = newValue != null)
             SnsBlockProbe.record(
                 id, bits, keys, hasContent, hasAttr, SnsBlockProbe.Outcome.SKIP_EMPTY,
@@ -434,21 +539,41 @@ object SnsGuard {
         }
         SnsBlockProbe.record(
             id, bits, keys, hasContent, hasAttr, SnsBlockProbe.Outcome.BLOCKED,
-            cv = values, newValue = newValue,
+            cv = values, newValue = newValue, keep = null,
         )
+        // 约束 5：灰标台账参数与旧实现逐字一致
+        SnsDeletedTag.onBlocked(id, bits, want)
     }
 
     /**
-     * 拦截的 after 半场：**立刻回查**这条的 sourceType，证明「键摘掉后库里没被改成 0」。
+     * 拦截的 after 半场：读回 ContentValues 里 `sourceType` 的**现值**，交
+     * [SnsBitLogic.afterShape] 互斥判定「拦住了 / 没拦住」，并回查库里值。
      *
-     * 放 after 是唯一的正确位置：before 里查到的还是写之前的旧值。
+     * ⚠️ **R42 bit3 写回改造**：以前 after 靠「ContentValues 里读不到 sourceType」判定甲生效；
+     * 写回后 cv 里**有**该键（值 = keep），判据失效。现在把读到的值原样传给
+     * [SnsBlockProbe.finishAfterWrite]，由纯函数分类（见 `docs/_r42_bit3_impl.md` §2）：
+     * 写回路径读到 keep、降级（摘键）路径读不到键（null）、没拦住则读到微信原值 want。
+     *
+     * 放 after 是唯一正确位置：before 里读到的是写之前的旧值 / 我们刚 put 的值，
+     * 证明不了「微信实际拿去执行的 ContentValues 是什么形态」。
      * 第一句仍是零反射的表名比较，非 `SnsInfo` 直接走。
+     *
+     * 前提：`param.args[1]` 与 before 是**同一个** ContentValues 对象，且 before 已验证过
+     * `cvApiOf` / `get` 可用（否则根本走不到拦截），所以 after 里读不到键只可能是「被摘掉」。
      */
     private fun onSnsUpdateBlockAfter(param: XC_MethodHook.MethodHookParam) {
         val a = param.args ?: return
         if ((a.getOrNull(0) as? String) != TABLE) return
         if (!SnsBlockProbe.hasPending()) return
-        SnsBlockProbe.finishAfterWrite { id -> SnsBlockProbe.readBits(param.thisObject, id) }
+        val values = a.getOrNull(1)
+        val api = if (values != null) cvApiOf(values) else null
+        val raw = if (api != null) {
+            runCatching { api.get?.invoke(values, "sourceType") }.getOrNull()
+        } else {
+            null
+        }
+        val observed = intOfAny(raw)
+        SnsBlockProbe.finishAfterWrite(observed) { id -> SnsBlockProbe.readBits(param.thisObject, id) }
     }
 
     /**
@@ -1319,5 +1444,5 @@ object SnsGuard {
 
     fun stat(): String =
         "SNS stat blockEnabled=${cfg().blockEnabled} sqlBlock=${cfg().sqlBlockEnabled} " +
-            "snsDb=${snsDb != null}"
+            "albumFix=${cfg().albumFixEnabled} snsDb=${snsDb != null}"
 }
