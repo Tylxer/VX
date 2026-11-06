@@ -21,6 +21,14 @@ _*.log
 .tmp/
 *.orig
 
+# 一次性调试产物（dex 反编译 / LSPosed 配置 / magisk 模块 / uiautomator dump）
+_r35_*.py
+ui.xml
+_lspdcfg/
+_mods/
+# 变异验证脚本已提升为正式工具：app/src/test/mut/，根目录下遗留的副本不再入库
+wxgroup/_*.py
+
 # Android / IDE
 local.properties
 *.iml
