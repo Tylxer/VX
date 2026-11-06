@@ -226,3 +226,19 @@ UPDATE SnsInfo SET sourceType = sourceType & -9
 
 「只有上界」的分页（`snsId < B`）`rangeKey` 解析不出 key，记成 `?`，
 但**拦截照常生效**（计入 `sqlBlock9`）。只影响「同一批行被重试几次」的统计粒度。
+
+## §10 主页可见性缺口的真机基线（2026-11-07 00:41，修之前）
+
+`op=sql` 探针（正确写法见下）读 `SnsInfo` 最近 10 行，同一好友 `wxid_xlrbelf6hv0w22`（昵称 verity）：
+
+| snsId（signed） | sourceType | localFlag | 含义 |
+|---|---|---|---|
+| `-3397762123896778223` | **10** | 2 | 删除前**进过**主页 ⇒ 有 bit3，主页相册可见 |
+| `-3397763077853081064` | **2** | 2 | 删除前**没进过**主页 ⇒ 无 bit3，**主页相册查不到（缺口）** |
+
+两条都被拦下过（时间线仍在），差别只在于「是否曾被相册列表拉取过」。
+⇒ 印证 bit3 不是动态类型的属性，纯粹是「有没有被主页拉过」的记账位。
+
+⛔ 探针写法：`am broadcast -a com.lx.wxgroup.action.PROBE --es op sql --es q "select ... from SnsInfo ..."`
+SQL **只包一层双引号**；再包一层单引号会被 `SQLX` 白名单拒
+（`拒绝：只允许 select / 只读 pragma（收到 'select ...'）`）。
