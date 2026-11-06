@@ -48,6 +48,12 @@ import java.util.concurrent.atomic.AtomicInteger
  *
  * ## 拦在 SQLite 层而不是 hook 某个 `plugin.sns.*`
  * `SnsInfo` 表名、字段名都是未混淆的，比混淆的 `a1.b2` 抗版本。
+ *
+ * ## R42 方案 B（写时拦截补不上的那一半）
+ * 写时拦截管的是 `updateWithOnConflict`，但清 bit3 还有一条**裸 SQL** 通道：
+ * `UPDATE SnsInfo SET sourceType = sourceType & -9 WHERE ...`（进好友主页就执行，一次 6 条）。
+ * 位置在 [onSnsSql]：把 `& -9` 改成恒等掩码 `& -1` 后**照常执行**（命中集合与 `changes()` 都不变），
+ * 判定/改写是纯函数 [SnsSqlRewrite]，`& -3` 只识别不拦。
  */
 object SnsGuard {
 
@@ -61,10 +67,17 @@ object SnsGuard {
     private data class Config(
         /** R42 路线甲：`updateWithOnConflict` **before** 里摘掉 `sourceType`（写时拦截）。 */
         val blockEnabled: Boolean,
+        /**
+         * R42 方案 B：`execSQL` 里 `sourceType & -9` 改写为 no-op（清 bit3 的裸 SQL）。
+         *
+         * ⚠️ 必须是 `blockEnabled && 未开调试覆盖`：SQL 改写是写时拦截的**补位**，
+         * 写时拦截关掉时位型根本到不了 `10`，单独开它没有意义（见 [Keys.ANTIREVOKE_SNS_SQLBLOCK_OFF]）。
+         */
+        val sqlBlockEnabled: Boolean,
     )
 
     @Volatile
-    private var config = Config(false)
+    private var config = Config(false, false)
 
     @Volatile
     private var cfgAt = 0L
@@ -120,8 +133,9 @@ object SnsGuard {
         runCatching { installCapture(cls) }
             .onFailure { LogX.w("SNS: capture hook failed: ${it.javaClass.simpleName}") }
         // ⚠️ **常驻**的只有 delete / execSQL / updateWithOnConflict / insert(WithOnConflict)
-        // 六个（R42 甲：delete/execSQL 是「是否有裸 SQL 绕过」的旁证计数，update/insert 是
-        // 写时拦截 + 通道计数）。非 SnsInfo 全部第一句零反射短路，query 一律不挂。
+        // 六个（R42 甲：update/insert 是写时拦截 + 通道计数；delete 是旁证计数；
+        // R42 乙：execSQL 升级为**方案 B 的改写点**，只对 `SnsInfo` + `& -9` 生效）。
+        // 非 SnsInfo 全部第一句零反射短路，query 一律不挂。
         if (ok.isEmpty()) {
             LogX.w("SNS: no hook installed, sns guard disabled")
             return
@@ -132,9 +146,11 @@ object SnsGuard {
     fun refresh() {
         // R42 路线甲：写时拦截跟随主开关「防止朋友圈动态撤回」（Keys.ANTIREVOKE_SNS）。
         // Keys.ANTIREVOKE_SNS_BLOCK 作为调试覆盖：true 强制开启；false（默认）= 不覆盖、跟随主开关。
+        val block = Kv.getBool(Keys.ANTIREVOKE_SNS) || Kv.getBool(Keys.ANTIREVOKE_SNS_BLOCK)
         config = Config(
-            blockEnabled = Kv.getBool(Keys.ANTIREVOKE_SNS) ||
-                Kv.getBool(Keys.ANTIREVOKE_SNS_BLOCK),
+            blockEnabled = block,
+            // 方案 B：写时拦截开启时默认一起拦；调试键置 true 则只关这一层（A/B 对照用）
+            sqlBlockEnabled = block && !Kv.getBool(Keys.ANTIREVOKE_SNS_SQLBLOCK_OFF),
         )
         cfgAt = SystemClock.elapsedRealtime()
     }
@@ -202,10 +218,18 @@ object SnsGuard {
      * - before 钩子把 `sourceType` 摘掉 ⇒ after 钩子读不到值 ⇒ 按 [SnsBlockProbe.isBlockedValues]
      *   判定为「甲已生效」而不报形态告警。
      *
+     * ## 两个拦截点（R42 方案 A）
+     * 1. **写 0**（`2→0` / `8→0`）—— 旧行为，逐字保留，不查旧值也拦；
+     * 2. **非 0 纯降位**（`10→8` 清 bit1、`10→2` 清 bit3）—— 新增。必须查旧值才能与
+     *    `0→2` / `0→8` 这类**加位**区分；混合改写（删一位又添一位，如 `8→2`）一律放行，
+     *    判据见 [SnsBitLogic.decide]。
+     *
      * ## 代价
      * ① 第一句零反射字符串比较（微信所有表的 update 都经过这里）；
      * ② 只有 `SnsInfo` + values 里有 `sourceType` 才反射读值；
-     * ③ 只有 `== 0`（真正的清位）才点查一次库、记账、可能摘键。
+     * ③ 写 0 ⇒ 点查一次库、记账、可能摘键；
+     *    非 0 ⇒ 新值同时含 bit1+bit3（如 `10`）直接放行（零 IO），
+     *    缺位时才点查一次旧值（真实频次：一次进主页几十次，不是热路径）。
      * ④ 开关关闭时**照样记账**（只计数、不摘键）—— 开/关对照实验必须有同一套计数，
      *    否则「关的时候没看到」会被误读成「没发生」。
      */
@@ -291,13 +315,16 @@ object SnsGuard {
             }
             return
         }
-        // ③ 非 0：正常行写 2/10（也包含微信把我们补的位打回 2），不是清位
+        // ③ 非 0：**先排除加位**，再按「旧值 vs 新值」判断是不是降位（R42 方案 A）
         if (st != 0) {
             SnsBlockProbe.noteUpdateNonZero()
+            // 新值同时含 bit1+bit3（如 10）⇒ 一定没丢位，连旧值都不用查（热路径零 IO）
+            if (!SnsBitLogic.needsOld(st)) return
+            onSnsUpdateDrop(a, param.thisObject, values, api, st)
             return
         }
 
-        // ---- ④ 命中：微信要把这一条的可见位清掉 ----
+        // ---- ④ 命中：微信要把这一条的可见位清掉（写 0，旧实现逐字保留）----
         val id = runCatching { snsIdOf(a) }.getOrDefault(0L)
         val db = param.thisObject
         val bits = if (id != 0L) SnsBlockProbe.readBits(db, id) else null
@@ -311,15 +338,75 @@ object SnsGuard {
             LogX.w("BLOCK warn: sourceType=0 但 whereArgs 里抠不出 snsId keys=$keys（本条照拦）")
         }
 
+        applyBlock(values, api, id, bits, keys, hasContent, hasAttr, newValue = null)
+    }
+
+    /**
+     * 非 0 写入的降位判定（`10→8` 清 bit1、`10→2` 清 bit3）。
+     *
+     * ## 为什么这里一定要查旧值
+     * `2` 既可能是 `10→2`（纯降位，要拦），也可能是 `0→2`（加位，必须放行）。
+     * 只有库里旧值能区分 —— 见 [SnsBitLogic.decide]。
+     *
+     * ## 查不到旧值时为什么放行
+     * 没有旧值就无法证明是降位；这条路径上「多拦」会直接把动态写不进相册，
+     * 与「宁可少拦」的旧口径相比，这里的代价不对等，所以 `old == null` 一律放行并记账。
+     */
+    private fun onSnsUpdateDrop(
+        a: Array<Any?>,
+        db: Any?,
+        values: Any,
+        api: CvApi,
+        st: Int,
+    ) {
+        val id = runCatching { snsIdOf(a) }.getOrDefault(0L)
+        if (id == 0L) {
+            // 抠不出 id ⇒ 查不到旧值 ⇒ 无法判定，放行（与「写 0」的保守方向相反，理由见上）
+            SnsBlockProbe.noteDropUnknown()
+            return
+        }
+        val bits = SnsBlockProbe.readBits(db, id)
+        if (SnsBitLogic.decide(bits?.src, st) == SnsBitLogic.Action.ALLOW) {
+            SnsBlockProbe.noteDropAllowed()
+            return
+        }
+        val keys = runCatching { api.size?.invoke(values) as? Int ?: -1 }.getOrDefault(-1)
+        val hasContent = runCatching { api.get?.invoke(values, "content") != null }
+            .getOrDefault(false)
+        val hasAttr = runCatching { api.get?.invoke(values, "attrBuf") != null }
+            .getOrDefault(false)
+        applyBlock(values, api, id, bits, keys, hasContent, hasAttr, newValue = st)
+    }
+
+    /**
+     * 真正的「摘 `sourceType` 键」动作 —— 写 0 与非 0 降位**共用**这一份。
+     *
+     * @param newValue 微信这次想写入的值；`null` = 写 0 路径（与旧实现逐字一致）
+     */
+    private fun applyBlock(
+        values: Any,
+        api: CvApi,
+        id: Long,
+        bits: SnsBlockProbe.Bits?,
+        keys: Int,
+        hasContent: Boolean,
+        hasAttr: Boolean,
+        newValue: Int?,
+    ) {
         if (!cfg().blockEnabled) {
-            SnsBlockProbe.record(id, bits, keys, hasContent, hasAttr, SnsBlockProbe.Outcome.OFF)
+            // 开关关闭时**照旧记账**（开/关对照实验必须有同一套计数）
+            SnsBlockProbe.record(
+                id, bits, keys, hasContent, hasAttr, SnsBlockProbe.Outcome.OFF,
+                newValue = newValue,
+            )
             return
         }
 
         val remove = api.remove
         if (remove == null) {
             SnsBlockProbe.record(
-                id, bits, keys, hasContent, hasAttr, SnsBlockProbe.Outcome.SKIP_NO_API
+                id, bits, keys, hasContent, hasAttr, SnsBlockProbe.Outcome.SKIP_NO_API,
+                newValue = newValue,
             )
             LogX.w("BLOCK skip: no ContentValues.remove on ${values.javaClass.name}")
             return
@@ -327,7 +414,8 @@ object SnsGuard {
         val ok = runCatching { remove.invoke(values, "sourceType") }.isSuccess
         if (!ok) {
             SnsBlockProbe.record(
-                id, bits, keys, hasContent, hasAttr, SnsBlockProbe.Outcome.SKIP_NO_API
+                id, bits, keys, hasContent, hasAttr, SnsBlockProbe.Outcome.SKIP_NO_API,
+                newValue = newValue,
             )
             LogX.w("BLOCK skip: remove(sourceType) threw on ${values.javaClass.name}")
             return
@@ -335,15 +423,18 @@ object SnsGuard {
         // ⑤ 摘完变空 ⇒ SQLite 的 update 会抛 IllegalArgumentException。宁可放回去不拦，也不能崩。
         val left = runCatching { api.size?.invoke(values) as? Int ?: -1 }.getOrDefault(-1)
         if (left == 0) {
-            runCatching { api.putInt?.invoke(values, "sourceType", 0) }
-            SnsBlockProbe.noteSkipEmpty(id)
+            // 放回的必须是**微信原本要写的值**：写 0 路径是 0，降位路径是 2/8 —— 放错值等于替微信改库
+            runCatching { api.putInt?.invoke(values, "sourceType", newValue ?: 0) }
+            SnsBlockProbe.noteSkipEmpty(id, isDrop = newValue != null)
             SnsBlockProbe.record(
-                id, bits, keys, hasContent, hasAttr, SnsBlockProbe.Outcome.SKIP_EMPTY
+                id, bits, keys, hasContent, hasAttr, SnsBlockProbe.Outcome.SKIP_EMPTY,
+                newValue = newValue,
             )
             return
         }
         SnsBlockProbe.record(
-            id, bits, keys, hasContent, hasAttr, SnsBlockProbe.Outcome.BLOCKED, values,
+            id, bits, keys, hasContent, hasAttr, SnsBlockProbe.Outcome.BLOCKED,
+            cv = values, newValue = newValue,
         )
     }
 
@@ -443,52 +534,76 @@ object SnsGuard {
                 unhookCapture()
             }
         }
-        // R42 W2：execSQL 是「清位第二条通道」的头号嫌疑（旧模板 `sourceType & -3`）。
+        // R42 W2：execSQL 是「清位第二条通道」的头号嫌疑（`sourceType & -3` / `& -9`）。
         // 只在 SQL 里出现 SnsInfo 时才多一次 lowercase（平时零开销）。
+        // R42 方案 B：`& -9` 从「只识别」升级为「改写为 no-op 后执行」；
+        //   ⛔ 其他任何形态（含 `& -3`）一律**原样透传**，连正则都不再跑一次。
         if (sql != null && sql.contains(TABLE)) {
-            runCatching {
-                SnsBlockProbe.noteSql(
-                    sql,
-                    isSourceWrite = looksLikeSourceWrite(sql),
-                    clear = isSourceClearSql(sql),
-                    own = isOwnFixSql(sql),
-                )
-            }.onFailure { LogX.w("SNS sql count err: ${it.javaClass.simpleName}") }
+            runCatching { onSnsSql(sql, param) }
+                .onFailure { LogX.w("SNS sql count err: ${it.javaClass.simpleName}") }
         }
     }
 
-    // ------------------------------------------------------------------ execSQL 计数判据（随 SnsTimelineSrcLogic 删除内联到这里）
-
-    /** 微信「批量清时间线来源位」那条 UPDATE 的形态：`sourceType = sourceType & -3` */
-    private val CLEAR_SQL_RE =
-        Regex("""sourcetype\s*=\s*\(?\s*sourcetype\s*&\s*\(?\s*-3\b""")
-
-    /** 这条 SQL 是不是「微信在清 bit1」 */
-    private fun isSourceClearSql(sql: String?): Boolean {
-        if (sql.isNullOrBlank()) return false
-        val s = sql.lowercase()
-        if (!s.contains("snsinfo")) return false
-        return CLEAR_SQL_RE.containsMatchIn(s)
+    /**
+     * `execSQL` 命中 `SnsInfo` 之后的全部动作：**先决定改不改写，再记账**。
+     *
+     * ## 为什么改写放在记账之前
+     * 账本里的 `sqlBlock9 / blkOff / blkFail` 是「实际发生了什么」，不是「本可以发生什么」。
+     * 顺序反了就会出现「计数说拦了、SQL 其实原样执行」这种自欺。
+     *
+     * ## 方案 B 只在 `& -9` 上动手（理由见 [SnsSqlRewrite] 的类注释）
+     * - `& -9`（清 bit3）：改写 `& -1`，语义 = 赋回原值，WHERE / 命中集合 / `changes()` 全不变；
+     * - `& -3`（清 bit1）：**只识别 + 告警**。真机从未出现（`sqlClear=0`），没有样本能估副作用，
+     *   而它与 `& -9` 可能共处同一条语句（`BOTH`），贸然改写等于在没有观测的前提下改微信的写库语义。
+     * - 其余：不进 [SnsSqlRewrite]，只计数（零额外开销）。
+     */
+    private fun onSnsSql(sql: String, param: XC_MethodHook.MethodHookParam) {
+        val kind = SnsBitLogic.sqlClear(sql)
+        val block = when {
+            // ① 连形态都不是（绝大多数 SnsInfo 上的 execSQL）—— 零动作
+            !kind.clearsBit3 -> SnsBlockProbe.SqlBlock.NONE
+            // ② 形态像、但清位不在 SET 里（WHERE 里的同名表达式 / 非 UPDATE）⇒ 不是可改写对象。
+            //    ⚠️ 这一条与「记账」无关：sqlClear9 已经记过了，这里只决定动不动手。
+            !SnsSqlRewrite.shouldBlock(sql) -> SnsBlockProbe.SqlBlock.NONE
+            // ③ 该拦但开关关着（A/B 对照的 B 组）：原样执行，但要能被看见
+            !cfg().sqlBlockEnabled -> SnsBlockProbe.SqlBlock.OFF
+            else -> applySqlRewrite(param, sql)
+        }
+        SnsBlockProbe.noteSql(
+            sql = sql,
+            isSourceWrite = SnsBitLogic.looksLikeSourceWrite(sql),
+            clearBit1 = kind.clearsBit1,
+            clearBit3 = kind.clearsBit3,
+            own = SnsBitLogic.isOwnFix(sql),
+            block = block,
+        )
     }
 
-    /** 这条 SQL 看起来像「改 `SnsInfo.sourceType`」，但没被 [isSourceClearSql] 认出来 */
-    private fun looksLikeSourceWrite(sql: String?): Boolean {
-        if (sql.isNullOrBlank()) return false
-        val s = sql.lowercase()
-        return s.contains("snsinfo") && s.contains("sourcetype") &&
-            (s.contains("update") || s.contains(" set "))
+    /**
+     * 把 `& -9` 换成 `& -1` 并写回 `param.args[0]`（before 钩子里改，SQL 尚未执行）。
+     *
+     * @return [SnsBlockProbe.SqlBlock.BLOCKED] = 真的改了；[SnsBlockProbe.SqlBlock.FAILED] = 没改动，
+     *   SQL 将**原样执行**（= 本条没拦住），由账本的 `blkFail` 暴露，⛔ 不许静默。
+     */
+    private fun applySqlRewrite(
+        param: XC_MethodHook.MethodHookParam,
+        sql: String,
+    ): SnsBlockProbe.SqlBlock {
+        val out = SnsSqlRewrite.rewrite(sql)
+        if (out == sql) {
+            LogX.w("BLOCK fail: 判定为可拦但改写无变化，本条原样执行 ${sql.take(200)}")
+            return SnsBlockProbe.SqlBlock.FAILED
+        }
+        runCatching { param.args[0] = out }
+            .onFailure {
+                LogX.w("BLOCK fail: 写回 SQL 参数失败 ${it.javaClass.simpleName}")
+                return SnsBlockProbe.SqlBlock.FAILED
+            }
+        return SnsBlockProbe.SqlBlock.BLOCKED
     }
 
-    /** 我们自己补位/回滚写的 SQL（`sourceType = sourceType | 10`）—— 采样时要排除 */
-    private val OWN_FIX_SQL_RE =
-        Regex("""sourcetype\s*=\s*\(?\s*sourcetype\s*\|\s*\(?\s*(?:10|2)\b""")
-
-    private fun isOwnFixSql(sql: String?): Boolean {
-        if (sql.isNullOrBlank()) return false
-        val s = sql.lowercase()
-        if (!s.contains("snsinfo")) return false
-        return OWN_FIX_SQL_RE.containsMatchIn(s)
-    }
+    // ------------------------------------------------------------------ execSQL 计数判据
+    // R42：判据已抽到 [SnsBitLogic]（纯函数，可单测）；这里不再内联正则。
 
     /**
      * 是不是朋友圈库。
@@ -1203,5 +1318,6 @@ object SnsGuard {
     }
 
     fun stat(): String =
-        "SNS stat blockEnabled=${cfg().blockEnabled} snsDb=${snsDb != null}"
+        "SNS stat blockEnabled=${cfg().blockEnabled} sqlBlock=${cfg().sqlBlockEnabled} " +
+            "snsDb=${snsDb != null}"
 }

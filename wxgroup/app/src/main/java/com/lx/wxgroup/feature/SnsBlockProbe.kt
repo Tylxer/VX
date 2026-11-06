@@ -11,6 +11,7 @@ import java.lang.reflect.Method
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
+import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicInteger
 import java.util.concurrent.atomic.AtomicLong
 
@@ -50,8 +51,11 @@ object SnsBlockProbe {
     /** 汇总日志最小间隔 */
     private const val STAT_GAP_MS = 60_000L
 
-    /** execSQL 原文采样上限（去重后） */
-    private const val SQL_SAMPLE_MAX = 20
+    /** execSQL 原文采样上限（去重后）。R42 取证：需存下 `& -9` 等未识别模板的完整 WHERE，20 → 60 */
+    private const val SQL_SAMPLE_MAX = 60
+
+    /** 未识别 SQL 的落盘长度。R42 取证：200 会在 `IN (...)` 列表中间截断，看不到尾部条件 */
+    private const val SQL_LOG_CHARS = 1500
 
     /** 采样器间隔 / 上限（30s × 60 = 30 分钟） */
     private const val TRACE_EVERY_MS = 30_000L
@@ -91,6 +95,19 @@ object SnsBlockProbe {
     private val updSeen = AtomicInteger()
     private val updZero = AtomicInteger()
 
+    // R42 方案 A：`sourceType != 0` 的**降位**（`10→8` 清 bit1 / `10→2` 清 bit3）。
+    // ⛔ 与上面的 hit（写 0）分开计：合成一个数就看不出「新加的两条判据到底命中没有」。
+    private val dropSeen = AtomicInteger()     // 进入降位判定（含最终放行的）
+    private val dropBlocked = AtomicInteger()  // 真的摘了键
+    private val dropOff = AtomicInteger()      // 命中但开关关闭
+    private val dropAllowed = AtomicInteger()  // 查了旧值，证明是加位/原地 ⇒ 放行
+    private val dropUnknown = AtomicInteger()  // 抠不出 id / 查不到旧值 ⇒ 无法判定，放行
+    private val dropEmpty = AtomicInteger()    // 摘完 values 空 ⇒ 放回
+    private val dropNoApi = AtomicInteger()    // 没有 remove 方法
+
+    /** 「降位判定抠不出 id」只告警一次，之后只计数（热路径不能刷日志） */
+    private val dropUnknownWarned = AtomicBoolean(false)
+
     // W2：INSERT 通道
     private val insSeen = AtomicInteger()
     private val insZero = AtomicInteger()
@@ -104,9 +121,27 @@ object SnsBlockProbe {
     // W2：execSQL 通道
     private val sqlSns = AtomicInteger()      // SQL 里含 SnsInfo
     private val sqlSrc = AtomicInteger()      // 且看起来在改 sourceType
-    private val sqlClear = AtomicInteger()    // 且命中 `sourceType & -3` 形态
+    private val sqlClear = AtomicInteger()    // 且命中 `sourceType & -3` 形态（清 bit1）—— ⛔ 只识别不拦
+    private val sqlClear9 = AtomicInteger()   // 且命中 `sourceType & -9` 形态（清 bit3）—— 方案 B 起可拦
     private val sqlOwn = AtomicInteger()      // 且是我们自己补位写的
     private val sqlUnmatched = AtomicInteger()// 且是改 sourceType 但没被上面两类认出来 ⭐ 有它才叫「抓出别的通道」
+
+    // R42 方案 B：`& -9` 的**拦截**记账。⛔ 与 sqlClear9（识别数）分开：
+    // 识别了但没拦（开关关 / 改写失败）必须能单独看见，否则「开关开了却没效果」查不出来。
+    private val sqlBlock9 = AtomicInteger()     // 真的改写为 no-op 并放行执行
+    private val sqlBlock9Off = AtomicInteger()  // 命中但开关关闭（原样执行）
+    private val sqlBlock9Fail = AtomicInteger() // 命中、开关开启，但改写没产生变化 ⇒ 原样执行（= 没拦住，非 0 即故障）
+
+    /** 同一 snsId 区间的被拦次数：>1 就是微信在对同一批行**重试**的证据 */
+    private val block9Ranges = HashMap<String, Int>()
+
+    @Volatile
+    private var block9RangeMaxKey = "-"
+
+    private val block9RangeMax = AtomicInteger()
+
+    /** 区间表上限：分页区间是长尾的，不能无界增长（进程内只做判据，丢新 key 可接受） */
+    private const val RANGE_MAX = 64
 
     // 拦截后立刻回查（证明摘键真的生效：写完之后库里还是原值）
     private val afterOk = AtomicInteger()
@@ -119,6 +154,8 @@ object SnsBlockProbe {
         val snsId: Long,
         /** 写库**前**库里的 sourceType（现查；`?` = 查不到） */
         val before: String,
+        /** 微信这次**想写入**的值（`0` = 旧的「清位」路径；`2`/`8` = 新增的降位路径） */
+        val want: String,
         /** ContentValues 的 key 数量 —— W3 的核心证据（2~5 个 ⇒ 只带改动列；十几二十个 ⇒ 整行 upsert） */
         val keys: Int,
         val hasContent: Boolean,
@@ -134,7 +171,7 @@ object SnsBlockProbe {
         var after: String = "?"
 
         fun line(): String =
-            "BLOCK ev id=$snsId at=$clock before=$before keys=$keys " +
+            "BLOCK ev id=$snsId at=$clock before=$before want=$want keys=$keys " +
                 "C=${if (hasContent) 1 else 0} A=${if (hasAttr) 1 else 0} " +
                 "blk=${if (blocked) 1 else 0} after=$after lf=$lf sef=$sef ct=$ct"
     }
@@ -181,6 +218,26 @@ object SnsBlockProbe {
         SKIP_NO_ID,  // 抠不出 snsId（仍会拦，见 onBlocked）
     }
 
+    /**
+     * 一条 `& -9` 裸 SQL 的**实际去向**（R42 方案 B）。
+     *
+     * ⛔ 四个值必须分开报：「识别到了」与「真拦住了」是两件事，
+     * 合成一个 bool 会让「开关开了但改写没生效」永远查不出来。
+     */
+    enum class SqlBlock {
+        /** 不是 `& -9` 形态（绝大多数 execSQL） */
+        NONE,
+
+        /** 已改写为 no-op 并放行执行（`sourceType & -1`） */
+        BLOCKED,
+
+        /** 命中但开关关闭 ⇒ 原样执行（A/B 对照的那个 B） */
+        OFF,
+
+        /** 命中、开关开启，但改写没产生变化 ⇒ 原样执行。⚠️ 非 0 = 拦截失效，必须查 */
+        FAILED,
+    }
+
     // ------------------------------------------------------------------ 入口：UPDATE 命中
 
     /** 这次 update 的 ContentValues 里没有 `sourceType`（绝大多数正常写，只计数） */
@@ -203,16 +260,33 @@ object SnsBlockProbe {
         skipNoApi.incrementAndGet()
     }
 
-    fun noteSkipEmpty(snsId: Long) {
-        skipEmpty.incrementAndGet()
-        LogX.w("BLOCK skip: empty values snsId=$snsId (sourceType 已放回，本条未拦)")
+    /** 摘完 values 变空 ⇒ 放回原值、放弃拦截。[isDrop] 决定记到哪一套计数里 */
+    fun noteSkipEmpty(snsId: Long, isDrop: Boolean) {
+        if (isDrop) dropEmpty.incrementAndGet() else skipEmpty.incrementAndGet()
+        LogX.w("BLOCK skip: empty values snsId=$snsId isDrop=$isDrop (sourceType 已放回，本条未拦)")
+    }
+
+    /** 降位判定时抠不出 snsId（⇒ 查不到旧值 ⇒ 放行）。首次打一行，之后只计数。 */
+    fun noteDropUnknown() {
+        dropSeen.incrementAndGet()
+        dropUnknown.incrementAndGet()
+        if (dropUnknownWarned.compareAndSet(false, true)) {
+            LogX.w("BLOCK drop: 抠不出 snsId，无法判定旧值 ⇒ 本条放行（之后同类只计数）")
+        }
+    }
+
+    /** 查了旧值，证明是加位/原地重写 ⇒ 放行（这是「加位必须放行」的正面证据） */
+    fun noteDropAllowed() {
+        dropSeen.incrementAndGet()
+        dropAllowed.incrementAndGet()
     }
 
     /**
-     * 记录一次 `sourceType=0` 的命中。
+     * 记录一次命中的现场。
      *
      * @param cv 被摘键的 ContentValues（只有 [Outcome.BLOCKED] 时非空，用于事后回查配对）
-     * @return 记进账本的事件；`null` = 参数不成立（不会发生，防御用）
+     * @param newValue 微信想写入的值；`null` = 写 0 路径（旧语义），`!= 0` = 降位路径
+     * @return 记进账本的事件
      */
     fun record(
         snsId: Long,
@@ -222,15 +296,23 @@ object SnsBlockProbe {
         hasAttr: Boolean,
         outcome: Outcome,
         cv: Any? = null,
+        newValue: Int? = null,
     ): Event {
-        hit.incrementAndGet()
-        updSeen.incrementAndGet()
-        updZero.incrementAndGet()
+        val isDrop = newValue != null && newValue != 0
+        if (isDrop) {
+            // updSeen 已在 noteUpdateNonZero() 里加过，这里不重复
+            dropSeen.incrementAndGet()
+        } else {
+            hit.incrementAndGet()
+            updSeen.incrementAndGet()
+            updZero.incrementAndGet()
+        }
         val nowMs = System.currentTimeMillis()
         lastHitMs.set(nowMs)
         val e = Event(
             snsId = snsId,
             before = bits?.src?.toString() ?: "?",
+            want = (newValue ?: 0).toString(),
             keys = keys,
             hasContent = hasContent,
             hasAttr = hasAttr,
@@ -242,18 +324,18 @@ object SnsBlockProbe {
         )
         when (outcome) {
             Outcome.BLOCKED -> {
-                blocked.incrementAndGet()
+                if (isDrop) dropBlocked.incrementAndGet() else blocked.incrementAndGet()
                 if (snsId == 0L) skipNoId.incrementAndGet()
                 if (cv != null) {
                     rememberBlockedCv(cv)
                     pending.set(e)
                 }
-                logHitThrottled(e)
+                logBlockedThrottled(e, isDrop)
             }
-            Outcome.OFF -> skipOff.incrementAndGet()
+            Outcome.OFF -> if (isDrop) dropOff.incrementAndGet() else skipOff.incrementAndGet()
             Outcome.SKIP_EMPTY -> { /* 计数已在 noteSkipEmpty 里加过 */ }
-            Outcome.SKIP_NO_API -> { }
-            Outcome.SKIP_NO_ID -> skipNoId.incrementAndGet()
+            Outcome.SKIP_NO_API -> if (isDrop) dropNoApi.incrementAndGet() else skipNoApi.incrementAndGet()
+            Outcome.SKIP_NO_ID -> if (isDrop) dropUnknown.incrementAndGet() else skipNoId.incrementAndGet()
         }
         synchronized(events) {
             events.add(e)
@@ -297,10 +379,12 @@ object SnsBlockProbe {
         pending.remove()
     }
 
-    private fun logHitThrottled(e: Event) {
+    private fun logBlockedThrottled(e: Event, isDrop: Boolean) {
         if (!allowLog(hitLogAt, e.snsId)) return
+        // 写 0 与降位分开打标签：一份日志里混着两种动作时，靠 tag 就能分开数
+        val tag = if (isDrop) "drop" else "hit"
         LogX.i(
-            "BLOCK hit snsId=${e.snsId} before=${e.before} keys=${e.keys} " +
+            "BLOCK $tag snsId=${e.snsId} before=${e.before} want=${e.want} keys=${e.keys} " +
                 "hasContent=${e.hasContent} hasAttr=${e.hasAttr} at=${e.clock}"
         )
     }
@@ -332,7 +416,9 @@ object SnsBlockProbe {
         if (!lastStatEl.compareAndSet(last, now)) return
         LogX.i(
             "BLOCK stat hit=${hit.get()} blocked=${blocked.get()} " +
-                "nonZero=${nonZero.get()} last=${hms(System.currentTimeMillis())}"
+                "nonZero=${nonZero.get()} " +
+                "drop=${dropSeen.get()}/${dropBlocked.get()} " +
+                "last=${hms(System.currentTimeMillis())}"
         )
     }
 
@@ -362,36 +448,93 @@ object SnsBlockProbe {
     }
 
     /**
-     * execSQL：清位的**另一条候选通道**。
+     * execSQL：清位的**另一条通道**（方案 B 起，`& -9` 在这里被**改写为 no-op**）。
      *
-     * @param clear 命中 `sourceType = sourceType & -3` 形态
+     * ⛔ 本函数仍然只记账：不碰 SQL、不影响执行、不决定拦不拦。
+     * 「改不改写」是 [SnsGuard] 在调用本函数**之前**做完的（改写要改 `param.args`），
+     * 这里只接收结果 [block] 并分类计数 —— 这样账本和实际行为不会各说一套。
+     *
+     * @param clearBit1 命中 `sourceType = sourceType & -3` 形态（清时间线位）—— ⛔ 只识别不拦
+     * @param clearBit3 命中 `sourceType = sourceType & -9` 形态（清相册位）—— 方案 B 的拦截对象
      * @param own 我们自己补位/回滚写的（`| 2` / `| 10`），要单独计，否则会把噪音当微信行为
+     * @param block 这条 SQL 的实际去向（见 [SqlBlock]）
      */
-    fun noteSql(sql: String, isSourceWrite: Boolean, clear: Boolean, own: Boolean) {
+    fun noteSql(
+        sql: String,
+        isSourceWrite: Boolean,
+        clearBit1: Boolean,
+        clearBit3: Boolean,
+        own: Boolean,
+        block: SqlBlock = SqlBlock.NONE,
+    ) {
         sqlSns.incrementAndGet()
         if (!isSourceWrite) return
         sqlSrc.incrementAndGet()
-        when {
-            clear -> sqlClear.incrementAndGet()
-            own -> sqlOwn.incrementAndGet()
-            else -> {
-                sqlUnmatched.incrementAndGet()
-                if (sampleSql(sql)) {
-                    LogX.w("BLOCK w2 sql-unmatched ${sql.take(200)}")
+        // 两种清位各自独立计数：一条 SQL 同时含 `& -3` 和 `& -9` 时两个都加（不互斥）
+        if (clearBit1) sqlClear.incrementAndGet()
+        if (clearBit3) {
+            sqlClear9.incrementAndGet()
+            val tag = when (block) {
+                SqlBlock.BLOCKED -> {
+                    sqlBlock9.incrementAndGet()
+                    noteBlock9Range(SnsSqlRewrite.rangeKey(sql))
+                    "已拦 -9→${SnsSqlRewrite.NOOP_MASK}"
                 }
+                SqlBlock.OFF -> {
+                    sqlBlock9Off.incrementAndGet()
+                    "未拦·开关关"
+                }
+                SqlBlock.FAILED -> {
+                    sqlBlock9Fail.incrementAndGet()
+                    "未拦·改写失败"
+                }
+                SqlBlock.NONE -> "未拦·未到拦截线"
+            }
+            // 原文仍是**微信原本要执行的**那条 —— 判据要靠它，不能存改写后的
+            if (sampleSql(sql, sqlSamples9)) {
+                val rng = SnsSqlRewrite.rangeKey(sql) ?: "?"
+                LogX.w("BLOCK w2 sql-clear9($tag) rng=$rng ${sql.take(SQL_LOG_CHARS)}")
+            }
+        }
+        if (clearBit1 || clearBit3) return
+        if (own) {
+            sqlOwn.incrementAndGet()
+        } else {
+            sqlUnmatched.incrementAndGet()
+            if (sampleSql(sql, sqlSamples)) {
+                LogX.w("BLOCK w2 sql-unmatched ${sql.take(SQL_LOG_CHARS)}")
             }
         }
     }
 
-    /** 原文采样：去重 + 上限 20 条。返回 true = 这条是新的、值得打一行 */
-    private fun sampleSql(sql: String): Boolean = synchronized(sqlSamples) {
-        if (sqlSamples.size >= SQL_SAMPLE_MAX) return false
-        if (sqlSamples.contains(sql)) return false
-        sqlSamples.add(sql)
+    /** 同一 snsId 区间的被拦次数；>1 说明微信在对同一批行重试（不是我们改坏了，就是它本来就这么干） */
+    private fun noteBlock9Range(key: String?) {
+        val k = key ?: "?"
+        var n = 0
+        synchronized(block9Ranges) {
+            if (block9Ranges.containsKey(k) || block9Ranges.size < RANGE_MAX) {
+                n = (block9Ranges[k] ?: 0) + 1
+                block9Ranges[k] = n
+            }
+        }
+        if (n > block9RangeMax.get()) {
+            block9RangeMax.set(n)
+            block9RangeMaxKey = k
+        }
+    }
+
+    /** 原文采样：去重 + 上限 [SQL_SAMPLE_MAX] 条。返回 true = 这条是新的、值得打一行 */
+    private fun sampleSql(sql: String, into: MutableList<String>): Boolean = synchronized(into) {
+        if (into.size >= SQL_SAMPLE_MAX) return false
+        if (into.contains(sql)) return false
+        into.add(sql)
         true
     }
 
     private val sqlSamples = ArrayList<String>()
+
+    /** `& -9` 的原文样本单独存：不能被 `sql-unmatched` 的 60 条配额挤掉 */
+    private val sqlSamples9 = ArrayList<String>()
 
     // ------------------------------------------------------------------ 读回查
 
@@ -470,17 +613,24 @@ object SnsBlockProbe {
 
     // ------------------------------------------------------------------ 统计输出
 
-    /** `op=snsg sub=blockstat`：4 行计数 + 最近 10 个事件，**总行数 ≤ 16** */
+    /** `op=snsg sub=blockstat`：5 行计数 + 最近 10 个事件，**总行数 ≤ 16** */
     fun stat(): List<String> {
         val out = ArrayList<String>(16)
         out += "BLOCK stat hit=${hit.get()} blocked=${blocked.get()} nonZero=${nonZero.get()} " +
             "skipOff=${skipOff.get()} last=${lastHitText()}"
         out += "BLOCK skip empty=${skipEmpty.get()} noApi=${skipNoApi.get()} noId=${skipNoId.get()} " +
             "parseFail=${parseFail.get()} afterOk=${afterOk.get()} afterFail=${afterFail.get()}"
+        out += "BLOCK drop seen=${dropSeen.get()} blocked=${dropBlocked.get()} " +
+            "off=${dropOff.get()} allow=${dropAllowed.get()} unknown=${dropUnknown.get()} " +
+            "empty=${dropEmpty.get()} noApi=${dropNoApi.get()}"
         out += "BLOCK upd seen=${updSeen.get()} zero=${updZero.get()} nosrc=${updNoSrcKey.get()} | " +
             "ins seen=${insSeen.get()} zero=${insZero.get()} nz=${insNonZero.get()} nosrc=${insNoKey.get()}"
+        val rngSize = synchronized(block9Ranges) { block9Ranges.size }
         out += "BLOCK w2 delSns=${delSns.get()} delRow=${delRow.get()} " +
             "sqlSns=${sqlSns.get()} sqlSrc=${sqlSrc.get()} sqlClear=${sqlClear.get()} " +
+            "sqlClear9=${sqlClear9.get()} sqlBlock9=${sqlBlock9.get()} " +
+            "blkOff=${sqlBlock9Off.get()} blkFail=${sqlBlock9Fail.get()} " +
+            "rng=$rngSize max=${block9RangeMax.get()}x@$block9RangeMaxKey " +
             "sqlOwn=${sqlOwn.get()} sqlUnmatched=${sqlUnmatched.get()}"
         val snapshot = synchronized(events) { ArrayList(events) }
         val from = (snapshot.size - EV_SHOW).coerceAtLeast(0)

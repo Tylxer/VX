@@ -1,17 +1,32 @@
-> ## ⛔ R42 订正（2026-11-05）—— 先读这一段再往下看
+> ## ⛔ R42 订正（2026-11-06 更新）—— 先读这一段再往下看
 >
-> 朋友圈防撤回**已改为「写时拦截」**（路线甲）：hook wcdb `updateWithOnConflict` 的 **before**，
-> `SnsInfo` 的 `ContentValues` 里 `sourceType==0` 时 `remove("sourceType")`，让删除写不进库。
-> 真机已验：两次命中全部拦住，`sourceType` 保持 2，动态仍可见。见 `docs/_r42_block_result.md`。
+> 朋友圈防撤回**已改为「写时拦截」一家独大**，共三层，全部真机过：
+>
+> | 层 | 钩子 | 判据 | 实测 |
+> |---|---|---|---|
+> | 甲 | `updateWithOnConflict` **before** | `ContentValues` 含 `sourceType==0` ⇒ `remove` 该键 | 删后写 0 被拦，`after` 保持原值 |
+> | A | 同上 | 纯降位且丢 bit1/bit3（`10→8` / `10→2`）⇒ 摘键 | `want=8`/`want=2` 各拦 1 次，`after=10` |
+> | B | `execSQL` **before** | `UPDATE SnsInfo SET sourceType = sourceType & -9` ⇒ 常量换成 `-1`（恒等） | 8 条全拦，`blkFail=0` |
+>
+> **最终效果（2026-11-06 22:03 定案）**：好友删掉动态后，`sourceType` 停在 `10`
+> （`bit1=2` 时间线 + `bit3=8` 好友主页相册），**时间线与好友主页同时可见**。
+> 反例对照：只有甲+A 时 `& -9` 会把 bit3 削掉 ⇒ 时间线在、主页不在（`docs/_r42_bit_paths.md` §8）。
+> 详细时序见 `docs/_r42_bit_b_report.md` §7。
+>
+> ⚠️ **bit3 与动态类型无关**，只取决于「是否被好友主页相册列表拉取过」——纯文字动态进主页后
+> 同样会从 `2` 变 `10`。别再按「图片才进相册」推断。
+>
+> ⚠️ **`& -9` 不是只在删除流程执行**：进一次好友主页就执行 6 条（首屏 + 分页），
+> 按 `snsId` 区间分页、`sourceType in (64 个含 bit3 的值)`。副作用评估必须按这个触发面算。
 >
 > **因此本文件下列内容已废弃，对应代码已删除（勿按 git 历史恢复）**：
 > - 事后补位 `SnsTimelineSourceFix` / `SnsTimelineSrcLogic`（srcfix）
-> - 响应注入 `SnsTimelineMerge` / `SnsAlbumMerge`（方案 A）
+> - 响应注入 `SnsTimelineMerge` / `SnsAlbumMerge`（方案 A 的旧含义）
 > - `[已删除]` 灰标 `SnsTag` / `SnsDeletedTag`
 > - 归档恢复 `sns_archive` / `SnsRestoreLogic`
 > - R41 判据取证 `SnsRoundLedger` / `SnsSqlSpy` / `SnsSyncDelProbe`
 >
-> 原因是甲生效后 `sourceType` 永不为 0，所有以「库里出现 0」为前提的子系统同时失去触发条件。
+> 原因是写时拦截生效后 `sourceType` 永不为 0，所有以「库里出现 0」为前提的子系统同时失去触发条件。
 > **仍然有效、可继续引用的部分**：库结构与列名、`sourceType` 位语义（2/4/8）、
 > 时间线查询白名单、adapter 绑定回调落点等**取证事实**。
 >

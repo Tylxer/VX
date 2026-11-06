@@ -159,6 +159,19 @@ object Keys {
      * - 两者任一开启即写时拦截生效。
      */
     const val ANTIREVOKE_SNS_BLOCK = "antirevoke.sns_block"
+
+    /**
+     * R42 方案 B 的**调试覆盖**：true ⇒ 强制**不拦** execSQL 里的 `sourceType & -9`。
+     *
+     * 为什么需要它：方案 B 的唯一验收方式是「同一套操作，开/关各跑一遍看位型轨迹」。
+     * 主开关 [ANTIREVOKE_SNS] 一关会把**写时拦截（方案 A）**也一起关掉，两次实验的自变量就不止一个了。
+     * 本键只关「SQL 改写」这一层，写时拦截照常 ⇒ 才是干净的单变量对照。
+     *
+     * 实现：`SnsGuard` 里 `sqlBlockEnabled = blockEnabled && !Kv.getBool(本键)`。
+     * ⚠️ 它只能**关**不能**开**（默认 false = 跟随主开关）—— 单独开 SQL 改写而写时拦截关闭，
+     * 位型根本到不了 `10`，拦它没有意义，允许反而会误导。
+     */
+    const val ANTIREVOKE_SNS_SQLBLOCK_OFF = "antirevoke.sns_sqlblock_off"
     const val ANTIREVOKE_COMMENT = "antirevoke.comment"
     const val ANTIREVOKE_COMMENT_DELETED_TAG = "antirevoke.comment_deleted_tag"
     const val ANTIREVOKE_SHOW_HINT = "antirevoke.show_hint"
@@ -384,6 +397,11 @@ object Prefs {
         PrefSpec(
             Keys.ANTIREVOKE_SNS_BLOCK, PrefKind.SWITCH, "false", "防撤回",
             "实验：拦截朋友圈删除写库（摘 sourceType，测完关掉）"
+        ),
+        // R42 方案 B 的 A/B 对照开关：只关「execSQL 的 & -9 改写」这一层，写时拦截照常。
+        PrefSpec(
+            Keys.ANTIREVOKE_SNS_SQLBLOCK_OFF, PrefKind.SWITCH, "false", "防撤回",
+            "实验：不拦 SQL 清相册位（A/B 对照，测完关掉）"
         ),
         PrefSpec(Keys.ANTIREVOKE_COMMENT, PrefKind.SWITCH, "false", "防撤回", "防止评论撤回"),
         PrefSpec(Keys.ANTIREVOKE_COMMENT_DELETED_TAG, PrefKind.SWITCH, "false", "防撤回", "显示评论[已删除]标签"),
