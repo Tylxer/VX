@@ -285,6 +285,17 @@ object Keys {
      */
     const val SNSDEL_STYLE = "antirevoke.sns_deleted_tag"
 
+    /**
+     * R42 bit3 相册位补位的**反向对照开关**（布尔，`true` = 关补位、降级回纯摘键）。
+     *
+     * ⛔ 刻意**不登记 PrefSpec**：它只走 `op=kvset` 调试通道翻转，不该出现在设置界面，
+     * `PrefsVisibilityTest` 只遍历 [Prefs.ALL]，未登记即不受约束。
+     * 关掉它只停「写回补位」，A（写时拦截）/ B（`&-9`→`-1`）两层完全不动 ——
+     * 反向对照的自变量必须唯一；用主开关关会一次停掉三层，证明不了「主页出现」是补位带来的。
+     * 未设置即 `Kv.getBool=false` ⇒ `!false` ⇒ **补位默认开启**。
+     */
+    const val SNS_ALBUM_FIX_OFF = "antirevoke.sns_album_fix_off"
+
     // ⛔ 2026-10-27 已删：`sns.cdn_img` / `sns.cdn_rewrite_path` 两个键。
     //    随整条朋友圈图片 CDN 通路（`SnsCdnImage` 等 4 个源文件）一并物理删除，
     //    朋友圈图片已改道「SNS 缓存索引直扫」（`MomentsExport.buildSnsIndex`）。

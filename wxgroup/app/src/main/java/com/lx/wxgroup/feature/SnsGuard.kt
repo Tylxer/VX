@@ -74,10 +74,11 @@ object SnsGuard {
      * 「主页出现」是补位带来的。
      *
      * `Kv.getBool` 没有默认值参数、未设置即 false ⇒ `!false = true` ⇒ **补位默认开启**。
-     * ⚠️ 键**不登记 PrefSpec**：`PrefsVisibilityTest` 只遍历 `Prefs.ALL`，未登记的键不受约束；
+     * ⚠️ 键字面量收口在 [Keys.SNS_ALBUM_FIX_OFF]（原先是本文件私有字面量），但仍**不登记
+     * PrefSpec**：`PrefsVisibilityTest` 只遍历 `Prefs.ALL`，未登记的键不受约束；
      * 沿用 `antirevoke.` 前缀便于 `op=kvset` 直接改。`kvset` 探针结尾已调 [refresh]，热切换生效。
      */
-    private const val ALBUM_FIX_OFF_KEY = "antirevoke.sns_album_fix_off"
+    private const val ALBUM_FIX_OFF_KEY = Keys.SNS_ALBUM_FIX_OFF
 
     private data class Config(
         /** R42 路线甲：`updateWithOnConflict` **before** 里摘掉 `sourceType`（写时拦截）。 */
@@ -164,7 +165,10 @@ object SnsGuard {
             LogX.w("SNS: no hook installed, sns guard disabled")
             return
         }
-        LogX.i("SNS installed hooks=${ok.joinToString(",")} blockEnabled=${config.blockEnabled}")
+        LogX.i(
+            "SNS installed hooks=${ok.joinToString(",")} blockEnabled=${config.blockEnabled} " +
+                "sqlBlock=${config.sqlBlockEnabled} albumFix=${config.albumFixEnabled}"
+        )
     }
 
     fun refresh() {

@@ -501,11 +501,13 @@ op=kvget --es key antirevoke.sns_album_fix_off    # 回读复核
 
 - 两个 BLOCKED 分支仍都传 `cv = values`、`SnsDeletedTag.onBlocked(id, bits, want)` 参数不变；
   `kvset` 探针已调 `SnsGuard.refresh()` ⇒ 热切换生效，`EntryReceiver.kt` 未改。
-- ⚠️ `install()` 日志（`SnsGuard.kt:167`）维持 HEAD 原样
-  `SNS installed hooks=... blockEnabled=...`，**未**追加 `albumFix=`。可观测性以 `stat()` 的
-  `albumFix=` 为准（与 `verify.md §2 ②b` 一致），不影响验收链路。收口确认要求「不再改源码」
-  故未补这一处。**team-lead 已定：本次不改源码**（三条非阻塞建议统一留到真机验证后收口），
-  与 `review.md` 总裁决一致。
+- ✅ **2026-11-07 04:2x 已补**（原先留到真机验证后收口的三条非阻塞建议之一）：
+  `install()` 日志现在带全四项，与 `stat()` 口径一致 ——
+  `SNS installed hooks=... blockEnabled=... sqlBlock=... albumFix=...`。
+  动机：`install()` 是「新包是否加载」的第一判据，只有 `blockEnabled=` 时无法从这一行
+  确认补位与 SQL 层读回值，每次都要再发一次 `op=snsg sub=stat`。
+  ⚠️ 旧文档/脚本里按 `SNS installed hooks=... blockEnabled=...` 精确匹配的 grep 仍能命中
+  （新增字段在其后），但**逐字回显**的老日志（如 `_r42_verify.md §1`）属于历史记录，不追改。
 
 ### 8.2 刻意不登记 PrefSpec（最终取舍，勿反手登记）
 
