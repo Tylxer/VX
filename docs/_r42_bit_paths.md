@@ -216,8 +216,10 @@ UPDATE SnsInfo SET sourceType = sourceType & -9
 计数：`drop seen=26 blocked=3 allow=23 unknown=0`、`afterOk=3 afterFail=0`、
 `sqlClear9=8 sqlBlock9=8 blkFail=0`、`delSns=1 delRow=1`（**全程零 DELETE**）。
 
-⛔ **反向对照未做**：还没做「关掉 `antirevoke.sns_sqlblock_off=true` 后重跑」的消融实验，
-所以「主页还在」目前是相关性证据（8 条全拦 + 位型不变），不是唯一归因。
+⛔ **反向对照已做（22:10）**：只关 B 层（`sns_sqlblock_off=true`）再进主页 ⇒ **主页消失、`src 10→2`**，
+`sqlClear9` +2 / `sqlBlock9` 不变 / `blkOff` +2。⇒ **B 层是主页可见的必要条件**，不是冗余保险。
+⚠️ 该实验还证明：这次 `10→2` **完全没走 ContentValues**（`drop blocked` 未增）⇒
+**A 层看不见 SQL 通道的清位**，「拦了 `want=2` 就够了」是错的。详见 `docs/_r42_bit_b_report.md` §8。
 详细时序与日志原文见 `docs/_r42_bit_b_report.md` §7。
 
 ### 9.1 记账边界（已知，不影响正确性）
