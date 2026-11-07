@@ -155,6 +155,12 @@ object SnsBlockProbe {
     private val shapeNotBlocked = AtomicInteger()
     private val shapeUnknown = AtomicInteger()
 
+    // R42 self-exclude：作者是自己 ⇒ 彻底放行（不保位、不加前缀）。
+    // ⛔ 写 0 与降位**分开计**（合成一个数就分不清是哪条通道放行的）。
+    // ⛔ 独立新计数器，绝不碰 blocked / skipOff / afterOk / afterFail / shape*。
+    private val selfExcluded = AtomicInteger()     // 写 0 路径的自己删除
+    private val selfExcludedDrop = AtomicInteger() // 降位路径的自己删除
+
     // ------------------------------------------------------------------ 事件账本
 
     /** 一次「微信要清位」的现场快照 */
@@ -226,6 +232,7 @@ object SnsBlockProbe {
         SKIP_EMPTY,  // 摘完 values 空 ⇒ 放回、不拦
         SKIP_NO_API, // 没有 remove / put 方法
         SKIP_NO_ID,  // 抠不出 snsId（仍会拦，见 onBlocked）
+        SELF,        // 作者是自己 ⇒ 彻底放行（不保位、不加前缀），让微信的写原样落地
     }
 
     /**
@@ -350,6 +357,10 @@ object SnsBlockProbe {
             Outcome.SKIP_EMPTY -> { /* 计数已在 noteSkipEmpty 里加过 */ }
             Outcome.SKIP_NO_API -> if (isDrop) dropNoApi.incrementAndGet() else skipNoApi.incrementAndGet()
             Outcome.SKIP_NO_ID -> if (isDrop) dropUnknown.incrementAndGet() else skipNoId.incrementAndGet()
+            Outcome.SELF -> {
+                if (isDrop) selfExcludedDrop.incrementAndGet() else selfExcluded.incrementAndGet()
+                logSelfExcludedThrottled(e, isDrop)
+            }
         }
         synchronized(events) {
             events.add(e)
@@ -455,6 +466,16 @@ object SnsBlockProbe {
         LogX.i(
             "BLOCK $tag snsId=${e.snsId} before=${e.before} want=${e.want} keys=${e.keys} " +
                 "hasContent=${e.hasContent} hasAttr=${e.hasAttr} at=${e.clock}"
+        )
+    }
+
+    /** 自己删除的动态：作者 == self ⇒ 彻底放行。日志只做留痕，计数已由 [Outcome.SELF] 分支累加 */
+    private fun logSelfExcludedThrottled(e: Event, isDrop: Boolean) {
+        if (!allowLog(hitLogAt, e.snsId)) return
+        val tag = if (isDrop) "drop" else "hit"
+        LogX.i(
+            "BLOCK self $tag snsId=${e.snsId} before=${e.before} want=${e.want} " +
+                "（自己删除，彻底放行：不保位、不加前缀）"
         )
     }
 
@@ -705,6 +726,7 @@ object SnsBlockProbe {
         out += "BLOCK drop seen=${dropSeen.get()} blocked=${dropBlocked.get()} " +
             "off=${dropOff.get()} allow=${dropAllowed.get()} unknown=${dropUnknown.get()} " +
             "empty=${dropEmpty.get()} noApi=${dropNoApi.get()}"
+        out += "BLOCK self zero=${selfExcluded.get()} drop=${selfExcludedDrop.get()}"
         out += "BLOCK upd seen=${updSeen.get()} zero=${updZero.get()} nosrc=${updNoSrcKey.get()} | " +
             "ins seen=${insSeen.get()} zero=${insZero.get()} nz=${insNonZero.get()} nosrc=${insNoKey.get()}"
         val rngSize = synchronized(block9Ranges) { block9Ranges.size }

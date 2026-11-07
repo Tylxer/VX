@@ -41,15 +41,19 @@ object SnsPrefixProbe {
     private const val COL_CONTENT = "content"
     private const val BACKUP_DIR_NAME = "sns_prefix_backup"
 
-    /** 入口。sub ∈ probe|prefix|restore|stat|simdrop|setsrc2，id = snsId（可为负，adb 用 `--el` 传） */
+    /** 入口。sub ∈ probe|prefix|strip|restore|stat|simdrop|setsrc2|self，id = snsId（可为负，adb 用 `--el` 传） */
     fun run(sub: String, id: Long): List<String> = when (sub.lowercase()) {
         "probe" -> probe(id)
         "prefix" -> prefix(id)
+        "strip" -> strip(id)
         "restore" -> restore(id)
         "stat" -> stat()
         "simdrop" -> simdrop(id)
         "setsrc2" -> setsrc2(id)
-        else -> listOf("PREFIX unknown sub=$sub（可用 probe|prefix|restore|stat|simdrop|setsrc2）")
+        "self" -> self()
+        else -> listOf(
+            "PREFIX unknown sub=$sub（可用 probe|prefix|strip|restore|stat|simdrop|setsrc2|self）"
+        )
     }
 
     /**
@@ -132,6 +136,39 @@ object SnsPrefixProbe {
         return listOf(
             "PREFIX write id=$id before=${show(before)} after=${show(PREFIX + before)} " +
                 "rows=$rows backup=$bk"
+        )
+    }
+
+    /**
+     * 剥掉 `ContentDesc` 开头的 [PREFIX]（不影响其它任何字节）。
+     *
+     * 与 [prefix] 严格对称，但**不依赖备份**：`simdrop` 走的是生产路径
+     * [buildPrefixedBlob]，设计上明确不落备份（微信写库线程不做文件 IO），
+     * 所以那些被自动化测出来的前缀只能靠这个逆运算清掉。
+     *
+     * 幂等：开头不是 [PREFIX] ⇒ 直接返回 `skipped=none`，不写库。
+     */
+    private fun strip(id: Long): List<String> {
+        if (id == 0L) return listOf("PREFIX strip id=0（--el id <snsId> 必填）")
+        val d = db() ?: return listOf("PREFIX strip no db")
+        val cl = loader() ?: return listOf("PREFIX strip no host ClassLoader")
+        val orig = readBlob(d, id) ?: return listOf("PREFIX strip id=$id read-fail")
+
+        val tlo = parseTlo(cl, orig) ?: return listOf("PREFIX strip id=$id parse-fail")
+        val f = descField(cl) ?: return listOf("PREFIX strip id=$id no-field")
+        val before = readDesc(f, tlo) ?: return listOf("PREFIX strip id=$id field-read-fail")
+        if (!before.startsWith(PREFIX)) {
+            return listOf("PREFIX strip id=$id skipped=none desc=${show(before)}")
+        }
+        val after = before.removePrefix(PREFIX)
+
+        val setOk = runCatching { f.set(tlo, after) }.isSuccess
+        if (!setOk) return listOf("PREFIX strip id=$id field-set-fail")
+        val nb = serialize(cl, tlo) ?: return listOf("PREFIX strip id=$id serialize-fail")
+
+        val rows = updateContent(d, id, nb)
+        return listOf(
+            "PREFIX strip id=$id before=${show(before)} after=${show(after)} rows=$rows"
         )
     }
 
@@ -233,10 +270,47 @@ object SnsPrefixProbe {
         return listOf("PREFIX setsrc2 id=$id rows=$rows src=${src ?: "?"}")
     }
 
+    /**
+     * 取证：当前登录 wxid 是怎么读出来的（逐候选）+ 自己发的动态清单。
+     *
+     * 这是「排除自己」唯一的可观测证据。`isSelfAuthor` 取不到 self 时**恒不排除**，
+     * 所以必须能区分三种状态：真的取到了 / 4 条候选全 null / 进程还没 attach。
+     * 只靠「删除自己动态后没出现前缀」推不出结论 —— 那可能是排除生效，也可能是
+     * 前缀写入本身失败（两条路径的出口都是「没加前缀」）。
+     *
+     * 输出不含 wxid 明文：命中只给长度，自己的动态靠**库内等值匹配**列出 snsId。
+     */
+    private fun self(): List<String> {
+        val out = ArrayList<String>()
+        out += SnsGuard.selfWxidProbe()
+        val me = SnsGuard.selfWxidOrNull()
+        if (me == null) {
+            out += "SELF verdict=NO_SELF（排除自己不会生效）"
+            return out
+        }
+        val d = db() ?: run {
+            out += "SELF no db（先进一次朋友圈让 SnsGuard 拿到句柄）"
+            return out
+        }
+        val rows = queryRows(
+            d,
+            "select snsId,sourceType,localFlag from $TABLE where userName=? " +
+                "order by snsId desc limit 8",
+            arrayOf(me)
+        )
+        if (rows.isEmpty()) {
+            out += "SELF mine=0（自己没发过 / userName 列与 wxid 不等）"
+        } else {
+            out += "SELF mine=${rows.size} (limit 8)"
+            for (r in rows) out += "SELF item $r"
+        }
+        out += "SELF hint=拿上面某个 snsId 跑 sub=simdrop，自作者应**不出现** hasPrefix=true"
+        return out
+    }
+
     // ---------------------------------------------------------------- 反射底层
 
     private fun db(): Any? = SnsGuard.snsDbHandle()
-
     private fun loader(): ClassLoader? = SnsGuard.hostLoaderHandle()
 
     private fun tloClass(cl: ClassLoader): Class<*>? =
@@ -329,6 +403,59 @@ object SnsPrefixProbe {
         } finally {
             runCatching { XposedHelpers.callMethod(cur, "close") }
         }
+    }
+
+    /**
+     * 多列只读查询，每行拼成 `col=val,col=val`。只给探针用（[self]）。
+     *
+     * 值一律先试 `getString`（wcdb/AOSP 的 Cursor 会把 INTEGER 列转字符串），失败再退
+     * `getLong`；两者都不行就写 `?`，绝不因为某列类型异常丢掉整行。
+     */
+    private fun queryRows(d: Any, sql: String, args: Array<String>): List<String> {
+        val m = rawQueryMethod(d) ?: run {
+            LogX.w("PREFIX no rawQuery on ${d.javaClass.name}")
+            return emptyList()
+        }
+        val a: Any = if (m.parameterTypes[1] == Array<String>::class.java) {
+            args
+        } else {
+            Array<Any>(args.size) { args[it] }
+        }
+        val cur = runCatching { m.invoke(d, sql, a) }.onFailure {
+            LogX.w(
+                "PREFIX queryRows fail: ${(it.cause ?: it).javaClass.simpleName}: " +
+                    "${(it.cause ?: it).message?.take(80)}"
+            )
+        }.getOrNull() ?: return emptyList()
+        val out = ArrayList<String>()
+        try {
+            val n = runCatching {
+                XposedHelpers.callMethod(cur, "getColumnCount") as? Int ?: 0
+            }.getOrDefault(0)
+            val names = (0 until n).map {
+                runCatching {
+                    XposedHelpers.callMethod(cur, "getColumnName", it) as? String ?: "c$it"
+                }.getOrDefault("c$it")
+            }
+            while (runCatching {
+                    XposedHelpers.callMethod(cur, "moveToNext") as? Boolean == true
+                }.getOrDefault(false)
+            ) {
+                out += names.mapIndexed { i, name ->
+                    val v = runCatching {
+                        XposedHelpers.callMethod(cur, "getString", i) as? String
+                    }.getOrNull()
+                        ?: runCatching {
+                            (XposedHelpers.callMethod(cur, "getLong", i) as? Long)?.toString()
+                        }.getOrNull()
+                        ?: "?"
+                    "$name=$v"
+                }.joinToString(",")
+            }
+        } finally {
+            runCatching { XposedHelpers.callMethod(cur, "close") }
+        }
+        return out
     }
 
     private fun updateMethod(d: Any): Method? =

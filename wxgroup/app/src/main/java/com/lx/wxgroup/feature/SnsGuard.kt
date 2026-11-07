@@ -47,6 +47,12 @@ import java.util.concurrent.atomic.AtomicInteger
  * 所以这里**不区分作者**，一律拦 —— 否则开关永远不生效。
  * 说白了它的实际效果是「不让微信把朋友圈动态从本地库里抹掉」，偏留档 / 防误删。
  *
+ * ⚠️ **R42 self-exclude 例外**：上面的「一律拦」只对**写时拦截**（`updateWithOnConflict`
+ * 清 `sourceType`）生效；`readBits` 能读回该行的 `userName`，所以**自己发的动态可以排除**——
+ * 作者 == 当前登录 wxid 时**彻底放行**（不保位、不加前缀），让微信的写原样落地、动态真被删掉。
+ * 判据在 [applyBlock] 开头（`isSelfAuthor(bits?.userName)`），`bits == null` 或 wxid 取不到时
+ * **照常拦截**（绝不因拿不到作者放行）。物理 DELETE 钩子仍只计数、不拦（本就没作者信息可判）。
+ *
  * ## 拦在 SQLite 层而不是 hook 某个 `plugin.sns.*`
  * `SnsInfo` 表名、字段名都是未混淆的，比混淆的 `a1.b2` 抗版本。
  *
@@ -276,6 +282,8 @@ object SnsGuard {
      * 2. **非 0 纯降位**（`10→8` 清 bit1、`10→2` 清 bit3）—— 新增。必须查旧值才能与
      *    `0→2` / `0→8` 这类**加位**区分；混合改写（删一位又添一位，如 `8→2`）一律放行，
      *    判据见 [SnsBitLogic.decide]。
+     * ⚠️ **R42 self-exclude**：两个拦截点进 [applyBlock] 后都先判 `isSelfAuthor(bits?.userName)`，
+     * 命中即彻底放行（`record(SELF)` + return，不保位、不加前缀）；bits/wxid 取不到照常拦截。
      *
      * ## 代价
      * ① 第一句零反射字符串比较（微信所有表的 update 都经过这里）；
@@ -471,6 +479,17 @@ object SnsGuard {
      * 绝不 rethrow、**不影响删除拦截**。SKIP_EMPTY / SKIP_NO_API / OFF 分支不附加前缀
      * （那些分支本条根本没拦住，行照旧被清位，写前缀无意义）。
      *
+     * ## R42 self-exclude：作者是自己 ⇒ 彻底放行（不保位、不加前缀）
+     * 在 OFF 检查之后、keep 计算之前判断 `isSelfAuthor(bits?.userName)`：
+     * - 命中 ⇒ `record(SELF); return`，**不 put keep、不 remove、不 attachPrefix**，
+     *   微信这次 update（sourceType=0 / 降位）原样落地 ⇒ 动态真的被删掉；
+     * - ⛔ `isSelfAuthor(null)` 恒 false（`selfWxid()` 取不到也恒 false）⇒
+     *   **bits 读不到 / self wxid 取不到时照常走下面的保位/摘键**，绝不因拿不到作者而放行。
+     * 放在 [applyBlock] 开头一处、覆盖两个调用点（写 0 与降位），理由：
+     * 两处都已在调用前算好 `bits` 并传入，`bits?.userName` 是唯一的判据输入，无额外 IO；
+     * 单一决策点避免两处各自早退的判据漂移。留痕走 [SnsBlockProbe.Outcome.SELF]（独立
+     * 计数器 + 事件 + 限流日志），不污染 blocked / skipOff / afterOk / afterFail / shape*。
+     *
      * @param db wcdb 的 SQLiteDatabase（[SnsPrefixProbe.buildPrefixedBlob] 读 content 用）
      * @param newValue 微信这次想写入的值；`null` = 写 0 路径（与旧实现逐字一致）
      */
@@ -491,6 +510,18 @@ object SnsGuard {
         if (!cfg().blockEnabled) {
             SnsBlockProbe.record(
                 id, bits, keys, hasContent, hasAttr, SnsBlockProbe.Outcome.OFF,
+                newValue = newValue,
+            )
+            return
+        }
+
+        // R42 self-exclude：作者是自己 ⇒ 彻底放行（不保位、不加前缀），
+        // 让微信这次 update（sourceType=0 / 降位）原样落地，动态真的被删掉。
+        // ⛔ isSelfAuthor(null) 恒 false：bits 读不到（userName==null）或 self wxid 取不到时
+        //    **不**排除、照常走下面的保位/摘键 —— 绝不能因为拿不到作者就放行（硬红线）。
+        if (isSelfAuthor(bits?.userName)) {
+            SnsBlockProbe.record(
+                id, bits, keys, hasContent, hasAttr, SnsBlockProbe.Outcome.SELF,
                 newValue = newValue,
             )
             return
@@ -518,7 +549,7 @@ object SnsGuard {
                     cv = values, newValue = newValue, keep = keep,
                 )
                 // R42 prefix：写回路径附加前缀（保位已完成，前缀失败不影响拦截）
-                attachPrefix(db, values, api, id)
+                attachPrefix(db, values, api, id, bits?.userName)
                 return
             }
             // ⛔ 不吞异常：put 抛了要能看见，并降级为只摘键（此时 cv 未被改动）
@@ -571,11 +602,101 @@ object SnsGuard {
             cv = values, newValue = newValue, keep = null,
         )
         // R42 prefix：降级路径附加前缀（保位已完成，前缀失败不影响拦截）
-        attachPrefix(db, values, api, id)
+        attachPrefix(db, values, api, id, bits?.userName)
     }
 
     /** 前缀写入失败的告警只打一次（防系统性失败在删除路径刷屏） */
     private val prefixWarned = java.util.concurrent.atomic.AtomicBoolean(false)
+
+    // ------------------------------------------------------------------ 当前登录 wxid（排除自己）
+
+    /**
+     * 当前登录 wxid 的候选（按可靠性排序，取第一个非空）。
+     * 键名沿用旧 `SnsDeletedTag.selfWxid`（随灰标一起删除，此处为等价搬迁）。
+     */
+    private val SELF_CANDIDATES: List<Pair<String, String>> = listOf(
+        "com.tencent.mm_preferences" to "login_weixin_username",
+        "com.tencent.mm_preferences" to "login_user_name",
+        "system_config_prefs" to "login_weixin_username",
+        "com.tencent.mm" to "login_weixin_username",
+    )
+
+    /** 登录 wxid 缓存。**只缓存成功值**：取不到时下次再试（install 早期 Context 可能未就绪）。 */
+    @Volatile
+    private var selfWxidCache: String? = null
+
+    @Volatile
+    private var selfWxidWarned: Boolean = false
+
+    private fun selfWxid(): String? {
+        selfWxidCache?.let { return it }
+        val ctx = com.lx.wxgroup.core.HostContext.app() ?: return null
+        for ((file, key) in SELF_CANDIDATES) {
+            val v = runCatching {
+                ctx.getSharedPreferences(file, android.content.Context.MODE_PRIVATE)
+                    .getString(key, null)
+            }.getOrNull()
+            if (!v.isNullOrBlank()) {
+                selfWxidCache = v
+                return v
+            }
+        }
+        if (!selfWxidWarned) {
+            selfWxidWarned = true
+            LogX.w("PREFIX: self wxid unknown（不排除自己，照常加前缀）")
+        }
+        return null
+    }
+
+    /** 作者是不是自己。⛔ 取不到 self 时恒 false ⇒ **不排除**（与旧 `shouldRecord` 降级一致）。 */
+    private fun isSelfAuthor(author: String?): Boolean {
+        val me = selfWxid() ?: return false
+        return author != null && author == me
+    }
+
+    /** 探针复用的同一入口（`selfWxid` 是 private，跨文件不可见）。 */
+    internal fun selfWxidOrNull(): String? = selfWxid()
+
+    /**
+     * 探针入口：**逐候选**打印登录 wxid 的解析过程，不读写缓存。
+     *
+     * 为什么要把解析过程本身做成证据：`isSelfAuthor` 的判据是 `author == self`，而
+     * `self` 取不到时**恒不排除**（降级）。若 4 个候选 prefs 全部读不到，排除自己就是
+     * **静默失效** —— 代码看着对、日志不报错、行为却是「照常加前缀」。所以要能直接看到
+     * 哪条命中、哪条 null。
+     *
+     * 输出不含 wxid 明文（只给长度），避免日志里留完整账号。
+     */
+    internal fun selfWxidProbe(): List<String> {
+        val out = ArrayList<String>()
+        val ctx = com.lx.wxgroup.core.HostContext.app()
+        if (ctx == null) {
+            out += "SELF ctx=null（微信进程未 attach）"
+            return out
+        }
+        var hit: String? = null
+        for ((file, key) in SELF_CANDIDATES) {
+            val v = runCatching {
+                ctx.getSharedPreferences(file, android.content.Context.MODE_PRIVATE)
+                    .getString(key, null)
+            }.onFailure {
+                out += "SELF $file/$key throw ${it.javaClass.simpleName}"
+            }.getOrNull()
+            out += "SELF $file/$key = " + when {
+                v == null -> "null"
+                v.isBlank() -> "blank"
+                else -> "ok(len=${v.length})"
+            }
+            if (hit == null && !v.isNullOrBlank()) hit = v
+        }
+        out += "SELF resolved=" + (
+            hit?.let { "HIT len=${it.length}" }
+                ?: "null ⇒ isSelfAuthor 恒 false，排除自己不生效"
+            )
+        out += "SELF cached=${if (selfWxidCache == null) "-" else "yes"}"
+        return out
+    }
+
 
     /**
      * R42 prefix：把 `[已删除]\n` 前缀塞进同一次 update 的 `content` 列。
@@ -592,8 +713,12 @@ object SnsGuard {
      * - 幂等由 [SnsPrefixProbe.buildPrefixedBlob] 保证：ContentDesc 已带前缀 ⇒ 返回 null ⇒ 不写；
      * - 本函数只在两个 BLOCKED 分支调用（保位已成功），前缀失败**不影响删除拦截**。
      */
-    private fun attachPrefix(db: Any?, values: Any, api: CvApi, id: Long) {
+    private fun attachPrefix(db: Any?, values: Any, api: CvApi, id: Long, author: String?) {
         if (api.putBlob == null) return
+        // 自己发的动态不加前缀：作者就是当前登录账号 ⇒ 跳过。
+        // 语义沿用旧灰标 `shouldRecord` 的 `!isSelf(author, self)`（含「取不到 self 不排除」的降级）：
+        // 用户自己删自己的动态是明确意图，不该留一条「已被作者删除」的提示。
+        if (isSelfAuthor(author)) return
         val blob = SnsPrefixProbe.buildPrefixedBlob(db, id)
         if (blob == null) return
         runCatching { api.putBlob!!.invoke(values, "content", blob) }
