@@ -52,4 +52,23 @@ object PickerTabLogic {
         val i = newNames.indexOf(currentName)
         return if (i >= 0) i else 0
     }
+
+    /**
+     * R46 · 选择器列表「已选中的人排前面」—— **稳定分区**，不是排序。
+     *
+     * - `idOf(it) in selected` 的条目整体移到前面，其余留在后面；
+     * - **两组内部各自保持原有相对顺序**（`partition` 是稳定的，禁止换 `sortedBy*`）；
+     * - 纯函数、不写回数据源、不缓存结果 ⇒ 每次用新的 `selected` 调都会按最新勾选重排，
+     *   覆盖「反选 / 清空 / 切 Tab / 搜索 / 清空搜索」后的复位；
+     * - 只包含「分区」一件事：**什么时候重排**由调用方决定（勾选当下不重排，
+     *   否则用户点一行该行立刻跳走）。
+     */
+    fun <T> selectedFirst(
+        items: List<T>,
+        selected: Set<String>,
+        idOf: (T) -> String,
+    ): List<T> {
+        val (picked, rest) = items.partition { idOf(it) in selected }
+        return picked + rest
+    }
 }

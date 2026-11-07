@@ -243,3 +243,241 @@ if _lit > 7: _lit -= 16  # 4 位二补码
 
 ---
 
+
+---
+
+## ✅⑫.9 朋友圈**视频**解密定案（R45，2026-11-08 · 真机闭环）
+
+> 上一节处理的是**图片**（`picCachePath` / 缓存索引直扫）。本节是**视频**，两者链路不同，
+> 别再混：视频走 HTTP 直下 + **前 128KB 加密**，图片走缓存索引。
+
+### 结论一句话
+
+朋友圈视频 CDN 下载回来的是**只加密前 131072 字节**的 MP4，其余明文；
+**不要自研算法**（ISAAC-64 复现 126 组合全败），直接调微信自己的
+`com.tencent.mm.plugin.imgenc.MMIMAGEENCJNI.transFor()` 原地解密。
+
+### ⑫.9-I-0 密文结构（离线实测，`_kb/`）
+
+| 项 | 值 |
+|---|---|
+| 加密长度 | **131072 字节（128KB）**，之后全明文 |
+| 密钥流 | `明文 XOR 密文`；前 128KB 内 16384 个 8 字节块**全唯一无周期**，熵 7.9985 |
+| 结论 | **流密码 / 块无关**，且密钥流本身不可推导 ⇒ 只能借微信的 native 算 |
+
+CDN 响应头会直接给出这两个数（可用于替代硬编码）：
+
+```
+X-encflag: 1                # 已加密
+X-enclen: 131072            # 加密长度
+X-snsvideoflag: xV0
+X-Verify-Code: f005d69e…    # 与 key 无派生关系（已验证）
+```
+
+> ⛔ UA 必须是 `WeChat/arm64`；其它 UA 返回 `HTTP 400 X-retmsg: sns illegal ua http download2`。
+
+### ⑫.9-I-1 微信官方解密 API（**运行时真身**，非静态猜测）
+
+`com.tencent.mm.plugin.imgenc.MMIMAGEENCJNI`（classes7.dex），native 实现在 `libwechatcommon.so`。
+
+```java
+public static native long   free(long)                        // free(J)J
+public static native long   open(long)                        // open(J)J
+public static native long   open(String)                      // open(Ljava/lang/String;)J
+public static native byte[] readByte(long, byte[])            // readByte(J[B)[B
+public static native long   seek(long, long, int)             // seek(JJI)J
+public static native long   transFor(long h, byte[] buf, long off, long len)  // transFor(J[BJJ)J
+```
+
+三条铁律（都踩过）：
+
+1. ⛔ **静态 dex 解析会把它们显示成 `direct` 且不标 `static`**，容易误判成实例方法。
+   运行时 `api` 子命令实测：**6 个方法全是 `public static native`** ⇒ invoke 的 receiver 传 `null`。
+   但生产代码仍要按 `Modifier.isStatic` 兜底（版本漂移风险）。
+2. ⛔ 必须用**宿主的 ClassLoader**（`SnsGuard.hostLoaderHandle()`），模块自己的 loader 找不到这个类。
+3. `open` 有 `(J)` / `(String)` 两个重载，**必须按 `parameterTypes[0]` 精确挑**，不能 `getMethod` 猜。
+
+`transFor` 是**原地改写**：把 `buf` 传进去，返回后 `buf` 内容已是明文，无需接返回值。
+
+### ⑫.9-I-2 真机决定性验证（反向对照通过）
+
+```
+VIDDEC try enc=.../enc.mp4 key=1370298124 n=131072 r=0
+           hit256=256 firstDiff=-1  allSame=true  head8=00 00 00 1c 66 74 79 70
+VIDDEC try enc=.../enc.mp4 key=1370298125 n=131072 r=0
+           hit256=0   firstDiff=0   allSame=false head8=43 35 a6 bb f8 8a 28 10
+```
+
+| key | hit256 | firstDiff | allSame | head8 |
+|---|---|---|---|---|
+| `1370298124`（真值） | **256** | **-1** | **true** | `00 00 00 1c 66 74 79 70` = `ftyp` |
+| `1370298125`（减 1） | **0** | 0 | false | 随机 |
+
+`hit256` = 解密后前 256 字节里命中 MP4 特征（`ftyp` / `moov` / `mdat` / `free` / `wide`）的字节数。
+`firstDiff=-1` 表示前 131072 字节整段与已知明文样本逐字节相等。
+⇒ **不是巧合**：key 差 1 就完全失效，说明解密链路对 key 敏感、算法正确。
+
+### ⑫.9-I-3 key 来源定案：`SnsInfo.content` → `f8` → `f5` → `f25`
+
+`content` 是 **protobuf BLOB**，取 key 只需三层：
+
+```
+content (SnsInfo)
+  └─ f8   (SnsObject, length-delimited)
+       └─ f5  (MediaObject, length-delimited)   ← 可能有多个（图文混排），取第一个带 f25 的
+            ├─ f1  mediaId      (string)
+            ├─ f4  url          (string)
+            ├─ f25 encKey       (varint)  ★
+            └─ f26 32hex 串     (string)   ← 与缓存文件名第二段对应
+```
+
+Python 参考实现 `_r45_key.py` 已 **PASS**：
+
+```
+blob size = 1547
+encKey   = 1370298124
+mediaId  = 15049717216742806078
+url      = http://shzjwxsns.video.qq.com/102/20202/snsvideodownload?encfilekey=...
+```
+
+**兜底来源**：微信明文缓存文件名 `sight_<mediaId><32hex>&enc<十进制key>[_V2]` 里的 `&enc` 后数字。
+
+> ⛔⛔ **`&enc` 后缀的语义别搞反**（我曾推断错）：`&enc<数字>` 是「**下载时用的解密参数**」，
+> **不是**「这个文件是密文」。实测 `snsu_...&enc2400862626` 头是 `ff d8 ff e0 … JFIF` = **明文 JPEG**。
+
+### ⛔⑫.9-I-4 踩过的坑（会浪费半天，全记下）
+
+1. **`cast(content as text)` 做内容检索必假阴性**。SQLite 的 `cast(BLOB as TEXT)` 遇到 protobuf 里的
+   `0x00` **在第一个 NUL 处截断**，`instr(cast(content as text), "1370298124") = 0` 会让人误判
+   「key 不在 content 里」。**BLOB 列一律 `hex()` 导出后本地解析，禁止 `cast as text` 检索。**
+2. **`Long.TYPE` 在 Kotlin 里不存在**（那是 Java 的 `java.lang.Long.TYPE`），编译直接失败
+   `Unresolved reference 'TYPE'`。Kotlin 写法：`Long::class.javaPrimitiveType!!`。
+3. **探针读文件权限**：`/sdcard/_r45_enc.mp4` 属 `u0_a269 media_rw`，微信进程是 `u0_a363` ⇒ `read-fail`。
+   放 `/sdcard/Android/data/com.tencent.mm/files/` 下并 `chown u0_a363:u0_a363`。
+4. **自研 ISAAC-64 复现已正式作废**：96 + 30 组合，最高命中 3/256 = **随机期望**，不要再试。
+
+### ⑫.9-I-5 微X 的对照（参考，非依赖）
+
+- 微X v2.44 **确实有保存朋友圈视频功能**（此前我说「只有转发语义」是**错的**，用户已纠正）。
+- 落点在 **app 私有目录**：`/sdcard/Android/data/com.tencent.mm/files/WechatXposed/`
+  （`moments/<昵称 (wxid)>/<yyyy-MM-dd-HHmm>/{text.txt,img_N.jpg,video.mp4,url.txt}`），**必须 `su` 才能看**。
+- 它导出的 `video.mp4` 是**明文**：13,885,521 字节，box 结构自洽
+  （`ftyp 32 + moov 15490 + free 8 + mdat 13869991` ），`mdat` 首字节是 H.264 SPS（profile=100）。
+  ⇒ 它也在某处做了解密，与本节方案等价。
+- 微X 是**加密壳架构**：`classes.dex` 只是壳，真逻辑在 `assets/` 下 7 个 `92 c5 01 00` 魔数文件里，
+  native 用 `InMemoryDexClassLoader` 内存加载 ⇒ **静态逆向不可行，不用在这上面花时间**。
+
+### ⑫.9-I-6 生产接入（唯一正确形状）
+
+```
+1. 下载密文到 .tmp（downloadVideo 现有逻辑不变）
+2. key = snsVideoEncKey(content)            // f8.f5.f25
+3. 若 key <= 0 → 不做解密，直接放行（可能本身就是明文 / 旧版本）
+4. decryptInPlace(tmp, key)                 // 下面 5~8
+5.   if (isFtyp(前 8 字节)) → 已是明文，直接返回 true（幂等）
+6.   h = MMIMAGEENCJNI.open(long key)
+7.   buf = 读前 min(131072, size) 字节
+8.   transFor(h, buf, 0, buf.size) → buf 已就地变明文；finally free(h)
+9.   把 buf 覆盖回文件前段（RandomAccessFile "rw" + seek(0) + write）
+10. renameTo(dst)
+```
+
+⚠️ 幂等检查（第 5 步）不能省：`decryptInPlace` 会被重试路径重复调用，二次解密会把明文再 XOR 回密文。
+⚠️ `isFtyp` 的判据要宽松：`00 00 00 ?? 66 74 79 70`（第 4 字节可以是任意 box 长度），
+不要硬编码 `00 00 00 1c`。
+
+### 🟢⑫.9-I-7 `f25 == 0` 是**合法的「无需加密」**（双向实证，最重要的一条）
+
+> 这条推翻了我之前的隐含假设「解不出 key 就是解析有问题」。**不成立。**
+
+**全库统计**（本地完整库 `_kb/sns.db`，748MB，`SnsInfo` 共 **262647** 条有 content）：
+
+| `type` | 有条数 | `f25 > 0`（加密） | `f25 == 0`（明文） | 解析不出 `f8` |
+|---|---|---|---|---|
+| **15（朋友圈原生视频）** | **24525** | **22377（91.24%）** | **2148（8.76%）** | **0** |
+
+**关键旁证：`f25 > 0` 的 22377 条**全部**落在 `type=15`**，
+其它类型（1 图文 / 3 链接 / 2 纯文字 / 28 视频号 / 7 …）**一条都没有 key**。
+⇒ `f25` 是视频专有字段，不会在图文动态上误命中 —— 取 key **不需要先判 type**，
+取到 `>0` 就一定是该解密的那条。**解析失败 0 条**（24525/24525 全部能解出 `f8`）。
+
+**抽样 3000 条**（`order by createTime desc`）：
+
+```
+样本数(content 非空) = 3000
+取到 key(>0)      = 2960   (98.67%)
+key == 0          =   40   ( 1.33%)
+```
+
+那 40 条 **不是算法漏判**：`f25` **显式存在且值就是 `0`**（40/40 条，没有一条是「字段缺失」）。
+
+**真机下载双向对照**（`WeChat/arm64` UA）：
+
+| `content.f25` | 样本 | `X-encflag` | `X-enclen` | 落盘文件头 |
+|---|---|---|---|---|
+| `0` | 1 条实下 | **0** | **0** | `00 00 00 1c 66 74 79 70` = `ftyp` **明文** |
+| `1370298124` | 实下 | 1 | 131072 | 密文 |
+| `3660390825` | 实下 | 1 | 131072 | 密文 |
+| `3784293545` | 实下 | 1 | 131072 | 密文 |
+
+⇒ **`content.f25` 就是 CDN 加密标志的权威镜像**，不必再去读响应头 `X-encflag`：
+
+- `f25 > 0` ⇒ 加密，`X-enclen` **恒为 131072**（3/3 样本一致，可以硬编码）
+- `f25 == 0` ⇒ **完全没加密，直接是明文 MP4**，**绝不能拿去 XOR**（会把好文件毁掉）
+
+**生产语义钉死**：
+
+| 返回值 | 含义 | 动作 |
+|---|---|---|
+| `key > 0` | 该视频加密 | `decryptInPlace(tmp, key)` |
+| `key == 0` | 无需解密（或无法确定） | **直接放行，不解密** |
+
+⚠️ 「解析失败」也归到 `0`，因为**失败时的正确动作和不加密时一样**：宁可存原样，不能 XOR 坏。
+⚠️ `decryptInPlace` 内部 `key <= 0 → return false` 是**双保险**，保留。
+
+### ⛔⑫.9-I-8 拉库取证的正确姿势（踩过）
+
+```bash
+# ❌ adb exec-out + su cat 重定向 → 本地文件 0 字节（管道被 su 吃掉）
+adb exec-out "su -c 'cat .../SnsMicroMsg.db'" > local.db
+
+# ✅ 先 cp 到 /sdcard 再 pull
+adb shell su -c "cp .../SnsMicroMsg.db /sdcard/_kb_sns.db && chmod 666 /sdcard/_kb_sns.db"
+adb pull /sdcard/_kb_sns.db _kb/sns.db
+```
+
+⛔ `adb pull` 前必须 `export MSYS_NO_PATHCONV=1`，否则 Git Bash 把 `/sdcard/...`
+改写成 `F:/Program Files/.../sdcard/...`，报 `failed to stat remote object`。
+⛔ 用 `timed out` 的 `find /data/data/... -iname '*sight*'` 会卡死（748MB 库 + 深递归），
+耗时用 `ls` 定向看，别全树 find。
+
+### ✅⑫.9-I-9 生产定案（2026-11-08 04:11 · 真机闭环）
+
+**唯一解密判据 = `content.f25 > 0`**，代码落点 `MomentsExport.downloadVideo`：
+
+```kotlin
+if (encKey > 0L) {                 // 唯一 gate，不看 X-encflag
+    SnsVideoDecProbe.decryptInPlace(tmp, encKey, encLen)   // 失败只打日志，保留密文
+}
+tmp.renameTo(dst)
+```
+
+⛔ **曾写错、已修**：`if (encKey > 0L && encFlag != 0)`。
+`readHeaderInt` 对**响应头缺失/非法**返回 0 ⇒ 头一旦没拿到，22377 条加密视频
+全部静默留成密文（不报错、`outcome=COPIED`、计数照常）。
+**`f25` 来自本地 DB 是权威信号；`X-encflag` 只是同源副本，只能进日志，不能当 gate。**
+`X-enclen` 同理属于不可信输入，进 `decryptInPlace` 后 `coerceAtMost(131072)`。
+
+**真机双向对照**（`op=moments sub=viddl`，生产同链路）：
+
+| | 开关 | key | 日志 | 落盘文件头 |
+|---|---|---|---|---|
+| 正向 | `true` | 3805912539 | `VIDDEC ... ok=true why=decrypted` | `00 00 00 1c 66 74 79 70`，box 结构自洽 |
+| 反向 | `false` | 0 | `vid decrypt skip (encKey=0 encflag=1)` | `83 2f bc fc 7b d2 85 8b`（密文） |
+
+⇒ 明文确实来自解密；关开关只停解密，下载/落盘/计数不变（自变量唯一）。
+
+⚠️ 该修复消除的是**潜在**静默失效，真机 CDN 稳定返回 `X-encflag: 1`，
+新旧判据在本次实测中行为一致 —— 如实标注，不写成「已复现故障」。
+
+**全文（含独立复核、4 组变异验证、待办、真机踩坑）见 `docs/_r44_chain.md` 末节。**

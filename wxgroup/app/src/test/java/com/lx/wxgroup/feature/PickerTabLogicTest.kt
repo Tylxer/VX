@@ -115,3 +115,82 @@ class PickerTabLogicTest {
         assertEquals(0, PickerTabLogic.resolveCurrentIndex("好友", emptyList()))
     }
 }
+
+/**
+ * R46 · [PickerTabLogic.selectedFirst] 的判据回归。
+ *
+ * 需求：所有选人组件（设置自动导出名单 / 允许·排除名单 / 群发 / 转发目标）里
+ * 已选中的人排在前面。这里锁死三件容易改错的事：
+ * ① 是**稳定分区**，两组内部相对顺序不能乱（换成 sortedBy* 会打乱）；
+ * ② 结果不写回数据源、不缓存 ⇒ 换一组 selected 重算要跟着变（复位边界）；
+ * ③ 判定是「id 在 selected 里」，反转即回归。
+ *
+ * 变异验证逐组结论（真跑单测后的红条数）见 `docs/_r44_chain.md` R46 节与派发台账。
+ */
+class PickerSelectedFirstTest {
+
+    private data class P(val id: String, val name: String)
+
+    private val base = listOf(
+        P("a", "A"), P("b", "B"), P("c", "C"), P("d", "D"), P("e", "E")
+    )
+
+    private fun ids(xs: List<P>) = xs.map { it.id }
+
+    private fun order(sel: Set<String>) = ids(PickerTabLogic.selectedFirst(base, sel) { it.id })
+
+    /** 没勾选任何人 ⇒ 整表顺序逐字不变 */
+    @Test
+    fun noSelectedKeepsOriginalOrder() {
+        assertEquals(listOf("a", "b", "c", "d", "e"), order(emptySet()))
+    }
+
+    /** 部分已选 ⇒ 已选整体在前，且**两组内部**保持原相对顺序 */
+    @Test
+    fun pickedFirstAndBothGroupsStable() {
+        assertEquals(listOf("b", "d", "a", "c", "e"), order(setOf("b", "d")))
+        assertEquals(listOf("c", "e", "a", "b", "d"), order(setOf("e", "c")))
+    }
+
+    /** 全选 ⇒ 顺序不变（不能因为「排过序」就重排组内） */
+    @Test
+    fun allSelectedKeepsOriginalOrder() {
+        assertEquals(listOf("a", "b", "c", "d", "e"), order(base.map { it.id }.toSet()))
+    }
+
+    /** selected 里含列表不存在的 id ⇒ 不产生幽灵行、不影响顺序 */
+    @Test
+    fun unknownIdsIgnored() {
+        assertEquals(listOf("c", "a", "b", "d", "e"), order(setOf("zzz", "c")))
+    }
+
+    /** 重复 id 的条目必须一起稳定保留，不能去重 */
+    @Test
+    fun duplicateIdsStayStable() {
+        val dup = listOf(P("a", "A1"), P("a", "A2"), P("b", "B"))
+        val got = PickerTabLogic.selectedFirst(dup, setOf("a")) { it.id }
+        assertEquals(listOf("A1", "A2", "B"), got.map { it.name })
+    }
+
+    /** 幂等：对结果再跑一次，结果不变（防止每次 render 逐轮漂移） */
+    @Test
+    fun idempotent() {
+        val once = PickerTabLogic.selectedFirst(base, setOf("b", "d")) { it.id }
+        val twice = PickerTabLogic.selectedFirst(once, setOf("b", "d")) { it.id }
+        assertEquals(ids(once), ids(twice))
+    }
+
+    /** ⭐ 复位边界：反选 / 清空 / 换一组已选后，重算必须按**最新** selected 排，不能沿用旧顺序 */
+    @Test
+    fun resetsWhenSelectionChanges() {
+        assertEquals(listOf("b", "d", "a", "c", "e"), order(setOf("b", "d")))
+        assertEquals(listOf("a", "b", "c", "d", "e"), order(emptySet()))   // 清空
+        assertEquals(listOf("a", "e", "b", "c", "d"), order(setOf("a", "e"))) // 换成另一组
+    }
+
+    /** 空列表 ⇒ 空列表，不崩 */
+    @Test
+    fun emptyListReturnsEmpty() {
+        assertTrue(PickerTabLogic.selectedFirst(emptyList<P>(), setOf("a")) { it.id }.isEmpty())
+    }
+}

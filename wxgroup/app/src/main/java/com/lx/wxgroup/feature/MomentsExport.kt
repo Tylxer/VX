@@ -10,6 +10,8 @@ import de.robv.android.xposed.callbacks.XC_LoadPackage
 import java.io.File
 import java.io.FileInputStream
 import java.io.FileOutputStream
+import java.net.HttpURLConnection
+import java.net.URL
 import java.util.ArrayDeque
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicLong
@@ -209,6 +211,9 @@ object MomentsExport {
     private const val PAGE = 100
     private const val MAX_ROWS_PER_RUN = 500
 
+    /** `viddl` 探针按 id 有界查找的最多扫描行数（只读、不下载；超过仍没命中就报 notFound） */
+    private const val VDDL_SCAN_MAX_ROWS = 20_000
+
     /** 扫目录收集已导出 id 的上限（防异常大的目录把内存吃穿） */
     private const val SCAN_MAX_IDS = 20_000
 
@@ -220,12 +225,34 @@ object MomentsExport {
     //    正解见 docs/_r19_a4_probe.md。证据见 docs/_r20_a8_del.md。
 
     // ---- 原图下载（url 路线，见 MomentsLogic.kindOfUrl）----
+    /** 连接超时：连不上要快速失败，别把导出轮（单航班）挂死 */
     private const val DL_CONNECT_MS = 10_000
-    private const val DL_READ_MS = 30_000
+    /** 读取超时：77MB 长视频弱网下 30s 不够，给宽；超时后主动 disconnect + 删 tmp */
+    private const val DL_READ_MS = 120_000
     /** 单个媒体上限 20MB：朋友圈原图/短视频到不了这个量级，超了多半是下错了东西 */
     private const val MAX_MEDIA_BYTES = 20L * 1024 * 1024
     private const val DL_BUF = 8 * 1024
-    private const val DL_UA = "Mozilla/5.0 (Linux; Android 14; PJD110) AppleWebKit/537.36 Mobile"
+    /**
+     * R43 视频下载的 Referer。真机实测**加与不加结果相同**（400 与否只由 UA 决定），
+     * 保持空 = 不带。
+     */
+    private const val VID_REFERER = ""
+    /**
+     * R43 视频下载的 User-Agent。判据（2026-11-07 真机实测，三轮矩阵）：
+     * UA 含**大小写敏感**的 `WeChat` 或 `MicroMessenger` 即 200，缺则恒 400；
+     * 版本号 / 机型 / Chrome 版本**都不参与校验** ⇒ 故意不带会随微信升级过期的字段
+     * （`MicroMessenger/8.0.48.2580(0x28003036) ... SM-G991B ...` 那种别写死）。
+     *
+     * ⚠️ 刻意用**非 const** `val`：留一个运行时 `isEmpty()` 判定（见 [copyVideosForRow] 的
+     * `noUa` 分支）——「空 UA 也 200」是服务端特例、随时可能收紧，**不可依赖**，
+     * 所以空 UA 时不发请求、直接记账，而不是赌服务端继续放行。
+     */
+    private val VID_UA = "WeChat/arm64"
+    /**
+     * 单个视频上限 200MB。真机实测量级：1.0MB / 9.6MB / 17MB / 77.8MB（同一条 7 天前动态，
+     * 服务端声明总长 77,778,924）。200MB 能覆盖这批实测值并留余量；再往上大概率是下错东西。
+     */
+    private const val MAX_VIDEO_BYTES = 200L * 1024 * 1024
 
     private data class Config(
         val autoExport: Boolean,
@@ -250,6 +277,8 @@ object MomentsExport {
         val listImpossible: Boolean = false,
         /** R26：导出动态时同时拷图片（配置键 [Keys.MOMENTS_COPY_IMAGES]，默认 false） */
         val copyImages: Boolean = false,
+        /** R43：导出动态时同时下载朋友圈原生视频（配置键 [Keys.MOMENTS_COPY_VIDEOS]，默认 false） */
+        val copyVideos: Boolean = false,
         /**
          * R28：排除广告（`sourceType & 32 != 0`，见 [MomentsLogic.isAd]）。
          *
@@ -331,6 +360,30 @@ object MomentsExport {
      */
     private val imgAlready = AtomicLong(0)
 
+    // ---- 视频下载口径（R43，**独立于图片四态**，禁止混用：图片按 mediaId、视频按动态）----
+    /** `type != 15`：不是朋友圈原生视频，跳过（回填对账用） */
+    private val vidNotVideo = AtomicLong(0)
+    /** `type == 15` 但 content 里抽不出 `20202` 视频 URL */
+    private val vidNoUrl = AtomicLong(0)
+    /** UA 拼不出来（[VID_UA] 为空）——不发请求，直接记账 */
+    private val vidNoUa = AtomicLong(0)
+    /** HTTP 4xx（含 token 过期的 400）——**永久失败**，不回退不重试 */
+    private val vidHttp4xx = AtomicLong(0)
+    /** HTTP 5xx——服务端临时故障，游标轮转后下一轮自然再试 */
+    private val vidHttp5xx = AtomicLong(0)
+    /** 超过 [MAX_VIDEO_BYTES]（Content-Length 或实收字节） */
+    private val vidTooLarge = AtomicLong(0)
+    /** 200 但 Content-Type 不是 `video` 前缀（命中封面 jpg / 非预期内容），拒存 */
+    private val vidWrongType = AtomicLong(0)
+    /** 连接/读取/写盘/rename 抛异常 */
+    private val vidIoFail = AtomicLong(0)
+    /** 落盘前 `dir.usableSpace` 不足 */
+    private val vidSpace = AtomicLong(0)
+    /** tmp + rename 成功 */
+    private val vidCopied = AtomicLong(0)
+    /** 目标已存在且非空（回填短路，不重下） */
+    private val vidAlready = AtomicLong(0)
+
     /**
      * 本轮还剩多少行 `img mid` 明细可打（见 [IMG_LOG_MAX]）。
      *
@@ -364,7 +417,7 @@ object MomentsExport {
         runCatching { refresh() }
             .onFailure { LogX.w("$TAG export refresh failed: ${it.javaClass.simpleName}") }
         ensureTick(FIRST_TICK_MS)
-        LogX.i("$TAG export installed enabled=${config.autoExport} images=${config.copyImages}")
+        LogX.i("$TAG export installed enabled=${config.autoExport} images=${config.copyImages} videos=${config.copyVideos}")
     }
 
     fun refresh() {
@@ -382,6 +435,7 @@ object MomentsExport {
             listUnrestricted = resolved.unrestricted,
             listImpossible = resolved.impossible,
             copyImages = Kv.getBool(Keys.MOMENTS_COPY_IMAGES),
+            copyVideos = Kv.getBool(Keys.MOMENTS_COPY_VIDEOS),
             excludeAd = Kv.getBool(Keys.MOMENTS_EXCLUDE_AD),
         )
         cfgAt = android.os.SystemClock.elapsedRealtime()
@@ -809,6 +863,8 @@ object MomentsExport {
                     // ⛔ R20（A8 收敛）：这里原来调 `logImgProbe(row, nick)`（旧 md5 探针），已删。
                     // 图片：跟文本同一轮、同一目录落盘（文本去重 = 图片去重，见方案 Q6）
                     if (snsIdx != null) copyImagesForRow(snsIdx, row, dir)
+                    // R43 视频：同样只在新写 txt 时顺手下（已导出的靠独立回填轮补）
+                    if (c.copyVideos) copyVideosForRow(row, dir, detail = true, st = null)
                 } else {
                     er++
                     errs.incrementAndGet()
@@ -831,6 +887,11 @@ object MomentsExport {
         if (snsIdx != null && !stop) {
             runCatching { backfillImages(root, snsIdx) }
                 .onFailure { LogX.w("$TAG img backfill THREW ${it.javaClass.simpleName}") }
+        }
+        // R43 视频回填：独立一轮（type=15 判据 + 独立游标），同样只在空间未 abort 时跑。
+        if (c.copyVideos && !stop) {
+            runCatching { backfillVideos(root) }
+                .onFailure { LogX.w("$TAG vid backfill THREW ${it.javaClass.simpleName}") }
         }
 
         val now = System.currentTimeMillis()
@@ -897,6 +958,33 @@ object MomentsExport {
         }
         if (n != null) cache[w] = n
         return n
+    }
+
+    /**
+     * 按 snsId 有界查找一条动态（`viddl` 探针专用）。
+     *
+     * 数据源只有 [SnsGuard.listCurrentSns]（键集分页、只读，不改任何状态）。从最新往前翻页，
+     * 找到即返回；翻满 [VDDL_SCAN_MAX_ROWS] 或表尾仍未命中 ⇒ null。
+     * ⛔ 只查不写：不扫全库下载、不动 `moments.video_fill_cursor`、不改 `moments.last_export_at`。
+     */
+    private fun findSnsById(snsId: Long): GroupDb.SnsRow? {
+        if (snsId == 0L) return null
+        var ct = Long.MAX_VALUE
+        var sid = Long.MAX_VALUE
+        var scanned = 0
+        while (scanned < VDDL_SCAN_MAX_ROWS) {
+            val page = runCatching { SnsGuard.listCurrentSns(ct, sid, PAGE) }.getOrNull()
+                ?: return null
+            if (page.isEmpty()) return null
+            for (row in page) {
+                scanned++
+                ct = row.createTime
+                sid = row.snsId
+                if (row.snsId == snsId) return row
+            }
+            if (page.size < PAGE) return null
+        }
+        return null
     }
 
     // ⛔ 已删于 R20（A8 收敛）：logImgProbe() / imgRoots() —— 旧 md5 路线已三次真机证伪
@@ -1247,6 +1335,268 @@ object MomentsExport {
         }
     }
 
+    // -------------------------------------------------- 视频下载（R43 · url 路线）
+
+    /**
+     * 单条视频的落盘/判定结果（互斥穷尽）。
+     *
+     * 前 5 个（NOT_VIDEO..ALREADY）是「**未发请求**」的短路结局，在 [copyVideosForRow] 里判定；
+     * 后 6 个是「**真发起了下载**」之后的结局，由 [downloadVideo] 产出。
+     * 计数统一收口在 [countVid]，一处 `when` 覆盖全部 11 个值，无静默 else。
+     */
+    private enum class VidOutcome {
+        NOT_VIDEO, NO_URL, NO_UA, SPACE, ALREADY,
+        HTTP_4XX, HTTP_5XX, TOO_LARGE, WRONG_TYPE, IO_FAIL, COPIED
+    }
+
+    /** 单条视频的处理结果：outcome + 实际落盘字节数（非 COPIED/ALREADY 时为 0）+ 目标文件 */
+    private class VidResult(val outcome: VidOutcome, val bytes: Long, val file: File?)
+
+    /** 回填/主循环共用的轮内视频统计（聚合日志用，不参与全局计数口径） */
+    private class VidRoundStat {
+        var rows = 0
+        var notVideo = 0
+        var noUrl = 0
+        var noUa = 0
+        var copied = 0
+        var already = 0
+        var http4xx = 0
+        var http5xx = 0
+        var tooLarge = 0
+        var wrongType = 0
+        var ioFail = 0
+        var space = 0
+    }
+
+    /**
+     * 下载一条视频到 [dst]（先写 `.tmp` 再 rename，失败删 tmp）。
+     *
+     * ⛔ **无重试循环**：HTTP 4xx（token 过期）是永久失败，重试同一条 URL 无意义。
+     * 每条动态只有一个候选（`/20202/` 主源；`/20250/` 是封面 jpg，本功能不用，见
+     * [MomentsLogic.videoUrlCandidates]），不存在「主源失败回退备用」。
+     *
+     * @return outcome（只可能 HTTP_4XX/HTTP_5XX/TOO_LARGE/WRONG_TYPE/IO_FAIL/COPIED）+ 字节数
+     */
+    private fun downloadVideo(url: String, dst: File, encKey: Long): VidResult {
+        val tmp = File(dst.path + ".tmp")
+        var conn: HttpURLConnection? = null
+        try {
+            val c = URL(url).openConnection() as HttpURLConnection
+            conn = c
+            c.connectTimeout = DL_CONNECT_MS
+            c.readTimeout = DL_READ_MS
+            if (VID_REFERER.isNotEmpty()) c.setRequestProperty("Referer", VID_REFERER)
+            if (VID_UA.isNotEmpty()) c.setRequestProperty("User-Agent", VID_UA)
+            val code = c.responseCode
+            if (code != 200) {
+                runCatching { c.disconnect() }
+                LogX.w("$TAG vid http=$code url=$url")
+                val o = if (code in 400..499) VidOutcome.HTTP_4XX else VidOutcome.HTTP_5XX
+                return VidResult(o, 0, dst)
+            }
+            val ct = c.contentType?.substringBefore(';')?.trim()?.lowercase().orEmpty()
+            // 200 但返回的不是视频就拒收：防把 tar/HTML/封面 jpg 当视频存下来
+            if (ct.isNotEmpty() && !ct.startsWith("video/")) {
+                runCatching { c.disconnect() }
+                LogX.w("$TAG vid wrongType ct=$ct url=$url")
+                return VidResult(VidOutcome.WRONG_TYPE, 0, dst)
+            }
+            val declared = c.contentLengthLong
+            if (declared > MAX_VIDEO_BYTES) {
+                runCatching { c.disconnect() }
+                LogX.w("$TAG vid too large declared=$declared > $MAX_VIDEO_BYTES url=$url")
+                return VidResult(VidOutcome.TOO_LARGE, 0, dst)
+            }
+            val parent = dst.parentFile
+            if (parent != null && !parent.exists() && !parent.mkdirs()) {
+                runCatching { c.disconnect() }
+                LogX.w("$TAG vid mkdirs failed dir=${parent.path}")
+                return VidResult(VidOutcome.IO_FAIL, 0, dst)
+            }
+            var n = 0L
+            // R45：先读加密响应头（必须在 disconnect 之前，流消费完 header 仍可读）
+            val encFlag = readHeaderInt(c, "X-encflag")
+            val encLen = readHeaderLong(c, "X-enclen")
+            c.inputStream.use { input ->
+                FileOutputStream(tmp).use { out ->
+                    val buf = ByteArray(DL_BUF)
+                    while (true) {
+                        val r = input.read(buf)
+                        if (r < 0) break
+                        out.write(buf, 0, r)
+                        n += r
+                        if (n > MAX_VIDEO_BYTES) {
+                            // 与图片拷贝同款：半成品清掉，防下次 exists() 当成已下过
+                            runCatching { tmp.delete() }
+                            LogX.w("$TAG vid abort oversized bytes>$MAX_VIDEO_BYTES url=$url")
+                            return VidResult(VidOutcome.TOO_LARGE, 0, dst)
+                        }
+                    }
+                }
+            }
+            runCatching { c.disconnect() }
+            if (n == 0L) {
+                runCatching { tmp.delete() }
+                LogX.w("$TAG vid empty body url=$url")
+                return VidResult(VidOutcome.IO_FAIL, 0, dst)
+            }
+            // R45 解密：下载到 tmp 之后、rename 之前，原地解密。
+            //
+            // ⛔ **唯一判据是 `encKey > 0`**（f25 来自本地 DB，全库 24525 条零解析失败）。
+            //    `X-encflag` **只作日志观测，绝不参与是否解密的决策**：
+            //    它是 f25 的同源副本，但属于网络侧信号，可能被 CDN / 代理剥离、大小写变异、
+            //    或 `HttpURLConnection` 拿不到。一旦把 `encFlag != 0` 写成 AND 条件，
+            //    头缺失时即使 f25>0 也跳过解密 ⇒ 22377 条加密视频**静默留成密文**
+            //    （不报错、COPIED 照记、计数照常，只能 pull 出文件头才发现）。
+            //    ⭐ 对「f25>0 但文件实为明文」的防护由 `decryptInPlace` 的 `isFtyp` 幂等短路
+            //       贴身兜底，比网络响应头可靠得多。
+            //
+            // key==0（f25 显式 0 = 服务端声明未加密）直接放行，绝不能 XOR 好文件。
+            // 解密失败只打日志、保留密文文件，**绝不因此丢文件**（宁可存密文）。
+            if (MomentsLogic.shouldDecryptVideo(encKey)) {
+                val ok = SnsVideoDecProbe.decryptInPlace(tmp, encKey, encLen)
+                LogX.i(
+                    "$TAG vid decrypt key=$encKey ok=$ok encflag=$encFlag enclen=$encLen " +
+                        "dst=${dst.name}"
+                )
+            } else {
+                LogX.i(
+                    "$TAG vid decrypt skip (encKey=$encKey encflag=$encFlag) dst=${dst.name}"
+                )
+            }
+            if (!tmp.renameTo(dst)) {
+                runCatching { tmp.delete() }
+                LogX.w("$TAG vid rename failed dst=${dst.name}")
+                return VidResult(VidOutcome.IO_FAIL, 0, dst)
+            }
+            return VidResult(VidOutcome.COPIED, n, dst)
+        } catch (t: Throwable) {
+            // 超时/异常：断开连接 + 清半成品（防下次 exists() 把残留当已下过）
+            runCatching { conn?.disconnect() }
+            runCatching { tmp.delete() }
+            LogX.w(
+                "$TAG vid download threw ${t.javaClass.simpleName}: " +
+                    "${(t.cause ?: t).message?.take(80)} url=$url"
+            )
+            return VidResult(VidOutcome.IO_FAIL, 0, dst)
+        }
+    }
+
+    /** 读响应头为 Int（`X-encflag`）；缺失/非法返回 0（0 = 未加密，安全默认） */
+    private fun readHeaderInt(c: HttpURLConnection, name: String): Int =
+        runCatching { c.getHeaderField(name)?.trim()?.toIntOrNull() ?: 0 }.getOrDefault(0)
+
+    /** 读响应头为 Long（`X-enclen`）；缺失/非法返回 0（0 = 用默认 131072） */
+    private fun readHeaderLong(c: HttpURLConnection, name: String): Long =
+        runCatching { c.getHeaderField(name)?.trim()?.toLongOrNull() ?: 0L }.getOrDefault(0L)
+
+    /**
+     * 一条动态的视频下载（R43）。**生产与 `viddl` 探针共用本函数**（判定 + 下载 + 计数一条链路）。
+     *
+     * 进入边界（**六条缺一不可**）：`copy_videos=true`（由调用方闸）→ `type == 15`（权威判据）
+     * → 抽到 `/20202/` 视频 URL → UA 非空 → 目标文件不存在/为空 → `dir.usableSpace` 足够。
+     * 任何一条不满足都**不下载**，落入对应计数并返回对应 outcome。
+     *
+     * @param detail true = 主循环，逐条打明细；回填/探针传 false
+     * @param st 非空时按「本轮」累加（回填聚合日志）；全局计数两条路径都照常累加
+     * @return 处理结果（含字节数、目标文件），供 `viddl` 探针拼输出行复用
+     */
+    private fun copyVideosForRow(
+        row: GroupDb.SnsRow,
+        dir: File,
+        detail: Boolean,
+        st: VidRoundStat?,
+    ): VidResult {
+        if (!MomentsLogic.isSnsVideo(row.type)) {
+            return countVid(VidOutcome.NOT_VIDEO, row.snsId, null, 0, detail, st)
+        }
+        val urls = MomentsLogic.snsVideoUrls(row.content)
+        if (urls.isEmpty()) {
+            return countVid(VidOutcome.NO_URL, row.snsId, null, 0, detail, st)
+        }
+        // R45 解密开关：关掉 = 传 encKey=0（等同跳过解密，下载的仍是密文，用于反向对照）
+        val decryptOn = Kv.getBool(Keys.MOMENTS_VIDEO_DECRYPT)
+        val encKey = if (decryptOn) MomentsLogic.snsVideoEncKey(row.content) else 0L
+        // 一条动态 = 一个视频（候选里只剩 /20202/ 主源），固定单文件
+        val dst = File(dir, MomentsLogic.fileNameFor(row.snsId, 0, MomentsLogic.MediaKind.VIDEO, null))
+        val dstExists = dst.exists()
+        if (MomentsLogic.imgDone(dstExists, if (dstExists) dst.length() else 0L)) {
+            return countVid(VidOutcome.ALREADY, row.snsId, dst, if (dstExists) dst.length() else 0, detail, st)
+        }
+        // ⛔ UA 空时不发请求（空 UA 能 200 是服务端特例，不可依赖）
+        if (VID_UA.isEmpty()) {
+            return countVid(VidOutcome.NO_UA, row.snsId, dst, 0, detail, st)
+        }
+        // R46：viddl 单条探针不经过 export 分支的建目录逻辑；目录不存在时
+        // File.usableSpace 返回 0 ⇒ 会被下面误判成「空间不足」假阳性（outcome=space）。
+        // 生产路径已在 export 分支建过目录，这里 mkdirs() 幂等无副作用。
+        if (!dir.exists()) dir.mkdirs()
+        if (dir.usableSpace < MomentsLogic.MIN_FREE_BYTES) {
+            return countVid(VidOutcome.SPACE, row.snsId, dst, 0, detail, st)
+        }
+        val r = downloadVideo(urls.first(), dst, encKey)
+        return countVid(r.outcome, row.snsId, dst, r.bytes, detail, st)
+    }
+
+    /**
+     * 视频处理结果计数 + 一行日志 + 组结果，**唯一收口点**（覆盖 [VidOutcome] 全部 11 个值，
+     * 无静默 else）。全局计数与轮内统计同时累加。
+     */
+    private fun countVid(
+        outcome: VidOutcome,
+        snsId: Long,
+        dst: File?,
+        bytes: Long,
+        detail: Boolean,
+        st: VidRoundStat?,
+    ): VidResult {
+        when (outcome) {
+            VidOutcome.NOT_VIDEO -> {
+                vidNotVideo.incrementAndGet(); st?.let { it.notVideo++ }
+            }
+            VidOutcome.NO_URL -> {
+                vidNoUrl.incrementAndGet(); st?.let { it.noUrl++ }
+                if (detail) LogX.i("$TAG vid noUrl snsId=$snsId (type=15 但无 /20202/ 视频 URL)")
+            }
+            VidOutcome.NO_UA -> {
+                vidNoUa.incrementAndGet(); st?.let { it.noUa++ }
+                if (detail) LogX.w("$TAG vid noUa snsId=$snsId")
+            }
+            VidOutcome.SPACE -> {
+                vidSpace.incrementAndGet(); st?.let { it.space++ }
+                if (detail) LogX.w("$TAG vid space snsId=$snsId dst=${dst?.name}")
+            }
+            VidOutcome.ALREADY -> {
+                vidAlready.incrementAndGet(); st?.let { it.already++ }
+            }
+            VidOutcome.HTTP_4XX -> {
+                vidHttp4xx.incrementAndGet(); st?.let { it.http4xx++ }
+                if (detail) LogX.w("$TAG vid http4xx snsId=$snsId dst=${dst?.name}")
+            }
+            VidOutcome.HTTP_5XX -> {
+                vidHttp5xx.incrementAndGet(); st?.let { it.http5xx++ }
+                if (detail) LogX.w("$TAG vid http5xx snsId=$snsId dst=${dst?.name}")
+            }
+            VidOutcome.TOO_LARGE -> {
+                vidTooLarge.incrementAndGet(); st?.let { it.tooLarge++ }
+                if (detail) LogX.w("$TAG vid tooLarge snsId=$snsId dst=${dst?.name}")
+            }
+            VidOutcome.WRONG_TYPE -> {
+                vidWrongType.incrementAndGet(); st?.let { it.wrongType++ }
+                if (detail) LogX.w("$TAG vid wrongType snsId=$snsId dst=${dst?.name}")
+            }
+            VidOutcome.IO_FAIL -> {
+                vidIoFail.incrementAndGet(); st?.let { it.ioFail++ }
+                if (detail) LogX.w("$TAG vid ioFail snsId=$snsId dst=${dst?.name}")
+            }
+            VidOutcome.COPIED -> {
+                vidCopied.incrementAndGet(); st?.let { it.copied++ }
+                if (detail) LogX.i("$TAG vid copied snsId=$snsId dst=${dst?.name}")
+            }
+        }
+        return VidResult(outcome, bytes, dst)
+    }
+
     /**
      * R26 · 图片**回填轮**：给「txt 已导出但图还缺」的动态补图。
      *
@@ -1361,6 +1711,100 @@ object MomentsExport {
     /** 游标源编号的单字符展示（`C` = 当前 SnsInfo，`NEW` = 从最新开始） */
     private fun fillSrcName(c: MomentsLogic.FillCursor?): String = if (c == null) "NEW" else "C"
 
+    /**
+     * R43 · 视频**回填轮**：给「txt 已导出但视频还缺」的 type=15 动态补视频。
+     *
+     * ## 为什么**另开一轮**、不复用 [backfillImages]
+     * - 数据源不同：图片是本地 sns 缓存（[buildSnsIndex] 索引直扫，不联网）；视频是
+     *   content 里的 `snsvideodownload` CDN 地址（联网下载）。混在一起会让「索引建不建、
+     *   网络发不发」两个正交条件纠缠。
+     * - 判据不同：图片按 mediaId（protobuf 8>5>1）；视频按 `row.type == 15`。
+     * - 计数口径不同：图片是四态 + already + noMedia；视频是**另一套**失败分类
+     *   （noUrl/httpFail/tooLarge/ioFail/space），互不污染。
+     * - 游标独立（[Keys.MOMENTS_VIDEO_FILL_CURSOR]）：开/关 `copy_videos` 不该打乱图片回填进度。
+     *
+     * ## 与图片回填**共用**的两样（不复制）
+     * - 空间闸门：`runBlocking` 开头已判根目录 [MomentsLogic.MIN_FREE_BYTES]，视频在
+     *   [copyVideosForRow] 里再对 `dir.usableSpace` 判一次；两者是同一套「不足就不写」语义。
+     * - 单航班 [running] CAS：本函数作为 `runBlocking` 内的一个步骤，天然在单航班线程里串行；
+     *   手动探针 `vidfill` 与 `imgfill` 一样先抢 CAS。
+     *
+     * ## 限次 + 跨轮轮转
+     * 每轮最多 [MAX_BACKFILL_PER_RUN] 条动态，游标落盘轮转，与图片回填同一套机制。
+     * ⚠️ 视频下载**无重试循环**（token 过期是永久失败）：游标扫到底才回绕，
+     * 单条失败动态的下次尝试天然隔开一个完整扫描周期，不会每轮都轰炸最新那 200 条。
+     *
+     * @return 聚合日志行（探针 `sub=vidfill` 直接把它打出来）
+     */
+    private fun backfillVideos(root: String): String {
+        val st = VidRoundStat()
+        val nickCache = HashMap<String, String>()
+        val seen = HashSet<Long>()
+        val cur = SnsScanCursor()
+        val saved = runCatching { MomentsLogic.parseFillCursor(Kv.getString(Keys.MOMENTS_VIDEO_FILL_CURSOR)) }
+            .onFailure { LogX.w("$TAG vid backfill cursor read failed ${it.javaClass.simpleName}") }
+            .getOrNull()
+        if (saved != null) cur.seek(fillSrc(saved.src), saved.ct, saved.sid)
+        var filledRows = 0
+        var noTxt = 0
+        var wrapped = false
+
+        scan@ while (st.rows < MAX_BACKFILL_PER_RUN) {
+            val page: List<GroupDb.SnsRow>? =
+                runCatching { SnsGuard.listCurrentSns(cur.ct, cur.sid, PAGE) }.getOrNull()
+            if (page == null || page.isEmpty()) {
+                wrapped = true
+                break
+            }
+            for (row in page) {
+                // ⛔ 配额判定必须在 `advanceTo` **之前**（与图片回填同一条规矩：游标停在未处理行
+                //    会跳过整整一圈）
+                if (st.rows >= MAX_BACKFILL_PER_RUN) break@scan
+                // ⚠️ 游标必须无条件推进（去重跳过的也要推，否则死循环）
+                cur.advanceTo(row.createTime, row.snsId)
+                if (!seen.add(row.snsId)) continue
+                st.rows++
+                val nick = nickOf(row.userName, nickCache)
+                val dir = File(
+                    MomentsLogic.exportDir(
+                        root, nick, row.userName, MomentsLogic.millisOf(row.createTime)
+                    )
+                )
+                // 没导出过 txt 的交给主循环（它同时会写 txt + 视频），这里不重复处理
+                if (!File(dir, MomentsLogic.textFileName(row.snsId)).exists()) {
+                    noTxt++
+                    continue
+                }
+                val before = st.copied
+                copyVideosForRow(row, dir, detail = false, st = st)
+                if (st.copied > before) filledRows++
+            }
+            if (page.size < PAGE) {
+                wrapped = true
+                break
+            }
+        }
+
+        val last = MomentsLogic.FillCursor(fillSrcCode(cur.src), cur.ct, cur.sid)
+        val next = MomentsLogic.fillCursorAfterRound(wrapped, last)
+        runCatching {
+            Kv.putString(
+                Keys.MOMENTS_VIDEO_FILL_CURSOR,
+                if (next == null) "" else MomentsLogic.encodeFillCursor(next)
+            )
+        }.onFailure { LogX.w("$TAG vid backfill cursor save failed ${it.javaClass.simpleName}") }
+
+        val line = "$TAG vid backfill rows=${st.rows} noTxt=$noTxt notVideo=${st.notVideo} " +
+            "noUrl=${st.noUrl} noUa=${st.noUa} filled=$filledRows copied=${st.copied} " +
+            "already=${st.already} http4xx=${st.http4xx} http5xx=${st.http5xx} " +
+            "tooLarge=${st.tooLarge} wrongType=${st.wrongType} ioFail=${st.ioFail} " +
+            "space=${st.space} " +
+            "from=${fillSrcName(saved)}:${saved?.ct ?: "-"} " +
+            "next=${fillSrcName(next)}:${next?.ct ?: "-"} wrapped=$wrapped"
+        LogX.i(line)
+        return line
+    }
+
     // ⛔ 已删于 R20（A8 收敛）：tryCopyImages() —— 旧 md5 路线已三次真机证伪
     //    （R15 分桶 0.68% / R16 全盘 find 零结果 / R19 文件名是 20 位数字串不含 md5）。
     //    正解见 docs/_r19_a4_probe.md。证据见 docs/_r20_a8_del.md。
@@ -1369,14 +1813,22 @@ object MomentsExport {
     fun stat(): String = runCatching {
         val c = cfg()
         "$TAG export stat enabled=${c.autoExport} images=${c.copyImages} imgHint=$IMG_SOURCE_HINT " +
+            "videos=${c.copyVideos} " +
             "running=$running " +
             "lastRunAt=$lastRunAt runs=${runs.get()} written=${written.get()} " +
             "skipped=${skipped.get()} listMiss=${listMiss.get()} err=${errs.get()} " +
             "imgRootMiss=${imgRootMiss.get()} imgFileMiss=${imgFileMiss.get()} " +
             "imgReadFail=${imgReadFail.get()} imgCopied=${imgCopied.get()} " +
             "imgAlready=${imgAlready.get()} imgNoMedia=${imgNoMedia.get()} " +
+            "vidNotVideo=${vidNotVideo.get()} vidNoUrl=${vidNoUrl.get()} " +
+            "vidNoUa=${vidNoUa.get()} vidHttp4xx=${vidHttp4xx.get()} " +
+            "vidHttp5xx=${vidHttp5xx.get()} vidTooLarge=${vidTooLarge.get()} " +
+            "vidWrongType=${vidWrongType.get()} vidIoFail=${vidIoFail.get()} " +
+            "vidSpace=${vidSpace.get()} " +
+            "vidCopied=${vidCopied.get()} vidAlready=${vidAlready.get()} " +
             // R27：回填游标（NEW / 空 = 下一轮从最新开始）—— 真机看它有没有在往前推
             "fillCursor=${Kv.getString(Keys.MOMENTS_FILL_CURSOR).ifBlank { "NEW" }} " +
+            "vidFillCursor=${Kv.getString(Keys.MOMENTS_VIDEO_FILL_CURSOR).ifBlank { "NEW" }} " +
             "list=${c.list.size} root=${c.root}"
     }.getOrElse { "$TAG export stat error=${it.javaClass.simpleName}" }
 
@@ -1386,9 +1838,13 @@ object MomentsExport {
      * - `export` 立刻起一轮（绕过最小间隔；开关只挡自动轮，不挡手动诊断）
      * - `snsidx` 只读诊断：索引能不能建起来、建了多少条
      * - `imgfill` R26 图片回填（给已导出但缺图的补图，受 `moments.copy_images` 约束）
+     * - `vidfill` R43 视频回填（给已导出但缺视频的 type=15 补视频，受 `moments.copy_videos` 约束）
+     * - `viddl` R43 单条视频下载诊断（`--el id <snsId>`；绕过开关，走生产同一条下载链路）
      * - `scan` 重扫导出目录，报告已导出条数
+     *
+     * @param id `viddl` 用的 snsId（`--el id`；其它 sub 忽略）
      */
-    fun probe(sub: String, n: Int = 5): String = runCatching {
+    fun probe(sub: String, n: Int = 5, id: Long = 0L): String = runCatching {
         when (sub.lowercase()) {
             "stat" -> stat()
             // ⛔ ⚠️ 别名，不是重复：入口 `op=moments sub=stat` 在 EntryReceiver 里被
@@ -1445,11 +1901,57 @@ object MomentsExport {
                     }
                 }
             }
+            // R43：**视频回填**（给「txt 已导出但视频缺」的 type=15 补视频）。手动触发。
+            // ⚠️ 仍受配置开关约束（单闸原则，不做隐藏旁路）；与图片回填一样共用 running 单航班。
+            "vidfill" -> {
+                val c = cfg()
+                if (!c.copyVideos) {
+                    "$TAG vid backfill SKIP copy_videos=false " +
+                        "（先 kvset ${Keys.MOMENTS_COPY_VIDEOS} true）"
+                } else if (!running.compareAndSet(false, true)) {
+                    "$TAG vid backfill SKIP a round is running"
+                } else {
+                    try {
+                        backfillVideos(c.root)
+                    } finally {
+                        running.set(false)
+                    }
+                }
+            }
+            // R43：单条视频下载诊断。走**生产同一条** [copyVideosForRow] 链路（判定+下载+计数）。
+            // ⛔ 绕过 copy_videos 开关（诊断入口），故打 `gate=bypass` 防误判「开关关了怎么还下」。
+            // 只下这一条：按 id 有界查找、不扫全库、不动游标、不改 last_export_at。
+            "viddl" -> {
+                val t0 = System.currentTimeMillis()
+                val row = findSnsById(id)
+                if (row == null) {
+                    "VIDDL id=$id gate=bypass type=- hit=false url=- " +
+                        "outcome=notFound bytes=0 file=- ms=${System.currentTimeMillis() - t0}"
+                } else {
+                    val c = cfg()
+                    val dir = File(
+                        MomentsLogic.exportDir(
+                            c.root, nickOf(row.userName, HashMap()), row.userName,
+                            MomentsLogic.millisOf(row.createTime),
+                        )
+                    )
+                    val hasUrl = MomentsLogic.snsVideoUrls(row.content).isNotEmpty()
+                    val r = copyVideosForRow(row, dir, detail = false, st = null)
+                    val file = r.file?.takeIf {
+                        r.outcome == VidOutcome.COPIED || r.outcome == VidOutcome.ALREADY
+                    }
+                    "VIDDL id=$id gate=bypass type=${row.type} hit=true " +
+                        "url=${if (hasUrl) "有" else "无"} outcome=${r.outcome.name.lowercase()} " +
+                        "bytes=${r.bytes} file=${file?.path ?: "-"} " +
+                        "ms=${System.currentTimeMillis() - t0}"
+                }
+            }
             "scan" -> {
                 val ids = scanExportedIds(File(cfg().root))
                 "$TAG scan exported=${ids.size} sample=${ids.take(5)}"
             }
-            else -> "$TAG export subs=estat|path|export|snsidx|imgfill|scan"
+            else -> "$TAG export subs=estat|path|export|snsidx|imgfill|vidfill|viddl|scan"
         }
     }.getOrElse { "$TAG export probe error=${it.javaClass.simpleName}" }
 }
+// [DONE] R45-02

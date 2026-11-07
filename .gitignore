@@ -35,6 +35,14 @@ local.properties
 .idea/
 .cxx/
 
+# R44/R45 本地取证留档（含 748MB 全库副本，本地保留、绝不入库）
+_kb/
+_mmso/
+_mxvid/
+_r44_ui.py
+_r45_*.py
+_isaac*.py
+
 # 工作区内部数据
 .workbuddy/
 __pycache__/

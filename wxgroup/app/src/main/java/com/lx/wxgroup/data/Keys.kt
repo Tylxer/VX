@@ -272,6 +272,29 @@ object Keys {
     const val MOMENTS_COPY_IMAGES = "moments.copy_images"
 
     /**
+     * R43：导出动态时**同时下载视频**（朋友圈原生视频，`type == 15`）。
+     *
+     * ⚠️ 与 [MOMENTS_COPY_IMAGES] 分开：图片是本地 sns 缓存直拷（不联网），视频是
+     * 从 content 里的 `snsvideodownload` CDN 地址**联网下载**、体积大（数 MB~数十 MB），
+     * 且 token 在有效期外就下不动。不该被图片开关顺带拖起来 ⇒ 独立开关、默认关。
+     * 判据与 URL 形态见 `docs/_r43_video_probe.md`。
+     */
+    const val MOMENTS_COPY_VIDEOS = "moments.copy_videos"
+
+    /**
+     * R45：导出视频下载后**原地解密**前 131072 字节（朋友圈视频 CDN 下回来是密文）。
+     *
+     * 关掉 = 下载的仍是密文，用于反向对照（验证「解密」这一层真的是解密层带来的效果，
+     * 而不是下载/落盘本身出了变化）。默认 true。
+     *
+     * ⚠️ 解密能力（[com.lx.wxgroup.feature.SnsVideoDecProbe.decryptInPlace]）已真机验证，
+     * 但 **enc key 的提取**当前未落地（key 在微信磁盘缓存文件名 `sight_<mediaId>&enc<数字>` 里，
+     * 不在 content protobuf 里，见 [MomentsLogic.snsVideoEncKey]）。key 提取补齐前，
+     * `copyVideosForRow` 里抽到的 key 恒为 0 ⇒ 即便本开关为 true，实际也走「跳过解密」分支。
+     */
+    const val MOMENTS_VIDEO_DECRYPT = "moments.video_decrypt"
+
+    /**
      * R42 bit3 相册位补位的**反向对照开关**（布尔，`true` = 关补位、降级回纯摘键）。
      *
      * ⛔ 刻意**不登记 PrefSpec**：它只走 `op=kvset` 调试通道翻转，不该出现在设置界面，
@@ -307,6 +330,15 @@ object Keys {
      * 换机/清空更有意义，也不该被备份带走。
      */
     const val MOMENTS_FILL_CURSOR = "moments.fill_cursor"
+
+    /**
+     * 视频**回填轮的低水位游标**（格式同 [MOMENTS_FILL_CURSOR]，见 `MomentsLogic.parseFillCursor`）。
+     *
+     * ⚠️ 与图片回填游标**分开存**：视频回填是独立一轮（判据是 `type == 15`，图片是 mediaId），
+     * 开关互不影响 —— 开/关 `copy_videos` 不该打乱图片回填的进度，反之亦然。
+     * 同 [MOMENTS_LAST_EXPORT_AT]：纯运行状态，**刻意不进 `Prefs.ALL`**。
+     */
+    const val MOMENTS_VIDEO_FILL_CURSOR = "moments.video_fill_cursor"
 
     // —— 群发域 ——
     const val BROADCAST_INTERVAL_S = "broadcast.interval_s"
@@ -470,6 +502,18 @@ object Prefs {
             Keys.MOMENTS_COPY_IMAGES, PrefKind.SWITCH, "false", "朋友圈",
             "导出图片（仅微信本地缓存里已有的图；历史/已删动态的图取不回）"
         ),
+        // R43：视频导出。默认关（snsvideodownload 裸 HTTP 当前 400 未解，见 docs/_r43_video_probe.md）。
+        // ⚠️ 摘要必须写明「需联网下载、下不动是常态」—— 别让用户当视频备份用。
+        PrefSpec(
+            Keys.MOMENTS_COPY_VIDEOS, PrefKind.SWITCH, "false", "朋友圈",
+            "导出视频（朋友圈原生视频，需联网下载；token 过期/下不动是常态）"
+        ),
+        // R45 解密。默认开（关掉 = 下载的仍是密文，用于反向对照验证解密层）。
+        // ⚠️ 消费点已接（copyVideosForRow），但 enc key 提取未落地 ⇒ 当前 key 恒 0、恒走跳过分支。
+        PrefSpec(
+            Keys.MOMENTS_VIDEO_DECRYPT, PrefKind.SWITCH, "true", "朋友圈",
+            "导出视频解密（前 131072 字节密文转明文）"
+        ),
         // ⛔ 2026-10-27 已删：这里原本登记着 `sns.cdn_img` / `sns.cdn_rewrite_path` 两项
         //    （hidden = true）。随整条 CDN 通路一并物理删除，判死判据保留备查：
         //      - sns.cdn_img：真机定案（docs/取证结论.md ⑫.9，2026-10-24）两条 ——
@@ -533,3 +577,4 @@ object Prefs {
         }
     }
 }
+// [DONE] R45-02

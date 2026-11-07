@@ -523,6 +523,27 @@ object MomentsLogic {
     private const val PROTO_FIELD_CONTENT_OBJ = 8
     private const val PROTO_FIELD_MEDIA_LIST = 5
     private const val PROTO_FIELD_MEDIA_ID = 1
+
+    /**
+     * MediaObject 里视频解密 key 的字段号（f25，varint）。
+     *
+     * 真机铁证（snsId=-3397026857690197446，content 1547 字节）：
+     * ```
+     * content --f8--> SnsObject --f5--> MediaObject --f25--> key(1370298124)
+     * ```
+     * 同一层还有 f1=mediaId、f4=CDN URL、f26=32位hex、f2=subType(视频=6)。
+     *
+     * 全库统计（24525 条 type=15 视频）：
+     * - f25>0（加密）= 22377（91.24%），X-enclen 恒 131072
+     * - f25==0（明文）= 2148（8.76%），X-encflag=0，直接是明文 MP4
+     * - 解析不出 f8 = 0（24525/24525 全解出，零失败）
+     *
+     * ⛔ f25 显式存在且值=0 是**合法明文态**，不是「字段缺失」——
+     *    两者最终都返回 0（不解密），但语义不同：前者是「服务端说没加密」，
+     *    后者是「结构里没这个字段」。返回值统一为 `0 = 无需解密/无法确定`，
+     *    调用方一律不解密，宁可存原样也不能拿 0 当错误去 XOR。
+     */
+    private const val PROTO_FIELD_MEDIA_ENC_KEY = 25
     private const val LEGACY_FIELD_CONTENT_OBJ = 6
     private const val LEGACY_FIELD_MEDIA_LIST = 8
 
@@ -604,6 +625,48 @@ object MomentsLogic {
     }
 
     /**
+     * 取指定字段号（wiretype=0）的**第一个** varint 值。
+     *
+     * 与 [protoString] 对称：一个取 length-delimited 段转 String，这个取 varint 转 Long。
+     * 走同一套线格式扫描（[readVarintPublic]），结构断裂 / 字段缺失 ⇒ 返回 `0L`，不抛异常。
+     *
+     * ⛔ 返回 `0L`（**非空**）是有意的：对 [snsVideoEncKey] 的 f25 而言，
+     *    「字段缺失」与「字段显式为 0」最终都落到「不解密」，语义统一为 0，
+     *    调用方 `if (k > 0L)` 直接判，不需要再区分 null。
+     */
+    fun protoVarint(b: ByteArray, field: Int): Long {
+        if (field <= 0 || b.isEmpty()) return 0L
+        var i = 0
+        while (i < b.size) {
+            val t = readVarint(b, i) ?: return 0L
+            var pos = t.second
+            val tag = t.first
+            if (tag == 0L) return 0L // 字段号 0 非法
+            val f = (tag ushr 3).toInt()
+            when (tag and 0x07L) {
+                0L -> {
+                    val v = readVarint(b, pos) ?: return 0L
+                    if (f == field) return v.first
+                    pos = v.second
+                }
+                1L -> pos += 8                                    // fixed64
+                2L -> {
+                    val lv = readVarint(b, pos) ?: return 0L
+                    pos = lv.second
+                    val len = lv.first
+                    if (len < 0 || len > (b.size - pos).toLong()) return 0L
+                    pos += len.toInt()
+                }
+                5L -> pos += 4                                    // fixed32
+                else -> return 0L                                 // 3/4 = group，不支持
+            }
+            if (pos > b.size) return 0L
+            i = pos
+        }
+        return 0L
+    }
+
+    /**
      * 一步到位：`content` → 容器(8) → 媒体列表(5) → 每个元素的 d(1)。
      *
      * ⛔ **字段号于 2026-10-25（R19）由真机取证改过**：原为 `6 → 8 → 1`，
@@ -654,6 +717,9 @@ object MomentsLogic {
     /**
      * url 分类判据（**全部来自 2026-10-18 真机 `op=moments sub=imgurl` 的实际输出**，不是猜）：
      *
+     * ⛔ R43 订正：下面这条 `stodownload` 是 **type=28 视频号分享**的 url，不是朋友圈视频；
+     *   朋友圈**原生视频**（type=15）的 url 是 `…/snsvideodownload`，见 [VIDEO_MARKS]。
+     *
      * - `http://wxapp.tc.qq.com/<n>/<n>/stodownload?encfilekey=…&token=…` —— 视频 / 大图。
      *   ✅ **实测可下载**：设备上 curl 返回 HTTP 200、`video/mp4`、2826203 字节；
      *   ✅ 端到端已通：`op=moments sub=imgdl` 真机落盘 `vid_-3412979636140764498_0.mp4`。
@@ -670,7 +736,14 @@ object MomentsLogic {
      * ② 触发微信把图缓存到本地（用户点开大图）后走 md5 快速路径。
      */
     private val IMG_MARKS = listOf("mmsns", "qpic.cn")
-    private val VIDEO_MARKS = listOf("stodownload")
+    /**
+     * ⛔ R43 订正：朋友圈**原生视频**的域名特征**不是** `stodownload`，而是 `snsvideodownload`
+     * （`szzjwxsns.video.qq.com/102/<n>/snsvideodownload`，见 `docs/_r43_video_probe.md`）。
+     * `stodownload` 主要出现在 **type=28 视频号分享**（`wxapp.tc.qq.com`），
+     * 两者在 URL 层都是视频，但**朋友圈视频的权威判据是 `type == 15`**（[SNS_TYPE_VIDEO]），
+     * 不是这个列表。这里保留两者只是让 [kindOfUrl] 能把两类视频 URL 都归为 VIDEO。
+     */
+    private val VIDEO_MARKS = listOf("snsvideodownload", "stodownload")
     private val NOISE_MARKS = listOf("dldir1.qq.com", "mp.weixin.qq.com/s", "res.wx.qq.com")
 
     /** 正文里的文章链接 / 资源图标 —— 都不是动态原图 */
@@ -703,6 +776,99 @@ object MomentsLogic {
         }
         return out.toList()
     }
+
+    // ------------------------------------------------- 朋友圈原生视频（R43）
+
+    /**
+     * 朋友圈**原生视频**的 `SnsInfo.type` 值 —— **权威判据**（不是 [kindOfUrl]）。
+     *
+     * 真机库实测 24517 行 type=15，其中 24513 行含 `snsvideodownload` URL（99.98%）。
+     * 判据证据见 `docs/_r43_video_probe.md`。URL 只负责「取哪个地址下载」，
+     * 「这条动态有没有朋友圈视频」必须看 `type == 15`，不能靠 URL 猜（
+     * `stodownload` 那种 URL 是 type=28 视频号分享，不是朋友圈视频）。
+     */
+    const val SNS_TYPE_VIDEO = 15
+
+    /** 这条动态是不是朋友圈原生视频（[SNS_TYPE_VIDEO]）。纯值比较，单测覆盖 */
+    fun isSnsVideo(type: Int): Boolean = type == SNS_TYPE_VIDEO
+
+    /** 真朋友圈视频的域名特征（`…/snsvideodownload`，见 [VIDEO_MARKS]） */
+    private const val VIDEO_DOWNLOAD_MARK = "snsvideodownload"
+
+    /**
+     * 从一批 URL 里挑出朋友圈视频的下载候选，**只取主源 `/20202/`**。
+     *
+     * 一条 type=15 动态的 `snsvideodownload` URL 有两条：
+     * - `…/102/20202/snsvideodownload?…&dur=<秒>&…` —— **主源（视频）**，带 `dur`；
+     * - `…/102/20250/snsvideodownload?…&ui=1&ut=…` —— **封面图（不是视频）**。
+     *
+     * ⛔ R43 订正（见 `docs/_r43_video_probe.md` §4.2）：`/20250/` 实测返回
+     * `ct=image/jpg`、32KB —— 是**封面**，不是备用视频源。所以这里**只留 20202**，
+     * 没有 20202 时返回空，**不退回到 20250**（退回会把封面图当视频存下来）。
+     */
+    fun videoUrlCandidates(urls: List<String>): List<String> =
+        urls.filter { it.lowercase().contains(VIDEO_DOWNLOAD_MARK) && it.contains("/20202/") }
+            .distinct()
+
+    /** 一条动态 content 里的朋友圈视频下载候选（[extractUrls] + [videoUrlCandidates] 的组合） */
+    fun snsVideoUrls(blob: ByteArray?): List<String> = videoUrlCandidates(extractUrls(blob))
+
+    /**
+     * 朋友圈视频解密用的 **ISAAC-64 enc key**（`content --f8--> f5 --> f25`，varint）。
+     *
+     * 真机确证（snsId=-3397026857690197446，content 1547 字节）：
+     * ```
+     * TimeLineObject
+     * └─ f8 = SnsObject
+     *    ├─ f1 = "Sight"（媒体类型）
+     *    ├─ f2 = 15（type = SNS_TYPE_VIDEO）
+     *    └─ f5 = MediaObject
+     *        ├─ f1  = mediaId（"15049717216742806078"）
+     *        ├─ f4  = CDN URL（snsvideodownload）
+     *        ├─ f25 = 1370298124   ★ 解密 key
+     *        └─ f26 = 32位 hex
+     * ```
+     *
+     * ## 返回值语义（钉死）
+     * `0` = **无需解密 / 无法确定**，两者对调用方等价：**一律不解密**。
+     * - `f25 > 0`（加密）→ 返回该 key；
+     * - `f25` 显式存在且值 = 0（明文，全库 8.76%）→ 返回 0；
+     * - 解析不出 f8/f5/f25（结构断裂）→ 返回 0。
+     * ⛔ 不要把「f25==0」当「解析失败」——前者是服务端声明未加密，返回 0 恰好正确。
+     *
+     * ## 不做 type 判断
+     * 全库统计 f25>0 的 22377 条**全部**落在 type=15；其它类型一条 key 都没有。
+     * 所以取到 >0 就一定是该解密的那条，无需先判 `type == 15`（多一层耦合多一个错点）。
+     *
+     * ## 多 media 遍历
+     * 全库 68637 条多 media 动态里 f25 从未出现「第一个 0、后面非 0」（0 例，恒全 0 或全同值）。
+     * 但**遍历取第一个 >0** 的成本是几次字节扫描，抗版本漂移，故保留遍历。
+     */
+    fun snsVideoEncKey(blob: ByteArray?): Long {
+        if (blob == null || blob.isEmpty()) return 0L
+        val obj = protoSegments(blob, PROTO_FIELD_CONTENT_OBJ).firstOrNull() ?: return 0L
+        if (obj.isEmpty()) return 0L
+        for (media in protoSegments(obj, PROTO_FIELD_MEDIA_LIST)) {
+            if (media.isEmpty()) continue
+            val k = protoVarint(media, PROTO_FIELD_MEDIA_ENC_KEY)
+            if (k > 0L) return k
+        }
+        return 0L
+    }
+
+    /**
+     * R46 · 视频下载回来后**是否要解密**的唯一判据（纯函数，零副作用）。
+     *
+     * - `encKey > 0`（`f25>0`）⇒ 必须解密：CDN 回来的前 128KB 是密文；
+     * - `encKey == 0`（`f25==0`）⇒ **服务端声明的合法明文**，XOR 会毁文件；
+     * - 负值 / 0 一律不解密（宁可存密文，也不能写坏文件）。
+     *
+     * ⛔ `X-encflag` **绝不参与判据**：它是 `f25` 的网络侧同源副本，可能被 CDN /
+     * 代理剥离或大小写变异。R45 实证：写成 `encKey > 0 && encFlag != 0` 会在头缺失时
+     * 让 22377 条加密视频**静默留成密文**（不报错、COPIED 照记）。
+     * ⚠️ 关 `moments.video_decrypt` 开关由上层把 `encKey` 置 0 实现，本函数不感知开关。
+     */
+    fun shouldDecryptVideo(encKey: Long): Boolean = encKey > 0L
 
     private val VIDEO_EXTS = setOf("mp4", "mov", "m4v")
     private val CT_EXT = mapOf(
@@ -990,3 +1156,4 @@ object MomentsLogic {
         return p == l || p.startsWith("$l/")
     }
 }
+// [DONE] R45-02

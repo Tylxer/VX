@@ -407,7 +407,13 @@ class PickerPage(
             for (s in list) {
                 if (s.items.isEmpty()) continue
                 visible.add(Row.Header(s.name))
-                for (it in s.items) visible.add(Row.Entry(it))
+                // R46：已选中的人排在本段最前（稳定分区，组内原顺序不变）。
+                // 排序只发生在 render —— 勾选当下仅 notifyDataSetChanged，不重排，
+                // 否则用户点一行该行立刻跳走。切 Tab / 搜索 / 清空搜索 / 群聊补跑刷新
+                // 都会重新 render ⇒ 一律按当时最新的 selected 重排。
+                for (it in PickerTabLogic.selectedFirst(s.items, selected) { it.id }) {
+                    visible.add(Row.Entry(it))
+                }
             }
             notifyDataSetChanged()
         }

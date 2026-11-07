@@ -425,7 +425,11 @@ class ForwardPicker(
             for (s in list) {
                 if (s.items.isEmpty()) continue
                 visible.add(Row(s.name, null))
-                for (it in s.items) visible.add(Row(null, it))
+                // R46：与 PickerPage.Adapter 同口径 —— 已选排前（稳定分区）。
+                // filter 也走 reset ⇒ 搜索 / 清空搜索 / 换 Tab 都会按当时 selected 重排。
+                for (it in PickerTabLogic.selectedFirst(s.items, selected) { it.id }) {
+                    visible.add(Row(null, it))
+                }
             }
             notifyDataSetChanged()
         }

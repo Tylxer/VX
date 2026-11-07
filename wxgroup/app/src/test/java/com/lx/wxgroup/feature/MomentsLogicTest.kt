@@ -610,4 +610,151 @@ class MomentsLogicTest {
         assertEquals("img_-3412979636140764498_0.jpg", n)
         assertTrue(n.none { it == '/' || it == '\\' || it == ':' })
     }
+
+    // ---------------------------------------------------------------- R43 朋友圈原生视频
+
+    // 形态来自 docs/_r43_video_probe.md 的完整样本（20202 主源带 dur，20250 是封面图 jpg）
+    private val SNS_VIDEO_20202 =
+        "http://szzjwxsns.video.qq.com/102/20202/snsvideodownload?encfilekey=abc&token=xyz&idx=1&bizid=1023&dotrans=9&dur=15"
+    private val SNS_VIDEO_20250 =
+        "http://szzjwxsns.video.qq.com/102/20250/snsvideodownload?encfilekey=abc&token=xyz&idx=1&bizid=1023&dotrans=0&ui=1&ut=1"
+
+    @Test
+    fun isSnsVideoOnlyType15() {
+        assertTrue(MomentsLogic.isSnsVideo(15))
+        assertFalse(MomentsLogic.isSnsVideo(0))
+        assertFalse(MomentsLogic.isSnsVideo(28)) // 视频号分享不是朋友圈视频
+        assertFalse(MomentsLogic.isSnsVideo(1))
+    }
+
+    @Test
+    fun kindOfUrlRecognizesSnsVideoDownload() {
+        // ⛔ R43 订正：真朋友圈视频域名 snsvideodownload（不含 stodownload 子串），必须归 VIDEO
+        assertEquals(MomentsLogic.MediaKind.VIDEO, MomentsLogic.kindOfUrl(SNS_VIDEO_20202))
+    }
+
+    @Test
+    fun videoUrlCandidatesKeepsOnlyMain20202() {
+        val urls = listOf(SNS_VIDEO_20250, SNS_VIDEO_20202, IMG_URL, "https://example.com/a.mp4")
+        val got = MomentsLogic.videoUrlCandidates(urls)
+        // 只留 /20202/ 主源；20250 是封面 jpg（不是视频），必须被丢弃
+        assertEquals(listOf(SNS_VIDEO_20202), got)
+    }
+
+    @Test
+    fun videoUrlCandidatesEmptyWhenNoSnsVideoDownload() {
+        assertEquals(emptyList<String>(), MomentsLogic.videoUrlCandidates(listOf(IMG_URL, ARTICLE_URL)))
+        assertEquals(emptyList<String>(), MomentsLogic.videoUrlCandidates(emptyList()))
+    }
+
+    @Test
+    fun videoUrlCandidatesEmptyWhenOnlyCover() {
+        // 20250 是封面图，实测 ct=image/jpg、32KB（见 _r43_video_probe.md §4.2）——只有它时返回空，不退回
+        assertEquals(emptyList<String>(), MomentsLogic.videoUrlCandidates(listOf(SNS_VIDEO_20250)))
+    }
+
+    @Test
+    fun snsVideoUrlsExtractsFromBlob() {
+        val blob = "pre$SNS_VIDEO_20250 post $SNS_VIDEO_20202 tail".toByteArray()
+        val got = MomentsLogic.snsVideoUrls(blob)
+        // 只抽出 20202 主源（20250 封面被丢弃）
+        assertEquals(listOf(SNS_VIDEO_20202), got)
+    }
+
+    // ------------------------------------------------ 朋友圈视频解密 key（R45）
+
+    /**
+     * 构造一份 protobuf 片段，只含本例所需字段，字节级直接写（不依赖真实 950 字节样本）。
+     *
+     * 结构：`content --8--> SnsObject --5(repeated)--> MediaObject --25--> key`
+     */
+    private fun hexOf(s: String): ByteArray = s.chunked(2).map { it.toInt(16).toByte() }.toByteArray()
+
+    /**
+     * 用例 1：正常加密视频，`f25 = 1370298124`。
+     *
+     * 这个 key 是真机 snsId=-3397026857690197446 的实际值，
+     * 已被 [SnsVideoDecProbe] 的 `try` 子命令验证能把密文 100% 还原成明文
+     * （`hit256=256 firstDiff=-1 allSame=true`）。
+     */
+    private val ENC_CONTENT_HEX =
+        "42462a440a14313530343937313732313637343238303630373810062223687474703a2f2f78" +
+            "2f32303230322f736e73766964656f646f776e6c6f61643f613d31c8018caeb48d05"
+
+    /** 用例 2：`f25` **显式存在且值为 0** —— 服务端声明「这条没加密」（全库 8.76%） */
+    private val PLAIN_CONTENT_HEX = "420c2a0a0a033131311006c80100"
+
+    /** 用例 3：两个 media，第一个**没有** f25，第二个 `f25 = 777` */
+    private val TWO_MEDIA_HEX = "42162a070a0331313110062a0b0a033232321006c8018906"
+
+    /**
+     * 用例 3b：两个 media，第一个 `f25` **显式为 0**，第二个 `f25 = 777`。
+     *
+     * ⛔ 这条是变异验证补出来的：原用例（第一个**没有** f25）在「去掉 `k>0` 过滤」的变异下
+     * **仍然全绿**，因为 `protoVarint` 对缺失字段返回 `0L`、`if (k > 0L)` 恰好跳过了。
+     * 只有「第一个 media 有 f25 且为 0」才能区分「取第一个值」与「取第一个正值」。
+     * 真实库里虽然没出现这种组合（68637 条多 media 全是全 0 或全同值），
+     * 但这是遍历逻辑**唯一能被证伪**的入口，必须有用例守着。
+     */
+    private val FIRST_ZERO_MEDIA_HEX = "42152a080a03313131c801002a090a03323232c8018906"
+
+    @Test
+    fun snsVideoEncKeyReturnsKeyWhenEncrypted() {
+        assertEquals(1370298124L, MomentsLogic.snsVideoEncKey(hexOf(ENC_CONTENT_HEX)))
+    }
+
+    /**
+     * ⛔ 这条最重要：`f25 == 0` 必须返回 `0` 而**不是**当成解析失败抛/忽略。
+     *
+     * 真机已实证（`docs/conclusions/moments_cdn.md` ⑫.9-I-7）：
+     * `f25 == 0` 的样本下载回来 `X-encflag: 0`、文件头就是 `ftyp` 明文。
+     * 对它做 XOR 会把好文件毁掉。
+     */
+    @Test
+    fun snsVideoEncKeyReturnsZeroWhenExplicitlyPlain() {
+        assertEquals(0L, MomentsLogic.snsVideoEncKey(hexOf(PLAIN_CONTENT_HEX)))
+    }
+
+    /** 多 media 时取第一个 `> 0` 的 key（第一个没有 f25 不能直接返回 0） */
+    @Test
+    fun snsVideoEncKeyScansAllMediaObjects() {
+        assertEquals(777L, MomentsLogic.snsVideoEncKey(hexOf(TWO_MEDIA_HEX)))
+    }
+
+    /**
+     * 多 media 且**第一个 media 的 f25 显式为 0** 时，仍要取到第二个的 `777`。
+     *
+     * ⛔ 这条专门守住「取第一个 **正值**」而不是「取第一个**值**」——
+     * 去掉 `if (k > 0L)` 过滤后本用例必须变红（变异验证已确认它能抓到）。
+     */
+    @Test
+    fun snsVideoEncKeySkipsZeroKeyAndTakesNextPositive() {
+        assertEquals(777L, MomentsLogic.snsVideoEncKey(hexOf(FIRST_ZERO_MEDIA_HEX)))
+    }
+
+    @Test
+    fun snsVideoEncKeyReturnsZeroOnBadInput() {
+        assertEquals(0L, MomentsLogic.snsVideoEncKey(null))
+        assertEquals(0L, MomentsLogic.snsVideoEncKey(ByteArray(0)))
+        // 结构断裂（字段号 0 非法）
+        assertEquals(0L, MomentsLogic.snsVideoEncKey(hexOf("00")))
+        // 有 f8 但没有 f5 媒体列表
+        assertEquals(0L, MomentsLogic.snsVideoEncKey(hexOf("42030a0178")))
+        // 顶层只有 f6（旧 R15 形态）—— 纯 `8→5→25` 路径下取不到，返回 0（不再回退）
+        assertEquals(0L, MomentsLogic.snsVideoEncKey(hexOf("320b42090a03333333c801e707")))
+    }
+
+    /**
+     * 关键回归：**图片/文字动态不能拿到 key**。
+     *
+     * 全库实测 `f25 > 0` 的 22377 条**全部**落在 `type=15`（视频），
+     * type=1（图文）/2（纯文字）/3（链接）一条 key 都没有。
+     * 这条用例保证「给图文动态套用 key 提取」不会误命中。
+     */
+    @Test
+    fun snsVideoEncKeyZeroForImageMomentShape() {
+        // f8 里只有 f1(mediaId) + f2(type=1 图文)，没有 f25
+        val imageContent = hexOf("420c2a0a0a033939391001")
+        assertEquals(0L, MomentsLogic.snsVideoEncKey(imageContent))
+    }
 }

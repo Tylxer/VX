@@ -456,12 +456,14 @@ object EntryReceiver {
                     "moments" -> {
                         val sub = intent.getStringExtra("sub") ?: "stat"
                         val n = intent.getIntExtra("n", 5)
+                        // ⚠️ snsId 是 Long 且可能为负，用 `--el id`（getLongExtra 配 --ei 会静默得 0）
+                        val id = intent.getLongExtra("id", 0L)
                         io {
                             when (sub.lowercase()) {
                                 "stat", "env", "act", "refresh", "load", "rvmethods" ->
                                     LogX.i(com.lx.wxgroup.feature.MomentsAuto.probe(sub))
                                 else ->
-                                    LogX.i(com.lx.wxgroup.feature.MomentsExport.probe(sub, n))
+                                    LogX.i(com.lx.wxgroup.feature.MomentsExport.probe(sub, n, id))
                             }
                         }
                     }
@@ -665,6 +667,19 @@ object EntryReceiver {
                         val id = intent.getLongExtra("id", 0L)
                         io {
                             for (l in com.lx.wxgroup.feature.SnsPrefixProbe.run(sub, id)) {
+                                LogX.i(l)
+                            }
+                        }
+                    }
+                    // 朋友圈视频解密探针（R45）
+                    // --es op viddec --es sub api|dec|key|try --es arg "..." [--el off 0] [--el len 131072]
+                    "viddec" -> {
+                        val sub = intent.getStringExtra("sub").orEmpty()
+                        val arg = intent.getStringExtra("arg").orEmpty()
+                        val off = intent.getLongExtra("off", 0L)
+                        val len = intent.getLongExtra("len", 131072L)
+                        io {
+                            for (l in com.lx.wxgroup.feature.SnsVideoDecProbe.run(sub, arg, off, len)) {
                                 LogX.i(l)
                             }
                         }
