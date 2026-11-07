@@ -111,9 +111,21 @@ object SnsGuard {
     @Volatile
     private var snsDb: Any? = null
 
+    /**
+     * 宿主（微信）ClassLoader，[install] 时记下。
+     *
+     * ⛔ 微信的类（如 `com.tencent.mm.protocal.protobuf.TimeLineObject`）**只能用宿主
+     * ClassLoader** 加载，模块自己的 ClassLoader 加载不到（真机必抛 CNFE）。
+     * 供 [SnsPrefixProbe] 反序列化 `content` BLOB 用。
+     */
+    @Volatile
+    private var hostLoader: ClassLoader? = null
+
     // ------------------------------------------------------------------ 安装
 
     fun install(lpparam: XC_LoadPackage.LoadPackageParam) {
+        // 宿主 ClassLoader 必须最先进来记下：下面 findClass 失败早退时探针也还能用。
+        hostLoader = lpparam.classLoader
         val cls = runCatching {
             XposedHelpers.findClass(
                 "com.tencent.wcdb.database.SQLiteDatabase",
@@ -295,6 +307,10 @@ object SnsGuard {
             runCatching { c.getMethod("put", String::class.java, Int::class.javaObjectType) }
                 .getOrNull()
                 ?: runCatching { c.getMethod("put", String::class.java, Any::class.java) }.getOrNull()
+        val putBlob: Method? =
+            runCatching { c.getMethod("put", String::class.java, ByteArray::class.java) }
+                .getOrNull()
+                ?: runCatching { c.getMethod("put", String::class.java, Any::class.java) }.getOrNull()
     }
 
     @Volatile
@@ -379,7 +395,7 @@ object SnsGuard {
             LogX.w("BLOCK warn: sourceType=0 但 whereArgs 里抠不出 snsId keys=$keys（本条照拦）")
         }
 
-        applyBlock(values, api, id, bits, keys, hasContent, hasAttr, newValue = null)
+        applyBlock(db, values, api, id, bits, keys, hasContent, hasAttr, newValue = null)
     }
 
     /**
@@ -416,7 +432,7 @@ object SnsGuard {
             .getOrDefault(false)
         val hasAttr = runCatching { api.get?.invoke(values, "attrBuf") != null }
             .getOrDefault(false)
-        applyBlock(values, api, id, bits, keys, hasContent, hasAttr, newValue = st)
+        applyBlock(db, values, api, id, bits, keys, hasContent, hasAttr, newValue = st)
     }
 
     /**
@@ -445,12 +461,21 @@ object SnsGuard {
      * - A/B 反向对照：`cfg().albumFixEnabled == false` ⇒ keep 直接置 null ⇒ 只摘键，
      *   A 层（写时拦截）与 B 层（`&-9 → -1`）**完全不动**，自变量唯一（见 [ALBUM_FIX_OFF_KEY]）；
      *   `SNS stat` 会显示 `albumFix=<true|false>` 便于确认开关读回。
-     * - [SnsDeletedTag.onBlocked] 仍在 BLOCKED 分支调用、参数不变（约束 5）；
-     *   方案 B 的 `& -9 → -1` 一行未动（约束 5）。
+     * - 方案 B 的 `& -9 → -1` 一行未动。
      *
+     * ## R42 prefix：删除拦截成功时把 `[已删除]` 写进同一次 update 的 content
+     * 两个 BLOCKED 分支（写回 / 降级）都调 [attachPrefix]，把前缀 blob 与 sourceType
+     * 一起塞进**同一个** ContentValues —— 微信这一次 update 全做完，没有第二条写。
+     * ⚠️ 前缀附加**在保位逻辑之后**：保位（put/remove 及 SKIP_EMPTY 放回）已完成、
+     * 结果已定，前缀失败（buildPrefixedBlob 返回 null / put 抛异常）只打限流日志、
+     * 绝不 rethrow、**不影响删除拦截**。SKIP_EMPTY / SKIP_NO_API / OFF 分支不附加前缀
+     * （那些分支本条根本没拦住，行照旧被清位，写前缀无意义）。
+     *
+     * @param db wcdb 的 SQLiteDatabase（[SnsPrefixProbe.buildPrefixedBlob] 读 content 用）
      * @param newValue 微信这次想写入的值；`null` = 写 0 路径（与旧实现逐字一致）
      */
     private fun applyBlock(
+        db: Any?,
         values: Any,
         api: CvApi,
         id: Long,
@@ -492,8 +517,8 @@ object SnsGuard {
                     id, bits, keys, hasContent, hasAttr, SnsBlockProbe.Outcome.BLOCKED,
                     cv = values, newValue = newValue, keep = keep,
                 )
-                // 约束 5：灰标台账参数与旧实现逐字一致（want = newValue ?: 0）
-                SnsDeletedTag.onBlocked(id, bits, want)
+                // R42 prefix：写回路径附加前缀（保位已完成，前缀失败不影响拦截）
+                attachPrefix(db, values, api, id)
                 return
             }
             // ⛔ 不吞异常：put 抛了要能看见，并降级为只摘键（此时 cv 未被改动）
@@ -545,8 +570,41 @@ object SnsGuard {
             id, bits, keys, hasContent, hasAttr, SnsBlockProbe.Outcome.BLOCKED,
             cv = values, newValue = newValue, keep = null,
         )
-        // 约束 5：灰标台账参数与旧实现逐字一致
-        SnsDeletedTag.onBlocked(id, bits, want)
+        // R42 prefix：降级路径附加前缀（保位已完成，前缀失败不影响拦截）
+        attachPrefix(db, values, api, id)
+    }
+
+    /** 前缀写入失败的告警只打一次（防系统性失败在删除路径刷屏） */
+    private val prefixWarned = java.util.concurrent.atomic.AtomicBoolean(false)
+
+    /**
+     * R42 prefix：把 `[已删除]\n` 前缀塞进同一次 update 的 `content` 列。
+     *
+     * ## 为什么是 before 而不是 after
+     * after 里改 values 已经晚了 —— `updateWithOnConflict` 的 SQL 早就执行完，
+     * 再改 values 不会写进库。要「content 前缀与 sourceType 保位**一起**落地」，
+     * 只能在这条钩子的 **before** 半场把 `content` 键塞进**同一个** ContentValues，
+     * 让微信这一次 update 把两件事都做完（第二次写库 = 竞态 + 冷启/下拉刷新被覆写）。
+     *
+     * ## 硬约束
+     * - 整段 `runCatching`，出错只打限流日志、绝不 rethrow —— 这是微信写库线程，抛异常 = 崩微信；
+     * - `api.putBlob == null`（wcdb 没有 put(String,byte[])）直接跳过，不降级为别的手段；
+     * - 幂等由 [SnsPrefixProbe.buildPrefixedBlob] 保证：ContentDesc 已带前缀 ⇒ 返回 null ⇒ 不写；
+     * - 本函数只在两个 BLOCKED 分支调用（保位已成功），前缀失败**不影响删除拦截**。
+     */
+    private fun attachPrefix(db: Any?, values: Any, api: CvApi, id: Long) {
+        if (api.putBlob == null) return
+        val blob = SnsPrefixProbe.buildPrefixedBlob(db, id)
+        if (blob == null) return
+        runCatching { api.putBlob!!.invoke(values, "content", blob) }
+            .onFailure {
+                if (prefixWarned.compareAndSet(false, true)) {
+                    LogX.w(
+                        "PREFIX attach fail: put(content) threw on ${values.javaClass.name}: " +
+                            "${it.javaClass.simpleName}（保位不受影响）"
+                    )
+                }
+            }
     }
 
     /**
@@ -858,6 +916,9 @@ object SnsGuard {
      *  **本轮没有新增任何常驻钩子**。调用方必须容忍 null（= 这次启动微信还没碰过朋友圈库）。
      */
     internal fun snsDbHandle(): Any? = snsDb
+
+    /** 只读暴露宿主 ClassLoader，给 [SnsPrefixProbe] 反序列化 `content` BLOB 用 */
+    internal fun hostLoaderHandle(): ClassLoader? = hostLoader
 
     private fun rawQueryMethod(db: Any): Method? =
         runCatching {

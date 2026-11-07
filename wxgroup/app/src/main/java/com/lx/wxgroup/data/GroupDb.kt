@@ -47,7 +47,6 @@ class GroupDb private constructor(context: Context) :
         private const val T_DND = "auto_dnd_done"
         private const val T_SEEN = "group_seen"
         private const val T_RESCUED = "rescued"
-        private const val T_SNS_DELETED = "sns_deleted"
 
         @Volatile
         private var instance: GroupDb? = null
@@ -98,7 +97,6 @@ class GroupDb private constructor(context: Context) :
         createDndTable(db)
         createRescuedTable(db)
         createSeenTable(db)
-        createSnsDeletedTable(db)
     }
 
     override fun onUpgrade(db: SQLiteDatabase, oldVersion: Int, newVersion: Int) {
@@ -157,11 +155,6 @@ class GroupDb private constructor(context: Context) :
         }
         if (oldVersion < 8) {
             createSeenTable(db)
-        }
-        if (oldVersion < 10) {
-            // R42 朋友圈「已删除」灰标台账：写时拦截丢时间线位时落一笔。
-            // CREATE TABLE IF NOT EXISTS 幂等；不破坏既有表。
-            createSnsDeletedTable(db)
         }
     }
 
@@ -534,92 +527,13 @@ class GroupDb private constructor(context: Context) :
     }
 
     // ------------------------------------------------- 「已删除」灰标台账（R42）
-
-    /**
-     * 朋友圈「已删除」灰标台账。
-     *
-     * 写入时机：写时拦截 A 层真摘键、且这次写丢了时间线位（bit1）、且作者不是自己。
-     * 同一 snsId 只保留一条（PRIMARY KEY + CONFLICT_IGNORE，首记录为准）。
-     *
-     * ⚠️ 这是模块自己的库（AOSP SQLite），**不走 wcdb**，读写不会触发挂在微信库上的钩子。
-     */
-    private fun createSnsDeletedTable(db: SQLiteDatabase) {
-        db.execSQL(
-            """
-            CREATE TABLE IF NOT EXISTS $T_SNS_DELETED (
-                sns_id     INTEGER PRIMARY KEY,
-                created_at INTEGER NOT NULL
-            )
-            """.trimIndent()
-        )
-    }
-
-    /**
-     * 登记一条「已删除」动态。**已存在就不覆盖**（首记录为准，保留首次时间戳）。
-     *
-     * @return true = 本次新插入（或本来就在台账里）；false = snsId 非法
-     */
-    fun recordSnsDeleted(snsId: Long, createdAt: Long = System.currentTimeMillis()): Boolean {
-        if (snsId == 0L) return false
-        val values = ContentValues().apply {
-            put("sns_id", snsId)
-            put("created_at", createdAt)
-        }
-        return runCatching {
-            writableDatabase.insertWithOnConflict(
-                T_SNS_DELETED, null, values, SQLiteDatabase.CONFLICT_IGNORE
-            )
-        }.getOrDefault(-1L) >= 0
-    }
-
-    /** 台账里是否已有这条（渲染判定用，逐条点查）。 */
-    fun hasSnsDeleted(snsId: Long): Boolean {
-        if (snsId == 0L) return false
-        readableDatabase.query(
-            T_SNS_DELETED, arrayOf("sns_id"), "sns_id=?", arrayOf(snsId.toString()),
-            null, null, null
-        ).use { return it.moveToFirst() }
-    }
-
-    /** 全量取台账 snsId（渲染用的内存缓存全量重建）。⚠️ 只取 sns_id 一列，不碰大字段。 */
-    fun snsDeletedIds(): Set<Long> {
-        val out = HashSet<Long>()
-        runCatching {
-            readableDatabase.query(T_SNS_DELETED, arrayOf("sns_id"), null, null, null, null, null)
-                .use { c -> while (c.moveToNext()) out.add(c.getLong(0)) }
-        }.onFailure { LogX.w("GroupDb snsDeletedIds failed: ${it.javaClass.simpleName}") }
-        return out
-    }
-
-    /** 台账条数（`sub=stat` 用）。 */
-    fun countSnsDeleted(): Int {
-        return runCatching {
-            readableDatabase.rawQuery("SELECT COUNT(*) FROM $T_SNS_DELETED", null)
-                .use { c -> if (c.moveToFirst()) c.getInt(0) else 0 }
-        }.onFailure { LogX.w("GroupDb countSnsDeleted failed: ${it.javaClass.simpleName}") }
-            .getOrDefault(0)
-    }
-
-    /** 最近 N 条（`sub=stat` 用；`created_at desc` 取最新）。 */
-    fun recentSnsDeleted(limit: Int): List<Pair<Long, Long>> {
-        val out = ArrayList<Pair<Long, Long>>()
-        runCatching {
-            readableDatabase.query(
-                T_SNS_DELETED, arrayOf("sns_id", "created_at"), null, null, null, null,
-                "created_at DESC", limit.toString()
-            ).use { c ->
-                while (c.moveToNext()) out += c.getLong(0) to c.getLong(1)
-            }
-        }.onFailure { LogX.w("GroupDb recentSnsDeleted failed: ${it.javaClass.simpleName}") }
-        return out
-    }
-
-    /** 清空台账（`sub=purge` 便于重测）。 */
-    fun purgeSnsDeleted(): Int {
-        return runCatching { writableDatabase.delete(T_SNS_DELETED, null, null) }
-            .onFailure { LogX.w("GroupDb purgeSnsDeleted failed: ${it.javaClass.simpleName}") }
-            .getOrDefault(0)
-    }
+    // ⛔ 2026-11-07 已删：`sns_deleted` 台账随灰标渲染整块移除。
+    //    前缀本身就是记录（`[已删除]` 写进 SnsInfo.content），不再需要模块自己的台账。
+    //    原 7 个成员（createSnsDeletedTable / recordSnsDeleted / hasSnsDeleted /
+    //    snsDeletedIds / countSnsDeleted / recentSnsDeleted / purgeSnsDeleted）
+    //    连同 DB_VERSION=10 的建表迁移一并物理删除。
+    //    ⚠️ 老用户库里的孤儿表 `sns_deleted` 留在原地不 drop（无害，也不再被读取）；
+    //    DB_VERSION 维持 10 不升：删的是「未消费」的冷表，不值得触发一次全库迁移。
 
     /** 已见过的群（跨重启的基线）。空集合 = 首次运行，调用方要做冷启动处理。 */
     fun listSeenGroups(): Set<String> {

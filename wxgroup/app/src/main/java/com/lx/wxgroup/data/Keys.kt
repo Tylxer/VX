@@ -272,20 +272,6 @@ object Keys {
     const val MOMENTS_COPY_IMAGES = "moments.copy_images"
 
     /**
-     * R42 朋友圈「已删除」灰标样式（布尔开关，`true` = 开 / `false` = 关）。
-     *
-     * ⚠️ **默认 `true`（开）**。这是**探针驱动**的运行时开关
-     * （`op=snsdel sub=style --es val on|off`，兼容旧写法 `line`=on），但默认值必须可兜底 ——
-     * 所以登记 PrefSpec（`PrefKind.SWITCH`，`def = "true"`），`Kv.getString` 读不到时回落到 `true`，
-     * 而不是空串。`SnsDeletedTagLogic.parseStyle` 把布尔串 `"true"`/`"1"` 翻成 LINE，
-     * 并保留空/null ⇒ LINE 的兜底（宁可多标，不能装完等于没装）。
-     *
-     * ⚠️ key 前缀是 `antirevoke`（不是 `snsdel`）：它是朋友圈**防撤回**的配套功能，
-     * 归「防撤回」域；`snsdel` 只是探针的 `op` 名，与持久化 key 无关。
-     */
-    const val SNSDEL_STYLE = "antirevoke.sns_deleted_tag"
-
-    /**
      * R42 bit3 相册位补位的**反向对照开关**（布尔，`true` = 关补位、降级回纯摘键）。
      *
      * ⛔ 刻意**不登记 PrefSpec**：它只走 `op=kvset` 调试通道翻转，不该出现在设置界面，
@@ -439,8 +425,6 @@ object Prefs {
             Keys.ANTIREVOKE_DEBUG_SELF, PrefKind.SWITCH, "false", "防撤回",
             "调试：连自己撤回也拦（验证拦截是否生效用，测完关掉）"
         ),
-        // R42 已删除灰标：默认 true（开），false 关闭。探针 op=snsdel sub=style 也写这同一个 key。
-        PrefSpec(Keys.SNSDEL_STYLE, PrefKind.SWITCH, "true", "防撤回", "已删除灰标"),
 
         // 红包域。⚠️ 只有 UI 层 4 项（消息层引擎已删除，见 REDPACKET_AUTO_OPEN 的注释）
         PrefSpec(Keys.REDPACKET_AUTO_OPEN, PrefKind.SWITCH, "false", "红包", "自动点击拆红包"),

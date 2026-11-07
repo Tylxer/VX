@@ -241,13 +241,6 @@ class HookEntry : IXposedHookLoadPackage {
             SnsGuard.install(lpparam)
         }.onFailure { LogX.e("SnsGuard install failed", it) }
 
-        // ---- 防撤回·朋友圈「已删除」灰标（R42 line 样式）----
-        // 记录点挂在 SnsGuard.applyBlock（A 层真摘键且丢时间线位）；渲染挂
-        // WxRecyclerAdapter.onBindViewHolder + getData()。只读 sns_deleted 表 + 插一行灰字。
-        runCatching {
-            com.lx.wxgroup.feature.SnsDeletedTag.install(lpparam)
-        }.onFailure { LogX.e("SnsDeletedTag install failed", it) }
-
         // ---- 聊天·自动加载原图（开关：chat.auto_hd_img）----
         // 借微信自己下压缩图那一脚（t1 构造）起跳，再调下载服务下原图。
         // ⛔ 曾按「downloadType==1」当闸门，真机实测微信传的是 0，已废 —— 改用 msgId+done 去重。
