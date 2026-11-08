@@ -1064,7 +1064,94 @@ curl 先验 `X-encflag: 1` 确认源本身是加密的）：
    需某位名单好友新发一条朋友圈后观察 `written>0` 才算闭环。
 2. **覆盖边界**：后台同步 `x2(256)` 只拉最新一批、非历史；导出读「当前 SnsInfo」单源
    ⇒ 库里没有的历史动态不会自动补导。
-3. **本轮未装包上真机**（无人值守）：改动是 UI 排序 + 纯函数抽取 + 死代码归档，
-   构建/单测/变异/静态复核全绿，但「列表视觉顺序」这一条**没有真机截图证据**。
-   按用户级硬规则「真机测试前必须交叉验证代码变更」，本轮以「装包前等价物」替代，
-   未跨过装包这一步。
+3. ~~**本轮未装包上真机**（无人值守）……~~ **已在下面的 R46 复核轮收口**：
+   装包 `lastUpdateTime 03:58:06 → 16:28:33`，真机 dump + 截图证实已选排前，
+   「列表视觉顺序」不再缺证据。
+
+## R46 复核轮 · 独立第二视角 + 第三入口修复 + 真机验收（16:4x，用户在场）
+
+### 一、补齐的是哪两个缺口
+
+`4ac6aae` 已推，但上一轮四条实现 lane 零产出 ⇒ 台账判「**没有独立第二视角**、分包下限 FAIL」；
+且无人值守未装包 ⇒ 「列表视觉顺序」无真机证据。本轮只补这两项。
+
+### 二、三条独立复核 lane（全部成功返回）
+
+| lane | 范围 | 结论 |
+|---|---|---|
+| A | UI 排序（`PickerTabLogic` / `PickerPage` / `ForwardPicker` / 单测） | 6 PASS / **1 FAIL**：漏第三入口 |
+| B | 导出收口（`shouldDecryptVideo` / `downloadVideo` / `viddl` / 探针摘除 / gate 单测） | 6 PASS、**可装包**，3 条非阻断建议 |
+| C | 第三入口修复复核（`BatchPicker` / 新单测 / 第四个入口排查） | 6 PASS / **1 FAIL**：新单测假验证；生产代码正确、可装包 |
+
+报告：`docs/_r46_review_picker.md` / `_export.md` / `_batchpicker.md`（只读复核、未改源码、审计留痕）。
+
+⭐ **派发根因修正**：上一轮带 `name`（teammate 异步），父 turn 一结束子代理即成对 `killed`。
+本轮改**前台同步**（不带 `name` / 不 `run_in_background`）+ 强制「第一个 tool call 就落盘结论、
+之后分块追加」⇒ 三条 lane 全部完整返回并落盘，零产出问题消失。
+
+### 三、lane A 抓到的真缺口 → 已修
+
+`BatchPicker.FriendAdapter`（分组管理 → 批量添加成员）是**第三个「展开可见行」入口**：
+`visible` 初值 `ArrayList(all)` 与 `filter` 的 `addAll(all)` / `add(f)` 都没走 `selectedFirst`，
+而它带 `LinkedHashSet(db.memberWxids(groupId))` 预选 ⇒ 用户要的「其他类似组件」未全覆盖。
+lane A 同时排除了 `GroupPicker` / `GroupDetailPage.MemberAdapter` / `GroupManagerPage` 等误报。
+
+修法（`BatchPicker.kt`，按现成结论补接线）：
+- 初值 → `ArrayList(PickerTabLogic.selectedFirst(all, selected) { it.wxid })`
+- `filter("")` → `visible.addAll(selectedFirst(all, selected) { it.wxid })`
+- 非空分支 → 先按 `all` 原序收集 `matched`，再 `selectedFirst(matched, selected)`；
+  ⛔ 不能边匹配边 `visible.add`，否则无从分区。
+- 三档边界：进入（初值）/ 返回（搜索、清空搜索）/ 复位（反选清空后下一次 filter 按最新 selected）。
+  `selected` 是外层 `LinkedHashSet` 的引用共享；勾选/全选/反选/清空回调**只**
+  `notifyDataSetChanged()` + `refreshCounter()`，不触发 filter ⇒ 不会「点一行该行跳走」。
+  确定按钮的 `toAdd` / `toRemove` 按 `selected` 迭代，与显示顺序解耦。
+
+### 四、lane C 抓到的假验证 → 已修
+
+初版 `batchPickerPreselectedMembersFirstAfterFilter` 把已选放成列表前缀、id 升序 ⇒
+「完全不分区」「整体按 key 排序」两类错误实现**全绿**（等价变异假验证），
+复位断言两次期望值还一模一样（零区分力）。重设计为：未选项 `d` 排在已选 `b` 前、
+两组 id 均非升序（`[d,b,a,c]`）、预选集合插入顺序 `c,b` 与列表 `b,c` 相反、
+复位期望与首次期望不同。
+
+**4 组变异验证**（真跑单测，逐组确认新增用例也变红）：
+
+| 变异 | 红条数 | 新增用例变红 |
+|---|---|---|
+| 判定反转 `in` → `!in` | 5 | YES |
+| 前后段颠倒 | 5 | YES |
+| 整体按 key 排序 | 4 | YES |
+| 完全不分区（恒返回入参） | 4 | YES |
+
+恢复源码后 BUILD SUCCESSFUL。全量单测 **787 条全绿**（786 + 新增 1）。
+
+### 五、装包 + 真机验收
+
+- `assembleDebug` BUILD SUCCESSFUL → `adb install -r` →
+  `lastUpdateTime 03:58:06 → 16:28:33` → 双 `force-stop` + `am start` 冷启微信
+  （LSPosed 常需第二次才重载）。
+- 导航：微信「更多功能」→「分组模块」→「朋友圈」→「设置自动导出名单」。
+- **决定性证据**（`uiautomator dump` + 截图 `_kb/r46_picker.png`）：
+  `已选 4 项 · 可见 2515`，可见 7 行 —— 前 4 行全为绿色勾选
+  （`菟纸小姐姐🐰` / `5000` / `东营易泰新材料王琪` / `落浔张桂凤`），
+  第 5~7 行才是空心未勾选的 `2598...@openim`。判据「所有已选行排在未选行之前」**PASS**，
+  截图目视一致。
+- 重复验证：退出重进 7 行顺序逐字一致；切「我的分组」Tab 3 行全未选、
+  切回「好友」Tab 已选仍在前。全程**未点「确定」**，分类页仍显示「4 人」⇒ 配置未被改动。
+- 收尾：设备 `/sdcard/_r46*` 临时文件已清、微信恢复到会话列表。
+
+### 六、本轮如实标注的未验边界（不粉饰）
+
+1. **搜索 / 清空搜索态未取得干净 dump**：中文输入法组合态干扰 ——
+   `input text "2"` 后 IME 弹起把列表压到 4 行（全已选 ⇒ 判据「空真」）；
+   BACK 收键盘会连选人页一起关掉，ESC 又取消未上屏字符使搜索框为空。
+   该边界由单测（`resetsWhenSelectionChanges` / 新用例）+ 三份独立复核 + 代码路径覆盖，
+   **不写成真机已验**。
+2. **第三入口 `BatchPicker` 未单独上真机**：现版卡片式主界面无「分组管理」直入口，
+   不冒险盲点；由 lane C 7 条复核 + 4 组变异单测覆盖。
+3. lane B 的 3 条非阻断建议未改：① `downloadVideo` 是 `4ac6aae` 首次提交，
+   git 无法做替换前后逐字对照（改用日志/行为契约核对）；
+   ② gate 单测只锁纯函数，锁不住调用点把 `encFlag` 重新混入（R45 缺陷形态）——
+   本轮由 lane B 逐行核对调用点，未加源码文本断言测试；
+   ③ `viddl` 的 `mkdirs()` 忽略返回值（目录已存在时守卫零副作用，探针用途可接受）。
+4. §五 的 1 / 2 两条（R25 真落盘 `written>0`、历史动态不补导）**仍未收口**，与本轮无关。

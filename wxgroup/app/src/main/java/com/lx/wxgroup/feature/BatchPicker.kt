@@ -188,7 +188,12 @@ object BatchPicker {
     ) : BaseAdapter() {
 
         /** 当前可见（过滤后）的数据。过滤只影响它，不影响 selected。 */
-        private val visible = ArrayList<Friend>(all)
+        // R46：第三个「展开可见行」入口 —— 与 PickerPage / ForwardPicker 同口径，
+        // 打开时把已是本群成员的预选项排前。selected 是外层 LinkedHashSet 的引用，
+        // 勾选/全选/反选/清空当下只 notifyDataSetChanged()（见调用方），不重排。
+        private val visible = ArrayList<Friend>(
+            PickerTabLogic.selectedFirst(all, selected) { it.wxid }
+        )
 
         override fun getCount(): Int = visible.size
         override fun getItem(position: Int): Friend = visible[position]
@@ -205,14 +210,18 @@ object BatchPicker {
             val kw = keyword.trim()
             visible.clear()
             if (kw.isEmpty()) {
-                visible.addAll(all)
+                // R46：清空搜索框 ⇒ 按当时最新的 selected 重排（含「反选/清空」后的复位）
+                visible.addAll(PickerTabLogic.selectedFirst(all, selected) { it.wxid })
             } else {
                 val lower = kw.lowercase()
+                val matched = ArrayList<Friend>()
                 for (f in all) {
                     if (f.displayName.lowercase().contains(lower) ||
                         f.wxid.lowercase().contains(lower)
-                    ) visible.add(f)
+                    ) matched.add(f)
                 }
+                // 先按原序收集命中项，再做稳定分区：匹配结果内部顺序不被打乱
+                visible.addAll(PickerTabLogic.selectedFirst(matched, selected) { it.wxid })
             }
             notifyDataSetChanged()
         }

@@ -193,4 +193,35 @@ class PickerSelectedFirstTest {
     fun emptyListReturnsEmpty() {
         assertTrue(PickerTabLogic.selectedFirst(emptyList<P>(), setOf("a")) { it.id }.isEmpty())
     }
+
+    /**
+     * R46 第三入口（BatchPicker 批量添加成员）：预选的是「已是本群成员」的人，
+     * idOf 用 wxid，visible 由 filter 重建。
+     *
+     * ⛔ 用例形状是故意设计的（见 `docs/_r46_review_batchpicker.md` 问题5）：
+     * ① **未选项必须排在原列表前面**（d 在 b 前），否则「根本不分区 / 恒返回原序」
+     *    也能全绿 —— 初版把已选放成前缀，是等价变异假验证；
+     * ② 两组内部的 id 都**非升序**（已选 b,c 夹在未选 d,a 之间；未选组 d→a 降序），
+     *    才能抓到「组内按 key 排序」这类破坏稳定分区的实现；
+     * ③ 预选集合插入顺序 `c,b` 与列表顺序 `b,c` 相反 ⇒ 抓「按 selected 迭代顺序输出」；
+     * ④ 复位断言的期望与首次期望**不同**，否则零区分力。
+     */
+    @Test
+    fun batchPickerPreselectedMembersFirstAfterFilter() {
+        val matched = listOf(
+            P("wxid_d", "的"),  // 未选，却排在前面
+            P("wxid_b", "波"),  // 已选
+            P("wxid_a", "阿"),  // 未选
+            P("wxid_c", "次")   // 已选
+        )
+        val preselected = linkedSetOf("wxid_c", "wxid_b") // 插入顺序与列表顺序相反
+        val out = PickerTabLogic.selectedFirst(matched, preselected) { it.id }
+        // 已选按列表原序 [b,c] 在前，未选按列表原序 [d,a] 在后
+        assertEquals(listOf("wxid_b", "wxid_c", "wxid_d", "wxid_a"), ids(out))
+        // 反选 / 清空选择后，下一次 filter 必须复位成命中集原序（与上面期望不同）
+        assertEquals(
+            listOf("wxid_d", "wxid_b", "wxid_a", "wxid_c"),
+            ids(PickerTabLogic.selectedFirst(matched, emptySet()) { it.id })
+        )
+    }
 }
