@@ -33,6 +33,7 @@ import com.lx.wxgroup.feature.ScrollDock
 import com.lx.wxgroup.feature.SnsGuard
 import com.lx.wxgroup.feature.VoiceFileGuard
 import com.lx.wxgroup.feature.VoiceGuard
+import com.lx.wxgroup.feature.MediaTableGuard
 import com.lx.wxgroup.feature.MomentsAuto
 import com.lx.wxgroup.feature.MomentsExport
 import com.lx.wxgroup.feature.PatBlock
@@ -221,6 +222,7 @@ class HookEntry : IXposedHookLoadPackage {
         // 判据走 data/VoiceGuardLogic（纯函数，有单测），详情见 feature/VoiceGuard.kt。
         runCatching {
             VoiceGuard.install(lpparam)
+            MediaTableGuard.install(lpparam)
         }.onFailure { LogX.e("VoiceGuard install failed", it) }
 
         // ---- 防撤回·语音文件防删（R21c 真机定的根因，最后一块补丁）----

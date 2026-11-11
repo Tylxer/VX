@@ -296,6 +296,13 @@ object SnsGuard {
      */
     private val snsBlockGuard = object : XC_MethodHook() {
         override fun beforeHookedMethod(param: MethodHookParam) {
+            // R49 写事件探针（第三个独立开关，默认关）：关时**只有这一个 boolean 判断**、零额外动作；
+            // 开时在 R42 任何逻辑之前忠实记录参数（SnsInfo 才记），零查库、零日志、零改写。
+            // 同包 com.lx.wxgroup.feature，无需 import。异常只 warn，绝不向微信写库路径抛。
+            if (SnsWriteProbe.isArmed()) {
+                runCatching { SnsWriteProbe.captureUpdate(param.args) }
+                    .onFailure { LogX.w("WP captureUpdate err: ${it.javaClass.simpleName}") }
+            }
             runCatching { onSnsUpdateBefore(param) }
                 .onFailure { LogX.w("SNS block hook err: ${it.javaClass.simpleName}") }
         }

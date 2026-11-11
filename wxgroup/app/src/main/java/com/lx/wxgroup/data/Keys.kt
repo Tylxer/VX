@@ -138,6 +138,7 @@ object Keys {
 
     // —— 防撤回域（6 项，v6.3 定：全部默认关闭；+ 2 个辅助开关）——
     const val ANTIREVOKE_MSG = "antirevoke.msg"
+    const val ANTIREVOKE_MEDIA_DELETE = "antirevoke.media_delete"
 
     /**
      * 防止朋友圈动态撤回（R42 起驱动**路线甲：写时拦截**，见 [ANTIREVOKE_SNS_BLOCK]）。
@@ -365,6 +366,24 @@ object Keys {
      * 判读表见 `docs/_r37_k7_twostage.md` §1.4。
      */
     const val DEBUG_K7_SNAP_PROBE = "debug.k7_snap_probe"
+
+    /**
+     * R49 阶段二 · R-C 结构化写事件探针（`SnsWriteProbe`）的**第三个独立开关**。
+     *
+     * ⛔ 与防撤回域的 `antirevoke.sns` / `antirevoke.sns_block` **零耦合**：
+     * 本开关只控制「before 钩子里是否记录结构化写事件账本」，不改 R42 写时拦截 /
+     * bit3 写回 / `[已删除]\n` 前缀 / `SnsSqlRewrite` 的 `& -9 → & -1` 改写中的任何行为。
+     * ⛔ 临时全放行仍需把上面两个 R42 开关**都关**，与本开关无关。
+     *
+     * 默认 `false`（`Kv.getBool` 未设置即 false）：关闭时 `SnsGuard`/`SnsBlockProbe`
+     * 的 before 里**除一个 boolean 判断外零额外动作**；开启时账本也只是进程内只读结构，
+     * 冷启（进程重建）天然清零，`arm` 之前的写事件不追溯记录。
+     *
+     * ⚠️ **故意不进 `Prefs.ALL`**：避免与防撤回域两个开关在设置页并列造成「耦合」误解；
+     * 只由 `op=writeprobe sub=arm|disarm` 写模块自有 KV 控制（⛔ 不写微信库）。
+     * 真机开法：`--es op writeprobe --es sub arm`（取完证 `sub=disarm`）。
+     */
+    const val SNS_WRITE_PROBE = "sns.write_probe"
 }
 
 /** 配置项的元数据总表。遍历它就能渲染出全部设置页 */
@@ -435,6 +454,7 @@ object Prefs {
 
         // 防撤回域：默认全关，由用户自己开（决策 #2）
         PrefSpec(Keys.ANTIREVOKE_MSG, PrefKind.SWITCH, "false", "防撤回", "防止消息撤回"),
+        PrefSpec(Keys.ANTIREVOKE_MEDIA_DELETE, PrefKind.SWITCH, "false", "防撤回", "实验：拦截撤回图片/视频媒体表 delete"),
         PrefSpec(Keys.ANTIREVOKE_SNS, PrefKind.SWITCH, "false", "防撤回", "防止朋友圈动态撤回"),
         // R42 路线甲写时拦截的调试覆盖：true 强制开；false（默认）跟随上面的主开关。
         PrefSpec(

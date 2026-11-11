@@ -125,6 +125,7 @@ object RevokeRescue {
                     //   这是唯一能自证的判据 —— 见 [auditImage] 的 KDoc。
                     runCatching { auditImage(msgId, orig.imgPath) }
                         .onFailure { LogX.w("RRV imgAudit failed: ${it.javaClass.simpleName}") }
+                    MediaTableGuard.invalidate(msgId)
                 }
                 if (isVoice) {
                     // ① 登记「别删这个文件」（拦 File.delete，见 VoiceFileGuard）

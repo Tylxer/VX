@@ -123,6 +123,15 @@ object AutoHdImg {
     /** 拿不到 msgId 的累计次数（探针用） */
     private val noMsgId = AtomicInteger(0)
 
+    /**
+     * ⛔ R52 探针（只读）：异常形态（`img=null` / `localId=0`）溯源日志按 msgId 去重。
+     *
+     * LogX 是 5000 行环形缓冲（`LogX.kt:22,83-88`）+ `K7 perf` 每秒刷屏，几分钟就能把
+     * 旧证据冲掉；重复点开同一张被撤回图不能无脑再打。上限 64 条，满了只停观测、
+     * 不影响任何下载行为（与 [sigSeen]/[missSeen] 同款「只防刷屏、不做判据」口径）。
+     */
+    private val traceSeen = java.util.concurrent.ConcurrentHashMap.newKeySet<Long>()
+
     @Volatile private var lastErr = ""
     @Volatile private var lastTalker = ""
 
@@ -248,12 +257,17 @@ object AutoHdImg {
                 return
             }
             synchronized(done) { if (!done.add(msgId)) { skipDup.incrementAndGet(); return } }
+            // ⛔ R52 探针（只读）：仅「被撤回图形态」(localId==0，即微信建的 `(0,msgId)` t1)
+            //    才在微信线程上抓一次构造参数 + 调用栈；正常图完全不碰，热路径零额外开销。
+            //    ⚠️ 放在 `done` 去重之后：我们 fire 出来的 t1 二次进这里会被 :259 挡掉，
+            //    不会重复抓栈。ctorTrace 只是个只读 String，不改 `param.args`。
+            val ctorTrace = if (localId == 0L) ctorTraceOf(param.thisObject, param.args, type) else null
             // ⚠️ t1 构造在主线程：下载服务入队会触发 NetScene 投递，绝不能在主线程跑
             runCatching {
                 pool.execute {
                     selfFiring.set(true)
                     try {
-                        runCatching { fire(localId, msgId) }
+                        runCatching { fire(localId, msgId, ctorTrace) }
                             .onFailure {
                                 fail.incrementAndGet()
                                 lastErr = it.javaClass.simpleName
@@ -302,9 +316,99 @@ object AutoHdImg {
     }
 
     /**
+     * ⛔ R52 探针（只读）：把这一条 `t1` 构造「能拿到的全部入参 + 实例字段 + 微信侧调用栈」
+     * 拼成一行，仅供异常形态溯源。
+     *
+     * ⚠️ 只在 `localId == 0` 时调用（正常图完全不碰）；栈必须在**微信线程**（构造函数所在线程）
+     * 抓 —— 放到 `pool` 线程抓就只剩模块自己的调用栈，看不出是从哪条链来的。
+     * 截断保护：每个入参 `.take(40)`、整行 `.take(600)`，防长串撑爆 LogX 5000 行环形缓冲。
+     * ⛔ 纯观测：不读 param.result、不改 `param.args`、不写任何字段。
+     */
+    private fun ctorTraceOf(thisObj: Any?, args: Array<Any?>?, type: Int): String {
+        val sb = StringBuilder(160)
+        sb.append("n=").append(args?.size ?: -1).append(" type=").append(type)
+        args?.forEachIndexed { i, a ->
+            sb.append(" a[").append(i).append("]=")
+                .append(a?.javaClass?.simpleName ?: "null").append(":")
+                .append(runCatching { a.toString() }.getOrNull()?.take(40) ?: "?")
+        }
+        sb.append(" fld[h=").append(instLong(thisObj, "h"))
+            .append(" i=").append(instLong(thisObj, "i"))
+            .append(" j=").append(instLong(thisObj, "j"))
+            .append(" o=").append(instInt(thisObj, "o"))
+            .append(" q=").append(instLong(thisObj, "q")).append("]")
+        // 只取微信侧 3~5 帧（类名/方法名），de.robv / java / 模块自身帧全是噪声，不打整栈
+        val host = Throwable().stackTrace
+            .asSequence()
+            .filter { it.className.startsWith("com.tencent.") }
+            .take(5)
+            .joinToString("|") { "${it.className.substringAfterLast('.')}.${it.methodName}" }
+        sb.append(" stack=").append(host.ifBlank { "no-host-frame" })
+        return sb.toString().take(600)
+    }
+
+    /**
+     * ⛔ R52 探针（只读）：借 `AntiRevoke.msgQueryHandle()` **已捕获**的 message 库句柄 +
+     * 已缓存的 `rawQuery` Method，一次单行只读查 `message.imgPath`。
+     *
+     * ⛔ 不新开 DB 连接（句柄是 AntiRevoke 写库 hook 里抓的那个 `msgDb`）、不写库、
+     * 不扫类（`rawQueryMethod` 在 AntiRevoke 内已缓存）、不引入耗时反射；
+     * 带 `AntiRevokeHint.BYPASS`（`/*w*/`）绕过模块自己的诊断 SQL 改写
+     * （同 `AntiRevoke.kt:897-901` / `RevokeRescue.kt:269-275` 的既有口径）。
+     * 句柄 / 查询任一失败都只回一句说明，绝不抛到 `fire()` 外层影响下载。
+     */
+    private fun readMsgImgPath(msgId: Long): String {
+        val h = AntiRevoke.msgQueryHandle() ?: return "no db handle"
+        val (db, m) = h
+        return runCatching {
+            // WCDB 两个 rawQuery 重载都要认：String[]（兼容 AOSP）与 Object[]
+            val bind: Any = if (m.parameterTypes.size > 1 &&
+                m.parameterTypes[1] == Array<String>::class.java
+            ) arrayOf(msgId.toString()) else arrayOf<Any>(msgId.toString())
+            val sql = AntiRevokeHint.BYPASS + "select imgPath from message where msgId=? limit 1"
+            val cur = m.invoke(db, sql, bind)
+            if (cur == null) {
+                "null cursor"
+            } else {
+                try {
+                    if (XposedHelpers.callMethod(cur, "moveToFirst") as? Boolean != true) "no row"
+                    else (XposedHelpers.callMethod(cur, "getString", 0) as? String)?.take(64) ?: "null col"
+                } finally {
+                    runCatching { XposedHelpers.callMethod(cur, "close") }
+                }
+            }
+        }.getOrElse { "query err ${it.javaClass.simpleName}" }
+    }
+
+    /**
+     * ⛔ R52 探针（只读）：异常形态溯源，TAG 前缀 `HDIMG trace`。
+     *
+     * 触发：`imgPath == null || imgPath.isNullOrBlank() || localId == 0`
+     * （即被撤回图点开时 `HDIMG fired … img=null localId=0` 的形态）；**正常图零额外日志**。
+     * ⭐ 限流：按 msgId 去重、上限 64 条，防 LogX 5000 行环形 + `K7 perf` 每秒刷屏把
+     * 旧证据冲掉；DB 只读查询只在真正要打这一条时才跑，不是每次点击都跑。
+     * ⛔ 纯观测：不改 `t1` 参数、不改下载触发逻辑、不碰 `param.result`、不新增任何写操作。
+     */
+    private fun traceIfAbnormal(
+        msgId: Long,
+        localId: Long,
+        imgPath: String?,
+        imgT: Int?,
+        ctorTrace: String?,
+    ) {
+        if (imgPath != null && imgPath.isNotBlank() && localId != 0L) return
+        if (traceSeen.size >= 64 || !traceSeen.add(msgId)) return
+        LogX.w(
+            "$TAG trace msgId=$msgId localId=$localId img=${imgPath?.take(48)} t=$imgT " +
+                "talker=${lastTalker.take(32)} | ctor=${ctorTrace ?: "n/a(localId!=0)"}",
+        )
+        LogX.w("$TAG trace db msgId=$msgId imgPath=${readMsgImgPath(msgId)}")
+    }
+
+    /**
      * 发起一次原图下载。全程反射 + runCatching：微信任一层漂移都只丢这一次，不崩。
      */
-    private fun fire(localId: Long, msgId: Long) {
+    private fun fire(localId: Long, msgId: Long, ctorTrace: String?) {
         val cl = hostCl ?: throw IllegalStateException("hostCl null (install 没成功)")
         fired.incrementAndGet()
 
@@ -384,6 +488,13 @@ object AutoHdImg {
             synchronized(done) { done.remove(msgId) }
             LogX.w("$TAG svc.c rejected msgId=$msgId -> $r (retryable)")
         }
+        // ⛔ R52 探针（只读）：异常形态（img=null / localId=0，即被撤回图点开时）才溯源，
+        //    正常图零额外日志。放在两条 `svc.c` 分支之后 ⇒ `r` 真/假都能看到，
+        //    紧跟 `HDIMG fired`；按 msgId 去重，重复点开同一张图不再刷屏。
+        //    ⚠️ `imgT==1`（:426 already）与名单拦截（:463-470 skipScope）的提前 return 不走这里；
+        //    两键 allow/exclude 默认 `"[]"`（`Keys.kt:445-446`）⇒ 默认设置下被撤回图必到此。
+        //    [需真机] 若现场把名单配成非空且把它拦下，则这一条不出现，需改走 `dev.py q 'HDIMG sig'`。
+        traceIfAbnormal(msgId, localId, imgPath, imgT, ctorTrace)
     }
 
     // ------------------------------------------------------------ 名单展开（g:/t:）

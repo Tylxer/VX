@@ -660,6 +660,17 @@ object EntryReceiver {
                             }
                         }
                     }
+                    // R49 阶段二 · R-C 结构化写事件探针（第三个独立开关，默认关，全只读微信库）。
+                    // --es op writeprobe --es sub stat|dump|reset|arm|disarm
+                    // arm/disarm 只改模块自有 KV；stat/dump 的行级命中判定走只读 select。
+                    "writeprobe" -> {
+                        val sub = intent.getStringExtra("sub").orEmpty()
+                        io {
+                            for (l in com.lx.wxgroup.feature.SnsWriteProbe.export(sub)) {
+                                LogX.i(l)
+                            }
+                        }
+                    }
                     // 写前缀最小验证探针（只读 probe / 写 prefix / 还原 restore / 列备份 stat）
                     // --es op snsprefix --es sub probe|prefix|restore|stat --el id <snsId>
                     "snsprefix" -> {
@@ -687,6 +698,32 @@ object EntryReceiver {
                     // 自动加载原图：--es op hdimg --es sub stat
                     "hdimg" -> {
                         LogX.i(com.lx.wxgroup.feature.AutoHdImg.stat())
+                    }
+                    // R52 Pro lane A · MTG 只读账本（不写微信库、不改任何运行时状态、不碰 hdimg/AutoHdImg）
+                    //   --es op mtg --es sub stat  = 打印 MediaTableGuard.stat() 原文（前缀 "MTG stat"）
+                    //   --es op mtg --es sub reset = 只清账本，复位后回打一次 stat 便于核对归零
+                    // ⛔ 独立 op 分支 + 显式 when(sub)：sub 拼错只落下面只读 else 的日志，
+                    //    绝不会像 `snsg sub=srcfix` 的 sub2 拼错那样掉进 else->run() 写库分支
+                    //    （tools/dev.py:24-27；docs/开发回路速查.md:456-461）。广播不投递时本分支不执行、模块静默。
+                    "mtg" -> {
+                        val sub = intent.getStringExtra("sub").orEmpty()
+                        when (sub) {
+                            "stat" -> LogX.i(com.lx.wxgroup.feature.MediaTableGuard.stat())
+                            "reset" -> {
+                                com.lx.wxgroup.feature.MediaTableGuard.resetLedger()
+                                LogX.i(com.lx.wxgroup.feature.MediaTableGuard.stat())
+                            }
+                            // 兜底路径探针：`--es val <msgId>`，`0`/缺省 ⇒ 强制走 via=recent。
+                            // ⚠️ 用 `--es` 不用 `--el`：`--el` 只收 signed long，且 `adb shell` 会二次解析。
+                            "lookup" -> {
+                                val raw = intent.getStringExtra("val").orEmpty()
+                                val id = raw.trim().toLongOrNull() ?: 0L
+                                // `--es tok <md5>` 可选：冷启后保护池为空时用它跑真实命中
+                                val tok = intent.getStringExtra("tok")
+                                LogX.i(com.lx.wxgroup.feature.MediaTableGuard.probeLookup(id, tok))
+                            }
+                            else -> LogX.i("MTG unknown sub=$sub")
+                        }
                     }
                     // A13 探针 convtop / A7 探针 marktest 已用完，随 ConvTopProbe 一起删除：
                     // 结论已固化在 ConvLayout 与 MarkRead 的注释里。

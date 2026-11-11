@@ -557,6 +557,14 @@ object SnsBlockProbe {
         own: Boolean,
         block: SqlBlock = SqlBlock.NONE,
     ) {
+        // R49 写事件探针（第三个独立开关，默认关）：关时**只有这一个 boolean 判断**。
+        // ⚠️ 放在 sqlSns++ 之前 ⇒ seen 覆盖所有含 SnsInfo 的 execSQL（不被 isSourceWrite 过滤）。
+        // sql 是**改写前的原文**：onSnsSql 传的原始局部变量（applySqlRewrite 只改 param.args[0]，
+        // 见 SnsGuard.kt:909），见本文件 :583 的既有契约「原文……不能存改写后的」。
+        if (SnsWriteProbe.isArmed()) {
+            runCatching { SnsWriteProbe.captureExecSql(sql) }
+                .onFailure { LogX.w("WP captureExecSql err: ${it.javaClass.simpleName}") }
+        }
         sqlSns.incrementAndGet()
         if (!isSourceWrite) return
         sqlSrc.incrementAndGet()
