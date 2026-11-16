@@ -74,7 +74,10 @@ def _sq(v):
     s = str(v)
     if s == "":
         return "''"
-    return "'" + s.replace("'", "'\\''") + "'"
+    # 双引号也要消掉：外层 Windows 命令行会被自动加一对双引号包住整条命令，
+    # 值里再出现 `"` 会让 adb 转义成 `\"`，到设备端就多出一个反斜杠。
+    s = s.replace("'", "'\\''").replace('"', "'\"'")
+    return "'" + s + "'"
 
 
 # 这些开关后面紧跟的**值**需要转义；开关本身不转义
@@ -82,18 +85,32 @@ _VALUE_FLAGS = ("--es", "--esn", "--esa", "--ei", "--el", "--ef")
 
 
 def bc(*extras, quiet=True):
-    args = []
-    want_val = False
-    for e in extras:
-        if want_val:
-            args.append(_sq(e))
-            want_val = False
+    # ⛔ 2026-11-16 修：原实现用「上一个 token 是 --es 就给它加引号」，
+    #    但 `--es` 后面紧跟的是**键名**，键名把 want_val 消耗掉了 ⇒ **值从来没被加引号**。
+    #    症状：`--es val "hello world"` → 设备端按空格切词 → `pkg=world`（包名被吃），
+    #    广播发到不存在的包、**静默零投递**，探针看起来「没执行」。
+    #    ⚠️ 再修一次（同轮）：`--es` 后面是**两个** token（键名 + 值），
+    #    按「flag+1」配对会把值漏在引号外。除 `--esn`（null extra，只有键名）外一律吃 2 个。
+    parts = []
+    i = 0
+    n = len(extras)
+    while i < n:
+        e = extras[i]
+        if e in _VALUE_FLAGS and i + 1 < n:
+            parts.append(e)
+            parts.append(_sq(extras[i + 1]))
+            if e != "--esn" and i + 2 < n:
+                parts.append(_sq(extras[i + 2]))
+                i += 3
+                continue
+            i += 2
             continue
-        args.append(e)
-        if e in _VALUE_FLAGS:
-            want_val = True
-    return sh("shell", "am", "broadcast", "-a", PKG + ".action.PROBE", *args,
-              "-p", HOST, quiet=quiet)
+        parts.append(e)
+        i += 1
+    # ⛔ Windows 下必须**整条命令当一个字符串**交给 `adb shell`：
+    #    传 list 时 Python 用 `list2cmdline` 拼命令行，引号会被 adb 丢掉。
+    cmd = " ".join(["am", "broadcast", "-a", PKG + ".action.PROBE"] + parts + ["-p", HOST])
+    return sh("shell", cmd, quiet=quiet)
 
 
 def dbg_size():
@@ -230,7 +247,7 @@ def cmd_probe(a):
     kv, pos, i = {}, [], 0
     while i < len(a):
         x = a[i]
-        if x in ("--val", "--grep", "--n", "--wait", "--q", "--key"):
+        if x in ("--val", "--grep", "--n", "--wait", "--q", "--key", "--sql"):
             if i + 1 >= len(a):
                 print("%s 缺值" % x)
                 return
@@ -262,6 +279,10 @@ def cmd_probe(a):
     #    只发 val 会让模块收到空 q，返回「只允许 select/pragma/with（收到 ''）」。
     if "q" in kv:
         ex += ["--es", "q", kv["q"]]
+    # ⛔ `op=gconv`（伪会话写库探针）读的是 extra **`sql`**，不是 `q`（EntryReceiver.kt:195）。
+    #    混用会得到「sql: --es sql 不能为空」—— 看起来像探针没跑，其实是参数名错。
+    if "sql" in kv:
+        ex += ["--es", "sql", kv["sql"]]
     # `op=kvget` 读的是 extra **`key`**（EntryReceiver.kt:848），不是 val。
     # 而且 kvget 走的是**模块自己的配置库**，`op=sql` 打开的是微信 sns.db —— 两者别混。
     if "key" in kv:

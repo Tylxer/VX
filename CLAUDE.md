@@ -108,15 +108,15 @@
 
 | 产出物性质                                                 | 档位                                         |
 | ----------------------------------------------------- | ------------------------------------------ |
-| 判据设计、根因推理、Hook 链路推导、**复核 Hook/反射/异步/并发级改动**           | `model="custom-local:deepseek-v4-pro-202606"`（custom-local:deepseek-v4-pro-202606，自定义 tokenhub） |
-| 按现成判据写代码 / 写单测 / 写脚本 / 写文档 / 编译报错修复、**复核纯逻辑/单测/文档改动** | `model="custom-local:deepseek-v4-flash-202605"`（custom-local:deepseek-v4-flash-202605，自定义 tokenhub） |
+| 判据设计、根因推理、Hook 链路推导、**复核 Hook/反射/异步/并发级改动**           | `model="deepseek-v4-pro"`（DeepSeek-V4-Pro，官方自定义 API · api.deepseek.com） |
+| 按现成判据写代码 / 写单测 / 写脚本 / 写文档 / 编译报错修复、**复核纯逻辑/单测/文档改动** | `model="deepseek-v4.1-flash"`（DeepSeek-V4.1-Flash，官方自定义 API · api.deepseek.com） |
 
 - **复核档位 = 被审改动的档位**，与「复核者是否读源码」「改动有几个文件」无关。  
   （全项目统一措辞，便于 grep 检索；两种极端都错：「复核只读 ⇒ Flash」错，「复核一律 Pro」也错。）  
   审一个 Hook / 反射 / 异步时序 / 并发改动 ⇒ **Pro**，即使 diff 只有 10 行。
 - ⛔ **Pro 类活不许主会话自己做**（2026-10-24 新增，硬要求）。  
   **任何工作开工前先按上表做档位判定**，判定为 Pro 的：
-  - 必须**单独开一个 `model="custom-local:deepseek-v4-pro-202606"`（custom-local:deepseek-v4-pro-202606，自定义 tokenhub）的子代理**去跑；
+  - 必须**单独开一个 `model="deepseek-v4-pro"`（DeepSeek-V4-Pro，官方自定义 API · api.deepseek.com）的子代理**去跑；
   - 主会话只能做上表第二行（Flash 类）的活：接线 / 按现成判据写代码 / 单测 / 脚本 / 文档 /  
     编译报错修复 / 跑验证 / 汇总。
   - **主会话当前档位不作判据**：主会话模型由用户在侧边栏切换、随时可变、且无任何运行时提示  
@@ -144,7 +144,7 @@
   §五与用户级记忆 0.5 都写明「派完**立刻在同一 turn 里继续做实事**」。  
   R33 实证：用户在真机侧秒回，我判断「派子代理要等分钟级、窗口会丢」而放弃派发 ——  
   **这个判断是错的**，派发零等待成本，「用户在线」不构成不派的理由。
-- ⚠️ **模型 id 同名冲突 / 解析顺序证据**见 `docs/conclusions/model_routing.md`：workbuddy 内置模型（Deepseek-V4-Pro / Deepseek-V4.1-Flash）**裸写 ID 即命中**；若改用你导入的同名自定义模型，须加 `custom-local:` 前缀区分。
+- ⚠️ **模型 id 同名冲突 / 解析顺序证据**见 `docs/conclusions/model_routing.md`：裸写 `deepseek-v4-pro` / `deepseek-v4.1-flash` 即命中你导入的**官方自定义 DeepSeek 模型**（api.deepseek.com）；若实测静默降档到内置（扣 WorkBuddy 积分），按环境坑手册 0.7 加 `custom-local:` 前缀强制走 tokenhub。
   ⚠️ **与 ① 的关系（冲突取严，2026-10-24 裁定 = 甲）**：  
   ① 定的是**实现 lane 的数量下限**，本条定的是**Pro 类活的档位归属**，两条都要满足。  
   改动面只落在单一 Hook / 反射类文件（Pro 类）⇒ ① 判「0 个 lane」合法，但本条要求仍须  
