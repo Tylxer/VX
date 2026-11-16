@@ -180,6 +180,17 @@ object ContactSqlSource {
     fun ready(): Boolean = mainDb != null
 
     /**
+     * 主消息库句柄（只读暴露，给 `feature/GconvPage` 的 `convDb()` 当第二级回退）。
+     *
+     * 为什么这个句柄可以信：它由本类的捕获钩子写入，判据是「SQL 含 `rcontact`」+「`getPath()`
+     * 以 `EnMicroMsg.db` 结尾」两条**都已由宿主自己证明**的约束；而且 `rconversation` /
+     * `message` / `rcontact` 本来就在这同一个库里（真机冷启约 3 秒就捕获）。
+     * ⚠️ 与 `AntiRevoke.lastDb` 不是一类：后者是「任意表最近一次 update 的库」，在上面查
+     * `rconversation` 会 `no such table`（`AntiRevoke.kt:819-826`）。
+     */
+    internal fun mainDbOrNull(): Any? = mainDb
+
+    /**
      * 只读诊断：把 wxid 翻成「昵称 / 备注 / 微信号」。
      *
      * 存在的理由：日志和数据库里全是 wxid，`sourceType` 取证时知道「被删动态属于

@@ -17,6 +17,7 @@ import com.lx.wxgroup.core.ConvReader
 import com.lx.wxgroup.core.HostContext
 import com.lx.wxgroup.data.ConvLayout
 import com.lx.wxgroup.data.Group
+import com.lx.wxgroup.data.GroupConvPlan
 import com.lx.wxgroup.data.GroupDb
 import com.lx.wxgroup.data.Keys
 import com.lx.wxgroup.data.Kv
@@ -81,6 +82,15 @@ object ConvFilter {
 
     /** 重建去抖：微信一有新消息就 notify，2900 条全量重读会卡 */
     private const val REBUILD_DEBOUNCE_MS = 250L
+
+    /**
+     * R54 B：给「曾被我方接管过」的伪会话行 View 打的标记 key。
+     *
+     * AOSP `View.setTag(int, Object)` 要求 `key >>> 24 >= 2`（0x47 = 71 满足）；
+     * ⛔ 不能用 `View.generateViewId()` 的值（可能 < 0x02000000 会抛
+     * IllegalArgumentException），也不能用无 key 的 `v.setTag(obj)`（会覆盖微信自己的 tag）。
+     */
+    private const val GCONV_ROW_TAG_KEY = 0x47525643
 
     /**
      * R22 性能探针的报警阈值（毫秒）。
@@ -625,8 +635,22 @@ object ConvFilter {
                     restoreAnchor(list)
                     fa.notifyDataSetChanged()
                 }
+                // R54 C：开开关后立即兜底 post 一次同步（不依赖 onDataChanged）。
+                kickGconvSync()
             }, REBUILD_DEBOUNCE_MS)
         }
+    }
+
+    /**
+     * R54 C：gconv 首次同步兜底。开开关、冷启后即使一直没来 onDataChanged 也能灌库。
+     *
+     * 只 post 到 [GroupConvStore] 的单一后台线程，绝不在调用方（主线程）直接跑 sync；
+     * [kvset] 已调 [refresh]，[install] 末尾、[refresh] 去抖块末尾各调一次，覆盖
+     * 「开关打开 / 列表创建后一直没有 onDataChanged」的场景。
+     */
+    private fun kickGconvSync() {
+        if (!runCatching { Kv.getBool(Keys.GCONV_MODE) }.getOrDefault(false)) return
+        GroupConvStore.postSync()
     }
 
     /**
@@ -898,6 +922,8 @@ object ConvFilter {
         restoreAnchor(list)
         fa.notifyDataSetChanged()
         LogX.i("K7 installed inner=${inner.javaClass.name} rows=${fa.size}")
+        // R54 C：列表创建后兜底 post 一次同步（覆盖冷启首次没有 onDataChanged）。
+        kickGconvSync()
         return fa
     }
 
@@ -1037,6 +1063,16 @@ object ConvFilter {
         @Volatile
         var layout: ConvLayout.Layout = ConvLayout.Layout(emptyList())
             private set
+
+        /**
+         * R54：gconv 开关是否打开。只在 [rebuild] 开头读一次 [Kv] 写到这里，
+         * 供 [getView] / [onDataChanged] 复用 —— [getView] 是每帧热路径，绝不能在里面
+         * 查 Kv（一次 SQLite 查询，`:106` 的旧坑）。
+         *
+         * 关着（默认）时下面所有 gconv 分支都不生效，旧的自绘分组行原样工作。
+         */
+        @Volatile
+        private var gconvEnabled = false
 
         /** 会话快照：wxid + 时间。**下标必须与微信 adapter 一一对应**，否则点错人 */
         @Volatile
@@ -1193,6 +1229,14 @@ object ConvFilter {
             val n = runCatching { wrapped.count }.getOrDefault(0)
             val db = GroupDb.current()
             val enabled = runCatching { Kv.getBool(Keys.CHAT_GROUP_ROW_ENABLED) }.getOrDefault(true)
+            // R54：gconv 开关整个 rebuild 只读这一次，存进字段给 getView / onDataChanged 复用。
+            // 与上面的 enabled 并列，别塞进 getView 热路径（那里每行读 Kv 会退化成查库）。
+            gconvEnabled = runCatching { Kv.getBool(Keys.GCONV_MODE) }.getOrDefault(false)
+            // R54 G+H 同一招：effEnabled 随 gconv 翻转而变 ⇒ 作为 configStamp 的 enabled
+            // 项使指纹改变 ⇒ 破 :1269 短路、翻转开关即触发全量重建（消除 H 的「字段热/
+            // layout 冷」半生效态）；同时 gconv ON 时它为 false ⇒ light 路径不再对已清空的
+            // memberSets 跑 O(组数×2900) 空转（消除 G）。:1296 零改动分支仍用原 enabled。
+            val effEnabled = enabled && !gconvEnabled
             // 未读角标开关：整个 rebuild 只读这一次（每行读会把滚动变成查库）
             val showUnread = runCatching { Kv.getBool(Keys.CHAT_SHOW_UNREAD) }.getOrDefault(true)
             val filterId = currentGroupId()
@@ -1212,7 +1256,7 @@ object ConvFilter {
             // `pinFold(view) folded=true -> rebuild`，置顶分组行却纹丝不动。
             val configStamp = PinFoldLogic.configStamp(
                 n = n,
-                enabled = enabled,
+                enabled = effEnabled,
                 filterId = filterId,
                 showUnread = showUnread,
                 membersHash = cachedMembers.hashCode(),
@@ -1253,7 +1297,7 @@ object ConvFilter {
                 lastSummariesVersion = summariesVersion
                 // layout 复用，只重算分组行摘要（models）。成员集合复用上一次的
                 // （见 [memberSets] 注释：成员变化都走完整重建，这里不查库）。
-                if (filterId == NONE && db != null && enabled) {
+                if (filterId == NONE && db != null && effEnabled) {
                     rebuildModels(db, groups, memberSets, showUnread)
                 }
                 probeCost(tRebuild, snapsCost, n, "light")
@@ -1281,7 +1325,11 @@ object ConvFilter {
                     ConvLayout.filtered(snaps, cachedMembers)
                 }
                 else -> {
-                    if (groups.isEmpty()) {
+                    // R54：gconv 开时恒走现成的 passthrough 分支（§10.2）——
+                    // 保留 GroupedAdapter 包装链但不插自绘分组行，让微信原生渲染
+                    // 库里的 wxgrp_ 伪会话行。关着（gconvEnabled=false）时
+                    // `|| false` 与原 `groups.isEmpty()` 逐字节等价，回滚零差异。
+                    if (groups.isEmpty() || gconvEnabled) {
                         memberSets = emptyMap()
                         models = emptyMap()
                         lastSpecs = emptyList()
@@ -1437,6 +1485,17 @@ object ConvFilter {
                             " snaps=${snaps.size} layoutBefore=$b layoutAfter=${layout.size} changed=$changed"
                     )
                     if (changed) runCatching { notifyDataSetChanged() }
+
+                    // R54：事件驱动的伪会话同步。挂在这个 250ms 去抖回调而不是 install()
+                    // 里的一次性入口：收消息 / 成员变更 / 分组增删改都会触发 inner observer
+                    // → onDataChanged，这里已经是「微信动过库之后」的稳定窗口。
+                    //
+                    // ⚠️ 主线程只 post、不等待、不切线程：sync（全表读 3120 行 + 读写微信
+                    // 主库）与 60s 节流都已下沉到 [GroupConvStore] 的单一后台线程，
+                    // 主线程不再有任何全表读 / 写库（复核 A）。整段 runCatching 只打日志。
+                    runCatching {
+                        if (gconvEnabled) GroupConvStore.postSync()
+                    }.onFailure { LogX.w("K7 gconv sync fail: ${it.javaClass.simpleName}") }
                 }, REBUILD_DEBOUNCE_MS)
             }
         }
@@ -1703,16 +1762,94 @@ object ConvFilter {
             val r = layout.convIndexOf(position)
             if (r < 0 || ctx == null) return placeholder(parent)
 
+            // R54 B：convertView 污染防御。在决定 cv 之前预判本行 gid（与下面命中分支
+            // 同源、不新增查库）。gconv OFF 时短路为 null ⇒ 整块零生效（回滚生命线）。
+            // 用 runCatching 兜住取值，异常绝不能改变返回值。
+            val rowGid = if (gconvEnabled) runCatching {
+                GroupConvPlan.groupIdOf(ConvReader.username(wrapped.getItem(r)))
+            }.getOrNull() else null
+
             // convertView 的**类型必须和本行的类型一致**才能交给微信复用。
             // ListView 的 RecycleBin 池子是按「换 adapter 之前」的 viewTypeCount 建的，
             // 池子数量对不上时会串类型 —— 微信的 getView 会把自己的类型强转
             // convertView，直接抛异常，这一行就渲染成空白（真机实测踩到）。
             // 对不上就当没有 convertView，让它自己新建。
-            val cv = convertView?.takeIf { viewTypeOf(it) == getItemViewType(position) }
+            var cv = convertView?.takeIf { viewTypeOf(it) == getItemViewType(position) }
+
+            // R54 B：曾被我方接管过（带 tag）的 View 被复用成普通行（rowGid==null）时，
+            // 丢弃它、强制微信新建干净的 View（自然带宿主自己的 listener），避免「点普通
+            // 会话误开 GroupDetailPage / GroupRowMenu」。其余情况维持上面的类型校验。
+            // ⛔ 不挂 gconvEnabled 前置：ON→OFF 热切换后开关已关，但带我方 tag 的 View 仍在
+            // 回收池，残留的 GroupDetailPage/GroupRowMenu listener 必须照样清掉；OFF 时
+            // rowGid 恒为 null 且正常场景无带 tag 的 View ⇒ 零差异保持，命中的正是热切换残留。
+            // ⛔ 不在非命中行无条件 setXxxListener(null)：wrapped.getView 已跑完，无条件清空
+            // 会连微信刚设的 listener 一起清掉，普通行反而点不动。
+            if (rowGid == null && cv?.getTag(GCONV_ROW_TAG_KEY) != null) {
+                cv = null
+            }
 
             // 规矩 3：绝不返回 null。微信的 getView 万一抛了，给个占位行也比空白强
-            return runCatching { wrapped.getView(r, cv, parent) }
+            val v = runCatching { wrapped.getView(r, cv, parent) }
                 .getOrNull() ?: placeholder(parent)
+
+            // R54：伪会话行接管（点击 / 长按）。gconv 开关只决定**点开哪一页**，不再是总闸门：
+            // OFF = 回滚路径（回到 R55 之前的分组详情页），而不是「一律不接管」—— 不接管会被
+            // 宿主按伪会话直送 ChattingUI（真机对照过：标题只有组名 + 「对方还不是你的朋友」），
+            // 比详情页更没用。长按仍只在 gconv ON 时覆盖（用户拍板「长按本轮不动」），
+            // OFF 时交回宿主原生菜单。
+            //
+            // 为什么保留 GroupedAdapter 包装链、不去 hook 微信混淆类 `p3.getView`：
+            // getView 本来就逐行拿到 item 与微信渲染好的 View，在这里覆盖 listener 是
+            // **零新增 hook** 的最短路径；那些宿主 hook 点全是「未证实」，且 viewType
+            // 数量一变就会串回收池（conv_list.md:5）。这是 §10.2 推翻 §8 的定案。
+            //
+            // 为什么用窄口径（GroupConvPlan.isOurs ≡ groupIdOf 能反解出合法 gid）而不是只看
+            // "wxgrp_" 前缀：ownWhere() 是 SQL 层宽口径，会命中 wxgrp_t1 这类探针残留行，
+            // 它们反解不出 gid；硬接管会拿 null 去开 GroupDetailPage。这里直接判
+            // `groupIdOf != null`（与 isOurs 等价、少一次解析），为 null 就保守放行，
+            // 交回微信原行为（无害）。
+            //
+            // 为什么第一版不覆盖标题：会话标题是宿主**自绘 View**（不是 TextView，
+            // feature/ConvMenuInject.kt:772），找不到可靠的 setText 落点；改名统一走
+            // GroupConvStore.sync() 写 rcontact.nickname，微信有联系人内存缓存，下次冷启
+            // 才生效（§10.1 #5）。所以这里只接点击/长按，不碰标题、不 setText。
+            runCatching {
+                // r 是**原始下标**（见 :1640-1651 的双语义说明），取 item 必须用 r。
+                // isOurs/groupIdOf 是 O(1)（一次 startsWith + hex 反解），不查库、不遍历会话。
+                val item = wrapped.getItem(r)
+                val username = ConvReader.username(item)
+                // gid 非空即 isOurs 命中；null 直接放行，不接管（窄口径）。
+                GroupConvPlan.groupIdOf(username)?.let { gid ->
+                    // R54 B：给命中行打我方标记（带 key，不覆盖微信自己的 tag）。
+                    // getView 决定 cv 时据此判断该 View 是否曾被我方接管过。
+                    v.setTag(GCONV_ROW_TAG_KEY, gid)
+                    if (gconvEnabled) {
+                        // 微信在 wrapped.getView() 内部已给行设过自己的 listener，我们在**之后**
+                        // 覆盖才有效（performItemClick 真机零命中，conv_list.md:9-13）。
+                        // 用 v.context（必是 Activity）：HostContext.activity() 在 LauncherUI 恒 null
+                        // （覆写 onResume 不触发），会 BadTokenException（conv_list.md:84）。
+                        // R55 路线 E（用户拍板）：点分组行 → 复用微信「折叠的群聊」页，
+                        // 由 GconvPage 换掉该页数据源与标题；长按仍走原 GroupRowMenu（本轮不动）。
+                        v.setOnClickListener { GconvPage.open(v.context, gid) }
+                        v.setOnLongClickListener {
+                            GroupRowMenu.show(v.context, gid)
+                            true   // 必须 return true，否则冒泡成点击 / 弹微信原生菜单（conv_list.md:82-83）
+                        }
+                    } else {
+                        // 回滚路径：不进「折叠的群聊」页，回到分组详情页。
+                        // 组名**点击时**才查 —— 这段每次 bind 都会跑，挪到外面等于把 bind 变成查库。
+                        v.setOnClickListener {
+                            val name = runCatching {
+                                GroupDb.current()?.listGroups()?.firstOrNull { it.id == gid }?.name
+                            }.getOrNull()?.takeIf { it.isNotBlank() } ?: "分组"
+                            GroupDetailPage.open(v.context, gid, name)
+                        }
+                    }
+                }
+            }.onFailure { LogX.w("K7 gconv row hook fail: ${it.javaClass.simpleName}") }
+
+            // 整段异常只打日志、绝不改变返回值：仍然返回微信那个 v（或占位行）。
+            return v
         }
 
         private fun placeholder(parent: ViewGroup?): View {

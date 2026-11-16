@@ -171,6 +171,50 @@ object EntryReceiver {
                             LogX.i("PROBE $line")
                         }
                     }
+                    // R53 竞品操作点观测（纯只读）：微X 静态被 native 壳加密，改从宿主侧看它。
+                    //   --es op xh --es sub hook [--es val com.fkzhang] [--ei n 60]
+                    //     → 读 XposedBridge 的全局 hook 表，列出微X 已挂的 Member
+                    //   --es op xh --es sub row [--ei n 30]
+                    //     → dump 会话列表 adapter 链 + 每可见行的 viewType/tag/item
+                    // 走 io{} 起线程：row 那条要回主线程跑并等 latch，在 onReceive 主线程里
+                    // 直接等会把广播卡成 ANR。
+                    "xh" -> {
+                        val sub = intent.getStringExtra("sub") ?: "hook"
+                        val f = intent.getStringExtra("val").orEmpty()
+                        val n = intent.getIntExtra("n", 60)
+                        io {
+                            for (l in com.lx.wxgroup.probe.HookListProbe.run(sub, f, n)) {
+                                LogX.i("XH $l")
+                            }
+                        }
+                    }
+                    // R54 阶段0：伪会话写库探针。只碰 `wxgrp_` 前缀的行，删/改都带备份。
+                    // sub=stat|trial|rename|clean|sql；返回行已自带 "GCONV " 前缀，别再拼。
+                    "gconv" -> {
+                        val sub = intent.getStringExtra("sub") ?: "stat"
+                        val v = intent.getStringExtra("val")
+                        val s = intent.getStringExtra("sql")
+                        val n = intent.getIntExtra("n", 60)
+                        io {
+                            for (l in com.lx.wxgroup.probe.GroupConvProbe.run(sub, v, s, n)) {
+                                LogX.i(l)
+                            }
+                        }
+                    }
+                    // R54：生产侧伪会话同步入口。与阶段0 探针 op=gconv 分开，避免 sub 冲突：
+                    // 这里只调 GroupConvStore（真业务），那边是可控的写库实验探针。
+                    "gcs" -> {
+                        val sub = intent.getStringExtra("sub") ?: "stat"
+                        // R54：只 post 到 GroupConvStore 的单一后台线程，不等待、不另起 io{}。
+                        // 手动 sync 用 force=true 绕过节流（验收 SOP 依赖它立即灌库）。
+                        runCatching {
+                            when (sub) {
+                                "sync" -> com.lx.wxgroup.feature.GroupConvStore.postSync(force = true)
+                                "clean" -> com.lx.wxgroup.feature.GroupConvStore.postClean()
+                                else -> com.lx.wxgroup.feature.GroupConvStore.postStat()
+                            }
+                        }.onFailure { LogX.w("ENTRY gcs fail: ${it.javaClass.simpleName}") }
+                    }
                     // K9 验证期临时入口：设备里没有 sqlite3，改配置只能从模块内部写 Kv。
                     // 验证完随本分支一起删除。
                     "kvset" -> {

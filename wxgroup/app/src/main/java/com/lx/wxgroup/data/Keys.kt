@@ -56,6 +56,31 @@ object Keys {
     const val CHAT_GROUP_ROW_ENABLED = "chat.group_row_enabled"
 
     /**
+     * R54：分组行改走「微信主库伪会话」（`wxgrp_<gid>`），由微信原生渲染，
+     * 不再插自绘分组行（`GroupRowView`）。
+     *
+     * ⛔ **默认 false**，且这是回滚开关不是「没做完先关着」：关着时 `ConvFilter.rebuild()`
+     * 完全沿用旧的 `groups.isEmpty()` 语义，自绘分组行原样工作；`ConvLayout` /
+     * `GroupRowView` / `GroupedAdapter` 一个都没删 ⇒ 回滚只需把这个键置回 false，
+     * 再由 `GroupConvStore.clean()` 清掉库里残留的 `wxgrp_` 行，零成本、不用发版。
+     *
+     * 同开**不会**出现两套分组行：`ConvFilter.rebuild()` 的 `|| gconvEnabled` 已让自绘行
+     * 不出现，只有一套微信原生伪会话行（旧注释「两套行同时出现」与实现不符，已更正）。
+     * 本轮已用 `effEnabled = enabled && !gconvEnabled` 消掉同开时 light 路径的
+     * O(组数×2900) 空跑，故**无需强制关** [CHAT_GROUP_ROW_ENABLED]。
+     *
+     * ⚠️ 回滚坑：若按旧注释手动关过 [CHAT_GROUP_ROW_ENABLED]，回滚时**必须把它与
+     * [GCONV_MODE] 一起复位**（前者开回 true、后者置回 false），否则 `enabled=false`
+     * 会让 `rebuild()` 走「零改动」分支 ⇒ 分组行全没，容易被误判成回滚失败。
+     *
+     * 为什么切换后要冷启微信才生效：微信把会话标题/联系人放在内存缓存里，
+     * 纯写库不刷列表、改名不重启也不生效（§10.1 #1/#5）；第一版也不覆盖标题
+     * （标题是宿主自绘 View 而非 TextView，`feature/ConvMenuInject.kt:772`），
+     * 改名统一走 `GroupConvStore.sync()` 写 `rcontact.nickname`，下次冷启生效。
+     */
+    const val GCONV_MODE = "chat.gconv_enabled"
+
+    /**
      * 长按普通会话时，往**微信自己的菜单**里加「加入分组 / 标记已读」两项。
      *
      * 注入点是微信自己那个菜单 PopupWindow（详见
@@ -417,6 +442,12 @@ object Prefs {
     val ALL: List<PrefSpec> = listOf(
         // 聊天域
         PrefSpec(Keys.CHAT_GROUP_ROW_ENABLED, PrefKind.SWITCH, "true", "聊天", "启用分组行"),
+        // R54：数据层伪会话分组行。默认关（回滚零成本）；开它时记得把上面的自绘分组行关掉（互斥）。
+        // 切换后冷启微信才生效（微信联系人/会话内存缓存，§10.1）。
+        PrefSpec(
+            Keys.GCONV_MODE, PrefKind.SWITCH, "false", "聊天",
+            "数据层分组行（实验，默认关；切换后冷启微信生效）"
+        ),
         PrefSpec(
             Keys.FORWARD_NATIVE, PrefKind.SWITCH, "false", "聊天",
             "原生转发（带「转发」标记）—— 未真机验证，默认关；关着走降级重发"

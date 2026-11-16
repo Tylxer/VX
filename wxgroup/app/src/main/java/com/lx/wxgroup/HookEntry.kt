@@ -27,6 +27,7 @@ import com.lx.wxgroup.feature.AntiRevokeHint
 import com.lx.wxgroup.feature.AutoHdImg
 import com.lx.wxgroup.feature.ConvMenuInject
 import com.lx.wxgroup.feature.ForceForward
+import com.lx.wxgroup.feature.GconvPage
 import com.lx.wxgroup.feature.GroupBar
 import com.lx.wxgroup.feature.HintBadge
 import com.lx.wxgroup.feature.ScrollDock
@@ -186,6 +187,14 @@ class HookEntry : IXposedHookLoadPackage {
         runCatching {
             ConvFilter.install(lpparam)
         }.onFailure { LogX.e("ConvFilter install failed", it) }
+
+        // ---- R55 路线 E：分组行点击 → 复用微信「折叠的群聊」页 ----
+        // 只换数据源与标题，不写宿主任何列（parentRef / nickname 一律不碰）。
+        // 类名已在 classes4.dex 核实：ConvBoxServiceConversationUI（+ 内部 FmUI）、
+        // t0（Adapter）、com.tencent.mm.ui.w8（Cursor 基类）。详见 feature/GconvPage.kt。
+        runCatching {
+            GconvPage.install(lpparam)
+        }.onFailure { LogX.e("GconvPage install failed", it) }
 
         // ---- M4-C 探针：会话页打开时打出 Chat_User（验证「点第 N 行开第 N 行」）----
         runCatching {
