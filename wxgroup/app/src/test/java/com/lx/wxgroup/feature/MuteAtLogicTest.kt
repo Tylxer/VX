@@ -96,6 +96,50 @@ class MuteAtLogicTest {
         assertFalse(MuteAtLogic.isAtMe("普通消息，没有@", listOf("V")))
     }
 
+    // ---------------------------------------------------------- 只防@全体成员（R56 allOnly）
+
+    @Test
+    fun allOnlyBroadcastMentionsStillMatch() {
+        // @所有人 / @all（大小写不敏感）恒命中，与 allOnly 无关
+        assertTrue(MuteAtLogic.isAtMe("@所有人 请查看", emptyList(), allOnly = true))
+        assertTrue(MuteAtLogic.isAtMe("@all 请查看", emptyList(), allOnly = true))
+        assertTrue(MuteAtLogic.isAtMe("@ALL 请查看", emptyList(), allOnly = true))
+        // CJK 紧贴也必须命中（中文正文紧贴中文关键字是常态）
+        assertTrue(MuteAtLogic.isAtMe("@所有人请查看", emptyList(), allOnly = true))
+    }
+
+    @Test
+    fun allOnlyIgnoresAliases() {
+        // 核心断言：allOnly=true 时 @我的昵称不再静音（照常响铃）
+        assertFalse(MuteAtLogic.isAtMe("verity: @V 3", listOf("V"), allOnly = true))
+        assertFalse(MuteAtLogic.isAtMe("张三: @老王 在吗", listOf("V", "老王"), allOnly = true))
+    }
+
+    @Test
+    fun allOnlyFalseKeepsOldBehavior() {
+        // 回归：allOnly=false（默认）时别名照常参与判定，老行为不破
+        assertTrue(MuteAtLogic.isAtMe("verity: @V 3", listOf("V"), allOnly = false))
+        // 不传第三参 = 默认 allOnly=false
+        assertTrue(MuteAtLogic.isAtMe("verity: @V 3", listOf("V")))
+    }
+
+    @Test
+    fun allOnlyEmptyTextNeverMatches() {
+        assertFalse(MuteAtLogic.isAtMe("", listOf("V"), allOnly = true))
+    }
+
+    @Test
+    fun quantitiesAllMembersTokenMatchesEvenInAllOnly() {
+        // `@全体成员` 与 `@所有人` 同级：恒命中，不受 allOnly 影响
+        assertTrue(MuteAtLogic.isAtMe("@全体成员 请查看", emptyList(), allOnly = true))
+    }
+
+    @Test
+    fun quantitiesAllMembersTokenMatchesWhenFollowedByCjk() {
+        // CJK 紧贴也必须命中（证明不算名字字符的规则同样覆盖新关键字）
+        assertTrue(MuteAtLogic.isAtMe("@全体成员请注意", emptyList(), allOnly = true))
+    }
+
     // ---------------------------------------------------------- 作用域（名单）
 
     @Test

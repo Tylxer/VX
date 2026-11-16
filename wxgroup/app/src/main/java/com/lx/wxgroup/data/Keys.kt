@@ -118,6 +118,17 @@ object Keys {
     const val CHAT_MUTE_AT_EXCLUDE = "chat.mute_at_exclude"
 
     /**
+     * R56：只防 @全体成员（**默认 true**）。
+     *
+     * - `true`  ⇒「防止被@」只认 `@所有人` / `@all`（大小写不敏感），用户配置的
+     *   「我的昵称」[CHAT_AT_ALIASES] 一律不参与判定 ⇒ **@我的消息照常响铃**；
+     * - `false` ⇒ 完全恢复旧行为：@所有人 / @all / @我的昵称 都静音。
+     *
+     * ⚠️ **只有把本开关关掉（置 false），[CHAT_AT_ALIASES] 才会重新参与判定**。
+     */
+    const val CHAT_MUTE_AT_ALL_ONLY = "chat.mute_at_all_only"
+
+    /**
      * 原生转发（G1）：让转出去的消息**带「转发」标记**，而不是降级重发成一条普通消息。
      *
      * ⛔ **默认 false**，且这是刻意的，不是「没做完先关着」：
@@ -467,6 +478,11 @@ object Prefs {
         PrefSpec(Keys.CHAT_SHOW_UNREAD, PrefKind.SWITCH, "true", "聊天", "显示未读"),
         PrefSpec(Keys.CHAT_DISABLE_PAT, PrefKind.SWITCH, "false", "聊天", "关闭拍一拍"),
         PrefSpec(Keys.CHAT_MUTE_AT_ENABLED, PrefKind.SWITCH, "false", "聊天", "开启防止被@"),
+        // R56：默认开，@我照常响铃、只静音 @全体（见 Keys.CHAT_MUTE_AT_ALL_ONLY）
+        PrefSpec(
+            Keys.CHAT_MUTE_AT_ALL_ONLY, PrefKind.SWITCH, "true", "聊天",
+            "只防@全体成员（@我照常提醒）"
+        ),
         PrefSpec(Keys.CHAT_MUTE_AT_ALLOW, PrefKind.ENTER, "[]", "聊天", "设置允许名单"),
         PrefSpec(Keys.CHAT_MUTE_AT_EXCLUDE, PrefKind.ENTER, "[]", "聊天", "设置排除名单"),
         PrefSpec(
@@ -476,6 +492,7 @@ object Prefs {
         PrefSpec(Keys.CHAT_AUTO_HD_ALLOW, PrefKind.ENTER, "[]", "聊天", "原图：设置允许名单"),
         PrefSpec(Keys.CHAT_AUTO_HD_EXCLUDE, PrefKind.ENTER, "[]", "聊天", "原图：设置排除名单"),
         // 判断「@我」用。留空则只认 @所有人（见 Keys.CHAT_AT_ALIASES 的注释）
+        // ⚠️ 只在「只防@全体成员」关掉时生效（R56，见 Keys.CHAT_MUTE_AT_ALL_ONLY）
         PrefSpec(Keys.CHAT_AT_ALIASES, PrefKind.TEXT, "", "聊天", "我的昵称（判断@我）"),
         PrefSpec(Keys.CHAT_DND_ENABLED, PrefKind.SWITCH, "false", "聊天", "免打扰"),
         // 起止相等 = 不生效，不是全天（决策 #7）

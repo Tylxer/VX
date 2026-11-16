@@ -36,7 +36,8 @@ import java.util.concurrent.atomic.AtomicLong
  * 该条退回 talker-only 匹配 —— 这是**可接受的降级**（下一条通知即恢复），不是 bug。
  *
  * 探针用法（op=quiet：`sub` 选中本功能，`sub2` 是本功能的子命令）：
- *   sub=at sub2=status | scope | aliases | map | extras
+ *   sub=at sub2=status | scope | aliases | map | extras | judge
+ *   sub=at sub2=judge --es val "某条通知正文"   # 确定性验证判据（不依赖真有人 @）
  */
 object MuteAt {
 
@@ -68,7 +69,14 @@ object MuteAt {
                 )
             ) return false
             val text = notificationText(notification)
-            if (!MuteAtLogic.isAtMe(text, MuteAtLogic.aliases(Kv.getString(Keys.CHAT_AT_ALIASES)))) {
+            // R56：只防 @全体成员 的开关，读一次存局部变量（通知热路径，避免重复查 Kv）
+            val allOnly = Kv.getBool(Keys.CHAT_MUTE_AT_ALL_ONLY)
+            if (!MuteAtLogic.isAtMe(
+                    text,
+                    MuteAtLogic.aliases(Kv.getString(Keys.CHAT_AT_ALIASES)),
+                    allOnly,
+                )
+            ) {
                 return false
             }
             matched.incrementAndGet()
@@ -83,14 +91,26 @@ object MuteAt {
         notification.extras?.getCharSequence(Notification.EXTRA_BIG_TEXT)?.let { append(it) }
     }
 
-    fun probe(sub: String): String = runCatching {
+    fun probe(sub: String, text: String? = null): String = runCatching {
         when (sub.lowercase()) {
-            "status" -> "registered=$registered enabled=${Kv.getBool(Keys.CHAT_MUTE_AT_ENABLED)} matched=${matched.get()} bridge=${QuietNotificationBridge.status()}"
+            "status" -> "registered=$registered enabled=${Kv.getBool(Keys.CHAT_MUTE_AT_ENABLED)} matched=${matched.get()} bridge=${QuietNotificationBridge.status()} allOnly=${Kv.getBool(Keys.CHAT_MUTE_AT_ALL_ONLY)}"
             "scope" -> "allow=${Kv.getList(Keys.CHAT_MUTE_AT_ALLOW)} exclude=${Kv.getList(Keys.CHAT_MUTE_AT_EXCLUDE)}"
             "aliases" -> "aliases=${MuteAtLogic.aliases(Kv.getString(Keys.CHAT_AT_ALIASES))}"
             "map" -> QuietNotificationBridge.mapStatus()
             // 取证用：最近一条通知的全部 extras（定「EXTRA_TITLE 是否即群名」锚点）
             "extras" -> QuietNotificationBridge.lastNotificationDump()
+            // R56：不依赖真有人 @全体，用传入正文确定性验证判据（两种模式各跑一遍）
+            "judge" -> {
+                val t = text?.takeIf { it.isNotBlank() }
+                if (t == null) {
+                    "judge: val 为空（--es val \"某条通知正文\"）"
+                } else {
+                    val aliases = MuteAtLogic.aliases(Kv.getString(Keys.CHAT_AT_ALIASES))
+                    val on = MuteAtLogic.isAtMe(t, aliases, allOnly = true)
+                    val off = MuteAtLogic.isAtMe(t, aliases, allOnly = false)
+                    "judge text=$t allOnly=true -> $on | allOnly=false -> $off | aliases=$aliases"
+                }
+            }
             // ---- 群名桥（2026-10-18）：名单里配群名的用户，靠它验证命中 ----
             // `sub=at sub2=grpstat`   数据源状态（ready/count/lastError）
             // `sub=at sub2=grpname`   重装一次再打状态（只在后台线程查库）
@@ -101,7 +121,7 @@ object MuteAt {
                 GroupNameSource.stat()
             }
             "grplist" -> GroupNameSource.sampleText(8)
-            else -> "subs=status,scope,aliases,map,extras,grpstat,grpname,grplist"
+            else -> "subs=status,scope,aliases,map,extras,judge,grpstat,grpname,grplist"
         }
     }.getOrElse { "error=${it.javaClass.simpleName}" }
 }

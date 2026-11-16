@@ -36,10 +36,20 @@ package com.lx.wxgroup.feature
  *
  * ## 三、「@的是不是我」（chat.at_aliases）
  * - `@所有人` 恒命中（微信中文客户端的渲染）；
+ *   ✅ **真机实证（2026-11-16，8.0.48/2588）**：在群里真发一条 @全体成员，
+ *   `message.content` 存的是 `wxid_xxx:\n@所有人`（同一份正文也喂给通知 ticker）
+ *   ⇒ **这版微信只渲染 `@所有人`**，`@全体成员` 四个字不会出现。
+ * - `@全体成员` 恒命中（与 `@所有人` 同级，**不受 allOnly 影响**）。**保留作跨版本兜底**：
+ *   本版不产生该文案（见上条），将来若某版本改渲染，这里仍能命中；代价是「有人手打
+ *   `@全体成员` 四个字但没真 @」会被误静音 —— 概率极小，且用户看到该文案本来就想静音。
+ *   真机取证方式：`op=quiet sub=at sub2=extras`，或直接查 `message.content`（见上）；
  * - `@all` 命中且**大小写不敏感**（`@ALL` / `@All` 都认，英文客户端渲染）；
  * - `@别名` 命中且**大小写敏感**：别名是用户填的精确身份，`@v` 不命中别名 `V`
  *   （宁可漏判，也不把 @别人 的消息静音 —— Keys.CHAT_AT_ALIASES 注释里的决策）；
- * - 别名留空 → 只剩前两条，@任何具体人都不静音；
+ * - **「只防 @全体成员」态（R56，`allOnly=true`）**：只认前三条（`@所有人` / `@全体成员` / `@all`），
+ *   **不看 aliases** —— @我的消息照常响铃，只有 @全体成员才静音。
+ *   `allOnly=false`（默认，即关掉 `chat.mute_at_all_only`）才轮到 `@别名` 参与判定；
+ * - 别名留空 → 只剩前三条，@任何具体人都不静音；
  * - **防短名误伤**（取证结论「通知静音」节实证）：`@alias` 后不能紧跟
  *   ASCII 字母/数字/下划线/短横线，否则别名 `V` 会把 `@Verity` / `@VIP` /
  *   `@V_2` / `@V-test` 全算成 @我。**CJK 字符不算名字字符** —— 中文正文紧贴
@@ -86,12 +96,20 @@ object MuteAtLogic {
     /**
      * 这条消息是不是 @了我。
      *
-     * [aliases] 留空时只认 `@所有人` / `@all` —— 宁可漏判也不把 @别人 的消息静音。
+     * [aliases] 留空时只认 `@所有人` / `@全体成员` / `@all` —— 宁可漏判也不把 @别人 的消息静音。
+     *
+     * [allOnly] 为 true 时只认 `@所有人` / `@全体成员` / `@all`（`@all` 大小写不敏感），
+     * **不看 aliases**
+     * —— 对应「只防 @全体成员」（`chat.mute_at_all_only` 默认开）：
+     * @我的消息照常响铃，只有 @全体成员才静音。false（默认值）则恢复旧行为，
+     * 前三条命中后继续用 aliases 判「@我」。
      */
-    fun isAtMe(text: String, aliases: Collection<String>): Boolean {
+    fun isAtMe(text: String, aliases: Collection<String>, allOnly: Boolean = false): Boolean {
         if (text.isEmpty()) return false
         if (containsAtAlias(text, "所有人")) return true
+        if (containsAtAlias(text, "全体成员")) return true
         if (containsAtAlias(text, "all", ignoreCase = true)) return true
+        if (allOnly) return false
         return aliases.any { containsAtAlias(text, it) }
     }
 

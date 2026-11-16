@@ -466,7 +466,11 @@ object EntryReceiver {
                         val arg = intent.getStringExtra("sub2") ?: "status"
                         when (sub.lowercase()) {
                             "pat" -> LogX.i("QUIET " + com.lx.wxgroup.feature.PatBlock.probe(arg))
-                            "at" -> LogX.i("QUIET " + com.lx.wxgroup.feature.MuteAt.probe(arg))
+                            "at" -> LogX.i(
+                                "QUIET " + com.lx.wxgroup.feature.MuteAt.probe(
+                                    arg, intent.getStringExtra("val")
+                                )
+                            )
                             "dnd" -> LogX.i("QUIET " + com.lx.wxgroup.feature.DndWindow.probe(arg))
                             "grp" -> LogX.i(
                                 "QUIET " + com.lx.wxgroup.feature.AutoDndGroup.probe(
