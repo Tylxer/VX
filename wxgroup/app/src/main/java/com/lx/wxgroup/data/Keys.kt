@@ -81,6 +81,20 @@ object Keys {
     const val GCONV_MODE = "chat.gconv_enabled"
 
     /**
+     * 数据层分组行（gconv 路径）的**单人头像**：显示「该组最后发消息的人」的头像。
+     *
+     * - 只对 `wxgrp_<16hex>` 伪会话生效（`NativeConvAvatar` hook `modelavatar.x.i` 时先判前缀），
+     *   真实联系人头像零影响；非四宫格、不合成 Bitmap，直接返回 lastSender 的微信头像。
+     * - **兜底**：解不出 lastSender、或头像解码失败时**保持微信默认灰头像**（不设返回、放行原方法），
+     *   绝无色块/白洞。
+     * - **默认 true**：这是用户当前主路径（gconv=1）的目标视觉效果，不是「没做完先关着」；
+     *   关掉只是退回微信默认群头像（灰色人形）。
+     * - 运行时 `enabled = 本开关 ∧ [GCONV_MODE]`，二者都在装机时读一次 —— 切 gconv 需冷启，
+     *   与本模块既有约定一致；gconv 关着时本 hook 零生效，不残留状态。
+     */
+    const val GCONV_AVATAR = "chat.gconv_avatar"
+
+    /**
      * 长按普通会话时，往**微信自己的菜单**里加「加入分组 / 标记已读」两项。
      *
      * 注入点是微信自己那个菜单 PopupWindow（详见
@@ -458,6 +472,10 @@ object Prefs {
         PrefSpec(
             Keys.GCONV_MODE, PrefKind.SWITCH, "false", "聊天",
             "数据层分组行（实验，默认关；切换后冷启微信生效）"
+        ),
+        PrefSpec(
+            Keys.GCONV_AVATAR, PrefKind.SWITCH, "true", "聊天",
+            "数据层分组行显示最后发消息人的头像（切换后冷启微信生效）"
         ),
         PrefSpec(
             Keys.FORWARD_NATIVE, PrefKind.SWITCH, "false", "聊天",

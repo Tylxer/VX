@@ -39,6 +39,7 @@ import com.lx.wxgroup.feature.MomentsAuto
 import com.lx.wxgroup.feature.MomentsExport
 import com.lx.wxgroup.feature.PatBlock
 import com.lx.wxgroup.feature.MuteAt
+import com.lx.wxgroup.feature.NativeConvAvatar
 import com.lx.wxgroup.feature.DndWindow
 import com.lx.wxgroup.feature.AutoDndGroup
 import com.lx.wxgroup.feature.RedPacket
@@ -187,6 +188,14 @@ class HookEntry : IXposedHookLoadPackage {
         runCatching {
             ConvFilter.install(lpparam)
         }.onFailure { LogX.e("ConvFilter install failed", it) }
+
+        // ---- R59：数据层分组行（gconv）单人头像（最后发消息的人）----
+        // hook modelavatar.x.i(String)（AvatarStorage 内存查表），命中 wxgrp_ 时替换成
+        // 该组 lastSender 的微信头像（非拼图、不合成）；解析走后台线程 + 30s 节流缓存 +
+        // 取不到回落微信默认头像。详见 feature/NativeConvAvatar.kt。
+        runCatching {
+            NativeConvAvatar.install(lpparam)
+        }.onFailure { LogX.e("NativeConvAvatar install failed", it) }
 
         // ---- R55 路线 E：分组行点击 → 复用微信「折叠的群聊」页 ----
         // 只换数据源与标题，不写宿主任何列（parentRef / nickname 一律不碰）。

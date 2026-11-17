@@ -101,6 +101,12 @@ object GroupConvProbe {
         if (sub.trim().lowercase() == "views") return com.lx.wxgroup.feature.GconvPage.dumpViews()
         // R55d：`trace` 只挂「纯日志」钩子（不改返回值/不改状态），同样不需要库句柄。
         if (sub.trim().lowercase() == "trace") return com.lx.wxgroup.feature.GconvPage.traceInstall()
+        // R55g：`finishtrace` 只挂「纯日志」finish 追踪钩子（不改返回值/不改状态），同样不需要库句柄。
+        if (sub.trim().lowercase() == "finishtrace") return com.lx.wxgroup.feature.GconvPage.finishTraceInstall()
+        // R55h：`satrace` 只挂「纯日志」startActivity 追踪钩子（不改返回值/不改状态），同样不需要库句柄。
+        if (sub.trim().lowercase() == "satrace") return com.lx.wxgroup.feature.StartActivityTrace.install()
+        // R59：数据层分组行单人头像现场对账（只读，NativeConvAvatar.dump 自己处理 db 为空的情况）。
+        if (sub.trim().lowercase() == "ava") return com.lx.wxgroup.feature.NativeConvAvatar.dump()
         val db = AntiRevoke.wxDb()
         if (db == null) {
             say(out, "no DB instance —— 先让微信写一次库（收发一条消息），主库句柄才被捕获")

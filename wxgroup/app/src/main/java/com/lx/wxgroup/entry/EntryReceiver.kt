@@ -687,6 +687,30 @@ object EntryReceiver {
                             LogX.i("PROBE kv $k = ${com.lx.wxgroup.data.Kv.getString(k)}${if (known) "" else " (未登记)"}")
                         }
                     }
+                    // R57 取证：只读列出所有分组 + 成员数 + 前 4 个成员 wxid。
+                    // 存在理由：分组行 2×2 拼图要求「成员 ≥4」，而成员数在 UI 上看不到
+                    // （副标题只显示最后发信人）。没有这条探针只能靠猜「组里人不够」还是「代码没生效」。
+                    // --es op groups
+                    "groups" -> io {
+                        val db = com.lx.wxgroup.data.GroupDb.current()
+                        if (db == null) {
+                            LogX.w("GROUPS no db —— 模块库还没打开（先让模块写一次配置）")
+                            return@io
+                        }
+                        val gs = runCatching { db.listGroups() }.getOrElse { e ->
+                            LogX.w("GROUPS listGroups fail ${e.javaClass.simpleName}")
+                            return@io
+                        }
+                        LogX.i("GROUPS count=${gs.size}")
+                        for (g in gs) {
+                            val m = runCatching { db.memberWxids(g.id) }
+                                .getOrDefault(emptySet())
+                            LogX.i(
+                                "GROUPS id=${g.id} name=${g.name} members=${m.size}" +
+                                    " first=${m.take(4)}"
+                            )
+                        }
+                    }
                     // wxid -> 昵称/备注（只读，取证里全是 wxid，必须翻成人能认的名字）
                     // --es op who --es val "wxid_a,wxid_b"
                     "who" -> {

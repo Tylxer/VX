@@ -44,7 +44,7 @@ object AvatarLoader {
     fun attach(cl: ClassLoader) { hostCl = cl }
 
     /** 反射解析结果：只解析一次；失败后 [dead] 置位，不再重试、日志只 warn 一次 */
-    private class Storage(val x: Any, val i: Method, val j: Method)
+    private class Storage(val x: Any, val i: Method, val j: Method, val q: Method?)
 
     private val lock = Any()
     @Volatile private var storage: Storage? = null
@@ -100,8 +100,13 @@ object AvatarLoader {
         val j = step(AvatarProbeLogic.Step.GET_J) { xc.getMethod("j", String::class.java) }
             ?: return fail(errors)
 
+        // q 是「把 Bitmap 注入微信头像内存缓存 + 通知观察者刷新」（伪会话行换头像后发布刷新用）。
+        // 非关键路径：拿不到只让 publish 静默退化为不通知，不影响 i/j 取图 —— 不计入探针步骤，
+        // 否则 AvatarProbeLogic 的 7 步诊断串会被拉长、连带既有单测断言一起变。
+        val q = runCatching { xc.getMethod("q", String::class.java, Bitmap::class.java) }.getOrNull()
+
         LogX.i("AvatarLoader 反射链路 OK " + AvatarProbeLogic.diagnose(CLS_SUBCORE, errors))
-        return Storage(x, i, j)
+        return Storage(x, i, j, q)
     }
 
     private fun fail(errors: Map<AvatarProbeLogic.Step, String?>): Storage? {
@@ -158,6 +163,45 @@ object AvatarLoader {
                 // FALLBACK：行已复用 / 拿不到图 → 保持首字兜底，静默
             }
         }
+    }
+
+    /**
+     * 预取某 wxid 的真头像并塞进模块缓存（内存 LruCache → 磁盘 1080 解码）。
+     *
+     * ⛔ 只能在后台线程调用：`x.j` 是磁盘 IO + 1080 decode，进主线程会卡帧。
+     * 拿不到返回 null，由调用方保持原默认头像。返回的是微信共享 LruCache 引用，**绝不 recycle**。
+     * 解码成功后写进模块 LruCache —— 这样微信自己的 LruCache 被 trim 后，
+     * 主线程 `getCached` 仍能从模块缓存命中（见 [NativeConvAvatar] 的兜底链）。
+     */
+    fun prefetch(wxid: String): Bitmap? {
+        if (wxid.isBlank()) return null
+        getCached(wxid)?.let { return it }
+        val s = storage() ?: return null
+        val bm = runCatching { s.j.invoke(s.x, wxid) as? Bitmap }
+            .onFailure {
+                LogX.w("AvatarLoader prefetch j fail wxid=$wxid " +
+                    "${it.javaClass.simpleName}: ${it.message?.take(120)}")
+            }
+            .getOrNull()
+            ?.takeIf { !it.isRecycled }
+        if (bm == null) LogX.w("AvatarLoader prefetch null wxid=$wxid (磁盘无图/非 Bitmap)")
+        if (bm != null) cache.put(wxid, bm)
+        return bm
+    }
+
+    /**
+     * 把某张 Bitmap 写进微信头像**内存缓存**并通知刷新（`x.q` = 写 LruCache + 通知 `k74/t0` 观察者）。
+     *
+     * ⚠️ 主线程调用（`x.q` 会通知观察者，触发会话列表刷新头像）。
+     * 只写内存缓存、不写磁盘文件、不碰 `rcontact` —— 与「写头像文件」方案无关，重启微信自然失效。
+     * `q` 反射不到时静默退化（本轮那张图显示不出来，但绝不抛异常）。
+     */
+    fun publish(username: String, bitmap: Bitmap) {
+        if (username.isBlank() || bitmap.isRecycled) return
+        val s = storage() ?: return
+        val q = s.q ?: return
+        runCatching { q.invoke(s.x, username, bitmap) }
+            .onFailure { LogX.w("AvatarLoader publish failed: ${it.javaClass.simpleName}") }
     }
 }
 

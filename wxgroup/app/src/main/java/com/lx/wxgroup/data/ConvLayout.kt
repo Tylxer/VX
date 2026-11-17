@@ -137,8 +137,21 @@ object ConvLayout {
         if (!pinFolded) for (g in pinned) rows.add(ConvRow.Group(g.id))
 
         for (i in convs.indices) {
-            val owner = ownerOf[convs[i].wxid]
+            val wxid = convs[i].wxid
+            val owner = ownerOf[wxid]
             when {
+                // R59：我方伪会话（`wxgrp_<gid>`）是「分组行」的数据载体，不是真实会话。
+                //
+                // - `gconv=1` 时它由微信原生渲染 —— 那条路走上面的 passthrough 分支，
+                //   **根本不会进到这个循环**，所以这里过滤不会影响主路径；
+                // - `gconv=0` 时分组行由 [ConvRow.Group] 自绘，伪会话必须隐藏，
+                //   否则同一个组在列表里出现两次（真机实测：顶部自绘「123」+ 下方
+                //   微信库里那条灰色人形「123」，时间/无副标题都对得上伪会话的记录）。
+                //
+                // ⛔ 放在 `owner` 判断**之前**：伪会话不属于任何组（`owner` 恒 null），
+                // 若按「没归组就原样保留」处理就必然漏出去。
+                GroupConvPlan.isOurs(wxid) -> Unit
+
                 // 没归组：原样保留（规则 1）
                 owner == null -> rows.add(ConvRow.Conv(i))
 

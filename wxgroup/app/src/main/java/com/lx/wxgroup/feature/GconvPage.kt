@@ -352,6 +352,107 @@ object GconvPage {
         return out
     }
 
+    // ------------------------------------------------- R55g finish 追踪（只读，不改行为）
+
+    /** 只读 finish 追踪的节流表：同一路 + 同一调用栈 300ms 内只打一行。 */
+    private val finishTraceLast = java.util.concurrent.ConcurrentHashMap<String, Long>()
+
+    @Volatile
+    private var finishTraceInstalled = false
+
+    /**
+     * 只打日志、绝不改返回值的 finish 追踪钩子 —— 用来**经验性**回答：
+     * 「按一次 back 后 task 里 ConvBox 与 ChattingUI 一起消失」到底是**谁**调了
+     * `ConvBoxServiceConversationUI.finish()`，以及它是不是从 `Activity.finish` 基类路径下来的。
+     *
+     * 挂两路（两路都要，因为 finish 可能不经 ConvBox 自己的 override）：
+     *  a) `com.tencent.mm.ui.conversation.ConvBoxServiceConversationUI.finish` 自身 override
+     *     （`own`）—— 直接被打到说明有人显式调了 ConvBox 的 finish；
+     *  b) `android.app.Activity.finish` 基类（`base`）—— 回调里**先判** `thisObject` 类名是否
+     *     以 `com.tencent.mm` 开头，只对微信的 Activity 打印（否则会把全系统的 finish 刷进日志）。
+     *     它同时兜住「不经 ConvBox override、直接 super.finish() / 反射调 Activity.finish」那条路。
+     *
+     * ⛔ 这里**只许** `LogX.i`：不许 `param.result = ...`、不许 setAccessible 之外的任何反射、
+     *    绝不改变宿主调用行为、绝不吞异常后改变返回值。
+     */
+    internal fun finishTraceInstall(): List<String> {
+        if (finishTraceInstalled) return listOf("GCONV_FIN already installed")
+        val ldr = cl ?: return listOf("GCONV_FIN classLoader 未就绪（模块还没 install）")
+        finishTraceInstalled = true
+        val out = mutableListOf<String>()
+
+        // a) ConvBox 自身的 finish
+        runCatching {
+            val c = XposedHelpers.findClass(PAGE, ldr)
+            if (c == null) {
+                out.add("GCONV_FIN hook own: $PAGE not found")
+            } else {
+                val set = XposedBridge.hookAllMethods(c, "finish", object : XC_MethodHook() {
+                    override fun beforeHookedMethod(param: MethodHookParam) = logFinish("own", param)
+                })
+                out.add("GCONV_FIN hook own $PAGE.finish n=${set.size}")
+            }
+        }.onFailure {
+            out.add("GCONV_FIN hook own fail: ${it.javaClass.simpleName}: ${it.message?.take(80)}")
+        }
+
+        // b) Activity.finish 基类，只对微信的 Activity 打印
+        runCatching {
+            val set = XposedBridge.hookAllMethods(
+                Activity::class.java, "finish",
+                object : XC_MethodHook() {
+                    override fun beforeHookedMethod(param: MethodHookParam) {
+                        val self = param.thisObject ?: return
+                        if (!self.javaClass.name.startsWith(HOST)) return
+                        logFinish("base", param)
+                    }
+                }
+            )
+            out.add("GCONV_FIN hook base android.app.Activity.finish n=${set.size}")
+        }.onFailure {
+            out.add("GCONV_FIN hook base fail: ${it.javaClass.simpleName}: ${it.message?.take(80)}")
+        }
+
+        LogX.i("GCONV_FIN installed")
+        return out
+    }
+
+    /**
+     * 打一行 finish 命中日志（只读）。`self` = 正在 finish 的那个 Activity 短类名，
+     * `trace` = 跳过钩子自身 / Xposed 桥 / 反射 / VM 帧后、从「被 hook 的 finish」往上的
+     * 调用方链（`<-` 连接，短类名.方法名）。
+     */
+    private fun logFinish(which: String, param: XC_MethodHook.MethodHookParam) {
+        runCatching {
+            val trace = callerTrace()
+            val key = "$which|$trace"
+            val now = System.currentTimeMillis()
+            val last = finishTraceLast.put(key, now) ?: 0L
+            if (now - last < 300L) return@runCatching
+            val self = param.thisObject?.javaClass?.name?.substringAfterLast('.') ?: "null"
+            LogX.i("GCONV_FIN $which self=$self $trace tid=${Thread.currentThread().name}")
+        }.onFailure {
+            LogX.w("GCONV_FIN $which log fail: ${it.javaClass.simpleName}")
+        }
+    }
+
+    /**
+     * 从当前线程栈取「调用方」帧：`dropWhile` 跳过我们自己的类、Xposed 桥、反射与 VM 帧，
+     * 剩下第一帧就是被 hook 的 finish，往后就是它的调用方。
+     */
+    private fun callerTrace(): String =
+        Thread.currentThread().stackTrace
+            .dropWhile {
+                it.className.startsWith("com.lx.wxgroup") ||
+                    it.className.startsWith("de.robv.android.xposed") ||
+                    it.className.startsWith("java.lang.reflect") ||
+                    it.className.startsWith("java.lang.Thread") ||
+                    it.className.startsWith("dalvik.system") ||
+                    it.className.startsWith("java.lang.StackTraceElement")
+            }
+            .take(12)
+            .joinToString("<-") { it.className.substringAfterLast('.') + "." + it.methodName }
+
     // ------------------------------------------------- 捕获 EnMicroMsg.db（P0）
 
     /**
@@ -624,15 +725,22 @@ object GconvPage {
             return
         }
         // 启动形状：**同任务、不加 flag**（行 View 的 context 就是本页 Activity）。
-        // ⚠️ 未证实的部分写在这里，别当成结论：真机上「带 CLEAR_TOP/NEW_TASK」与「不带」
-        //    按返回**都落到主列表**（不是回到分组页）⇒ 更可能是 `ChattingUI` 自己 singleTask/
-        //    清栈所致，而不是我们的 flag 造成。原生「折叠的群聊」页是否也这样**还没对照过**
-        //    （我们没有真实被折叠的会话可测）。选不带 flag 的版本，因为它的副作用更小。
+        //
+        // R59 已定案的部分（真机 extras 对比，同机同版本 8.0.48）：
+        //   原生 `ChatroomContactUI → ChattingUI` 传
+        //   `{Chat_Mode=1, chat_from_scene_for_group_chats=4, specific_chat_from_scene=10,
+        //     finish_direct=true}`；我方原先只有 `{Chat_User, Chat_Mode=1}`。
+        //   缺 `finish_direct` 的后果：ChattingUI 返回时发
+        //   `startActivityForResult(LauncherUI, FLAG_ACTIVITY_CLEAR_TOP)`（栈
+        //   `FragmentActivity.startActivityFromFragment ← a.b ← ChattingUI.startActivityForResult`），
+        //   **AMS 侧**把中间的 ConvBox 一起清掉（所以 `Activity.finish` 钩子抓不到它）。
+        //   本轮只补 `finish_direct` 做最小验证；另外两个 scene 键先不动（它们更可能是埋点/动效）。
         val ok = runCatching {
             val i = Intent().apply {
                 setClassName(HOST, CHATTING)
                 putExtra("Chat_User", talker)
                 putExtra("Chat_Mode", 1)
+                putExtra("finish_direct", true)
                 if (ctx !is Activity) addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
             }
             ctx.startActivity(i)
