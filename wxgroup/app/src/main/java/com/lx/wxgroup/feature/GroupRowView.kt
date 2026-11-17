@@ -88,6 +88,16 @@ object GroupRowView {
         val showUnread: Boolean = true,
         /** A4-c：整组没消息时展示的成员名（最多 3 个） */
         val memberNames: List<String> = emptyList(),
+        /**
+         * 2×2 拼图头像要用的 wxid（**恰好 4 个**，顺序由 [com.lx.wxgroup.feature.ConvFilter]
+         * 排好：最后发消息的人优先，其余按 wxid 升序补齐 ⇒ 每次 rebuild 结果一致，头像不会跳）。
+         *
+         * 不足 4 个成员时为**空列表** ⇒ 回落单头像（[lastSenderWxid]）。
+         * 为什么不做 2/3 格的拼图：空格留白比单头像难看，且微信自己的群头像也只对 ≥4 人做拼图。
+         *
+         * ⚠️ 这里只放**已算好的 wxid**，[bind] 内绝不查库（列表滚动是热路径）。
+         */
+        val avatarWxids: List<String> = emptyList(),
     )
 
     /**
@@ -99,6 +109,8 @@ object GroupRowView {
         val avatarImage: ImageView,
         val avatarLetters: TextView,
         val avatarBg: GradientDrawable,
+        /** 2×2 拼图的四格，顺序：左上 / 右上 / 左下 / 右下 */
+        val avatarGrid: Array<ImageView>,
         val title: TextView,
         val subtitle: TextView,
         val time: TextView,
@@ -120,6 +132,11 @@ object GroupRowView {
          * 注意 `avatarImage.tag` 是 [AvatarLoader] 自己的复用校验锚，不在这里抢着用。
          */
         var avatarWxid: String? = null
+        /**
+         * 2×2 拼图当前绑的是哪 4 个人（`wxid1,wxid2,wxid3,wxid4`）。
+         * `null` = 当前不是拼图模式。与 [avatarWxid] 互斥，切换时两边都清。
+         */
+        var avatarGridKey: String? = null
         /** 首字层当前的首字种子 / 是否中性色，用来判断要不要重设文字与背景色 */
         var avatarSeed: String? = null
         var avatarNeutral: Boolean? = null
@@ -160,6 +177,23 @@ object GroupRowView {
             layoutParams = FrameLayout.LayoutParams(avatarSize, avatarSize)
         }
 
+        // 2×2 拼图层：成员 ≥4 时用它替代单头像（微信群头像同款）。
+        // 四格尺寸/位置一次算好：2*cell + gap = avatarSize，中间形成 1dp 十字缝。
+        // ⚠️ 只建 4 个 ImageView，不建容器 ViewGroup —— 外层 [avatarBox] 的圆形裁剪
+        //    本来就对所有子 View 生效（clipToOutline），多一层反而多一次 measure。
+        val gridGap = (1 * d).toInt()
+        val gridCell = (avatarSize - gridGap) / 2
+        val gridViews = Array(4) { i ->
+            ImageView(ctx).apply {
+                scaleType = ImageView.ScaleType.CENTER_CROP
+                visibility = View.GONE
+                layoutParams = FrameLayout.LayoutParams(gridCell, gridCell).apply {
+                    leftMargin = if (i % 2 == 0) 0 else gridCell + gridGap
+                    topMargin = if (i < 2) 0 else gridCell + gridGap
+                }
+            }
+        }
+
         val avatarBox = FrameLayout(ctx).apply {
             clipToOutline = true
             // 用固定 size 而非 view.width/height：布局前的 transient 态宽高可能还是 0
@@ -172,6 +206,7 @@ object GroupRowView {
                 rightMargin = (12 * d).toInt()
             }
             addView(imageView)
+            gridViews.forEach { addView(it) }
             addView(lettersView)
         }
         row.addView(avatarBox)
@@ -229,6 +264,7 @@ object GroupRowView {
             avatarImage = imageView,
             avatarLetters = lettersView,
             avatarBg = lettersBg,
+            avatarGrid = gridViews,
             title = titleView,
             subtitle = subtitleView,
             time = timeView,
@@ -341,6 +377,23 @@ object GroupRowView {
      * 上一行的头像会留在屏幕上（串脸）。
      */
     private fun bindAvatar(h: Holder, m: Model) {
+        // 成员 ≥4 ⇒ 2×2 拼图（Model 契约：要么空、要么恰好 4 个）
+        if (m.avatarWxids.size >= 4) {
+            bindAvatarGrid(h, m.avatarWxids)
+            return
+        }
+        // 这一行原本是拼图、现在换成分组不足 4 人的组 ⇒ 先把四格彻底收掉，
+        // 否则复用行上会残留上一个分组的 4 张脸。
+        if (h.avatarGridKey != null) {
+            h.avatarGridKey = null
+            for (iv in h.avatarGrid) {
+                iv.tag = null
+                iv.setBackgroundColor(0)
+                iv.setImageDrawable(null)
+                iv.visibility = View.GONE
+            }
+        }
+
         val seed = m.lastSender.ifBlank { m.name }
         val neutral = m.lastSender.isBlank()
         val wxid = m.lastSenderWxid
@@ -369,6 +422,40 @@ object GroupRowView {
                 h.avatarLetters.visibility = View.GONE
                 h.avatarImage.visibility = View.VISIBLE
             }
+        }
+    }
+
+    /**
+     * 2×2 拼图头像：四格各自独立走 [AvatarLoader.bind]。
+     *
+     * - 每格的 `tag` 由 `AvatarLoader.bind` 写成该格的 wxid，异步回调据此校验 ⇒ 天然防串脸；
+     * - 兜底是「由 wxid 派生的稳定色块」（[colorOf]，与首字层同一套规则），真头像回来才清背景；
+     * - [Holder.avatarGridKey] 没变就整段跳过，`bind` 是滚动热路径。
+     */
+    private fun bindAvatarGrid(h: Holder, ids: List<String>) {
+        val key = ids.joinToString(",")
+        // 拼图模式下首字层/单图层都必须让位，否则圆里会叠一个字或一张大脸
+        h.avatarLetters.visibility = View.GONE
+        h.avatarImage.visibility = View.GONE
+        if (h.avatarGridKey == key) return
+        h.avatarGridKey = key
+        // 单图状态一并作废：否则以后切回「成员 <4 的组」时，会因 avatarWxid 相等而跳过重建
+        h.avatarWxid = null
+        h.avatarImage.tag = null
+        h.avatarImage.setImageDrawable(null)
+
+        for (i in h.avatarGrid.indices) {
+            val iv = h.avatarGrid[i]
+            val wxid = ids.getOrNull(i)
+            iv.tag = null
+            iv.setImageDrawable(null)
+            if (wxid.isNullOrBlank()) {
+                iv.visibility = View.GONE
+                continue
+            }
+            iv.visibility = View.VISIBLE
+            iv.setBackgroundColor(colorOf(wxid))
+            AvatarLoader.bind(iv, wxid) { iv.setBackgroundColor(0) }
         }
     }
 

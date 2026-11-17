@@ -1641,6 +1641,16 @@ object ConvFilter {
                 ?: db.findMember(wxid)?.displayName?.takeIf { it.isNotBlank() }
         }.getOrNull() ?: wxid
 
+        /**
+         * 2×2 拼图头像取哪 4 个人 —— 判据在 [AvatarGridLogic]（纯函数，有单测）。
+         *
+         * 这里只做「传参 + 注释」：成员不足 4 人会拿到空列表 ⇒ 分组行回落单头像。
+         * 成本：一次 ≤n 的排序（组内几百人，µs 级），只在 `rebuild()` 里跑；
+         * [GroupRowView.bind] 只消费结果，**不查库/不排序**。
+         */
+        private fun avatarOrder(wx: Set<String>, lastWxid: String): List<String> =
+            AvatarGridLogic.order(wx, lastWxid)
+
         /** A4 + A7：算出这个分组行该显示什么 */
         private fun buildModel(
             db: GroupDb,
@@ -1686,6 +1696,7 @@ object ConvFilter {
                 unread = unread,
                 showUnread = showUnread,
                 memberNames = names,
+                avatarWxids = avatarOrder(wx, senderWxid),
             )
         }
 
