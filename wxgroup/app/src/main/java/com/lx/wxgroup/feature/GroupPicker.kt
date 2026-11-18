@@ -159,6 +159,10 @@ object GroupPicker {
         LogX.i("PICKER applied ${friend.wxid}: $msg")
         // 成员关系变了 ⇒ 重读 cachedMembers 再重算（refresh() 不重读成员，筛选态下会无效）
         if (target != null || added > 0 || removed > 0) ConvFilter.refreshMembers()
+        // R69 建组即时灌库：仅「输入新名建了组」(target != null) 才 force 绕过 60s 节流；
+        // 纯勾选/取消已有分组是成员变更，行为逐字不变、不 force。单 worker 串行 + plan() 幂等
+        // 不重复插行，节流常量本身不动。真机判据：给好友输入新组名后 <3s 内新组置顶出现。
+        if (target != null) GroupConvStore.postSync(force = true)
         runCatching { Toast.makeText(ctx, msg, Toast.LENGTH_SHORT).show() }
             .onFailure { LogX.w("PICKER toast failed: ${it.javaClass.simpleName}") }
     }

@@ -136,6 +136,19 @@ object GroupConvStore {
      * 成员字段、成员增删不改 `groups` 快照，没法靠 hashCode 触发；一次 `rawQuery` 全读比对
      * 每个成员各查一次快得多。Map 里排除 `wxgrp_` / `wx__c_` 前缀，避免成员 wxid 撞上伪
      * 会话 username 时把 time 顶住不动（R54 §6.3）。
+     *
+     * # 空组 fallback 用 createdAt 而不是 0L（默认置顶）
+     * 空组 / 成员都无会话时 `maxOrNull()` 为 null，旧 fallback `0L` 会让
+     * `Desired.timeMs=0`、`flag=flagOf(0)=PIN_BASE`（整整 2^62）。这个 flag 虽在置顶区，
+     * 但 `conversationTime=0` 让它在置顶区内部按时间降序排到最末，真机实测落进「折叠置顶
+     * 聊天」区、肉眼看不见（R68 探针：新行 wxgrp_009e 排在微X 10 条 conversationTime>0
+     * 的置顶行之后）。改用 [Group.createdAt]（建组毫秒时间戳，与 rconversation.
+     * conversationTime 同量纲）：flag=PIN_BASE+createdAt > PIN_BASE，且 createdAt(~1.79e12)
+     * 远大于微X 的 conversationTime=1，故空组排进置顶区前部，实现「新建分组默认置顶」。
+     * 有成员的组仍取 max(成员会话时间)，行为逐字不变。createdAt=0 的脏数据退化回旧行为、
+     * 不崩（且备份恢复走 createGroup 写当前时间，正常不会有 0）。一处改即覆盖 b1 execSQL
+     * 与 b2 原生插入两条路径（两者都消费 [GroupConvPlan.Desired.timeMs]）。fallback 规则
+     * 抽成纯函数 [GroupConvPlan.effectiveTimeMs] 供 JVM 单测直接钉死（见 GroupConvPlanTest）。
      */
     fun sync(groups: List<Group>, membersOf: (Long) -> Set<String>): List<String> {
         val out = ArrayList<String>()
@@ -144,12 +157,19 @@ object GroupConvStore {
             say(out, "sync start db=${pathOf(db)} groups=${groups.size}")
             val times = readConvTimes(db, out)
             val desired = groups.map { g ->
-                val t = membersOf(g.id).mapNotNull { times[it] }.maxOrNull() ?: 0L
+                // 空组/成员无会话 ⇒ 用建组时间当 conversationTime，使 flag=PIN_BASE+createdAt
+                // > PIN_BASE 排进置顶区前部（默认置顶），而非 time=0 掉进「折叠置顶聊天」。
+                // effectiveTimeMs 是纯函数，单测直接钉死 fallback=createdAt（见 R68 变异验证）。
+                val memberTimes = membersOf(g.id).mapNotNull { times[it] }
+                val t = GroupConvPlan.effectiveTimeMs(memberTimes, g.createdAt)
                 GroupConvPlan.Desired(g.id, g.name, t, g.sortOrder)
             }
             val existing = readExisting(db, out)
             val ops = GroupConvPlan.plan(desired, existing)
             say(out, "sync plan desired=${desired.size} existing=${existing.size} ops=${ops.size}")
+            // b2：开关开着时 rconversation 改走宿主 s4.I（事务外发通知），事务内只写 rcontact + 预删除。
+            val nativeInsert = NativeConvInsert.isEnabled()
+            val deferredNative = ArrayList<GroupConvPlan.Desired>()
             inTransaction(db, out) { failures ->
                 for (op in ops) {
                     when (op) {
@@ -169,9 +189,32 @@ object GroupConvStore {
                             // 先删再插才幂等。复用带 ownWhere() 保护的 delete*Sql，绝不误删宿主行。
                             execLog(db, GroupConvPlan.deleteConvSql(u), "insertPreDelConv", u, out)?.let { failures += it }
                             execLog(db, GroupConvPlan.deleteContactSql(u), "insertPreDelContact", u, out)?.let { failures += it }
-                            execLog(db, GroupConvPlan.insertConvSql(op.d), "insertConv", u, out)?.let { failures += it }
-                            execLog(db, GroupConvPlan.insertContactSql(op.d), "insertContact", u, out)?.let { failures += it }
+                            if (nativeInsert) {
+                                // b2：rcontact 标题来源先写（事务内），rconversation 行留到事务外走 s4.I
+                                //（s4.I 会同步发 b(2) 通知，绝不能放进事务 —— 通知在提交前发出行为不确定，§4.3）。
+                                execLog(db, GroupConvPlan.insertContactSql(op.d), "insertContact", u, out)?.let { failures += it }
+                                deferredNative += op.d
+                            } else {
+                                // 现状路径逐字保持原样：execSQL 直写 rconversation（冷启才可见）。
+                                execLog(db, GroupConvPlan.insertConvSql(op.d), "insertConv", u, out)?.let { failures += it }
+                                execLog(db, GroupConvPlan.insertContactSql(op.d), "insertContact", u, out)?.let { failures += it }
+                            }
                         }
+                    }
+                }
+            }
+            // b2 段二（事务外、同 worker 线程、紧随事务之后）：s4.I 写 rconversation + 自动发
+            // b(2) 通知。宿主 CL 由 NativeConvInsert.install 存；失败降级回 execSQL 直写
+            //（回到现状，冷启可见），不吞失败日志。
+            if (nativeInsert && deferredNative.isNotEmpty()) {
+                for (d in deferredNative) {
+                    val u = GroupConvPlan.usernameOf(d.groupId)
+                    val rowid = NativeConvInsert.insertConv(u, d.timeMs, d.groupId)
+                    if (rowid == null) {
+                        say(out, "nativeInsert $u FAIL -> degrade execSQL")
+                        execLog(db, GroupConvPlan.insertConvSql(d), "insertConv", u, out)
+                    } else {
+                        say(out, "nativeInsert $u OK rowid=$rowid")
                     }
                 }
             }

@@ -18,12 +18,14 @@ import de.robv.android.xposed.callbacks.XC_LoadPackage
 import com.lx.wxgroup.core.ConvReader
 import com.lx.wxgroup.core.MarkRead
 import com.lx.wxgroup.data.Friend
+import com.lx.wxgroup.data.GroupConvPlan
 import com.lx.wxgroup.data.GroupDb
 import com.lx.wxgroup.data.Kv
 import com.lx.wxgroup.data.Keys
 import com.lx.wxgroup.data.WxidKind
 import com.lx.wxgroup.ui.UiKit
 import com.lx.wxgroup.util.LogX
+import java.lang.ref.WeakReference
 
 /**
  * A15（注入版）：往**微信自己的会话长按菜单**里加一行，而不是自己弹对话框。
@@ -155,6 +157,15 @@ object ConvMenuInject {
 
     private const val TAG_JOIN = "wxgroup.menu.join"
     private const val TAG_READ = "wxgroup.menu.read"
+    /** R61：伪会话行 prepend 的「解散聊天分组」项 tag */
+    private const val TAG_DISSOLVE = "wxgroup.menu.dissolve"
+
+    /**
+     * R61：PopupWindow 复用时记住上一次注入的 dissolve，切回真实会话时摘干净，
+     * 防止「解散聊天分组」残留到普通会话菜单里（普通会话零差异红线）。
+     */
+    @Volatile
+    private var lastDissolve: WeakReference<View>? = null
 
     private fun installPopupInject() {
         runCatching {
@@ -357,6 +368,77 @@ object ConvMenuInject {
         wxid: String, name: String
     ): List<TextView> {
         val ctx = sample.context
+        // R61：按 gid 分流。真实会话(gid==null)分支逐字保持改造前逻辑（普通会话零差异红线）；
+        // 伪会话(gid!=null)分支只 prepend「解散聊天分组」1 项（R62 起不再拦截宿主危险项）。
+        val gid = GroupConvPlan.groupIdOf(wxid)
+        // PopupWindow 复用：先把上一次伪会话注入的 dissolve 摘掉，避免残留到真实会话菜单。
+        // 纯真实会话流程下无此项，零影响。
+        lastDissolve?.get()?.let { stale ->
+            if (box is ListView) {
+                runCatching { box.removeHeaderView(stale) }
+                runCatching { box.removeFooterView(stale) }
+            } else {
+                runCatching { box.removeView(stale) }
+            }
+            lastDissolve = null
+        }
+
+        if (gid != null) {
+            // ============ 伪会话（wxgrp_<hex>）：只 prepend「解散聊天分组」1 项 ============
+            // 不构造 join/read、不调 onJoin/onMarkRead —— wxgrp_ 假 id 永不传给 findFriend（方案 B4）
+            var kind = "prepend"
+            val dissolve = newItem(ctx, sample, GroupRowMenuLabels.delete(true), TAG_DISSOLVE) {
+                runCatching { popup.dismiss() }
+                runCatching { GroupDb.current()?.deleteGroup(gid) }
+                runCatching { UiKit.toast(ctx, GroupRowMenuLabels.deleted(true)) }
+            }
+            val mine = listOf(dissolve)
+            val h0 = runCatching { sample.height }.getOrDefault(0)
+            val h = if (h0 > 0) h0 else ViewGroup.LayoutParams.WRAP_CONTENT
+            // 必须是 AbsListView.LayoutParams（同真实会话分支的坑）
+            runCatching {
+                dissolve.layoutParams = android.widget.AbsListView.LayoutParams(
+                    ViewGroup.LayoutParams.MATCH_PARENT, h
+                )
+            }
+            if (box is ListView) {
+                // B5：addHeaderView 要求 adapter 已被包成 HeaderViewListAdapter。
+                // 先加一个不可见 footer 触发包装，再摘掉并 addHeaderView，才能排在宿主项最前。
+                val prepended = runCatching {
+                    box.addFooterView(dissolve, null, false)
+                    box.removeFooterView(dissolve)
+                    box.addHeaderView(dissolve, null, false)
+                    true
+                }.getOrDefault(false)
+                if (!prepended) {
+                    // D5 降级：前插不通就放末尾，不上脆弱反射重排
+                    kind = "footer"
+                    runCatching { box.removeHeaderView(dissolve) }
+                    runCatching { box.removeFooterView(dissolve) }
+                    runCatching { box.addFooterView(dissolve, null, false) }
+                }
+            } else {
+                // 非 ListView 无法前插：挂到合适容器的末尾（safe fallback）
+                kind = "footer"
+                val p = box.parent
+                if (p is ViewGroup && p !is android.widget.AdapterView<*>) {
+                    runCatching { p.addView(dissolve) }
+                } else {
+                    runCatching { box.addView(dissolve) }
+                }
+            }
+            lastDissolve = WeakReference(dissolve)
+            LogX.i(
+                "CMI popup injected wxid=$wxid gid=$gid name=$name joined=-1 kind=$kind " +
+                    "box=${box.javaClass.name} isListView=${box is ListView} " +
+                    "adapter=${runCatching { (box as? android.widget.AdapterView<*>)?.adapter?.javaClass?.name }.getOrNull()} " +
+                    "parent=${runCatching { box.parent?.javaClass?.name }.getOrNull()} " +
+                    "sampleH=${runCatching { sample.height }.getOrDefault(-1)}"
+            )
+            return mine
+        }
+
+        // ============ 真实会话：以下代码块逐字保持改造前原样（普通会话零差异红线）============
         val joined = runCatching { GroupDb.current()?.groupsOf(wxid) }
             .getOrDefault(null) ?: emptyList()
         val joinLabel = if (joined.isEmpty()) "加入分组" else "分组管理（已加入 ${joined.size} 个）"
@@ -431,7 +513,7 @@ object ConvMenuInject {
             }
         }
         LogX.i(
-            "CMI popup injected wxid=$wxid name=$name joined=${joined.size} kind=$kind " +
+            "CMI popup injected wxid=$wxid gid=$gid name=$name joined=${joined.size} kind=$kind " +
                 "box=${box.javaClass.name} isListView=${box is ListView} " +
                 "adapter=${runCatching { (box as? android.widget.AdapterView<*>)?.adapter?.javaClass?.name }.getOrNull()} " +
                 "parent=${runCatching { box.parent?.javaClass?.name }.getOrNull()} " +

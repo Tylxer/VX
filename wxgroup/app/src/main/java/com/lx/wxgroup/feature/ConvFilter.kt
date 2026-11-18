@@ -1829,12 +1829,9 @@ object ConvFilter {
                         // 用 v.context（必是 Activity）：HostContext.activity() 在 LauncherUI 恒 null
                         // （覆写 onResume 不触发），会 BadTokenException（conv_list.md:84）。
                         // R55 路线 E（用户拍板）：点分组行 → 复用微信「折叠的群聊」页，
-                        // 由 GconvPage 换掉该页数据源与标题；长按仍走原 GroupRowMenu（本轮不动）。
+                        // 由 GconvPage 换掉该页数据源与标题。R61：长按交回微信原生菜单
+                        // （口径 a —— 不设 long-click listener，宿主 wrapped.getView 自己设的生效）。
                         v.setOnClickListener { GconvPage.open(v.context, gid) }
-                        v.setOnLongClickListener {
-                            GroupRowMenu.show(v.context, gid)
-                            true   // 必须 return true，否则冒泡成点击 / 弹微信原生菜单（conv_list.md:82-83）
-                        }
                     } else {
                         // 回滚路径：不进「折叠的群聊」页，回到分组详情页。
                         // 组名**点击时**才查 —— 这段每次 bind 都会跑，挪到外面等于把 bind 变成查库。

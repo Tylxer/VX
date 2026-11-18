@@ -8,6 +8,8 @@ import android.os.Looper
 import com.lx.wxgroup.core.HostContext
 import com.lx.wxgroup.core.MarkRead
 import com.lx.wxgroup.data.GroupDb
+import com.lx.wxgroup.data.Keys
+import com.lx.wxgroup.data.Kv
 import com.lx.wxgroup.ui.UiKit
 import com.lx.wxgroup.util.LogX
 
@@ -31,6 +33,19 @@ import com.lx.wxgroup.util.LogX
 object GroupRowMenu {
 
     private val mainHandler by lazy { Handler(Looper.getMainLooper()) }
+
+    /**
+     * R60：读一次 gconv 开关决定菜单末项文案（走 [GroupRowMenuLabels] 纯映射）。
+     *
+     * ⛔ 必须按开关二选一，OFF 态保留旧文案「删除分组」：GroupRowMenu 在
+     * `gconv=0` 的旧自绘分组行上照样会用（`ConvFilter.kt:1769`），直接改字面量
+     * 会破红线①「GCONV_MODE=false 零差异」（→ `_r55_microx_click_longclick.md` Q6）。
+     *
+     * 这里读一次 Kv 是可接受的：弹长按菜单是低频用户动作，不是 getView 每帧热路径。
+     * 文案映射本身是纯函数，单测见 `GroupRowMenuLabelsTest`。
+     */
+    private fun gconvOn(): Boolean =
+        runCatching { Kv.getBool(Keys.GCONV_MODE) }.getOrDefault(false)
 
     /**
      * 从 View 的 context 里剥出能用的 Activity。
@@ -80,12 +95,15 @@ object GroupRowMenu {
 
         LogX.i("GROWMENU open group=$groupId name=${g.name} pinned=${g.pinned}")
 
+        // R60：gconv ON 时末项对齐微X 文案「解散聊天分组」；OFF 保留旧文案（红线①）
+        val on = gconvOn()
+        val delLabel = GroupRowMenuLabels.delete(on)
         val items = arrayOf(
             if (g.pinned) "取消置顶" else "置顶该分组",
             "重命名",
             "管理成员",
             "标记已读",
-            "删除分组",
+            delLabel,
         )
 
         AlertDialog.Builder(ctx)
@@ -115,11 +133,11 @@ object GroupRowMenu {
                     }
                     4 -> UiKit.confirm(
                         ctx,
-                        "删除分组",
+                        delLabel,
                         "删除「${g.name}」？只会取消归组，成员不会丢失。",
                     ) {
                         db.deleteGroup(g.id)
-                        UiKit.toast(ctx, "已删除分组")
+                        UiKit.toast(ctx, GroupRowMenuLabels.deleted(on))
                         // 正在看这个分组的话顺手退回收纳态，否则会卡在空列表里
                         if (ConvFilter.currentGroupId() == g.id) ConvFilter.setGroup(0)
                         else ConvFilter.refresh()

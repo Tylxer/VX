@@ -215,6 +215,19 @@ object EntryReceiver {
                             }
                         }.onFailure { LogX.w("ENTRY gcs fail: ${it.javaClass.simpleName}") }
                     }
+                    // R66：统一只读取证探针 HCR（微X即时显示 vs 我方 wxgrp_ 通知链）。
+                    // --es op hcr --es sub on|off；无 sub/其它 → 打 enabled + 各 hook 挂没挂上。
+                    // 探针只打日志、不改 param、不主动调宿主方法；不持久化，冷启即静默。
+                    "hcr" -> {
+                        val sub = intent.getStringExtra("sub") ?: "status"
+                        when (sub) {
+                            "on" -> com.lx.wxgroup.probe.HostCacheRefreshProbe.turn(true)
+                            "off" -> com.lx.wxgroup.probe.HostCacheRefreshProbe.turn(false)
+                            else -> for (l in com.lx.wxgroup.probe.HostCacheRefreshProbe.status()) {
+                                LogX.i(l)
+                            }
+                        }
+                    }
                     // K9 验证期临时入口：设备里没有 sqlite3，改配置只能从模块内部写 Kv。
                     // 验证完随本分支一起删除。
                     "kvset" -> {
@@ -686,6 +699,20 @@ object EntryReceiver {
                             val known = com.lx.wxgroup.data.Prefs.spec(k) != null
                             LogX.i("PROBE kv $k = ${com.lx.wxgroup.data.Kv.getString(k)}${if (known) "" else " (未登记)"}")
                         }
+                    }
+                    // R60：只读打印「分组行长按菜单末项」当前文案（与菜单 UI 共用 GroupRowMenuLabels 映射）。
+                    // 存在理由：真手长按菜单无法用 adb input 触发（会被当点击，R55 定案），
+                    // 但纯文案改动需要真机确认「文案随 gconv 开关正确切换」。
+                    // --es op menulabel
+                    "menulabel" -> {
+                        val on = runCatching {
+                            com.lx.wxgroup.data.Kv.getBool(com.lx.wxgroup.data.Keys.GCONV_MODE)
+                        }.getOrDefault(false)
+                        LogX.i(
+                            "MENULABEL gconv=$on " +
+                                "item=${com.lx.wxgroup.feature.GroupRowMenuLabels.delete(on)} " +
+                                "toast=${com.lx.wxgroup.feature.GroupRowMenuLabels.deleted(on)}"
+                        )
                     }
                     // R57 取证：只读列出所有分组 + 成员数 + 前 4 个成员 wxid。
                     // 存在理由：分组行 2×2 拼图要求「成员 ≥4」，而成员数在 UI 上看不到

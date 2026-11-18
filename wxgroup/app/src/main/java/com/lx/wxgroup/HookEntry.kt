@@ -40,6 +40,7 @@ import com.lx.wxgroup.feature.MomentsExport
 import com.lx.wxgroup.feature.PatBlock
 import com.lx.wxgroup.feature.MuteAt
 import com.lx.wxgroup.feature.NativeConvAvatar
+import com.lx.wxgroup.feature.NativeConvInsert
 import com.lx.wxgroup.feature.DndWindow
 import com.lx.wxgroup.feature.AutoDndGroup
 import com.lx.wxgroup.feature.RedPacket
@@ -47,6 +48,7 @@ import com.lx.wxgroup.hook.PlusMenu
 import com.lx.wxgroup.probe.ChatListProbe
 import com.lx.wxgroup.probe.ChatOpenProbe
 import com.lx.wxgroup.probe.DexProbe
+import com.lx.wxgroup.probe.HostCacheRefreshProbe
 import com.lx.wxgroup.probe.LabelHuntProbe
 import com.lx.wxgroup.probe.MenuHuntProbe
 import com.lx.wxgroup.probe.MenuProbe
@@ -197,6 +199,13 @@ class HookEntry : IXposedHookLoadPackage {
             NativeConvAvatar.install(lpparam)
         }.onFailure { LogX.e("NativeConvAvatar install failed", it) }
 
+        // ---- R67 b2：新建分组走宿主 s4.I(r4) 原生插入 API（自发 b(2) 通知，即时显示）----
+        // 存宿主 CL + 装机读一次开关 chat.gconv_native_insert ∧ gconv_enabled（默认关）；
+        // 关着零行为变化。详见 feature/NativeConvInsert.kt + docs/_r67_b2_native_insert.md。
+        runCatching {
+            NativeConvInsert.install(lpparam)
+        }.onFailure { LogX.e("NativeConvInsert install failed", it) }
+
         // ---- R55 路线 E：分组行点击 → 复用微信「折叠的群聊」页 ----
         // 只换数据源与标题，不写宿主任何列（parentRef / nickname 一律不碰）。
         // 类名已在 classes4.dex 核实：ConvBoxServiceConversationUI（+ 内部 FmUI）、
@@ -313,6 +322,13 @@ class HookEntry : IXposedHookLoadPackage {
         runCatching {
             AutoDndGroup.install(lpparam)
         }.onFailure { LogX.e("AutoDndGroup install failed", it) }
+
+        // ---- R66：统一只读取证探针 HCR（hook 常驻、默认静默，广播 op=hcr sub=on 开）----
+        // 放在正常 install 序列里（AutoDndGroup 之后），**不进** DexProbe 那段因
+        // libdexkit.so 加载失败被禁用的块 —— 本探针只用 XposedHelpers 硬编码混淆名，
+        // 不依赖 DexKit。全部落点只打日志、不写 param、不主动调宿主方法。
+        runCatching { HostCacheRefreshProbe.install(lpparam) }
+            .onFailure { LogX.w("HostCacheRefreshProbe install failed: ${it.javaClass.simpleName}") }
 
         // ---- 6.3 红包：领取界面弹出时自动点「拆红包」（默认关）----
         runCatching {

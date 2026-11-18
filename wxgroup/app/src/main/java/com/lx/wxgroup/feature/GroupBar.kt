@@ -1513,6 +1513,20 @@ object GroupBar {
                 // 少了这一步，从横条建的分组要等下一次收消息才出现在会话列表里 ——
                 // 而 GroupManagerPage 建组那条路径早就通知了，两条入口行为必须一致。
                 ConvFilter.refreshMembers()
+                // R69 建组即时灌库：建组是低频结构性变化（用户手动点新建），值得绕过节流
+                // 立即写库。不能只靠 refreshMembers()→refresh()→kickGconvSync()：那条链是
+                // 非 force，会被 GroupConvStore 的 SYNC_THROTTLE_MS(60s) 节流吞掉 —— 真机
+                // 实测建组后 sync start 延迟 43~47s，要等下一次宿主 onDataChanged(~60s) 才写库。
+                // force=true 绕过节流（走 EntryReceiver op=gcs sub=sync 同款成熟路径），任务在
+                // gconv-store 单线程 worker 串行执行、主线程只 post 不等待，无性能问题；节流
+                // 常量本身不动，避免 refresh() 的 250ms 去抖在窗口内忙循环反复全表读。
+                // 幂等：随后到来的 250ms 去抖 sync / 60s 周期 sync 与本次 force 在同一 worker
+                // 串行，plan() 对已存在行只产 Update/no-op，不重复插行；postSync 接受任务即推进
+                // lastSyncMs，故随后的周期 sync 会被节流 60s（期望，避免立即重复）。
+                // 成员变更/加删成员路径不动，仍走原 refreshMembers() 非 force 链，行为逐字不变。
+                // 真机验收判据：建组后 <3s 内 GCONVSTORE 有 sync start + nativeInsert 日志、
+                // 列表即时出现新行（且默认置顶）。
+                GroupConvStore.postSync(force = true)
             } else {
                 UiKit.toast(ctx, "已存在同名分组")
             }

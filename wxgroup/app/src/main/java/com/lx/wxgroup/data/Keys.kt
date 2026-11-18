@@ -95,6 +95,17 @@ object Keys {
     const val GCONV_AVATAR = "chat.gconv_avatar"
 
     /**
+     * R67 b2：新建分组走宿主原生 insert API `s4.I(r4)`（让宿主自己发 `b(2)` 通知），
+     * 实现「不冷启即时显示分组行」；关着 = 现状 execSQL 直写 rconversation（冷启才可见）。
+     *
+     * - 运行时 `enabled = 本开关 ∧ [GCONV_MODE]`；默认 false（实验）。
+     * - 只影响 `rconversation` 的 insert；`rcontact`（标题来源）仍 execSQL 直写不变。
+     * - 整套混淆名（`vj0.h8`/`vj0.e.v`/`r4` 7 个 setter/`s4.I`）绑 8.0.48/2588，
+     *   版本不匹配时 [VersionGate] 已拦、反射失败还会降级回直写（见 NativeConvInsert）。
+     */
+    const val GCONV_NATIVE_INSERT = "chat.gconv_native_insert"
+
+    /**
      * 长按普通会话时，往**微信自己的菜单**里加「加入分组 / 标记已读」两项。
      *
      * 注入点是微信自己那个菜单 PopupWindow（详见
@@ -476,6 +487,10 @@ object Prefs {
         PrefSpec(
             Keys.GCONV_AVATAR, PrefKind.SWITCH, "true", "聊天",
             "数据层分组行显示最后发消息人的头像（切换后冷启微信生效）"
+        ),
+        PrefSpec(
+            Keys.GCONV_NATIVE_INSERT, PrefKind.SWITCH, "false", "聊天",
+            "数据层分组行：新建走宿主原生插入 API（实验，默认关；切换后冷启微信生效）"
         ),
         PrefSpec(
             Keys.FORWARD_NATIVE, PrefKind.SWITCH, "false", "聊天",

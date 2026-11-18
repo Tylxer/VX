@@ -78,6 +78,16 @@ class GroupManagerPage : PanelPage {
                         adapter.reload()
                         // 新分组 ⇒ 会话列表要插一行「没有会话的分组行」（ConvLayout 规则 4）
                         ConvFilter.refreshMembers()
+                        // R69 建组即时灌库（与 GroupBar.createGroup 同款修复）：建组是低频
+                        // 结构性变化，force=true 绕过 GroupConvStore 的 SYNC_THROTTLE_MS(60s)
+                        // 立即写库。不能只靠 refreshMembers()→refresh()→kickGconvSync()：那条链
+                        // 非 force，会被节流吞掉，新分组要等下一次宿主 onDataChanged(~60s) 才出现。
+                        // gconv-store 单线程串行 + plan() 幂等，保证不与 250ms 去抖 sync / 60s
+                        // 周期 sync 重复插行；主线程只 post 不等待，节流常量本身不动。
+                        // 成员变更/加删成员路径不动，仍走 refreshMembers() 非 force 链。
+                        // 真机验收判据：建组后 <3s 内 GCONVSTORE 有 sync start + nativeInsert
+                        // 日志、列表即时出现新行（且默认置顶）。
+                        GroupConvStore.postSync(force = true)
                         UiKit.toast(ctx, "已创建：$name")
                         LogX.i("MGR create id=$id name=$name")
                     } else {

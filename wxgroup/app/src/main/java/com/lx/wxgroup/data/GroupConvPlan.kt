@@ -47,6 +47,20 @@ object GroupConvPlan {
      */
     fun flagOf(conversationTimeMs: Long): Long = PIN_BASE + conversationTimeMs
 
+    /**
+     * 把「成员会话时间取最新、空组回退到建组时间」这条规则拎成纯函数，供 JVM 单测钉死
+     * 「新建分组默认置顶」语义。[GroupConvStore.sync] 里每条 desired 的 timeMs 就是
+     * `effectiveTimeMs(成员会话时间列表, g.createdAt)`。
+     *
+     * - 成员有会话时间：取 max（组内已有内容的组，行为不变）。
+     * - 空组 / 成员都无会话：用 [fallbackMs]（生产传 Group.createdAt，毫秒时间戳，与
+     *   rconversation.conversationTime 同量纲）⇒ flag=PIN_BASE+createdAt > PIN_BASE，
+     *   conversationTime 也 >0 ⇒ 排进置顶区前部；旧 fallback 0L 会 time=0 落进折叠区。
+     * - [fallbackMs]=0（createdAt 脏数据）退化为 0，仍属置顶区但排最末，不崩。
+     */
+    fun effectiveTimeMs(memberConversationTimes: List<Long>, fallbackMs: Long): Long =
+        memberConversationTimes.maxOrNull() ?: fallbackMs
+
     data class Desired(val groupId: Long, val name: String, val timeMs: Long, val sortOrder: Int)
     data class Existing(val username: String, val flag: Long, val conversationTime: Long, val nickname: String)
 

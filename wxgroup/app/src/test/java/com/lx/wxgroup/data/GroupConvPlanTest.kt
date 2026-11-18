@@ -118,10 +118,44 @@ class GroupConvPlanTest {
         assertEquals(4611686018427387904L, GroupConvPlan.PIN_BASE)
         // 真机逐位吻合（§5.1）：4611687812833690843 ↔ 1794406302939
         assertEquals(4611687812833690843L, GroupConvPlan.flagOf(1794406302939L))
-        assertEquals(GroupConvPlan.PIN_BASE, GroupConvPlan.flagOf(0))   // 空组仍属置顶区
+        assertEquals(GroupConvPlan.PIN_BASE, GroupConvPlan.flagOf(0))   // time=0 仍属置顶区
         for (t in listOf(1L, 999L, 1794406302939L, 253402300799999L)) {
             assertEquals("逐位 t=$t", GroupConvPlan.PIN_BASE + t, GroupConvPlan.flagOf(t))
         }
+    }
+
+    // ------------------------------------------------------------ 空组 fallback（默认置顶，R68）
+
+    @Test
+    fun effectiveTimeMs_emptyGroup_fallsBackToCreatedAt() {
+        val createdAt = 1794406302939L   // 2026-ish 毫秒时间戳，与 conversationTime 同量纲
+        // 空组 / 成员都无会话 ⇒ fallback 必须是 createdAt，不是 0L。
+        // 变异 M8：把 effectiveTimeMs 的 `?: fallbackMs` 改回 `?: 0L` ⇒ 这两条断言变红。
+        assertEquals(createdAt, GroupConvPlan.effectiveTimeMs(emptyList(), createdAt))
+        assertEquals(createdAt, GroupConvPlan.effectiveTimeMs(listOf(), createdAt))
+        // 有会话时间的成员：取组内最新一条，已有内容的组行为逐字不变。
+        assertEquals(900L, GroupConvPlan.effectiveTimeMs(listOf(100L, 900L, 400L), createdAt))
+        assertEquals(5L, GroupConvPlan.effectiveTimeMs(listOf(5L), createdAt))
+        // createdAt=0 脏数据：退化为 0、不崩（仍属置顶区但排最末）。
+        assertEquals(0L, GroupConvPlan.effectiveTimeMs(emptyList(), 0L))
+    }
+
+    @Test
+    fun effectiveTimeMs_emptyGroup_flagLandsInTopPinRegion() {
+        val createdAt = 1794406302939L
+        val t = GroupConvPlan.effectiveTimeMs(emptyList(), createdAt)
+        val flag = GroupConvPlan.flagOf(t)
+        // flag > PIN_BASE ⇒ 在置顶区内；createdAt 时间戳远大于微X 行 conversationTime=1 ⇒ 排在前面。
+        // 变异 M8（fallback 改回 0L）与 M9（flagOf 去掉 PIN_BASE）中任一都会让这两条变红。
+        assertTrue("空组 flag 必须 > PIN_BASE: $flag", flag > GroupConvPlan.PIN_BASE)
+        assertTrue("空组 flag 必须大于微X time=1 的置顶行: $flag", flag > GroupConvPlan.flagOf(1))
+        // 对照旧行为：time=0 时 flag==PIN_BASE，置顶区内部按 time 降序排最末 ⇒ 落进折叠区。
+        assertEquals(GroupConvPlan.PIN_BASE, GroupConvPlan.flagOf(0))
+        assertTrue("createdAt fallback 的 flag 必须严格大于 0L fallback 的 flag",
+            flag > GroupConvPlan.flagOf(0L))
+        // 不溢出：PIN_BASE(2^62) + createdAt(~1.79e12) 远小于 Long.MAX_VALUE。
+        assertEquals(GroupConvPlan.PIN_BASE + createdAt, flag)
+        assertTrue("flag 不该溢出", flag > 0 && flag < Long.MAX_VALUE)
     }
 
     // ------------------------------------------------------------ SQL 字面量
@@ -194,7 +228,9 @@ class GroupConvPlanTest {
 
     @Test
     fun plan_empty_group_timeZero_stays_pinned() {
-        val a = d(6, "空组", 0)   // timeMs = 0：空组
+        // R68 后真实空组 timeMs=createdAt（见 effectiveTimeMs_* 用例）；这里保留 time=0
+        // 覆盖 createdAt=0 脏数据 / 宿主旧行：仍在置顶区（flag=PIN_BASE），且 clean/自愈判据不变。
+        val a = d(6, "空组", 0)   // timeMs = 0：createdAt=0 脏数据或宿主遗留旧行
         assertEquals(GroupConvPlan.PIN_BASE, GroupConvPlan.flagOf(0))
         assertTrue(GroupConvPlan.plan(listOf(a), listOf(ex(a))).isEmpty())
         // 置顶位被清掉（flag 掉到 0）⇒ 必须判成 flag/time 重修
@@ -320,7 +356,7 @@ class GroupConvPlanTest {
 
     // ---------------------------------------------------------------- 变异验证（mutation check）
     //
-    // 本 lane 不跑 gradle（主 agent 统一编译 / 跑单测），以下 7 组变异按断言逐条静态核验：
+    // 本 lane 不跑 gradle（主 agent 统一编译 / 跑单测），以下 9 组变异按断言逐条静态核验：
     // 每组都是「非等价变异」—— 改完生产代码后明确至少有一条断言从绿变红；
     // 凡 0 条红的等价变异（只改空白 / 注释 / 与断言同源的表达式）一律不列入。
     //
@@ -344,7 +380,17 @@ class GroupConvPlanTest {
     // M7  deleteConvSql 去掉 `ownWhere() and`，只留 `username=`
     //     ⇒ sql_delete_is_scoped_to_own_namespace 的 `assertHas(sql, ownWhere(), ...)` 变红
     //       （这正是「绝不能删到非 wxgrp_ 行」的护栏）。
+    // M8  GroupConvPlan.effectiveTimeMs 的 `memberConversationTimes.maxOrNull() ?: fallbackMs`
+    //     把 `?: fallbackMs` 改回 `?: 0L`（即 R68 空组 fallback 回退到旧行为）
+    //     ⇒ effectiveTimeMs_emptyGroup_fallsBackToCreatedAt 的「空组 == createdAt」两条断言变红；
+    //       effectiveTimeMs_emptyGroup_flagLandsInTopPinRegion 的
+    //       `flag > PIN_BASE` / `flag > flagOf(1)` / `flag > flagOf(0)` 变红（time=0 掉回折叠区）。
+    // M9  flagOf 去掉 PIN_BASE（改成 `return conversationTimeMs`，即不置顶）
+    //     ⇒ flagOf_exact_pin_bit（硬编码 1L shl 62 / 真机 flag）、
+    //       sql_insertConv_is_single_minimal_insert（硬编码 4611687812833690843）、
+    //       effectiveTimeMs_emptyGroup_flagLandsInTopPinRegion 的 `flag > PIN_BASE` 变红。
     //
-    // 说明：M1 / M6 之所以能杀，是因为对应用例刻意硬编码了真机数值 / 精确 SQL 串，
-    // 而不是全靠生产代码里的同源表达式算期望值 —— 否则就是 0 条红的等价变异，已排除。
+    // 说明：M1 / M6 / M9 之所以能杀，是因为对应用例刻意硬编码了真机数值 / 精确 SQL 串 /
+    // 与 PIN_BASE 的大小关系，而不是全靠生产代码里的同源表达式算期望值 —— 否则就是 0 条红的
+    // 等价变异，已排除。M8 靠把 fallback 规则抽成纯函数 effectiveTimeMs 才成为可测的非等价变异。
 }
