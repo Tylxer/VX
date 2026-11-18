@@ -106,6 +106,17 @@ object Keys {
     const val GCONV_NATIVE_INSERT = "chat.gconv_native_insert"
 
     /**
+     * R70 A′：删除分组时，在 execSQL 删行事务提交后补发宿主删除通知
+     * `s4.b(5, s4, "wxgrp_<hex>")`，触发宿主会话列表重查让分组行**不冷启即时消失**。
+     *
+     * - 运行时 `enabled = 本开关 ∧ [GCONV_MODE]`；默认 false（实验）。
+     * - 只补发通知、不写库、不删消息、不调宿主 delete API；删行仍走 `GroupConvPlan.delete*Sql`。
+     * - 整套混淆名（`vj0.h8.b` / `vj0.e.v` / `s4.b`）绑 8.0.48/2588，VersionGate 已全局拦；
+     *   反射失败只告警、不影响删行（见 `feature/HostConvDelete.kt`）。
+     */
+    const val GCONV_DELETE_NOTIFY = "chat.gconv_delete_notify"
+
+    /**
      * 长按普通会话时，往**微信自己的菜单**里加「加入分组 / 标记已读」两项。
      *
      * 注入点是微信自己那个菜单 PopupWindow（详见
@@ -491,6 +502,10 @@ object Prefs {
         PrefSpec(
             Keys.GCONV_NATIVE_INSERT, PrefKind.SWITCH, "false", "聊天",
             "数据层分组行：新建走宿主原生插入 API（实验，默认关；切换后冷启微信生效）"
+        ),
+        PrefSpec(
+            Keys.GCONV_DELETE_NOTIFY, PrefKind.SWITCH, "false", "聊天",
+            "删组后补发宿主删除通知使分组行即时消失（实验，默认关；冷启生效）"
         ),
         PrefSpec(
             Keys.FORWARD_NATIVE, PrefKind.SWITCH, "false", "聊天",

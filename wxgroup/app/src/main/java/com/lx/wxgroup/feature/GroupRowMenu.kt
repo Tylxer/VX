@@ -137,6 +137,13 @@ object GroupRowMenu {
                         "删除「${g.name}」？只会取消归组，成员不会丢失。",
                     ) {
                         db.deleteGroup(g.id)
+                        // 删组只删我方分组表，伪会话行（wxgrp_<hex>）靠 GroupConvStore 下一轮 sync 清。
+                        // 非 force 的 sync 被 SYNC_THROTTLE_MS(60s) 节流，连删多个全被吞，真机实测要等
+                        // ~40s 宿主周期 sync 才删行（"删了但还显示"）。force=true 令 due 恒 true 即时删行。
+                        // 即便 deleteGroup 返回 false，force sync 是幂等全量重算，多跑一次无副作用。
+                        // 与下方 refresh/setGroup 职责不同（一个删会话伪行、一个刷新筛选态/分组行），都要保留。
+                        // 真机判据：删组后 <3s 会话列表分组行消失。
+                        GroupConvStore.postSync(force = true)
                         UiKit.toast(ctx, GroupRowMenuLabels.deleted(on))
                         // 正在看这个分组的话顺手退回收纳态，否则会卡在空列表里
                         if (ConvFilter.currentGroupId() == g.id) ConvFilter.setGroup(0)

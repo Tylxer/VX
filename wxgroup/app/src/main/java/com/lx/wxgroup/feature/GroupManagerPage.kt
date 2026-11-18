@@ -142,7 +142,14 @@ class GroupManagerPage : PanelPage {
                         "删除「${group.name}」，其中的 ${db.countMembers(group.id)} 条成员关系会一并清除。"
                     ) {
                         if (db.deleteGroup(group.id)) {
-                            onChanged()
+                            onChanged()  // adapter.reload + refreshMembers：管理页列表/成员数即时刷新（非 force）
+                            // 删除分组只删我方分组表，伪会话行（rconversation/rcontact 里的 wxgrp_<hex>）
+                            // 靠 GroupConvStore 下一轮 sync 清掉。onChanged() 的 refreshMembers() 非 force，
+                            // 会被 SYNC_THROTTLE_MS(60s) 吞掉——连删多个时真机实测要等 ~40s 宿主周期
+                            // sync 才删行，用户看到「删了但会话列表还显示」。force=true 令 due 恒 true，
+                            // 立即重算删行；与 onChanged 职责不同（一个管会话列表行、一个管管理页），都要保留。
+                            // 节流常量/建组/成员增删路径均不动；真机判据：删组后 <3s 分组行消失。
+                            GroupConvStore.postSync(force = true)
                             UiKit.toast(ctx, "已删除")
                             LogX.i("MGR delete id=${group.id} name=${group.name}")
                         }

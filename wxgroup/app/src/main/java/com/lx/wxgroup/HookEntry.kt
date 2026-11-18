@@ -40,6 +40,7 @@ import com.lx.wxgroup.feature.MomentsExport
 import com.lx.wxgroup.feature.PatBlock
 import com.lx.wxgroup.feature.MuteAt
 import com.lx.wxgroup.feature.NativeConvAvatar
+import com.lx.wxgroup.feature.HostConvDelete
 import com.lx.wxgroup.feature.NativeConvInsert
 import com.lx.wxgroup.feature.DndWindow
 import com.lx.wxgroup.feature.AutoDndGroup
@@ -205,6 +206,13 @@ class HookEntry : IXposedHookLoadPackage {
         runCatching {
             NativeConvInsert.install(lpparam)
         }.onFailure { LogX.e("NativeConvInsert install failed", it) }
+
+        // ---- R70 A′：删除分组补发宿主删除通知 s4.b(5,s4,user)（自发重查，即时消失）----
+        // 存宿主 CL + 装机读一次开关 chat.gconv_delete_notify ∧ gconv_enabled（默认关）；
+        // 关着零行为变化。详见 feature/HostConvDelete.kt + docs/_r70_microx_delete.md。
+        runCatching {
+            HostConvDelete.install(lpparam)
+        }.onFailure { LogX.e("HostConvDelete install failed", it) }
 
         // ---- R55 路线 E：分组行点击 → 复用微信「折叠的群聊」页 ----
         // 只换数据源与标题，不写宿主任何列（parentRef / nickname 一律不碰）。

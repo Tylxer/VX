@@ -390,6 +390,22 @@ object ConvMenuInject {
             val dissolve = newItem(ctx, sample, GroupRowMenuLabels.delete(true), TAG_DISSOLVE) {
                 runCatching { popup.dismiss() }
                 runCatching { GroupDb.current()?.deleteGroup(gid) }
+                // R70：删组只删我方分组表，伪会话行（rconversation/rcontact 里的 wxgrp_<hex>）
+                // 靠 GroupConvStore 下一轮 sync 清。非 force 被 SYNC_THROTTLE_MS(60s) 吞，
+                // 连删多个时真机实测要等 ~40s 宿主周期 sync 才删行（"删了但还显示"）。
+                // force=true 令 due 恒 true 立即重算删行；此入口原本连 refresh 都没有，最严重。
+                // 即便 deleteGroup 返回 false 也无妨：force sync 是幂等全量重算，多跑一次无副作用。
+                // 每次调用都用 runCatching 包住，沿用本回调风格，防宿主 UI 已销毁时抛异常。
+                runCatching { GroupConvStore.postSync(force = true) }
+                // 与 force sync 职责不同、都要保留：force 只删伪会话行，这里刷新会话列表，
+                // 让模块自绘分组行（若当前在分组筛选态）即时更新。
+                // 取舍：setGroup/refresh 内部都是 mainHandler.post 异步重建（非同步重画），
+                // 不存在 PopupWindow 已 dismiss 后同步重入的异常风险，故沿用 GroupRowMenu 同款写法；
+                // 当前是分组筛选态就 setGroup(0) 退回收纳态，否则 refresh() 重算列表。
+                runCatching {
+                    if (ConvFilter.currentGroupId() == gid) ConvFilter.setGroup(0)
+                    else ConvFilter.refresh()
+                }
                 runCatching { UiKit.toast(ctx, GroupRowMenuLabels.deleted(true)) }
             }
             val mine = listOf(dissolve)

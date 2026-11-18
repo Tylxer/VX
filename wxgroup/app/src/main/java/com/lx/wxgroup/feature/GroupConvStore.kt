@@ -170,13 +170,23 @@ object GroupConvStore {
             // b2：开关开着时 rconversation 改走宿主 s4.I（事务外发通知），事务内只写 rcontact + 预删除。
             val nativeInsert = NativeConvInsert.isEnabled()
             val deferredNative = ArrayList<GroupConvPlan.Desired>()
+            // R70 A′：删组补发宿主删除通知（s4.b(5,s4,user)）让分组行即时消失。与 b2 同款
+            // 分段：开关读一次 + 事务内收集成功删行的 username，事务提交后（事务外、同 worker）补发。
+            val deleteNotify = HostConvDelete.isEnabled()
+            val deferredNotify = ArrayList<String>()
             inTransaction(db, out) { failures ->
                 for (op in ops) {
                     when (op) {
                         is GroupConvPlan.Op.Delete -> {
                             val u = op.username
-                            execLog(db, GroupConvPlan.deleteConvSql(u), "deleteConv", u, out)?.let { failures += it }
-                            execLog(db, GroupConvPlan.deleteContactSql(u), "deleteContact", u, out)?.let { failures += it }
+                            val convFail = execLog(db, GroupConvPlan.deleteConvSql(u), "deleteConv", u, out)
+                            convFail?.let { failures += it }
+                            val contactFail = execLog(db, GroupConvPlan.deleteContactSql(u), "deleteContact", u, out)
+                            contactFail?.let { failures += it }
+                            // R70 A′：只在两表删行都成功时收集 u，供事务外补发通知。
+                            // 判据：execLog 返回 Throwable? —— null = 成功，非 null = 失败（已计入 failures 触发回滚）。
+                            // 删行失败不做通知，避免宿主重查后旧行还在、状态漂移。
+                            if (deleteNotify && convFail == null && contactFail == null) deferredNotify += u
                         }
                         is GroupConvPlan.Op.Update -> {
                             val u = GroupConvPlan.usernameOf(op.d.groupId)
@@ -216,6 +226,15 @@ object GroupConvStore {
                     } else {
                         say(out, "nativeInsert $u OK rowid=$rowid")
                     }
+                }
+            }
+            // R70 A′ 段二（事务外、同 worker 线程、紧随事务之后）：对成功删掉的行补发宿主
+            // 删除通知 s4.b(5,s4,user)，触发宿主 p3.f 重查让分组行即时消失（不冷启）。仿 b2
+            // 分段纪律：通知必须在事务提交后发，不能在提交前；失败只告警不影响删行主流程。
+            if (deleteNotify) {
+                for (u in deferredNotify) {
+                    HostConvDelete.notifyDeleted(u)
+                    say(out, "deleteNotify $u sent")
                 }
             }
             val where = GroupConvPlan.ownWhere()
