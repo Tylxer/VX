@@ -175,7 +175,7 @@ class HookEntry : IXposedHookLoadPackage {
             ConvMenuInject.install(lpparam)
         }.onFailure { LogX.e("ConvMenuInject install failed", it) }
 
-        // ---- 6.6 强制转发：聊天页长按消息菜单追加「转发到多个（模块）」----
+        // ---- 6.6 强制转发：聊天页长按消息菜单追加「转发（模块）」----
         // 注入点与 ConvMenuInject 同一套（PopupWindow show after），但必须先过
         // ForwardLogic.classifyMenu 确认是 CHAT_MSG 才注入（挂错到会话列表是最贵误判）。
         // 需求 6.6：不加开关、默认常开；发送链路（原生转发锚点 / K8 降级发送）未取证前

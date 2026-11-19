@@ -14,6 +14,7 @@ import com.lx.wxgroup.core.FileSender
 import com.lx.wxgroup.core.FileSenderB
 import com.lx.wxgroup.core.HostContext
 import com.lx.wxgroup.core.TextSender
+import com.lx.wxgroup.data.HintTextLogic
 import com.lx.wxgroup.data.Keys
 import com.lx.wxgroup.data.Kv
 import com.lx.wxgroup.ui.Panel
@@ -25,14 +26,61 @@ import de.robv.android.xposed.XposedBridge
 import de.robv.android.xposed.XposedHelpers
 import de.robv.android.xposed.callbacks.XC_LoadPackage
 import java.io.File
+import java.lang.reflect.Method
 import java.lang.ref.WeakReference
 import java.util.concurrent.ExecutorService
 import java.util.concurrent.Executors
+import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicInteger
 import java.util.concurrent.atomic.AtomicLong
 
 /**
- * 需求 6.6「强制转发」的 hook 侧：聊天页长按消息菜单里追加一项「转发到多个（模块）」。
+ * 原生菜单注入的**纯逻辑判据**（零 Android / Xposed 依赖，供 [NativeMenuInjectTest] 直接调）。
+ *
+ * 常量与 [ForceForward] 共用，单测锁值防漂移：
+ * - `ITEM_ID = 0x5747_0001`（"WXG" 高位），避开宿主原生 111/116/118/100/13/20；
+ * - `GROUP_ID = 0x5747_0000` 独立分组，不碰宿主 group 0；
+ * - `ORDER` 仅语义表态「排最后」——`wg4/q.p` 实际按插入顺序渲染，真正靠「最后 add」；
+ * - `ICON = 0x7f0f0529` 原生转发图标（8.0.48）。
+ */
+object NativeMenuGate {
+    const val GROUP_ID: Int = 0x5747_0000
+    const val ITEM_ID: Int = 0x5747_0001
+    const val ORDER: Int = Int.MAX_VALUE - 1
+    const val ICON: Int = 0x7f0f0529
+
+    /** 长按后多久内的菜单才注入（与 ForceForward.LONG_PRESS_WINDOW_MS 同值） */
+    const val WINDOW_MS: Long = 4000L
+
+    /**
+     * 门禁：四者同时满足才 add（防误注入会话列表 / 输入栏 / 图片浏览菜单）。
+     *
+     * - `enabled`：运行时开关；
+     * - `lastPressAt > 0` 且 `now - lastPressAt <= WINDOW_MS`：刚长按过；
+     * - `hasRef`：能从 pressed view 沿 View 链拿到 h9（聊天消息长按）。
+     *
+     * 为什么不带 talker：`currentChatTalker()` 取的是 `HostContext.activity().intent["Chat_User"]`，
+     * 而长按消息时前台 activity 是 LauncherUI，这个 extra 恒空——真机日志
+     * `FF NATIVE gate closed enabled=true age=151 talker= ref=true` 即因 talker 空被挡死。
+     * `hasRef=true` 已证明 View 链能拿到 h9 消息对象，而会话列表 / 输入栏 / 图片浏览菜单
+     * 的 View 链拿不到 h9，所以 hasRef 单条就足以把聊天消息菜单和别的菜单分开，talker 条件
+     * 冗余且有害，故从门禁移除。talker 仍用于 gate closed 日志诊断和选人器排除集，但不是门禁条件。
+     *
+     * ⚠️ `hasRef` 反射成本最高，调用方务必放最后一步算。
+     */
+    fun shouldInject(
+        enabled: Boolean,
+        lastPressAt: Long,
+        now: Long,
+        hasRef: Boolean,
+    ): Boolean = enabled &&
+        lastPressAt > 0L &&
+        now - lastPressAt <= WINDOW_MS &&
+        hasRef
+}
+
+/**
+ * 需求 6.6「强制转发」的 hook 侧：聊天页长按消息菜单里追加一项「转发（模块）」。
  *
  * 纯判据（菜单归类 / 目标展开 / 降级策略 / 汇总文案）全部在 [ForwardLogic]（零 Android
  * 依赖、有单测）；这里只做 UI / 反射 / hook。
@@ -73,8 +121,15 @@ object ForceForward {
     /** 注入项的 tag（按 tag 查重，PopupWindow 复用实例时先摘旧的） */
     private const val TAG_FORWARD = "wxgroup.menu.forward"
 
+    /**
+     * 我方原生条目「点击监听」的 tag（[bindMyItemClick] 挂 View.tag 去重）。
+     *
+     * 与 [TAG_FORWARD] 区分：前者是自绘项的 tag，这里是原生格子 View 的点击绑定标记。
+     */
+    private const val TAG_FORWARD_CLICK = "wxgroup.menu.click"
+
     /** 菜单项文案。含「转发」（与原生项并存时 UI 断言数 2）+「模块」角标（需求 6.6） */
-    private const val LABEL_FORWARD = "转发到多个（模块）"
+    private const val LABEL_FORWARD = "转发（模块）"
 
     /** 微信绿（模块项用绿色与原生黑色项区分） */
     private const val COLOR_MODULE = 0xFF07C160.toInt()
@@ -96,6 +151,54 @@ object ForceForward {
 
     /** 当前聊天页的会话 wxid（微信沿用多年的 intent extra 约定，见 [com.lx.wxgroup.core.ChatOpener]） */
     private const val EXTRA_CHAT_USER = "Chat_User"
+
+    /**
+     * R73 降级 ref 源：全部「菜单构建点 g0」宿主类。
+     *
+     * 由 `_cache/_s9dump/classes*.txt` 全量解析枚举（134 个类，签名统一），冻结于此。
+     * 统一签名：`g0(Lva4/r3;Landroid/view/View;Landroid/view/ContextMenu$ContextMenuInfo;Lcom/tencent/mm/storage/h9;)Z`
+     * —— 第 4 参 h9 即长按消息的消息对象。全部继承 `viewitems/s0` 但各自 override，
+     * 故不能只 hook 基类，需逐类挂载（见 [installG0RefHooks]）。
+     *
+     * 用途：最新一条消息 View 链取不到 h9（[msgRefOf] 失败点 B）时，
+     * 用 g0 入口缓存的 h9 作降级 ref，让门禁与点击快照都能拿到真实消息对象。
+     */
+    private val G0_HOST_CLASSES: List<String> = listOf(
+        "com.tencent.mm.ui.chatting.viewitems.ChattingItemDyeingTemplate", "com.tencent.mm.ui.chatting.viewitems.a5", "com.tencent.mm.ui.chatting.viewitems.ac", "com.tencent.mm.ui.chatting.viewitems.ad",
+        "com.tencent.mm.ui.chatting.viewitems.b8", "com.tencent.mm.ui.chatting.viewitems.b9", "com.tencent.mm.ui.chatting.viewitems.bd", "com.tencent.mm.ui.chatting.viewitems.c4",
+        "com.tencent.mm.ui.chatting.viewitems.c8", "com.tencent.mm.ui.chatting.viewitems.c9", "com.tencent.mm.ui.chatting.viewitems.cb", "com.tencent.mm.ui.chatting.viewitems.cf",
+        "com.tencent.mm.ui.chatting.viewitems.ci", "com.tencent.mm.ui.chatting.viewitems.cq", "com.tencent.mm.ui.chatting.viewitems.cr", "com.tencent.mm.ui.chatting.viewitems.d5",
+        "com.tencent.mm.ui.chatting.viewitems.d7", "com.tencent.mm.ui.chatting.viewitems.db", "com.tencent.mm.ui.chatting.viewitems.dh", "com.tencent.mm.ui.chatting.viewitems.dq",
+        "com.tencent.mm.ui.chatting.viewitems.ea", "com.tencent.mm.ui.chatting.viewitems.ef", "com.tencent.mm.ui.chatting.viewitems.eg", "com.tencent.mm.ui.chatting.viewitems.ep",
+        "com.tencent.mm.ui.chatting.viewitems.f9", "com.tencent.mm.ui.chatting.viewitems.fa", "com.tencent.mm.ui.chatting.viewitems.fd", "com.tencent.mm.ui.chatting.viewitems.fo",
+        "com.tencent.mm.ui.chatting.viewitems.fs", "com.tencent.mm.ui.chatting.viewitems.g8", "com.tencent.mm.ui.chatting.viewitems.g9", "com.tencent.mm.ui.chatting.viewitems.gb",
+        "com.tencent.mm.ui.chatting.viewitems.gm", "com.tencent.mm.ui.chatting.viewitems.gn", "com.tencent.mm.ui.chatting.viewitems.go", "com.tencent.mm.ui.chatting.viewitems.gs",
+        "com.tencent.mm.ui.chatting.viewitems.h1", "com.tencent.mm.ui.chatting.viewitems.h8", "com.tencent.mm.ui.chatting.viewitems.hb", "com.tencent.mm.ui.chatting.viewitems.hd",
+        "com.tencent.mm.ui.chatting.viewitems.hg", "com.tencent.mm.ui.chatting.viewitems.hm", "com.tencent.mm.ui.chatting.viewitems.i5", "com.tencent.mm.ui.chatting.viewitems.ic",
+        "com.tencent.mm.ui.chatting.viewitems.ig", "com.tencent.mm.ui.chatting.viewitems.in", "com.tencent.mm.ui.chatting.viewitems.j4", "com.tencent.mm.ui.chatting.viewitems.j5",
+        "com.tencent.mm.ui.chatting.viewitems.j7", "com.tencent.mm.ui.chatting.viewitems.jf", "com.tencent.mm.ui.chatting.viewitems.jh", "com.tencent.mm.ui.chatting.viewitems.jo",
+        "com.tencent.mm.ui.chatting.viewitems.k", "com.tencent.mm.ui.chatting.viewitems.k2", "com.tencent.mm.ui.chatting.viewitems.k7", "com.tencent.mm.ui.chatting.viewitems.kd",
+        "com.tencent.mm.ui.chatting.viewitems.kn", "com.tencent.mm.ui.chatting.viewitems.ko", "com.tencent.mm.ui.chatting.viewitems.l8", "com.tencent.mm.ui.chatting.viewitems.lg",
+        "com.tencent.mm.ui.chatting.viewitems.lm", "com.tencent.mm.ui.chatting.viewitems.m", "com.tencent.mm.ui.chatting.viewitems.m4", "com.tencent.mm.ui.chatting.viewitems.m8",
+        "com.tencent.mm.ui.chatting.viewitems.mb", "com.tencent.mm.ui.chatting.viewitems.mf", "com.tencent.mm.ui.chatting.viewitems.mg", "com.tencent.mm.ui.chatting.viewitems.mh",
+        "com.tencent.mm.ui.chatting.viewitems.mn", "com.tencent.mm.ui.chatting.viewitems.mr", "com.tencent.mm.ui.chatting.viewitems.n5", "com.tencent.mm.ui.chatting.viewitems.nb",
+        "com.tencent.mm.ui.chatting.viewitems.nc", "com.tencent.mm.ui.chatting.viewitems.nm", "com.tencent.mm.ui.chatting.viewitems.o7", "com.tencent.mm.ui.chatting.viewitems.of",
+        "com.tencent.mm.ui.chatting.viewitems.om", "com.tencent.mm.ui.chatting.viewitems.on", "com.tencent.mm.ui.chatting.viewitems.p6", "com.tencent.mm.ui.chatting.viewitems.p8",
+        "com.tencent.mm.ui.chatting.viewitems.po", "com.tencent.mm.ui.chatting.viewitems.pr", "com.tencent.mm.ui.chatting.viewitems.q5", "com.tencent.mm.ui.chatting.viewitems.q7",
+        "com.tencent.mm.ui.chatting.viewitems.q8", "com.tencent.mm.ui.chatting.viewitems.qm", "com.tencent.mm.ui.chatting.viewitems.r5", "com.tencent.mm.ui.chatting.viewitems.re",
+        "com.tencent.mm.ui.chatting.viewitems.rm", "com.tencent.mm.ui.chatting.viewitems.s0", "com.tencent.mm.ui.chatting.viewitems.s4", "com.tencent.mm.ui.chatting.viewitems.s9",
+        "com.tencent.mm.ui.chatting.viewitems.sc", "com.tencent.mm.ui.chatting.viewitems.se", "com.tencent.mm.ui.chatting.viewitems.sr", "com.tencent.mm.ui.chatting.viewitems.t4",
+        "com.tencent.mm.ui.chatting.viewitems.t7", "com.tencent.mm.ui.chatting.viewitems.t8", "com.tencent.mm.ui.chatting.viewitems.t9", "com.tencent.mm.ui.chatting.viewitems.tf",
+        "com.tencent.mm.ui.chatting.viewitems.tn", "com.tencent.mm.ui.chatting.viewitems.u7", "com.tencent.mm.ui.chatting.viewitems.u8", "com.tencent.mm.ui.chatting.viewitems.ua",
+        "com.tencent.mm.ui.chatting.viewitems.ui", "com.tencent.mm.ui.chatting.viewitems.un", "com.tencent.mm.ui.chatting.viewitems.va", "com.tencent.mm.ui.chatting.viewitems.vd",
+        "com.tencent.mm.ui.chatting.viewitems.vi", "com.tencent.mm.ui.chatting.viewitems.vm", "com.tencent.mm.ui.chatting.viewitems.vr", "com.tencent.mm.ui.chatting.viewitems.w4",
+        "com.tencent.mm.ui.chatting.viewitems.w8", "com.tencent.mm.ui.chatting.viewitems.wg", "com.tencent.mm.ui.chatting.viewitems.wo", "com.tencent.mm.ui.chatting.viewitems.wr",
+        "com.tencent.mm.ui.chatting.viewitems.x4", "com.tencent.mm.ui.chatting.viewitems.x7", "com.tencent.mm.ui.chatting.viewitems.x8", "com.tencent.mm.ui.chatting.viewitems.xc",
+        "com.tencent.mm.ui.chatting.viewitems.xg", "com.tencent.mm.ui.chatting.viewitems.xr", "com.tencent.mm.ui.chatting.viewitems.y2", "com.tencent.mm.ui.chatting.viewitems.ya",
+        "com.tencent.mm.ui.chatting.viewitems.yc", "com.tencent.mm.ui.chatting.viewitems.yn", "com.tencent.mm.ui.chatting.viewitems.yq", "com.tencent.mm.ui.chatting.viewitems.yr",
+        "com.tencent.mm.ui.chatting.viewitems.z3", "com.tencent.mm.ui.chatting.viewitems.z4", "com.tencent.mm.ui.chatting.viewitems.z7", "com.tencent.mm.ui.chatting.viewitems.za",
+        "com.tencent.mm.ui.chatting.viewitems.zm", "com.tencent.mm.ui.chatting.viewitems.zr",
+    )
 
     // ------------------------------------------------------------ 状态
 
@@ -140,8 +243,31 @@ object ForceForward {
     private var burstStartAt = 0L
     private var burstDeepest: WeakReference<View>? = null
 
+    /**
+     * R73 降级 ref：g0 入口缓存的消息对象 h9（第 4 参）。
+     *
+     * - 弱引用：h9 由宿主 adapter 持有，消息移出/删除后自然失效 ⇒ 安全降级 null，不误转旧消息；
+     * - 生命周期：新一次 burst 开始时清空（防跨消息串味），并记 [cachedG0At] 做时效校验；
+     * - 门禁 [onShowGridMenu] 与点击快照 [snapshotOf] 统一经 [cachedRef] 取用。
+     */
+    private var cachedG0Ref: WeakReference<Any>? = null
+    private var cachedG0At = 0L
+
+    /** g0 hook 延迟挂载幂等标志（业务 dex 冷启晚于 handleLoadPackage，首次长按时才挂） */
+    private val g0RefHooksMounted = AtomicBoolean(false)
+
     @Volatile
     private var lastPressAt = 0L
+
+    /** 原生 add 是否曾成功（只读探针对外报；本轮自绘已停，留作降级判据与观测） */
+    @Volatile
+    private var nativeInjectedOk = false
+
+    /** 门禁拒绝日志节流时间戳（q.p 双调 + 高频菜单，避免刷屏） */
+    private val natGateLogAt = AtomicLong(0L)
+
+    /** 点击绑定未找到我方 View 的日志节流（轮询 8 次仍 miss 才可能打） */
+    private val clickMissLogAt = AtomicLong(0L)
 
     private val mainHandler by lazy { Handler(Looper.getMainLooper()) }
 
@@ -162,10 +288,16 @@ object ForceForward {
     /** 签名与其它 feature 的 install 保持一致（lpparam 预留，当前 hook 的都是 android 框架类） */
     fun install(lpparam: XC_LoadPackage.LoadPackageParam) {
         loader = lpparam.classLoader
-        // 1) 长按链路第一站记目标视图（注入判据与点击时取原料都要用）
+        // 1) 长按链路第一站记目标视图（原生注入门禁 + 点击时取原料都要用）
         installLongPressTrap()
-        // 2) ★ 注入点：微信的长按菜单就是它自己画的 PopupWindow
-        installPopupInject()
+        // 2) ★ 原生菜单注入：hook wg4/q.p before，调微信 Menu.add 让宿主自己画格子
+        installNativeMenuInject()
+        // 3) ★ 点击接管：hook PopupWindow show after，给我方格子 View 直接挂 OnClickListener
+        //    我方格子无原生 id/图标，不在 s3.c()/j5.onItemClick 链里，原生监听器无效
+        installItemClickBind()
+        // 4) 自绘注入整体停用（函数体保留供降级）：原生格子已覆盖，避免双入口
+        // installPopupInject()
+        LogX.i("FF installed native-menu inject + item-click bind")
     }
 
     /**
@@ -182,12 +314,20 @@ object ForceForward {
                     runCatching {
                         val v = param.thisObject as? View ?: return
                         val now = System.currentTimeMillis()
+                        var newBurst = false
                         synchronized(pressLock) {
                             if (now - burstStartAt > BURST_GAP_MS) {
                                 burstStartAt = now
                                 burstDeepest = WeakReference(v)
+                                // R73：新一轮长按清空上一次的 g0 缓存，防跨消息串味
+                                cachedG0Ref = null
+                                cachedG0At = 0L
+                                newBurst = true
                             }
                         }
+                        // R73：business dex 冷启晚于 handleLoadPackage，首次长按（dex 已可见，
+                        // 且早于同一次长按的 g0）时延迟挂 g0 缓存钩子；幂等只挂一次。
+                        if (newBurst) installG0RefHooks()
                         lastPressAt = now
                     }
                 }
@@ -195,6 +335,60 @@ object ForceForward {
             val n = hookAll(View::class.java, "performLongClick", cb)
             LogX.i("FF installed long-press trap (View.performLongClick x$n)")
         }.onFailure { LogX.e("FF long-press trap install failed", it) }
+    }
+
+    /**
+     * R73 降级 ref 源：给 [G0_HOST_CLASSES] 里每个 `g0(r3,view,info,h9)` 的入口挂钩子，
+     * 把第 4 参 h9 缓存到 [cachedG0Ref]，供门禁与点击快照在 View 链取不到 h9 时降级使用。
+     *
+     * 延迟挂载（见文档 §1.4）：首次长按（performLongClick before）时调用，此时业务 dex 已可见，
+     * 且早于同一次长按的 g0；`[g0RefHooksMounted]` 保证只挂一次，`probe("on")` 也会触发。
+     * 全程 runCatching：单类 findClass/hook 失败只 WARN，其余照挂，绝不崩宿主。
+     */
+    private fun installG0RefHooks() {
+        if (!g0RefHooksMounted.compareAndSet(false, true)) return
+        runCatching {
+            val cl = loader
+            if (cl == null) {
+                g0RefHooksMounted.set(false) // 下次长按重试（loader 尚未就绪）
+                LogX.w("FF g0-ref mount skipped: no loader")
+                return
+            }
+            val cb = object : XC_MethodHook() {
+                override fun beforeHookedMethod(param: MethodHookParam) {
+                    runCatching {
+                        val args = param.args ?: return
+                        if (args.size < 4) return // 只认 (r3,view,info,h9) 4 参重载
+                        val h9 = args[3] ?: return
+                        val now = System.currentTimeMillis()
+                        synchronized(pressLock) {
+                            // g0 在 performLongClick 之后、本次 burst 内调用 ⇒ 必属当前长按
+                            cachedG0Ref = WeakReference(h9)
+                            cachedG0At = now
+                        }
+                    }
+                }
+            }
+            var ok = 0
+            for (name in G0_HOST_CLASSES) {
+                runCatching {
+                    val cls = XposedHelpers.findClass(name, cl)
+                    ok += hookAll(cls, "g0", cb)
+                }.onFailure { /* 单类失败不阻断其余：版本漂移/签名不符只少一个源 */ }
+            }
+            // P1：134 次 findClass/hookAll 全部失败（如冷启 dex 未就绪、probe("on") 抢跑）
+            // ⇒ 必须复位幂等标志，否则后续长按在方法开头直接 return，修复彻底失效且不可自愈。
+            // ok>0（哪怕只挂上 1 个）则保持 true：部分成功可接受（单类签名漂移只少一个源）。
+            if (ok == 0) {
+                g0RefHooksMounted.set(false)
+                LogX.w("FF g0-ref mount ok=0 will retry on next long-press (dex not ready?)")
+                return
+            }
+            LogX.i("FF g0-ref mounted classes=${G0_HOST_CLASSES.size} hooked=$ok")
+        }.onFailure {
+            g0RefHooksMounted.set(false)
+            LogX.w("FF g0-ref mount failed: ${it.javaClass.simpleName}")
+        }
     }
 
     private fun installPopupInject() {
@@ -206,6 +400,255 @@ object ForceForward {
             val n2 = hookAll(PopupWindow::class.java, "showAtLocation", cb)
             LogX.i("FF installed popup inject (showAsDropDown=$n1 showAtLocation=$n2)")
         }.onFailure { LogX.e("FF popup inject install failed", it) }
+    }
+
+    // ------------------------------------------------------------ 原生菜单注入（R73）
+
+    /**
+     * hook `wg4/q.p(II)Z`（deobf = MMPopupMenu.showGridMenu）的 **before**。
+     *
+     * 取证结论（`docs/_r73_native_menu_inject.md` §2.3）：此刻宿主所有原生 add 已完成、
+     * 网格尚未读取 `this.y`（`va4/r3`，实现 `android.view.Menu`）⇒ 此刻 add 必被渲染，
+     * 且作为「最后一个 add」排在最末。微信自己画格子，我方只在 MenuItem 上挂点击监听。
+     *
+     * 反射全 `runCatching`：类找不到 / 签名不符 / 取不到 menu 都只打日志，绝不崩宿主。
+     */
+    private fun installNativeMenuInject() {
+        val cl = loader ?: run {
+            LogX.w("FF NATIVE install skipped: no loader")
+            return
+        }
+        var found: Class<*>? = null
+        for (name in arrayOf("wg4.q", "wg4/q")) {
+            found = runCatching { XposedHelpers.findClass(name, cl) }.getOrNull()
+            if (found != null) break
+        }
+        val cls = found ?: run {
+            LogX.w("FF NATIVE install skipped: wg4.q not found")
+            return
+        }
+        val cb = object : XC_MethodHook() {
+            override fun beforeHookedMethod(param: MethodHookParam) {
+                runCatching { onShowGridMenu(param) }
+                    .onFailure { LogX.w("FF NATIVE hook threw: ${it.javaClass.simpleName}") }
+            }
+        }
+        // hookAll 会挂上同类里所有名为 p 的重载；cb 内按 (II)Z 签名过滤
+        val n = hookAll(cls, "p", cb)
+        LogX.i("FF NATIVE installed wg4.q.p x$n")
+    }
+
+    /** `q.p(II)Z` before：验签名 → 取 menu → 门禁 → 幂等 → add → 挂点击监听 */
+    private fun onShowGridMenu(param: MethodHookParam) {
+        // 只认 p(II)Z：hookAll 挂了全部同名重载，别的 p 不能碰
+        val m = param.method as? Method ?: return
+        if (m.returnType != java.lang.Boolean.TYPE) return
+        val pts = m.parameterTypes
+        if (pts.size != 2 || pts[0] != java.lang.Integer.TYPE || pts[1] != java.lang.Integer.TYPE) return
+
+        // this.y = va4/r3（实现 android.view.Menu）；用标准 Menu 接口 add/findItem/setIcon
+        val menu = runCatching {
+            XposedHelpers.getObjectField(param.thisObject, "y") as? android.view.Menu
+        }.getOrNull() ?: run {
+            LogX.w("FF NATIVE no y-menu on q instance")
+            return
+        }
+
+        val now = System.currentTimeMillis()
+        val age = if (lastPressAt > 0L) now - lastPressAt else Long.MAX_VALUE
+        // talker 仅用于 gate closed 日志诊断，不再是门禁条件（见 NativeMenuGate KDoc）
+        val talker = currentChatTalker()
+        val v = pressedView()
+        // msgRefOf 反射最贵，放最后一步；View 链取不到 h9 时（R73 最新一条消息）
+        // 降级用 g0 入口缓存的 h9 —— 只改 hasRef 取源，shouldInject 四条件一字不动。
+        val viewRef = v?.let { runCatching { msgRefOf(it) }.getOrNull() }
+        val hasRef = viewRef != null || runCatching { cachedRef() != null }.getOrDefault(false)
+        if (!NativeMenuGate.shouldInject(enabled, lastPressAt, now, hasRef)) {
+            // 节流：只在「像是该注入却被挡下」时打（窗口内 + enabled），避免刷屏
+            if (enabled && age <= LONG_PRESS_WINDOW_MS) {
+                val t = natGateLogAt.get()
+                if (now - t > 1000L && natGateLogAt.compareAndSet(t, now)) {
+                    LogX.i(
+                        "FF NATIVE gate closed enabled=$enabled age=$age " +
+                            "talker=${talker.take(16)} ref=$hasRef"
+                    )
+                }
+            }
+            return
+        }
+
+        // 幂等：一次长按 q.p 会被调 2 次，findItem 命中即本次已加过
+        if (runCatching { menu.findItem(NativeMenuGate.ITEM_ID) }.getOrNull() != null) return
+
+        // add + 图标全程兜底：r3 在该版本若混淆实现异常，只打日志不崩宿主。
+        // 本版本不挂 setOnMenuItemClickListener：真机证实我方格子无原生 id/图标、不进
+        // j5.onItemClick → s3.c() 链，原生监听器零回调；点击改由 View 层的
+        // installItemClickBind()/bindMyItemClick() 直接挂 OnClickListener 接管。
+        val ok = runCatching {
+            val mi = menu.add(
+                NativeMenuGate.GROUP_ID,
+                NativeMenuGate.ITEM_ID,
+                NativeMenuGate.ORDER,
+                LABEL_FORWARD,
+            ) ?: return@runCatching false
+            mi.setIcon(NativeMenuGate.ICON)
+            true
+        }
+        if (!ok.getOrDefault(false)) {
+            LogX.w("FF NATIVE add failed: ${ok.exceptionOrNull()?.javaClass?.simpleName}")
+            return
+        }
+        nativeInjectedOk = true
+        LogX.i(
+            "FF NATIVE added id=${NativeMenuGate.ITEM_ID} " +
+                "size=${runCatching { menu.size() }.getOrDefault(-1)} " +
+                "group=${NativeMenuGate.GROUP_ID}"
+        )
+    }
+
+    // ------------------------------------------------------------ 原生菜单点击接管（R73-L5 · 混合方案）
+
+    /**
+     * hook `PopupWindow.showAsDropDown / showAtLocation` 的 **after**，给我方原生条目
+     * 对应的 View 直接挂 OnClickListener（绕开微信 s3/j5 点击链）。
+     *
+     * 为什么不走原生监听器 / hook `s3.c()`：真机 00:33 菜单树定案——我方格子渲染成
+     * `LinearLayout#0x7f09122c → TextView#-(无 id)`，既无 WeImageView 图标也无原生
+     * TextView id `0x7f095769`。微信点击监听按原生格子结构/id 绑定（`j5.onItemClick
+     * → s3.c()`），我方格子根本不在那条链里：实测点击时 `s3.c()` 与
+     * `j5.onItemClick` 均零回调，`setOnMenuItemClickListener` 也永不触发（两根证伪）。
+     * 故改在 View 层直接接管点击。
+     *
+     * ⚠️ 只挂点击、**不注入 View**：回调绝不调 [tryInject]/[injectWhenReady]（自绘
+     * addView 那套绝不能恢复，否则同一菜单双入口）。hook 点与 [installPopupInject]
+     * 相同，但回调完全不同。
+     */
+    private fun installItemClickBind() {
+        runCatching {
+            val cb = object : XC_MethodHook() {
+                override fun afterHookedMethod(param: MethodHookParam) {
+                    runCatching {
+                        val popup = param.thisObject as? PopupWindow ?: return
+                        val cv = runCatching { popup.contentView }.getOrNull()
+                            ?: runCatching {
+                                XposedHelpers.getObjectField(popup, "mContentView") as? View
+                            }.getOrNull()
+                            ?: return
+                        bindMyItemClick(popup, cv)
+                    }.onFailure {
+                        LogX.w("FF CLICK bind hook threw: ${it.javaClass.simpleName}")
+                    }
+                }
+            }
+            val n1 = hookAll(PopupWindow::class.java, "showAsDropDown", cb)
+            val n2 = hookAll(PopupWindow::class.java, "showAtLocation", cb)
+            LogX.i("FF CLICK installed showAsDropDown=$n1 showAtLocation=$n2")
+        }.onFailure { LogX.e("FF CLICK install failed", it) }
+    }
+
+    /**
+     * 在网格 View 里找到我方条目，直接给它挂 OnClickListener。
+     *
+     * 门禁只要求 enabled + 长按时间窗（[LONG_PRESS_WINDOW_MS]），**不需要 hasRef/talker**：
+     * 点击发生时 [onForwardClick] 会重新取快照，且我们已经知道这是刚长按弹出的菜单。
+     *
+     * 定位靠文案 [LABEL_FORWARD] 而非 itemId —— 我方 TextView 无原生 id。用 [TAG_FORWARD_CLICK]
+     * 去重，避免 PopupWindow 复用导致同一 View 被重复绑定。
+     *
+     * show after 时网格子 View 可能还没 layout 完，但 TextView 的 text 已设置（与
+     * [collectTexts] 从 show after 就能读到菜单文案同理）；首轮找不到则 0/40/80…ms
+     * 轮询，最多 8 次，仍找不到打节流的 `FF CLICK bind miss`。
+     */
+    private fun bindMyItemClick(popup: PopupWindow, cv: View, attempt: Int = 0) {
+        runCatching {
+            if (!enabled) return
+            val now = System.currentTimeMillis()
+            if (lastPressAt <= 0L || now - lastPressAt > LONG_PRESS_WINDOW_MS) return
+            if (!runCatching { popup.isShowing }.getOrDefault(true)) return
+
+            val target = findForwardTextView(cv)
+            if (target == null) {
+                if (attempt >= 8) {
+                    val t = clickMissLogAt.get()
+                    if (now - t > 1000L && clickMissLogAt.compareAndSet(t, now)) {
+                        LogX.i("FF CLICK bind miss after $attempt tries")
+                    }
+                } else {
+                    Handler(Looper.getMainLooper()).postDelayed({
+                        runCatching { bindMyItemClick(popup, cv, attempt + 1) }
+                    }, if (attempt == 0) 40 else 80)
+                }
+                return
+            }
+
+            if (target.tag == TAG_FORWARD_CLICK) return
+
+            // 点击动作抽成局部函数：TextView 与其所在的格子容器共用同一份行为
+            fun fire() {
+                runCatching { popup.dismiss() }
+                onForwardClick()
+            }
+
+            // 真机：格子容器高 316px，但TextView 仅 114px，下方约 200px 图标位空白区
+            // 没有 onClick，点那里只走微信 dismiss。故除 TextView 自身外，再给向上的
+            // 格子容器挂同一 onClick，让整格任意位置都能触发。
+            var layers = 0
+            target.tag = TAG_FORWARD_CLICK
+            target.setOnClickListener { fire() }
+            layers++
+
+            // 只向上走最多 2 层（parent、parent.parent）：真机这两层都是我方格子专属容器
+            // （202x316）。红线——到不了含原生项的第二行容器（1010x316），也排除整窗 cv；
+            // 再要求子是 View 且子 View 数较少，避免误挂到微信自有大容器。
+            val maxCellChildren = 6
+            runCatching {
+                var parent: View? = target.parent as? View
+                repeat(2) {
+                    val p = parent ?: return@repeat
+                    val next = runCatching { p.parent }.getOrNull()
+                    val ok = p is ViewGroup &&
+                        p !== cv &&
+                        p.tag != TAG_FORWARD_CLICK &&
+                        runCatching { p.childCount <= maxCellChildren }.getOrDefault(false)
+                    if (ok) {
+                        p.tag = TAG_FORWARD_CLICK
+                        p.setOnClickListener { fire() }
+                        layers++
+                    }
+                    parent = next as? View
+                }
+            }
+
+            LogX.i(
+                "FF CLICK bound view=${target.javaClass.simpleName} " +
+                    "layers=$layers " +
+                    "text=${runCatching { target.text?.toString()?.trim() }.getOrDefault(LABEL_FORWARD)}"
+            )
+        }.onFailure {
+            LogX.w("FF CLICK bind threw: ${it.javaClass.simpleName}: ${it.message}")
+        }
+    }
+
+    /** 递归找文案恰为 [LABEL_FORWARD] 的 TextView（[WALK_BUDGET] 预算，逐层 runCatching） */
+    private fun findForwardTextView(root: View): TextView? {
+        val budget = intArrayOf(WALK_BUDGET)
+        var hit: TextView? = null
+        fun walk(v: View) {
+            if (hit != null || budget[0]-- <= 0) return
+            if (v is TextView &&
+                runCatching { v.text?.toString()?.trim() == LABEL_FORWARD }.getOrDefault(false)
+            ) {
+                hit = v
+                return
+            }
+            if (v is ViewGroup) {
+                for (i in 0 until v.childCount) {
+                    runCatching { v.getChildAt(i)?.let(::walk) }
+                }
+            }
+        }
+        runCatching { walk(root) }
+        return hit
     }
 
     // ------------------------------------------------------------ 注入
@@ -322,47 +765,49 @@ object ForceForward {
     /**
      * 找装菜单项的那个父容器 + 样式样本。
      *
-     * 判据：**同一个父容器**里同时命中 ≥2 个聊天菜单文案，且走**严格相等**
-     * （与 [ForwardLogic.classifyMenu] 的计数口径一致 —— contains 会把
-     * 「删除该聊天」错认成「删除」，那正是最贵误判的入口）。样本取容器内最后一个
-     * 命中项，保证样式来源就是菜单自己的行。
+     * R73 根因修复：旧实现只数「**直接子** TextView」，而 PopupWindow+ListView 的菜单项
+     * 在 `LinearLayout` 包 `TextView` 的 item 里，直接子命中恒 0 ⇒ classifyMenu 明明判成
+     * CHAT_MSG，这里却返回 null，我方入口根本没注入（真机日志 `classified CHAT_MSG but
+     * no box found`）。改为把 View 树抽象成 [ForwardLogic.MenuNode]，交给纯函数
+     * [ForwardLogic.findMenuBoxCandidate] **递归数子树命中、取最深容器** —— 口径与
+     * [ForwardLogic.classifyMenu] 的 collectTexts 对齐（严格相等 + 全层级）。
+     *
+     * 判据、最深优先防呆与变异防护都在纯函数里（有单测）；这里只做 View↔MenuNode 映射
+     * 与 [WALK_BUDGET] 预算控制。box 类型差异（ListView→addFooterView / 普通 ViewGroup→
+     * addView）仍由 [addItems] 按原样分发，注入方式一个字没动。
      */
     private fun findMenuBox(root: View): Pair<ViewGroup, TextView>? {
-        var found: ViewGroup? = null
-        var sample: TextView? = null
         val budget = intArrayOf(WALK_BUDGET)
-        fun walk(v: View) {
-            if (budget[0]-- <= 0 || found != null) return
-            if (v is ViewGroup) {
-                var hits = 0
+        // View → 纯数据节点。预算耗尽即停止展开子节点，防超大浮层卡住微信。
+        fun toNode(v: View): ForwardLogic.MenuNode {
+            budget[0]--
+            val text = if (v is TextView) runCatching { v.text?.toString() }.getOrNull() else null
+            val children = if (v is ViewGroup && budget[0] > 0) {
+                val out = ArrayList<ForwardLogic.MenuNode>(maxOf(0, v.childCount))
                 for (i in 0 until v.childCount) {
-                    val c = runCatching { v.getChildAt(i) }.getOrNull() ?: continue
-                    val t = (c as? TextView)?.text?.toString()?.trim()
-                    if (t != null && t in ForwardLogic.CHAT_MENU_WORDS) hits++
+                    if (budget[0] <= 0) break
+                    runCatching { v.getChildAt(i)?.let { out.add(toNode(it)) } }
                 }
-                if (hits >= 2) {
-                    found = v
-                    for (i in 0 until v.childCount) {
-                        val c = runCatching { v.getChildAt(i) }.getOrNull() ?: continue
-                        if (c !is TextView) continue
-                        val t = runCatching { c.text?.toString()?.trim() }.getOrNull()
-                        if (!t.isNullOrEmpty() && t in ForwardLogic.CHAT_MENU_WORDS) sample = c
-                    }
-                    return
-                }
-                for (i in 0 until v.childCount) {
-                    runCatching { v.getChildAt(i)?.let(::walk) }
-                }
-            }
+                out
+            } else emptyList()
+            return ForwardLogic.MenuNode(
+                text = text,
+                isContainer = v is ViewGroup,
+                children = children,
+                id = v,
+            )
         }
-        runCatching { walk(root) }
-        val box = found ?: return null
-        val s = sample ?: return null
-        return box to s
+        val cand = runCatching {
+            ForwardLogic.findMenuBoxCandidate(listOf(toNode(root)))
+        }.getOrNull() ?: return null
+        // 纯函数不认识 Android 类型：回映射时再次校验 box 是容器、sample 是菜单项 TextView。
+        val box = cand.boxId as? ViewGroup ?: return null
+        val sample = cand.sampleId as? TextView ?: return null
+        return box to sample
     }
 
     /**
-     * 把「转发到多个（模块）」塞进菜单容器。三路能力分发照搬 [ConvMenuInject]
+     * 把「转发（模块）」塞进菜单容器。三路能力分发照搬 [ConvMenuInject]
      * （ListView → addFooterView；别的 AdapterView → 加到父容器；普通 ViewGroup →
      * 直接 addView），差异只有文案/颜色/点击行为。
      */
@@ -468,13 +913,13 @@ object ForceForward {
             val snap = snapshotNow()
             LogX.i(
                 "FF forward clicked kind=${snap.kind} textLen=${snap.text.length} " +
-                    "chat=${snap.sourceChat.take(24)}"
+                    "stale=true chat=${snap.sourceChat.take(24)}"
             )
             openTargetPicker(snap)
         }.onFailure { LogX.e("FF forward click failed", it) }
     }
 
-    private fun snapshotNow(): ForwardLogic.Snapshot = snapshotOf(pressedView())
+    private fun snapshotNow(): ForwardLogic.Snapshot = snapshotOf(staleViewForProbe())
 
     /**
      * 从长按的 View 抓一次消息快照（文本 + **消息对象三要素**）。
@@ -490,12 +935,19 @@ object ForceForward {
      */
     private fun snapshotOf(v: View?): ForwardLogic.Snapshot {
         val viewText = v?.let { extractText(it) }.orEmpty()
+        // R73：View 链取不到 h9 时降级用 g0 入口缓存的 h9 —— ref 决定 kind/text/path/msgId/svrId，
+        // 两处依赖（门禁 hasRef、本快照）统一走 cachedRef，避免「按钮出来但点下去 SKIP」。
         val ref = v?.let { runCatching { msgRefOf(it) }.getOrNull() }
+            ?: runCatching { cachedRef() }.getOrNull()
         val kind = ref?.kind ?: ForwardLogic.Kind.UNKNOWN
         // View 树抽不出正文时，文本消息直接用库里的 content（更准；XML 类的消息不用它）
-        val text = viewText.ifBlank {
+        val rawText = viewText.ifBlank {
             if (kind == ForwardLogic.Kind.TEXT) ref?.content.orEmpty() else ""
         }
+        // R73-wxid：群聊消息的 h9 content 自带「发送者 wxid:\n」前缀（微信存储格式，私聊没有）。
+        // 原生转发与降级重发都读 snap.text，若原样发给对端就会看到一串 wxid。
+        // 复用 R30 已上线的 stripSender（正则收紧到 wxid_ 字面量+冒号，不误伤用户真实以 abc: 开头的正文）。
+        val text = HintTextLogic.stripSender(rawText)
         val path = ref?.imgPath.orEmpty()
         return ForwardLogic.Snapshot(
             kind = kind,
@@ -569,6 +1021,14 @@ object ForceForward {
         }.getOrNull() ?: return null
 
         // 5) 按名字取值（getter 未混淆；字段在父类 jj/m7 且 PRIVATE ⇒ 走 XposedHelpers 沿类链找）
+        return msgRefFromH9(h9)
+    }
+
+    /**
+     * 把消息对象 h9 反射成 [MsgRef]（与 [msgRefOf] 第 5 步逐字一致）。
+     * 抽出来供 g0 降级缓存 [cachedRef] 复用，保证两条来源产出的快照字段完全一致。
+     */
+    private fun msgRefFromH9(h9: Any): MsgRef {
         val msgId = runCatching { h9.javaClass.getMethod("getMsgId").invoke(h9) as? Long }.getOrNull() ?: 0L
         val msgType = runCatching { h9.javaClass.getMethod("getType").invoke(h9) as? Int }.getOrNull() ?: 0
         val content = runCatching { h9.javaClass.getMethod("getContent").invoke(h9) as? String }.getOrNull().orEmpty()
@@ -584,6 +1044,25 @@ object ForceForward {
             talker = talker,
             kind = ForwardLogic.kindOf(msgType, ForwardLogic.appMsgTypeOf(content)),
         )
+    }
+
+    /**
+     * R73 降级 ref：取 g0 入口缓存的 h9（[cachedG0Ref]）反射成 [MsgRef]。
+     *
+     * - 时效校验 `cachedAt >= burstStartAt`：缓存必属本次长按（g0 在 performLongClick 之后调），
+     *   杜绝上一轮遗留缓存被本轮误用；新 burst 时 [cachedG0Ref] 已被清空。
+     * - 弱引用解引用失败（GC / 消息移出）返回 null ⇒ 安全降级，不误转旧消息。
+     */
+    private fun cachedRef(): MsgRef? {
+        var cachedAt = 0L
+        var cached: Any? = null
+        synchronized(pressLock) {
+            cachedAt = cachedG0At
+            cached = cachedG0Ref?.get()
+        }
+        val h9 = cached ?: return null
+        if (cachedAt <= 0L || cachedAt < burstStartAt) return null
+        return runCatching { msgRefFromH9(h9) }.getOrNull()
     }
 
     /**
@@ -821,8 +1300,9 @@ object ForceForward {
                     "$msg（全部失败，详见日志 FORWARD）"
                 }
             } else {
-                // 需求点名的降级提示：只要有一条走了重发分支就必须说清楚没有转发标记
-                if (degraded > 0) "$msg · ${ForwardLogic.TOAST_DEGRADED}" else msg
+                // R73：用户明确不需要转发标记，降级重发是唯一通路，toast 不再提示「无转发标记」
+                // （每次都弹属纯噪音）；degraded 仍计数并进 summary 统计，仅不展示该后缀。
+                msg
             }
             UiKit.toast(ctx, text)
         }
@@ -1199,8 +1679,11 @@ object ForceForward {
             "stat" ->
                 "enabled=$enabled popups=${popupsSeen.get()} injected=${injected.get()} " +
                     "convSkipped=${convSkipped.get()} misses=${misses.get()} " +
-                    "lastKind=$lastKind lastPlan=$lastPlan"
+                    "lastKind=$lastKind lastPlan=$lastPlan " + nativeStatus()
             "on" -> {
+                // R73 辅触发：`op=forward sub=on`（turn(true)）时挂 g0 缓存钩子，
+                // 与首次长按的主触发幂等（g0RefHooksMounted），运行时 dex 已可见。
+                installG0RefHooks()
                 enabled = true
                 LogX.i("FF probe enabled=true")
                 "enabled=true"
@@ -1243,6 +1726,12 @@ object ForceForward {
                 "subs=stat,on,off,dump,pick,filerdy,filebrdy,fileb,msgsnap,nativerdy,snap"
         }
     }.getOrElse { "error=${it.javaClass.simpleName}" }
+
+    /** 原生菜单注入只读状态（复用 `op=forward sub=stat` 打印，不改 EntryReceiver） */
+    internal fun nativeStatus(): String =
+        "nativeInjectedOk=$nativeInjectedOk itemId=${NativeMenuGate.ITEM_ID} " +
+            "group=${NativeMenuGate.GROUP_ID} order=${NativeMenuGate.ORDER} " +
+            "icon=${NativeMenuGate.ICON}"
 
     // ------------------------------------------------------------ G1 探针（原生转发链路）
 
@@ -1625,11 +2114,14 @@ object ForceForward {
     }
 
     /**
-     * 探针专用：**忽略 TTL** 读最近一次长按抓到的 View。
+     * 长按快照取源（忽略 TTL）：读最近一次长按抓到的 View，专供「长按之后才发生」的取快照场景。
      *
-     * 与 [pressedView] 的唯一区别就是跳过 `BURST_TTL_MS` 过期判断。
-     * 生产路径**必须**继续用 [pressedView]（过期就当作没有长按，避免拿陈旧 View 去发错消息）；
-     * 探针只是取证，陈旧 View 反而有用 —— 但它是否仍挂在窗口上要看 `isAttachedToWindow`。
+     * 与 [pressedView] 的唯一区别就是跳过 `BURST_TTL_MS` 过期判断。点击链路 [onForwardClick]
+     * 必须经由 [snapshotNow] 用本函数、而非 [pressedView]：原生菜单入口从长按到用户点
+     * 「转发（模块）」常 >10s（真机实证 11.5s），[pressedView] 的 TTL 会让快照退化成
+     * UNKNOWN ⇒ planFor 判 SKIP，消息一个都发不出去。此时该 View 仍挂在窗口上，
+     * [snapshotOf] 的 [msgRefOf] 沿 View 链取 h9 不依赖 TTL，能稳定拿到真实消息对象。
+     * （供探针/取证使用时，陈旧 View 是否仍有效看 `isAttachedToWindow`。）
      */
     private fun staleViewForProbe(): View? = synchronized(pressLock) {
         burstDeepest?.get()

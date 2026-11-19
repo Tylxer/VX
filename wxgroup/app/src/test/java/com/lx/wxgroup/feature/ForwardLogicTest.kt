@@ -2,6 +2,8 @@ package com.lx.wxgroup.feature
 
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
+import org.junit.Assert.assertNotNull
+import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Test
 
@@ -229,6 +231,159 @@ class ForwardLogicTest {
         val three = listOf("复制", "转发", "收藏")
         assertEquals(ForwardLogic.MenuKind.CHAT_MSG, ForwardLogic.classifyMenu(three, minHits = 3))
         assertEquals(ForwardLogic.MenuKind.NONE, ForwardLogic.classifyMenu(three, minHits = 4))
+    }
+
+    // ------------------------------------------------------------ findMenuBoxCandidate
+    // R73 根因：findMenuBox 旧口径只数「直接子 TextView」，ListView 的 item 是
+    // LinearLayout 包 TextView ⇒ 命中恒 0。这些用例锁住「递归数子树」判据。
+    // R73-L2b：判据再收紧为「命中数最多优先、同数时取最深」，锁住多行网格菜单选菜单体。
+
+    private fun node(
+        id: String,
+        text: String? = null,
+        container: Boolean = false,
+        children: List<ForwardLogic.MenuNode> = emptyList(),
+    ) = ForwardLogic.MenuNode(text = text, isContainer = container, children = children, id = id)
+
+    /** 一个 ListView item：LinearLayout 包 TextView（真机 MH TREE-DIFF 的形状） */
+    private fun item(id: String, word: String) = node(
+        id, container = true, children = listOf(node("$id-tv", text = word))
+    )
+
+    @Test
+    fun findMenuBoxCandidateFindsListViewWithNestedItemViews() {
+        // 正例1：PopupWindow > FrameLayout > ListView > item(LinearLayout > TextView) xN
+        val listView = node(
+            "list", container = true,
+            children = listOf(item("it0", "复制"), item("it1", "转发"), item("it2", "删除")),
+        )
+        val tree = node("popup", container = true, children = listOf(
+            node("frame", container = true, children = listOf(listView))
+        ))
+        val cand = ForwardLogic.findMenuBoxCandidate(listOf(tree))
+        assertNotNull(cand)
+        // 最深优先：必须选 ListView，不能是更浅的 frame/popup（那样入口塞到列表外）
+        assertEquals("list", cand!!.boxId)
+        // 样本是子树 DFS 最后一个命中 TextView，样式来源就是真实菜单项那一行
+        assertEquals("it2-tv", cand.sampleId)
+    }
+
+    @Test
+    fun findMenuBoxCandidateFindsPlainMenuWithDirectTextChildren() {
+        // 正例2（零回归）：原生普通菜单，容器直接挂 TextView（无 item 包裹）
+        val menu = node(
+            "menu", container = true,
+            children = listOf(node("t0", text = "复制"), node("t1", text = "转发"), node("t2", text = "收藏")),
+        )
+        val cand = ForwardLogic.findMenuBoxCandidate(listOf(
+            node("popup", container = true, children = listOf(menu))
+        ))
+        assertNotNull(cand)
+        assertEquals("menu", cand!!.boxId)
+        assertEquals("t2", cand.sampleId)
+    }
+
+    @Test
+    fun findMenuBoxCandidateRejectsConvListMenu() {
+        // 反例1：会话列表菜单词不在 CHAT_MENU_WORDS（严格相等）⇒ 命中 0 ⇒ 不注入（CONV_LIST）
+        val conv = node(
+            "conv", container = true,
+            children = listOf(
+                node("c0", text = "删除该聊天"),
+                node("c1", text = "不显示该聊天"),
+                node("c2", text = "标为未读"),
+            ),
+        )
+        assertNull(ForwardLogic.findMenuBoxCandidate(listOf(conv)))
+    }
+
+    @Test
+    fun findMenuBoxCandidateRejectsNonMenuOverlay() {
+        // 反例2：非菜单浮层（无命中词）⇒ 找不到，静默放弃
+        val panel = node(
+            "panel", container = true,
+            children = listOf(node("x0", text = "发送"), node("x1", text = "表情"), node("x2", text = "语音输入")),
+        )
+        assertNull(ForwardLogic.findMenuBoxCandidate(listOf(panel)))
+    }
+
+    @Test
+    fun findMenuBoxCandidateNeedsAtLeastTwoHits() {
+        // 变异防护：只有 1 个命中词的浮层不算菜单 box。
+        // 若把判据放宽成 hits>=1，本用例（以及上面两个反例）应变红。
+        val one = node("one", container = true, children = listOf(node("t0", text = "复制")))
+        assertNull(ForwardLogic.findMenuBoxCandidate(listOf(one)))
+        // 2 个命中则入选，锁住「≥2」这个下界本身
+        val two = node("two", container = true, children = listOf(
+            node("t0", text = "复制"), node("t1", text = "转发")
+        ))
+        assertEquals("two", ForwardLogic.findMenuBoxCandidate(listOf(two))!!.boxId)
+    }
+
+    // --- R73-L2b：命中数优先 / 同数取最深（多行网格菜单定位） ---
+
+    @Test
+    fun findMenuBoxCandidatePicksMenuBodyForMultiRowGrid() {
+        // 真机 8.0.48 长按菜单形状（本次 bug 现场）：多行横排网格，不是 ListView。
+        //   PopupWindow > menu(菜单体) > [row1(5 项) | 分隔线 | row2(4 项)]
+        // 旧「最深优先」选中 row1（命中5、depth 更深）⇒ 入口 addView 塞进第一行 ⇒ 视觉在顶部；
+        // 新「命中数优先」应选覆盖全部 9 项的 menu ⇒ 入口落末尾。
+        fun textRow(prefix: String, words: List<String>) = words.mapIndexed { i, w ->
+            node("${prefix}c$i", text = w)
+        }
+        val row1 = node("row1", container = true, children = textRow(
+            "r1", listOf("复制", "转发", "收藏", "删除", "多选")
+        ))
+        val row2 = node("row2", container = true, children = textRow(
+            "r2", listOf("引用", "提醒", "翻译", "搜一搜")
+        ))
+        val menu = node("menu", container = true, children = listOf(
+            row1, node("divider", text = "分隔线"), row2,
+        ))
+        val tree = node("popup", container = true, children = listOf(menu))
+
+        val cand = ForwardLogic.findMenuBoxCandidate(listOf(tree))
+        assertNotNull(cand)
+        // 命中 9 > row1 的 5 ⇒ 选菜单体，不选最深的行容器
+        assertEquals("menu", cand!!.boxId)
+        // 样本 = 菜单体子树 DFS 最后一个命中项 = row2 最后一项「搜一搜」
+        assertEquals("r2c3", cand.sampleId)
+    }
+
+    @Test
+    fun findMenuBoxCandidateBreaksHitTieByDepth() {
+        // 同命中数取最深：ListView 与上层外壳命中同一批 N=3 项，必须选 ListView。
+        // 若同分取浅（外壳胜出），入口会被塞到列表之外 —— R73-L2b 明令禁止的回归。
+        val listView = node("list", container = true, children = listOf(
+            item("it0", "复制"), item("it1", "转发"), item("it2", "删除"),
+        ))
+        val shell = node("shell", container = true, children = listOf(listView))
+        val tree = node("popup", container = true, children = listOf(shell))
+
+        val cand = ForwardLogic.findMenuBoxCandidate(listOf(tree))
+        assertNotNull(cand)
+        assertEquals("list", cand!!.boxId)
+        assertEquals("it2-tv", cand.sampleId)
+    }
+
+    @Test
+    fun findMenuBoxCandidatePrefersMoreHitsOverDeeperContainer() {
+        // 本次 bug 的直接回归锁：浅层大容器（命中5）必须赢过深层小容器（命中2），
+        // 即便后者 depth 更大。旧「只比深度」会选 deep ⇒ 入口塞进小容器 ⇒ 位置错。
+        val big = node("big", container = true, children = listOf(
+            node("b0", text = "复制"), node("b1", text = "转发"), node("b2", text = "收藏"),
+            node("b3", text = "删除"), node("b4", text = "多选"),
+        ))
+        val deep = node("deep", container = true, children = listOf(
+            node("d0", text = "引用"), node("d1", text = "提醒"),
+        ))
+        val deepTree = node("outer", container = true, children = listOf(
+            node("mid", container = true, children = listOf(deep))
+        ))
+
+        val cand = ForwardLogic.findMenuBoxCandidate(listOf(big, deepTree))
+        assertNotNull(cand)
+        assertEquals("big", cand!!.boxId)
     }
 
     // ------------------------------------------------------------ resolveTargets
@@ -524,11 +679,12 @@ class ForwardLogicTest {
     @Test
     fun summaryTextIsStable() {
         assertEquals("已发送 3 个目标", ForwardLogic.summary(3, 0, 0, 0))
-        assertEquals("已发送 5 个目标 · 降级 2", ForwardLogic.summary(5, 2, 0, 0))
+        // R73：degraded 计数保留但不展示「降级 N」（用户不需要转发标记）
+        assertEquals("已发送 5 个目标", ForwardLogic.summary(5, 2, 0, 0))
         assertEquals("已发送 5 个目标 · 跳过 1", ForwardLogic.summary(5, 0, 1, 0))
         assertEquals("已发送 5 个目标 · 失败 3", ForwardLogic.summary(5, 0, 0, 3))
         assertEquals(
-            "已发送 5 个目标 · 降级 2 · 跳过 1 · 失败 3",
+            "已发送 5 个目标 · 跳过 1 · 失败 3",
             ForwardLogic.summary(5, 2, 1, 3)
         )
         // 全零也给出确定的文案（不返回空串）
@@ -536,8 +692,11 @@ class ForwardLogicTest {
     }
 
     @Test
-    fun degradedToastTextMatchesSpec() {
-        // 需求 6.6 原文：「已作为普通消息发送，无转发标记」
-        assertEquals("已作为普通消息发送，无转发标记", ForwardLogic.TOAST_DEGRADED)
+    fun degradedCountNoLongerShownInToast() {
+        // R73：用户明确不需要转发标记，toast 不再带降级字样（成功场景纯噪音）
+        val s = ForwardLogic.summary(5, 3, 0, 0)
+        assertFalse("toast 不得含「降级」", "降级" in s)
+        assertFalse("toast 不得含无转发标记提示", "转发标记" in s)
+        assertEquals("已发送 5 个目标", s)
     }
 }

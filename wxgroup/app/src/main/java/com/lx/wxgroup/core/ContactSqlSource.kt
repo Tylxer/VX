@@ -1,6 +1,7 @@
 package com.lx.wxgroup.core
 
 import android.content.Context
+import android.os.SystemClock
 import com.lx.wxgroup.data.ContactFilter
 import com.lx.wxgroup.data.Friend
 import com.lx.wxgroup.data.GroupDb
@@ -227,6 +228,158 @@ object ContactSqlSource {
         for (miss in ids) if (miss !in got) out += "WHO $miss (rcontact 里没有这行)"
         return out
     }
+
+    // ------------------------------------------------------------------ 昵称刷新
+
+    /**
+     * 进程级昵称刷新冷却（R73-t）：好友改名是低频事件，30s 内重复打开转发选人器不必重刷。
+     * 取 30_000L 的理由：真机每次刷新约 8~9 批 SQL / 1.6 万次反射（几十~低百 ms），
+     * 而「改名后立刻转发」是低频操作，30s 内复用上次结果完全够用；改名后若需立刻生效，
+     * 等 30s 或冷启即可，可接受。
+     */
+    private const val FRIEND_NAMES_REFRESH_COOLDOWN_MS = 30_000L
+
+    /**
+     * 上次「成功」刷新的时刻（单调递增的 elapsedRealtime）；0 = 本进程还没成功刷新过。
+     * ⚠️ 只在 written>0 时更新：失败 / 句柄未就绪不推进，下次打开还能重试（同 g0 P1 教训）。
+     * 标 @Volatile 配合 [refreshNamesLock]，保证多实例下读到的时间戳可见。
+     */
+    @Volatile
+    private var lastFriendNamesRefreshAt = 0L
+
+    /** 刷新串行锁：ForwardPicker 每次转发都 new 实例，锁住「冷却检查 + 刷新 + 记时间戳」整段，防重复全量刷。 */
+    private val refreshNamesLock = Any()
+
+    /**
+     * 把 rcontact 里的 **nickname / conRemark / alias** 灌回本地 friend_cache（转发选人器的昵称来源）。
+     *
+     * ## 为什么需要它（R73）
+     * 转发选人器只读本地 `friend_cache`（`ForwardPicker.loadTabs` → `GroupDb.allFriends`），
+     * 而 friend_cache 的好友昵称**唯一**靠 `ContactSync.doSync()` 从通讯录 adapter 对象图刷新，
+     * 那条路有三道节流锁（adapter 去重 / 进程内 5 次 / 30min 冷却），且读的是微信内存 h4 对象
+     * （内存未同步时读到的仍是旧值）。好友改昵称后，微信库 `rcontact` 已是新值、我方缓存还是旧值，
+     * 选人器就一直显示旧昵称。这里直读落地权威表 rcontact 覆盖本地缓存，绕开上述两条限制。
+     *
+     * ## 不新增行、不串改 type（关键）
+     * - 先用 `db.allFriends()` 取本地缓存的 **wxid → 原 type** 映射；
+     * - SQL 用 `where username in (本地 wxid)` 把 rcontact 的行收敛到本地已有的 wxid，
+     *   Kotlin 侧再用 `typeByWxid[wxid] ?: continue` 兜一次交集 —— **只更新已有行，绝不把 rcontact
+     *   里的群 / 公众号 / 系统号写进缓存**；
+     * - 组装 Friend 时 `type` 取本地原值（FRIEND / CHATROOM / …），**不能用固定 FRIEND**，
+     *   否则一次刷新会把群聊行改成好友类型。`upsertFriends` 走 CONFLICT_REPLACE 整行覆盖，
+     *   同 wxid 新值覆盖旧值，写路径无需改。
+     *
+     * ## 性能假设（同步调用，需真机确认）
+     * 由 [ForwardPicker.loadTabs] 在建 Tab、读 `allFriends()` **之前同步调用**，保证本次打开即新昵称。
+     * 假设：本地约 2245 个好友、每批 400 个 wxid 点查主键（约 6 批），每批只读 4 列，
+     * 预期 <100ms。若真机超标，再改为「异步刷新 + 清 tabs 重建」（需处理页已退出，复杂度高）。
+     *
+     * ## 进程级节流（R73-t）
+     * [ForwardPicker] 每次转发都 new 实例、loadTabs 每次都调本方法，曾导致每次打开都全量刷 ⇒ 卡顿。
+     * 现加 [FRIEND_NAMES_REFRESH_COOLDOWN_MS] 冷却：首次打开仍**同步**刷新（保证本次即新昵称），
+     * 之后 30s 内的重复打开直接跳过（打 `cooling down age=` 日志、返回 0），不再反复全量刷。
+     * ⚠️ 时间戳只在 written>0 成功写回时推进：失败 / 句柄未就绪不更新，下次打开可重试。
+     * 整段在 [refreshNamesLock] 内串行，防多实例并发重复刷新。
+     *
+     * 全程 runCatching：句柄未就绪 / 反射或 DB 失败只 WARN 返回 0，绝不崩宿主。
+     *
+     * @return 实际覆盖写入的条数（0 = 句柄未捕获 / 本地缓存为空 / 全部失败）
+     */
+    fun refreshFriendNames(): Int = synchronized(refreshNamesLock) {
+        // 进程级冷却：仅「上次成功刷新」之后过了冷却期才真正跑；
+        // 时间戳只在 written>0 时更新，失败 / 句柄未就绪不推进 ⇒ 下次打开还能重试。
+        val now = SystemClock.elapsedRealtime()
+        val last = lastFriendNamesRefreshAt
+        val age = now - last
+        if (last > 0L && age < FRIEND_NAMES_REFRESH_COOLDOWN_MS) {
+            LogX.d("CSQL refresh names skipped: cooling down age=${age}ms")
+            return@synchronized 0
+        }
+        val db = mainDbOrNull() ?: run {
+            LogX.d("CSQL refresh names skipped: main db not captured yet")
+            return@synchronized 0
+        }
+        val groupDb = GroupDb.current() ?: run {
+            LogX.w("CSQL refresh names skipped: GroupDb not ready")
+            return@synchronized 0
+        }
+        // 本地缓存的 wxid → 原 type（只更新已有行，type 必须保留原值）
+        val local = runCatching { groupDb.allFriends() }
+            .onFailure { LogX.w("CSQL refresh names: allFriends failed ${it.javaClass.simpleName}") }
+            .getOrDefault(emptyList())
+        if (local.isEmpty()) return@synchronized 0
+        val typeByWxid = HashMap<String, Int>(local.size + 1)
+        for (f in local) if (f.wxid.isNotBlank()) typeByWxid[f.wxid] = f.type
+
+        val m = rawQueryMethod(db) ?: run {
+            LogX.w("CSQL refresh names: no rawQuery on ${db.javaClass.name}")
+            return@synchronized 0
+        }
+        val refreshed = ArrayList<Friend>(local.size)
+        val batches = local.asSequence()
+            .map { it.wxid }
+            .filter { it.isNotBlank() }
+            .distinct()
+            .chunked(REFRESH_BATCH_SIZE)
+        for (ids in batches) {
+            // 内联引号常量（同 who()）：wxid 里的单引号加倍转义，避免拼出畸形/注入式 SQL
+            val csv = ids.joinToString(",") { "'${it.replace("'", "''")}'" }
+            val sql = "select username,nickname,conRemark,alias from $TABLE where username in ($csv)"
+            val cur = runCatching { m.invoke(db, sql, null) }
+                .onFailure {
+                    LogX.w("CSQL refresh names query failed ${it.javaClass.simpleName}: " +
+                        "${(it.cause ?: it).message?.take(80)}")
+                }
+                .getOrNull() ?: continue
+            try {
+                val ciUser = columnIndexOf(cur, "username")
+                if (ciUser < 0) {
+                    LogX.w("CSQL refresh names schema mismatch: no 'username' column, skip batch")
+                    continue
+                }
+                val ciNick = columnIndexOf(cur, "nickname")
+                val ciRemark = columnIndexOf(cur, "conRemark")
+                val ciAlias = columnIndexOf(cur, "alias")
+                // 缓存列下标：每行只付 4 次 getString 反射，不再对每列重复 getColumnIndex
+                fun textAt(ci: Int): String =
+                    if (ci < 0) "" else
+                        runCatching { XposedHelpers.callMethod(cur, "getString", ci) as? String }
+                            .getOrNull().orEmpty()
+                var guard = 0
+                while (guard++ < READ_MAX_ROWS && runCatching {
+                        XposedHelpers.callMethod(cur, "moveToNext") as? Boolean == true
+                    }.getOrDefault(false)
+                ) {
+                    val wxid = textAt(ciUser)
+                    if (wxid.isBlank()) continue
+                    val type = typeByWxid[wxid] ?: continue // 交集：本地没有的行一律不写
+                    refreshed += Friend(
+                        wxid = wxid,
+                        nickname = textAt(ciNick),
+                        remark = textAt(ciRemark),
+                        alias = textAt(ciAlias),
+                        type = type, // 保留本地原 type，绝不串改群聊/公众号
+                    )
+                }
+            } finally {
+                runCatching { XposedHelpers.callMethod(cur, "close") }
+            }
+        }
+        if (refreshed.isEmpty()) {
+            LogX.w("CSQL refresh names: 0 rows (rcontact 无本地好友对应行)")
+            return@synchronized 0
+        }
+        val written = runCatching { groupDb.upsertFriends(refreshed) }
+            .onFailure { LogX.w("CSQL refresh names upsert failed ${it.javaClass.simpleName}") }
+            .getOrDefault(0)
+        LogX.i("CSQL refresh names: read=${refreshed.size} upsert=$written")
+        // 只有真正写成功才推进冷却，失败留待下次打开重试
+        if (written > 0) lastFriendNamesRefreshAt = SystemClock.elapsedRealtime()
+        written
+    }
+
+    /** 昵称刷新每批 wxid 数：内联常量拼 SQL，分批约束单条 SQL 长度与解析开销（约 6 批覆盖 2245 好友） */
+    private const val REFRESH_BATCH_SIZE = 400
 
     /**
      * 兜底触发：句柄已捕获但还没补成功时，再试一次。

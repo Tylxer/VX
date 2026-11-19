@@ -56,8 +56,20 @@ sync)
     #    2026-10-24 实测：主 db mtime = 10-19 23:36，-wal 416KB mtime = 本次安装时刻；
     #    带三件套回放后 apk_path/enabled/scope 全部正确 —— 假警报，白折腾一次「去管理器勾选」。
     #    ⇒ 必须 db + -wal + -shm 三件套一起 cp、一起 pull，本地 sqlite 才会回放 WAL。
-    "$ADB" shell "su -c 'cp /data/adb/lspd/config/modules_config.db /sdcard/_m.db && cp /data/adb/lspd/config/modules_config.db-wal /sdcard/_m.db-wal && cp /data/adb/lspd/config/modules_config.db-shm /sdcard/_m.db-shm && chmod 666 /sdcard/_m.db*'" >/dev/null 2>&1
-    for f in _m.db _m.db-wal _m.db-shm; do "$ADB" pull "/sdcard/$f" "$ROOT/_cache/$f" >/dev/null 2>&1; done
+    # ⚠️ 2026-11-19 根因：Git Bash(MSYS) 会把以 / 开头的参数（/sdcard/_m.db、/data/adb/...）
+    #    自动改写成 Windows 路径（实测变成 F:/.../PortableGit/sdcard/_m.db），adb pull 必然失败；
+    #    原来的 >/dev/null 2>&1 又把错误吞掉 ⇒ 本地 _cache/_m.db 停在多天前且没有 -wal/-shm，
+    #    _check.py 读到旧快照 ⇒ 每次装包后误报 [STALE] apk_path（其实 LSPosed 早已更新，假警报）。
+    #    ⇒ 所有含 Android 路径的 adb 调用都加 MSYS_NO_PATHCONV=1（前缀方式，只作用于本条命令，
+    #      不影响其他分支）；WAL 三件套必须齐全；失败必须可见，别再退回静默吞错写法。
+    if ! MSYS_NO_PATHCONV=1 "$ADB" shell "su -c 'cp /data/adb/lspd/config/modules_config.db /sdcard/_m.db && cp /data/adb/lspd/config/modules_config.db-wal /sdcard/_m.db-wal && cp /data/adb/lspd/config/modules_config.db-shm /sdcard/_m.db-shm && chmod 666 /sdcard/_m.db*'" >/dev/null 2>&1; then
+        echo "[WARN] LSPosed db 三件套 cp 到 /sdcard 失败，apk_path 检查可能失真" >&2
+    fi
+    for f in _m.db _m.db-wal _m.db-shm; do
+        if ! MSYS_NO_PATHCONV=1 "$ADB" pull "/sdcard/$f" "$ROOT/_cache/$f" >/dev/null 2>&1; then
+            echo "[WARN] LSPosed db 三件套拉取失败 ($f)，apk_path 检查可能失真" >&2
+        fi
+    done
     PKGNAME=$PKG APKPATH="$P" HOSTPKG=$HOST "$PY" "$ROOT/tools/_check.py" "$ROOT/_cache/_m.db"
     ;;
 test)

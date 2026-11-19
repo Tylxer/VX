@@ -145,6 +145,83 @@ object ForwardLogic {
         return MenuKind.NONE
     }
 
+    // ------------------------------------------------------------------ 菜单容器定位
+
+    /**
+     * View 树的**纯数据**抽象（零 Android 依赖，可在 JVM 单测里造假树）。
+     *
+     * [ForceForward] 把真实的 `View/ViewGroup` 转成这棵树：`isContainer` 对应 ViewGroup
+     * （可作为注入容器），`text` 取 TextView 文本，`id` 回映射到真实 View（纯函数不解释它）。
+     */
+    data class MenuNode(
+        val text: String? = null,
+        val isContainer: Boolean = false,
+        val children: List<MenuNode> = emptyList(),
+        val id: Any? = null,
+    )
+
+    /** [findMenuBoxCandidate] 的结果：[boxId] 是容器节点 id，[sampleId] 是子树里最后一个命中文本节点 id。 */
+    data class MenuBoxCandidate(val boxId: Any?, val sampleId: Any?)
+
+    /**
+     * 从 View 树（抽象成 [MenuNode]）里找「装菜单项的容器」+「样式样本」，供注入用。
+     *
+     * 与 [classifyMenu] 用同一套 [CHAT_MENU_WORDS] **严格相等**口径 —— 这是修 R73 的根：
+     * 旧实现只数「直接子 TextView」，而 PopupWindow+ListView 的 item 是 `LinearLayout` 包
+     * `TextView`，直接子命中恒 0 ⇒ 明明 classifyMenu 判成 CHAT_MSG 却找不到 box。这里改成
+     * **递归数子树里所有命中 TextView**，与 classifyMenu 的 collectTexts 口径对齐。
+     *
+     * 策略：**先比子树命中数（多者胜），命中数相同再比深度（深者胜）**，候选仍需
+     * 子树命中 ≥[minHits]（后序遍历，深度只做同分裁决）。两条理由：
+     * (a) 真机 8.0.48 的长按菜单是**多行横排网格**（菜单体 > row1(5 项) + 分隔线 +
+     *     row2(4 项)），不是 ListView。若按旧的「最深优先」会选中第一行的行内容器
+     *     （命中 5、depth 更深），把入口 addView 塞进第一行 ⇒ 视觉出现在菜单顶部
+     *     （用户反馈「位置不对」）。命中数优先才能选中覆盖全部 9 项的**菜单体**，入口落到末尾。
+     * (b) 命中数相同时仍取最深，是为了不把更浅的 PopupWindow 外壳当 box —— 那会把
+     *     入口塞到列表外：ListView 场景里 ListView 与上层父容器子树命中数相同（同一批
+     *     item），但 ListView 更深 ⇒ 选 ListView（注入走 addFooterView）；若同分取浅，
+     *     外壳胜出就会把入口放到列表之外。
+     *
+     * 样本取子树 DFS 顺序**最后一个**命中文本节点，保证样式来源是真实菜单项那一行。
+     *
+     * @return 找到返回 [MenuBoxCandidate]，否则 null。
+     */
+    fun findMenuBoxCandidate(
+        roots: List<MenuNode>,
+        words: Set<String> = CHAT_MENU_WORDS,
+        minHits: Int = 2,
+    ): MenuBoxCandidate? {
+        // 子树内命中的文本节点 id（DFS 顺序）
+        fun hits(node: MenuNode): List<Any?> {
+            val out = ArrayList<Any?>()
+            val t = node.text?.trim()
+            if (!t.isNullOrEmpty() && t in words) out.add(node.id)
+            for (c in node.children) out.addAll(hits(c))
+            return out
+        }
+
+        var bestBox: Any? = null
+        var bestSample: Any? = null
+        var bestHits = -1
+        var bestDepth = -1
+
+        // 后序：先比命中数、再比深度；只有命中数相同才让更深者覆盖
+        fun walk(node: MenuNode, depth: Int) {
+            if (!node.isContainer) return
+            for (c in node.children) walk(c, depth + 1)
+            val hs = hits(node)
+            if (hs.size < minHits) return
+            if (hs.size > bestHits || (hs.size == bestHits && depth > bestDepth)) {
+                bestBox = node.id
+                bestSample = hs.last()
+                bestHits = hs.size
+                bestDepth = depth
+            }
+        }
+        for (r in roots) walk(r, 0)
+        return if (bestDepth >= 0) MenuBoxCandidate(bestBox, bestSample) else null
+    }
+
     // ------------------------------------------------------------------ 目标去重
 
     /** 模块分组节点的 id 前缀（选的是分组，发送前要展开成人） */
@@ -319,7 +396,8 @@ object ForwardLogic {
     /** 汇总 toast（逻辑层定文案），防止 UI 侧各自造句子 */
     fun summary(sent: Int, degraded: Int, skipped: Int, failed: Int): String {
         val sb = StringBuilder("已发送 $sent 个目标")
-        if (degraded > 0) sb.append(" · 降级 $degraded")
+        // R73：用户明确不需要转发标记，降级重发是常态通路，不再在 toast 展示「降级 N」。
+        // degraded 参数保留（计数与内部统计仍用），仅从展示文案中移除。
         if (skipped > 0) sb.append(" · 跳过 $skipped")
         if (failed > 0) sb.append(" · 失败 $failed")
         return sb.toString()

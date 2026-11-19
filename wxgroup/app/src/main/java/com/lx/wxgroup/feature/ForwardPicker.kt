@@ -14,6 +14,7 @@ import android.widget.LinearLayout
 import android.widget.ListView
 import android.widget.TextView
 import com.lx.wxgroup.core.ChatroomSource
+import com.lx.wxgroup.core.ContactSqlSource
 import com.lx.wxgroup.data.GroupDb
 import com.lx.wxgroup.ui.Panel
 import com.lx.wxgroup.ui.PanelPage
@@ -181,6 +182,16 @@ class ForwardPicker(
         // ⇒ 本次的效果是「打开转发选择器即触发补跑，本次或下次打开可见」，
         //    不再是「除非手动进通讯录滚一遍，否则永远没有」。
         ChatroomSource.runIfNeeded()
+
+        // R73：好友改昵称后，微信库 rcontact 已是新值、friend_cache 仍是旧值，选人器会显示旧昵称
+        // （缓存唯一靠 ContactSync 从通讯录 adapter 读，受 5 次/30min 节流且读的是可能滞后的内存对象）。
+        // 这里在首次建 Tab、读 allFriends() 之前**同步**直读 rcontact 覆盖本地缓存：
+        // 内部按本地 wxid 取交集、保留每行的原 type，只更新已有行、不新增非好友；
+        // 失败只 WARN 返回 0（runCatching 全程保护），不影响本页其余数据装载。
+        // 性能假设：2245 好友分 6 批点查主键、只读 4 列，预期 <100ms；真机超标再改异步+重建 Tab。
+        // ⚠️ tabs 只在首次 build 装载、refresh 复用（见 :77-79/:100-104），同步刷新保证本次打开即新昵称。
+        runCatching { ContactSqlSource.refreshFriendNames() }
+            .onFailure { LogX.w("FWDPICK refresh names failed ${it.javaClass.simpleName}") }
 
         // Tab1 好友·群聊：一次全量查询后按 wxid_type 拆两段（好友在前、群聊在后）
         val all = runCatching { db.allFriends() }.getOrDefault(emptyList())

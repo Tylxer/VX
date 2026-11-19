@@ -1,0 +1,20 @@
+=== R73-L2b 变异验证（Python 等价复刻，非 Kotlin 实跑）===
+baseline（正确判据）: 用例 9 条, 红 0 条
+
+=== M1 退化为旧「只比深度不比命中数」 (mode=depth_only, minHits=2, tie=deep)
+  RED PicksMenuBodyForMultiRowGrid               got=('row1', 'r1c4')   expected=('menu', 'r2c3')
+  RED PrefersMoreHitsOverDeeperContainer         got=('deep', 'd1')     expected=('big', 'b4')
+  语义检查: 红=2 条; 指定用例缺失=无
+
+=== M2 minHits 从 2 改 1 (mode=new, minHits=1, tie=deep)
+  RED needsAtLeastTwoHits_single                 got=('one', 't0')      expected=None
+  语义检查: 红=1 条; 指定用例缺失=无
+
+=== M3 同命中数取最浅（不取最深） (mode=new, minHits=2, tie=shallow)
+  RED findsListViewWithNestedItemViews           got=('popup', 'it2-tv') expected=('list', 'it2-tv')
+  RED findsPlainMenuWithDirectTextChildren       got=('popup', 't2')    expected=('menu', 't2')
+  RED PicksMenuBodyForMultiRowGrid               got=('popup', 'r2c3')  expected=('menu', 'r2c3')
+  RED BreaksHitTieByDepth                        got=('popup', 'it2-tv') expected=('list', 'it2-tv')
+  语义检查: 红=4 条; 指定用例缺失=无
+
+结论: 变异体 3/3 全部被捕获（每个 ≥1 条红且指定用例变红）
