@@ -227,4 +227,47 @@ R65 §甲-2（2026-11-18 21:49:18，HCR 13/13 探针全程）原文逐帧：
 
 ---
 
+## 7. 真机反向对照结果（§5 第 10 条，2026-11-19 20:17）
+
+**目的**：坐实正向「727ms 秒删」确由 A′ 补发的 `s4.b(5)` 通知带来，而非其它变量（force sync / 宿主自然重查）。采用单变量 A/B——只关 `chat.gconv_delete_notify`，其余开关不动。
+
+**单变量确认**（冷启后精确回读）：
+```
+chat.gconv_enabled       = true    （不变）
+chat.gconv_native_insert = true    （不变）
+chat.gconv_delete_notify = false   （唯一自变量）
+```
+`kvset chat.gconv_delete_notify false` → 冷启让 `HostConvDelete.install` 读到 false → HCR 探针 ON（20:06:51）→ logcat 清（20:06:54）。
+
+**日志铁证**（用户建组「反向测试」再删除）：
+```
+20:17:39.984 MGR create id=165 name=反向测试
+20:17:40.483 GCONVSTORE sync start groups=1
+20:17:40.489 nativeInsert wxgrp_00000000000000a5 OK rowid=3693   ← 建组仍秒出（b2 开关 true，未受影响）
+20:17:53.024 MGR delete id=165 name=反向测试
+20:17:53.673 GCONVSTORE sync plan desired=0 existing=1 ops=1
+20:17:53.674 op=deleteConv   user=wxgrp_...00a5 OK                ← 库行照删（force sync，+0.65s）
+20:17:53.674 op=deleteContact user=wxgrp_...00a5 OK
+                 ✗ 无 deleteNotify ... sent                       ← A′ 关闭，未补发通知
+                 ✗ 无 s4.b event=5                                ← 宿主未收到删除通知
+                 ✗ 无 p3.e event=5 / p3.f cursor-1 / notify ...p3  ← adapter 未重查
+20:19:12.314 HCR notify com.tencent.mm.ui.conversation.t0          ← 仅 t0（非 p3），与会话列表无关
+```
+**用户肉眼**：删除后界面旧行不消失，**要冷启才消失**——与日志「无 event=5 / 无 p3 重查」完全吻合。
+
+**A/B 对照判定**：
+
+| 维度 | 正向（delete_notify=true，11-18 23:50） | 反向（delete_notify=false，11-19 20:17） |
+|---|---|---|
+| 库行删除 | deleteConv OK | deleteConv OK（两者均靠 force sync，与开关无关） |
+| `s4.b event=5` | 删后 +0.46s 发出 | **无** |
+| `p3.e`/`p3.f`/`notify p3` | 全部触发，count 1577→1576 | **全部未触发** |
+| 界面消失 | 727ms 秒删（原生 adapter 重查） | **不消失，冷启才消失** |
+
+**结论**：库行在两种条件下都删（force sync 与开关无关），唯一差异是 A′ 是否补发删除通知——无通知则宿主 adapter 旧行冻结、只能冷启重载。**§5 第 10 条反向判据 PASS**，正向+反向构成完整因果闭环：即时消失确由 A′ 的 `s4.b(5)` 带来。附带坐实两点：b2 建组（event=2）不受本开关影响（反向中建组仍秒出）；关开关对租用侧零影响（gconv 仍 true，其它功能正常）。
+
+**现场恢复**：`kvset chat.gconv_delete_notify true`（20:20:19 now=true）→ HCR 探针 OFF（20:20:23）→ 冷启重载 → 三开关回读全 true。设备已还原为正向状态，无观测残留。
+
+---
+
 [DONE] R70 只读取证完成。微X 删组链 dex 级静态取证受阻（业务 dex 加密），基于 R66 建组真机链 + 宿主 delete dex 推断为「删行 + `s4.b(5,s4,user)` 宿主通知 → 重查消失」（删组本体 [需真机]）。宿主自身 delete dex 铁证：事件码 5、删单行用具体 username、全清才用空串、`b()` 只发事件不写库。推荐方案 A′＝execSQL 删行不变 + 事务外补发 `s4.b(5,s4,wxgrp_<hex>)`，新增 `feature/HostConvDelete.kt` + 开关 `chat.gconv_delete_notify`（默认关）+ VersionGate 绑 2588；全红线满足、不动节流、不破坏 b2。方案 B 渲染层注入因用户已否决自绘行 + 与 b2 双轨冲突，不推荐。必须真机验证判据见 §5。
