@@ -1,6 +1,8 @@
 package com.lx.wxgroup.core
 
+import com.lx.wxgroup.feature.ForwardLogic
 import com.lx.wxgroup.util.LogX
+import com.lx.wxgroup.core.ForwardCdnFieldHook
 import de.robv.android.xposed.XposedHelpers
 import de.robv.android.xposed.callbacks.XC_LoadPackage
 import java.io.File
@@ -115,9 +117,24 @@ object FileSender {
      * @param kind  由调用方按消息种类判定（见 [kindOfFile]）
      * @param wxid  目标会话
      * @param path  微信自己的本地路径（`Snapshot.localPath`）
+     * @param imgLocalId R73 决定性修复：源图 imgLocalId，写进 `hl0/m.a`（forwardFromImgId）。
+     *   >0 ⇒ j2 走 ImgInfo2/CDN 服务端引用拿清晰大图；默认 -1（含取不到）⇒ 保持原样读本地 ori。
+     * @param forwardCtx R73 转发上下文（原生 `MsgRetransmitUI.k6` 填、我方旧版缺失的 m.b/q1.r/q1.j
+     *   取值来源）。**默认 null ⇒ 三项全不写，与修复前逐字节相同**（单调追加、不倒退已闭环修复）。
+     *   仅当调用方确实拿到源消息信息时才传，取不到值一律留默认值回退现状。
+     * @param bigImgPath R76 P3 字节落盘：源图本地大图路径；仅在「存在 + >15KB + 非 th_ 前缀」
+     *   三门槛全过时覆盖 `q1.j`（优先级高于原生大图/缩略图）。默认 null ⇒ 整块跳过，逐字节不变。
      * @return true=已成功**入队**（≠ 对端已收到）；false=不支持/链路缺失/反射失败
      */
-    fun send(kind: Kind, wxid: String, path: String): Boolean {
+    // R73-转发上下文：第 5 参 forwardCtx（默认 null ⇒ 老调用点零影响）。
+    fun send(
+        kind: Kind,
+        wxid: String,
+        path: String,
+        imgLocalId: Long = -1L,
+        forwardCtx: ForwardLogic.Snapshot? = null,
+        bigImgPath: String? = null,
+    ): Boolean {
         val cl = loader ?: run {
             LogX.w("FileSender no classLoader (模块未 prepare？)")
             return false
@@ -135,6 +152,13 @@ object FileSender {
         if (path.isBlank()) {
             LogX.w("FileSender blank path (wxid=${wxid.take(24)})")
             return false
+        }
+        // R80 (a)：本目标发送前把源坏图 CDN 参数装进 pending（每目标各调一次）。
+        // forwardCtx 为空 / 取不到有效 imgLocalId·msgSvrId ⇒ 不 arm，由 hook 闸门安全降级。
+        forwardCtx?.let { ctx ->
+            if (ctx.imgLocalId > 0L && ctx.msgSvrId > 0L) {
+                ForwardCdnFieldHook.arm(ctx.sourceChat, ctx.msgSvrId, ctx.imgLocalId)
+            }
         }
         val f = File(path)
         // 文件不存在就别发：微信侧会静默失败，我们连日志都拿不到
@@ -164,10 +188,43 @@ object FileSender {
             XposedHelpers.setBooleanField(q1, "p", true)          // 8457d4
             XposedHelpers.setIntField(q1, "o", Q1_O_RES_ID)       // 8457de（int！不是 float）
 
-            // 转发信息对象：全默认值即可。`q1.<init>` 已 `new m()`，本条是「保持与 O8 同构」。
+            // 转发信息对象：R73 决定性修复 —— m.a(forwardFromImgId) 从硬编码 -1 改成源图 imgLocalId。
+            // - imgLocalId>0 ⇒ j2 构造器见 m.a>0 → d3.O8().o2(m.a) 挂 ImgInfo2 记录 →
+            //   SERVERID://→Y2(msgSvrId) + ot5 CDN 凭证 ⇒ 服务端引用/秒传 ⇒ 对端清晰大图（同微信自带转发）。
+            // - <=0（含默认 -1）⇒ 维持"读本地 ori"旧行为，安全降级，不碰已闭环三层。
+            // 其余字段序列一字不动：仍在此处 newInstance(mCls) → q1.f(m) → 后面 setIntField(q1,"h",13)。
             runCatching {
                 val mCls = XposedHelpers.findClass("hl0.m", cl)
-                XposedHelpers.callMethod(q1, "f", XposedHelpers.newInstance(mCls))
+                val m = XposedHelpers.newInstance(mCls)
+                val forwardFrom = if (imgLocalId > 0L) imgLocalId else -1L
+                runCatching { XposedHelpers.setLongField(m, "a", forwardFrom) }
+                    .onFailure { LogX.w("FileSender m.a skipped: ${it.javaClass.simpleName}") }
+                // R73 转发上下文（原生 MsgRetransmitUI.k6 填、我方旧版缺失）：单调追加。
+                // null（老调用点）或取不到值 ⇒ 三项全不写，与修复前逐字节相同。
+                forwardCtx?.let { ctx ->
+                    // m.b = 源消息 msgId（k6: MsgRetransmitUI.f），>0 才写；取不到保持默认 0。
+                    if (ctx.srcMsgId > 0L) runCatching {
+                        XposedHelpers.setLongField(m, "b", ctx.srcMsgId)
+                    }.onFailure { LogX.w("FileSender m.b skipped: ${it.javaClass.simpleName}") }
+                    // q1.r = 转发源前缀（k6: v4，形如 "wxid_xxx:"），非空才写；取不到保持默认 ""。
+                    if (ctx.srcTalkerPrefix.isNotBlank()) runCatching {
+                        XposedHelpers.setObjectField(q1, "r", ctx.srcTalkerPrefix)
+                    }.onFailure { LogX.w("FileSender q1.r skipped: ${it.javaClass.simpleName}") }
+                    // q1.j = 源图大图路径（k6: MsgRetransmitUI.g），非空才写，**覆盖**上面 q1.j=path
+                    // （缩略图路径），形成「原生大图路径优先、取不到回退缩略图路径」。须在 q1.a() 之前。
+                    if (ctx.srcBigImgPath.isNotBlank()) runCatching {
+                        XposedHelpers.setObjectField(q1, "j", ctx.srcBigImgPath)
+                    }.onFailure { LogX.w("FileSender q1.j skipped: ${it.javaClass.simpleName}") }
+                }
+                // R76 P3 字节落盘：三门槛全过才用 bigImgPath 覆盖 q1.j，优先级高于原生大图/缩略图。
+                // 默认 null/blank ⇒ 整块跳过；异常只丢本次覆盖，不影响外层 runCatching。
+                if (!bigImgPath.isNullOrBlank()) {
+                    val bf = File(bigImgPath)
+                    if (bf.exists() && bf.length() > 15 * 1024 && !bf.name.startsWith("th_"))
+                        runCatching { XposedHelpers.setObjectField(q1, "j", bigImgPath) }
+                            .onFailure { LogX.w("FileSender P3 q1.j skipped: ${it.javaClass.simpleName}") }
+                }
+                XposedHelpers.callMethod(q1, "f", m)
             }.onFailure { LogX.w("FileSender q1.f(m) skipped: ${it.javaClass.simpleName}") }
 
             XposedHelpers.setIntField(q1, "h", CONSTRUCTOR_ID_IMAGE)  // 8457fc（★ constructorId）
@@ -197,6 +254,7 @@ object FileSender {
             LogX.i("FileSender queued kind=$kind wxid=${wxid.take(24)} path=${path.take(80)}")
             true
         }.onFailure {
+            ForwardCdnFieldHook.clear()   // R80 (a)：发送失败清 pending，防串味
             LogX.w("FileSender send failed kind=$kind ${it.javaClass.simpleName}: ${it.message}")
         }.getOrDefault(false)
     }

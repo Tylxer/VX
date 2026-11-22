@@ -13,6 +13,7 @@ import com.lx.wxgroup.core.ContactSync
 import com.lx.wxgroup.core.DexKitLocator
 import com.lx.wxgroup.core.HostContext
 import com.lx.wxgroup.core.FileSender
+import com.lx.wxgroup.core.ForwardCdnFieldHook
 import com.lx.wxgroup.core.FileSenderB
 import com.lx.wxgroup.core.TextSender
 import com.lx.wxgroup.core.NotifyMute
@@ -132,6 +133,9 @@ class HookEntry : IXposedHookLoadPackage {
         SendProbe.prepare(lpparam)
         TextSender.prepare(lpparam)
         FileSender.prepare(lpparam)
+        // R80 (a)：图片转发上传前补源 CDN fileId/aesKey（全局 m1.e hook，严格闸门只在本次转发生效）。
+        runCatching { ForwardCdnFieldHook.install(lpparam) }
+            .onFailure { LogX.w("ForwardCdnFieldHook install failed: ${it.javaClass.simpleName}") }
         FileSenderB.prepare(lpparam)   // B 档探针：只在 op=forward sub=fileb 手动触发
 
         ContactSync.init(context)
@@ -337,6 +341,26 @@ class HookEntry : IXposedHookLoadPackage {
         // 不依赖 DexKit。全部落点只打日志、不写 param、不主动调宿主方法。
         runCatching { HostCacheRefreshProbe.install(lpparam) }
             .onFailure { LogX.w("HostCacheRefreshProbe install failed: ${it.javaClass.simpleName}") }
+
+        // ---- R73：图片 NetScene 只读取证探针 INP（hook 常驻、默认静默，广播 op=inp sub=on 开）----
+        // 抓 j2.onGYNetEnd 的 3 个 int + errMsg 与 j2 构造器 ori 路径，落锤「入队 true 但发送失败」。
+        // 只用 XposedHelpers 硬编码混淆名、不依赖 DexKit；全程 runCatching，只打日志、不改宿主。
+        runCatching { com.lx.wxgroup.probe.ImageNetSceneProbe.install(lpparam) }
+            .onFailure { LogX.w("ImageNetSceneProbe install failed: ${it.javaClass.simpleName}") }
+
+        // ---- R73：真机观察「微X图片转发为何清晰」只读取证探针（hook 常驻、默认静默，
+        // 广播 op=microimg sub=on|off 开/关，无 sub → 回显 status）----
+        // 13 个只读 hook 落点（CDN 下载链 / 入队链 / 路径来源），终局判据 = j2.O before 读 r0.u。
+        // 只用 XposedHelpers 硬编码混淆名、不依赖 DexKit；全程 runCatching，只打日志、不改宿主。
+        runCatching { com.lx.wxgroup.probe.MicroXImageObserveProbe.install(lpparam) }
+            .onFailure { LogX.w("MicroXImageObserveProbe install failed: ${it.javaClass.simpleName}") }
+
+        // ---- R77 stock CDN 只读取证探针（广播 op=stockcdn）----
+        // 验证裁决 (b) 成立门槛：CDN addSendTask 是否触发 + 完成回调能否拿到大图路径出参。
+        // 6 个只读 hook（B6/m1e/m0l0/s0b/R5/j2R），只打日志、不改 param、不主动调宿主方法；
+        // 只用 XposedHelpers 硬编码混淆名、不依赖 DexKit；全程 runCatching，默认静默。
+        runCatching { com.lx.wxgroup.probe.StockCdnProbe.install(lpparam) }
+            .onFailure { LogX.w("StockCdnProbe install failed: ${it.javaClass.simpleName}") }
 
         // ---- 6.3 红包：领取界面弹出时自动点「拆红包」（默认关）----
         runCatching {

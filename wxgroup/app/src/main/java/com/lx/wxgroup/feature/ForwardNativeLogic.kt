@@ -21,9 +21,12 @@ package com.lx.wxgroup.feature
  *
  * ## 档位声明（本文件里唯一的 ② 档）
  *
- * - [ForwardInfo.fromImgId] 恒 -1：**没有①档的 CDN imgId 获取路径**（不在 h9 字段表里，
- *   G1 §2.1 只坐实了它有这个语义）。⇒ 图片转发会重传，与现在的降级重发一致；
- *   转发标记由 `q1.h=13` + [ForwardInfo.msgId] 承担。
+ * - [ForwardInfo.fromImgId] 本纯函数仍填 [NO_IMG_ID]（**没有①档的 CDN imgId 获取路径**，
+ *   G1 §2.1 只坐实了它有这个语义），但 R73 决定性修复（Q1-R）起，`m.a` 不再恒 -1：
+ *   `ForceForward` 的取源链（`d3.O8().Q2/a3 → r0.a`）拿到源图 imgLocalId(>0) 后，由
+ *   `attachForwardInfo` 在写宿主字段时用 `snap.imgLocalId` **覆盖**本函数返回值 ⇒
+ *   j2 走 ImgInfo2/CDN 服务端引用拿清晰大图；取不到（<=0）保留 -1 = 旧行为"重传本地"。
+ *   ⚠️ 本文件 `forwardInfoOf` 是纯函数、不改（红线），覆盖只发生在 hook 侧一行赋值。
  * - [ForwardInfo.svrId] 填 `field_msgSvrId` 的十进制字符串：字段 `e` 是 `String` 而
  *   `field_msgSvrId` 是 `J`（long），**格式是推断的**。错了最多服务端忽略它
  *   （`t81/g.l` 的 h==4 分支只读 `m.b`，不读 `m.e`）。
@@ -97,7 +100,8 @@ object ForwardNativeLogic {
      * 这样「拿不到就填默认」=「和微信自己 new 一个空的 m 一样」，不会产生半截状态。
      */
     data class ForwardInfo(
-        /** `m.a` long：forwardFromImgId（源图 CDN imgId）。**恒 [NO_IMG_ID]**，见类注释②档 */
+        /** `m.a` long：forwardFromImgId（源图 CDN imgId）。本纯函数恒 [NO_IMG_ID]；
+         *  R73 起 hook 侧（`ForceForward.attachForwardInfo`）用 `snap.imgLocalId>0` 覆盖它走 CDN 引用 */
         val fromImgId: Long = NO_IMG_ID,
         /** `m.b` long：forwardMsgId（源消息 msgId，`h9.getMsgId()`） */
         val msgId: Long = NO_MSG_ID,

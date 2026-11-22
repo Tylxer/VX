@@ -13,6 +13,8 @@ import java.io.File
 import com.lx.wxgroup.data.BackupFlow
 import com.lx.wxgroup.data.BackupIO
 import com.lx.wxgroup.data.GroupDb
+import com.lx.wxgroup.data.Keys
+import com.lx.wxgroup.data.Kv
 import com.lx.wxgroup.feature.ConvFilter
 import com.lx.wxgroup.feature.GroupBar
 import com.lx.wxgroup.feature.GroupDetailPage
@@ -227,6 +229,66 @@ object EntryReceiver {
                                 LogX.i(l)
                             }
                         }
+                    }
+                    // R73：图片 NetScene 只读取证探针 INP（默认关，冷启静默）。
+                    // --es op inp --es sub on|off；无 sub/其它 → 打 enabled + hook 挂没挂上。
+                    "inp" -> {
+                        val sub = intent.getStringExtra("sub") ?: "status"
+                        when (sub) {
+                            "on" -> com.lx.wxgroup.probe.ImageNetSceneProbe.turn(true)
+                            "off" -> com.lx.wxgroup.probe.ImageNetSceneProbe.turn(false)
+                            else -> for (l in com.lx.wxgroup.probe.ImageNetSceneProbe.status()) {
+                                LogX.i(l)
+                            }
+                        }
+                    }
+                    // R73：真机观察「微X图片转发为何清晰」只读取证探针（默认关，冷启静默）。
+                    // --es op microimg --es sub on|off；无 sub/其它 → 回显 enabled + 13 hook 挂没挂上。
+                    // 探针只打日志、不改 param、不主动调宿主方法；不持久化，冷启即静默。
+                    "microimg" -> {
+                        val sub = intent.getStringExtra("sub") ?: "status"
+                        when (sub) {
+                            "on" -> com.lx.wxgroup.probe.MicroXImageObserveProbe.turn(true)
+                            "off" -> com.lx.wxgroup.probe.MicroXImageObserveProbe.turn(false)
+                            else -> for (l in com.lx.wxgroup.probe.MicroXImageObserveProbe.status()) {
+                                LogX.i(l)
+                            }
+                        }
+                    }
+                    // R77 stock CDN 只读取证探针（默认关，冷启静默）。
+                    // --es op stockcdn --es sub on|off；无 sub/其它 → 回显 enabled + 6 hook 挂没挂上。
+                    // 探针只打日志、不改 param、不主动调宿主方法；不持久化，冷启即静默。
+                    "stockcdn" -> {
+                        val sub = intent.getStringExtra("sub") ?: "status"
+                        when (sub) {
+                            "on" -> com.lx.wxgroup.probe.StockCdnProbe.turn(true)
+                            "off" -> com.lx.wxgroup.probe.StockCdnProbe.turn(false)
+                            else -> for (l in com.lx.wxgroup.probe.StockCdnProbe.status()) {
+                                LogX.i(l)
+                            }
+                        }
+                    }
+                    // R76 P3 字节落盘开关（仿 microimg / inp 写法）：
+                    //   --es op p3 --es sub on|off；无 sub → 回显当前 enabled
+                    //   --es op p3on / p3off → 直接开/关（真机反向对照用）
+                    "p3" -> {
+                        val sub = intent.getStringExtra("sub") ?: "status"
+                        when (sub) {
+                            "on" -> Kv.putBool(Keys.FORWARD_P3_BIGIMG, true)
+                            "off" -> Kv.putBool(Keys.FORWARD_P3_BIGIMG, false)
+                            else -> LogX.i(
+                                "PROBE P3 enabled=${Kv.getBool(Keys.FORWARD_P3_BIGIMG)} " +
+                                    "key=${Keys.FORWARD_P3_BIGIMG}"
+                            )
+                        }
+                    }
+                    "p3on" -> {
+                        Kv.putBool(Keys.FORWARD_P3_BIGIMG, true)
+                        LogX.i("PROBE P3 enabled=true")
+                    }
+                    "p3off" -> {
+                        Kv.putBool(Keys.FORWARD_P3_BIGIMG, false)
+                        LogX.i("PROBE P3 enabled=false")
                     }
                     // K9 验证期临时入口：设备里没有 sqlite3，改配置只能从模块内部写 Kv。
                     // 验证完随本分支一起删除。

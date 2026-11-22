@@ -106,18 +106,18 @@
 
 ### ② 档位判定（只看产出物，不看难不难、是不是只读；**主会话与子代理同样适用**）
 
-| 产出物性质                                                 | 档位 / 模型（内置，按 credits 计费）                          |
+| 产出物性质                                                 | 档位 / 模型                                                 |
 | ----------------------------------------------------- | ------------------------------------------------------- |
-| 判据设计、根因推理、Hook 链路推导、**复核 Hook/反射/异步/并发级改动**           | **Pro** = `model="deepseek-v4-pro"`（内置 DeepSeek-V4-Pro） |
-| 按现成判据写代码 / 写单测 / 编译报错修复 / **复核纯逻辑·单测改动**                  | **Flash** = `model="deepseek-v4.1-flash"`（内置 DeepSeek-V4.1-Flash） |
-| 写文档 / 写脚本 / 批量统计 / 日志过滤 / 格式清理 / 台账 / 单测样板 / **复核纯文档改动** | **Lite** = `model="hy4flash"`（内置 Hy4 flash，单价最低） |
+| 判据设计、根因推理、Hook 链路推导、**复核 Hook/反射/异步/并发级改动**           | **Pro** = `model="custom-local:deepseek-v4-pro"`（自定义 DeepSeek-V4 Pro） |
+| 按现成判据写代码 / 写单测 / 编译报错修复 / **复核纯逻辑·单测改动**                  | **Flash** = `model="custom-local:deepseek-flash"`（自定义 DeepSeek-V4.1-Flash） |
+| 写文档 / 写脚本 / 批量统计 / 日志过滤 / 格式清理 / 台账 / 单测样板 / **复核纯文档改动** | **Lite** = `model="hy4flash"`（内置 Hy4 flash，单价最低，未改） |
 
 - **复核档位 = 被审改动的档位**，与「复核者是否读源码」「改动有几个文件」无关。  
   （全项目统一措辞，便于 grep 检索；两种极端都错：「复核只读 ⇒ Flash」错，「复核一律 Pro」也错。）  
   审一个 Hook / 反射 / 异步时序 / 并发改动 ⇒ **Pro**，即使 diff 只有 10 行。
 - ⛔ **Pro 类活不许主会话自己做**（2026-10-24 新增，硬要求）。  
   **任何工作开工前先按上表做档位判定**，判定为 Pro 的：
-  - 必须**单独开一个 `model="deepseek-v4-pro"`（内置 DeepSeek-V4-Pro）的子代理**去跑；
+  - 必须**单独开一个 `model="custom-local:deepseek-v4-pro"`（自定义 DeepSeek-V4 Pro）的子代理**去跑；
   - 主会话只能做上表 Flash / Lite 两行的活：接线 / 按现成判据写代码 / 单测 / 脚本 / 文档 /
     编译报错修复 / 跑验证 / 汇总。
   - ⭐ **Lite 类（文档 / 脚本 / 统计 / 日志过滤 / 格式清理 / 台账）优先派 `model="hy4flash"` 子代理**：
@@ -147,17 +147,24 @@
   §五与用户级记忆 0.5 都写明「派完**立刻在同一 turn 里继续做实事**」。  
   R33 实证：用户在真机侧秒回，我判断「派子代理要等分钟级、窗口会丢」而放弃派发 ——  
   **这个判断是错的**，派发零等待成本，「用户在线」不构成不派的理由。
-- ⚠️ **模型 id 同名冲突 / 解析顺序证据**见 `docs/conclusions/model_routing.md`：本表三档均写**内置** id
-  （`deepseek-v4-pro` / `deepseek-v4.1-flash` / `hy4flash`），裸写即命中内置、按 credits 计费。
-  `resolveModel` 顺序：①精确 id → ②name → ③别名；内置同名项恒在①命中。
-  ⚠️ 若实测 `requestModelId` 静默回落到别的模型（R33 有 Pro→Flash 前科），改用 `custom-local:` 前缀
-  指向你导入的同名自定义模型，或换 id；**改完必须回填 transcript 真值**。
+- ⚠️ **模型 id 同名冲突 / 解析顺序证据**见 `docs/conclusions/model_routing.md`。
+  ⭐ **2026-11-21 用户拍板：Pro / Flash 两档改用自定义模型**（`~/.workbuddy/models.json` 真源已核对）：
+  - **Pro** = `custom-local:deepseek-v4-pro`（名 `DeepSeek-V4 Pro`，`api.deepseek.com`）。内置表有同名
+    `deepseek-v4-pro` ⇒ **必须带前缀**，裸写命中内置（R23 实测：内置 name=`Deepseek-V4-Pro`）。
+  - **Flash** = `custom-local:deepseek-flash`（名 `DeepSeek-V4.1-Flash`，`api.deepseek.com`）。内置无
+    `deepseek-flash` 同名（内置是 `deepseek-v4.1-flash`，不同 id），裸写亦命中自定义，但**统一带前缀**防漂移。
+  - **Lite** 仍为内置 `hy4flash`（用户本次未要求改）。
+  `resolveModel` 顺序：①精确 id → ②name → ③别名；内置同名项恒在①命中，自定义须 `custom-local:` 前缀才能选。
+  ⚠️ 每次派发**必须回填 transcript 的 `requestModelId` 真值**（R33 有 Pro→Flash 前科；自定义路由 rawUsage
+  不带 credit 字段，见下 §五）——**改完更要回填**。
   📌 **系数真源**（2026-11-18 读 `~/.workbuddy/storage/user-*/…/scoped/<hash>/wb-product-config.json`）：
   快照是**标价**：pro=x0.51 / v4.1-flash=x0.11 / hy4flash=x0.03；另 `hy4flash-free`=x0.00（免费试用档）。
   ✅ **用户口述的 pro=0.25 / v4.1-flash=0.06 = 标价 × 0.5（非高峰期 5 折，2026-11-18 澄清）**：
   0.51×0.5=0.255≈0.25、0.11×0.5=0.055≈0.06 —— 两者口径一致，不是矛盾；**算积分用折后值**。
-  ⚠️ 内置表无 `V4.1-PRO` 这个 id，Pro 档唯一合法 id 就是 `deepseek-v4-pro`（非高峰折后≈0.25）。
-  `hy4flash` 仅在最新快照出现（新增灰度 id），历史 transcript 零命中 ⇒
+  ⚠️ **Pro/Flash 已切自定义 `custom-local:` 直连 `api.deepseek.com`**：上述内置系数（pro=x0.51 / flash=x0.11）
+  不再套用这两档——自定义路由 `rawUsage` **不带 credit 字段**（`model_routing.md` 定案），面板显示 0
+  不等于免费；仅 Lite `hy4flash` 仍按内置 x0.03。
+  `hy4flash` 在最新快照出现（新增灰度 id），历史 transcript 零命中 ⇒
   **首次派发必须回填 `requestModelId` 确认真命中 hy4flash**（别静默回落到 `hy4flash-free` x0.00）。
   ⚠️ **与 ① 的关系（冲突取严，2026-10-24 裁定 = 甲）**：  
   ① 定的是**实现 lane 的数量下限**，本条定的是**Pro 类活的档位归属**，两条都要满足。  

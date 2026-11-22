@@ -125,10 +125,19 @@ class R73LatestMsgFixTest {
 
     @Test
     fun gateUsesG0CacheFallback() {
-        val line = sourceLines().first { it.trimStart().startsWith("val hasRef = ") }
+        // R73-A1：门禁不再内联 cachedRef，改为门禁/快照同源走 resolveRefForBurst；
+        // g0 降级能力必须仍在该统一解析入口里。
+        val gate = functionBody("private fun onShowGridMenu")
+        assertTrue("门禁 must 走 resolveRefForBurst 同源取 ref", "resolveRefForBurst(v)" in gate)
+        assertTrue("门禁 hasRef 必须由同源 ref 决定", "val hasRef = ref != null" in gate)
+        val resolve = functionBody("private fun resolveRefForBurst")
         assertTrue(
-            "门禁 hasRef 必须在 View 链取不到时用 cachedRef() 降级：实际=($line)",
-            "cachedRef()" in line && "viewRef != null" in line
+            "统一解析入口必须保留 cachedRef() 降级（最新一条兜底）",
+            "cachedRef()" in resolve
+        )
+        assertTrue(
+            "统一解析入口必须保留 msgRefOf 现场兜底",
+            "msgRefOf(it)" in resolve
         )
         assertTrue(
             "门禁仍须调用 NativeMenuGate.shouldInject 四条件（不得绕过）",
@@ -138,12 +147,14 @@ class R73LatestMsgFixTest {
 
     @Test
     fun snapshotUsesG0CacheFallback() {
-        val body = functionBody("private fun snapshotOf")
+        val snap = functionBody("private fun snapshotOf")
+        assertTrue("snapshotOf 的 ref 必须走同源 resolveRefForBurst", "resolveRefForBurst(v)" in snap)
+        val resolve = functionBody("private fun resolveRefForBurst")
         assertTrue(
-            "snapshotOf 的 ref 必须在 msgRefOf 失败时用 ?: cachedRef() 降级",
-            "?: runCatching { cachedRef() }.getOrNull()" in body
+            "resolveRefForBurst 必须在现场解析失败后保留 cachedRef() 降级",
+            "cachedRef()" in resolve
         )
-        assertTrue("快照仍须先走 View 链 msgRefOf（View 链优先）", "msgRefOf(it)" in body)
+        assertTrue("resolveRefForBurst 仍须走 View 链 msgRefOf", "msgRefOf(it)" in resolve)
     }
 
     @Test

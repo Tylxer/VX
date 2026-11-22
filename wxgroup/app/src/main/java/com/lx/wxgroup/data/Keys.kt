@@ -181,6 +181,15 @@ object Keys {
     const val FORWARD_NATIVE = "chat.forward_native"
 
     /**
+     * R76 P3 字节落盘：转发图片时预热下载原图，复制到逐目标独立临时大图文件后
+     * 作为 `FileSender.send` 第 6 参 `bigImgPath` 覆盖 q1.j（优先级高于原生大图/缩略图）。
+     *
+     * **默认 true**：P3 是修复（解决降级重发读缩略图/半截图导致对端模糊），
+     * 但保留开关供真机反向对照：`kvset chat.forward_p3_bigimg false` 后重启即回到修复前行为。
+     */
+    const val FORWARD_P3_BIGIMG = "chat.forward_p3_bigimg"
+
+    /**
      * 收到图片消息时**自动把原图下载下来**（不用手点「查看原图」）。
      *
      * 判定「是否已有原图」用 `ImgInfo.t == 1`（微信自己的 `AutoGetBigImgLogic` 用的
@@ -510,6 +519,10 @@ object Prefs {
         PrefSpec(
             Keys.FORWARD_NATIVE, PrefKind.SWITCH, "false", "聊天",
             "原生转发（带「转发」标记）—— 未真机验证，默认关；关着走降级重发"
+        ),
+        PrefSpec(
+            Keys.FORWARD_P3_BIGIMG, PrefKind.SWITCH, "true", "聊天",
+            "P3 字节落盘：转发图片预热下载原图+独立临时大图（修复，默认开；可关掉做反向对照）"
         ),
         PrefSpec(
             Keys.CHAT_CONV_MENU_ENABLED, PrefKind.SWITCH, "true", "聊天",

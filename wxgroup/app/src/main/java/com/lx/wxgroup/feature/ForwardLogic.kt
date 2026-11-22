@@ -1,5 +1,7 @@
 package com.lx.wxgroup.feature
 
+import com.lx.wxgroup.data.MediaGuardLogic
+
 /**
  * 需求 6.6「强制转发」的**纯逻辑层** —— 零 Android 依赖，可跑 JVM 单测。
  *
@@ -282,6 +284,87 @@ object ForwardLogic {
 
     // ------------------------------------------------------------------ 转发决策
 
+    // ------------------------------------------------------------ 图片路径解析（R73 第二层缺口）
+    //
+    // 以下两个函数是「URI → 真实大图路径」的**纯逻辑层**：零 Android / 零 IO / 零 Xposed，
+    // 可被 JVM 单测锁住。宿主侧 `ForceForward.resolveImagePath` 只负责 listFiles + exists，
+    // 把 (文件名, 字节数) 喂进 [pickImageFile]，选择口径全在这里（取证见
+    // docs/_r73_image_path_forensics.md §1.1/§4.3/§7.2）。
+
+    /**
+     * 把 32 位 md5 映射成微信 `image2` 的分桶片段 `xx/yy`（前 2 位 / 第 3~4 位）。
+     *
+     * 【真机确定】4 组独立样本逐字吻合（`docs/_r73_image_path_forensics.md` §1.1），
+     * 与宿主 `b1.C4/z3` 原生解析语义同源。长度不是 [MediaGuardLogic.MD5_LEN] 一律返回 null，
+     * 让调用方告警/放弃 —— 不猜、不截断。
+     *
+     * 长度常量复用 [MediaGuardLogic.MD5_LEN]（data 包纯 Kotlin、无 Android 依赖，
+     * 不破坏 JVM 单测），与 `hexToken` 的取 token 口径保持单一来源。
+     */
+    fun imageBucket(md5: String): String? =
+        if (md5.length == MediaGuardLogic.MD5_LEN)
+            md5.substring(0, 2) + "/" + md5.substring(2, 4)
+        else null
+
+    /**
+     * 无效图片文件的最小字节阈值。
+     *
+     * R73 第三层落锤（真机）：微信缓存桶里可能残留**无效占位文件**——目标图 `th_<md5>hd⌖`
+     * 只有 36 字节（文件名尾部带特殊字符），旧版 tier-2 只按名字匹配、不看大小，把它当 HD
+     * 缩略图发给上传器 ⇒ `ok=true`（入队）但 NetScene 上传失败、对端收不到（本机提示发送失败）。
+     * 真机有效文件：坏占位 36B / 真缩略图 3~8KB / HD 缩略图 ~16KB / 大图 40~194KB。
+     * 阈值取 1KB：远低于最小真缩略图、远高于 36B 坏文件。
+     */
+    private const val MIN_VALID_IMAGE_BYTES = 1_024L
+
+    /**
+     * 从桶目录枚举出的 `(文件名, 字节数)` 列表里挑出**最适合转发**的图片文件名。
+     *
+     * 优先级（【真机确定】，见 `docs/_r73_image_path_forensics.md` §4.3/§7.2）：
+     * 0. 先按 [MIN_VALID_IMAGE_BYTES] 滤掉无效占位文件（36B 坏 `th_<md5>hd`，第三层真机落锤）；
+     * 1. 文件名 `contains(md5)` 且**不以 `th_` 开头**且扩展名 ∈ {.jpg,.png,.jpeg,.webp}
+     *    → 取字节数最大者（大图 40~194KB，首选，对端拿到清晰图）；
+     * 2. 无 1 → 取 `th_<md5>hd` / `th_<md5>hd_tmp.jpg`（HD 缩略图，次选）；
+     * 3. 无 2 → 取 `th_<md5>`（缩略图兜底，宿主侧应打 warn 留痕）；
+     * 4. 都没有 → null（解析失败，调用方保留原 URI 让 [planFor] 安全 SKIP）。
+     *
+     * ⛔ 用 `contains(md5)` 而不是精确相等：微信同一张图有 `<md5>.jpg`/`<md5>.png`/
+     *    `th_<md5>`/`th_<md5>hd` 等多个文件，都要能认出；但 md5 定长 32 位，`contains`
+     *    不会串到同桶别人消息（前 2 位相同、后 30 位不同）的文件上。
+     * ⛔ 第 1 档必须排除 `th_` 前缀：否则 `maxByOrNull` 会挑到缩略图 ⇒ 对端收到模糊图
+     *    （§4.2 事故）。单测里专门有一个「超大 th_ 文件」用例锁住这个判别力。
+     *
+     * @param files 桶目录 `listFiles()` 映射出的 (文件名, 字节数)；宿主只负责枚举，选择口径全在这里
+     * @param md5   [MediaGuardLogic.hexToken] 取出的 32 位小写 md5
+     * @return 相对该桶目录的文件名，全不命中返回 null
+     */
+    fun pickImageFile(files: List<Pair<String, Long>>, md5: String): String? {
+        if (md5.length != MediaGuardLogic.MD5_LEN) return null
+        val imageExt = arrayOf(".jpg", ".png", ".jpeg", ".webp")
+        // 无效文件（36B 坏占位等）任何一档都不能选：按大小先滤一道，再走优先级。
+        val valid = files.filter { (_, bytes) -> bytes >= MIN_VALID_IMAGE_BYTES }
+
+        // 1) 大图：含 md5、非 th_ 前缀、图片扩展名，取字节最大者
+        val big = valid
+            .filter { (name, _) ->
+                !name.startsWith("th_") &&
+                    imageExt.any { name.endsWith(it, ignoreCase = true) } &&
+                    name.contains(md5)
+            }
+            .maxByOrNull { it.second }
+        if (big != null) return big.first
+
+        // 2) HD 缩略图：th_<md5>hd / th_<md5>hd_tmp.jpg
+        val hd = valid.firstOrNull { (name, _) -> name.contains("th_${md5}hd") }
+        if (hd != null) return hd.first
+
+        // 3) 缩略图兜底：th_<md5>
+        val thumb = valid.firstOrNull { (name, _) ->
+            name.startsWith("th_") && name.contains(md5)
+        }
+        return thumb?.first
+    }
+
     /** 一次长按取到的消息快照。取不到字段时全是默认值 —— 由 [planFor] 决定是否放弃 */
     data class Snapshot(
         val kind: Kind = Kind.UNKNOWN,
@@ -303,6 +386,23 @@ object ForwardLogic {
          * **0 = 没拿到**。用于填 `hl0/m.e`(forwardMsgSvrId)。
          */
         val msgSvrId: Long = 0L,
+        /**
+         * R73 决定性修复（Q1-R）：源图 imgLocalId，写进 `hl0/m.a`（forwardFromImgId）。
+         *
+         * 微信自带转发把它设为源消息的 ImgInfo2 localId(**>0**) ⇒ j2 走 ImgInfo2/CDN
+         * 服务端引用拿清晰大图；我方旧值恒 -1 ⇒ j2 读本地 ori 缩略图 ⇒ 模糊。
+         * **-1 = 取不到，安全降级回现有本地文件重传（不改任何已闭环三层）。**
+         * 该值是源消息属性、对所有目标相同 ⇒ 逐目标各建 m/q1/j2，多目标天然保留。
+         */
+        val imgLocalId: Long = -1L,
+        /**
+         * R73 转发上下文（原生 MsgRetransmitUI.k6 填入、我方旧版缺失）：m.b / q1.r / q1.j 的值来源。
+         * 三项默认值都取「取不到 ⇒ 其它 lane 回退现状」的安全值。该值是源消息属性、
+         * 对所有目标相同 ⇒ 逐目标各建 m/q1/j2，多目标天然保留。
+         */
+        val srcMsgId: Long = 0L,          // → 写进 hl0/m.b（源消息 msgId，>0 才写；原生 = MsgRetransmitUI.f）
+        val srcTalkerPrefix: String = "", // → 写进 hl0/q1.r（转发源前缀，形如 "wxid_xxx:"，带尾冒号；原生 = k6 入参）
+        val srcBigImgPath: String = "",   // → 写进 hl0/q1.j（源图大图路径，非 th_ 前缀；原生 = MsgRetransmitUI.g）
     )
 
     enum class NativeState {
