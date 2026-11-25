@@ -24,7 +24,8 @@ import java.io.File
  * 不得制造绿。变异用例对**真实源码**做内存变异后跑同一套判据，确认会红（非纸面声明）。
  *
  * 变异映射（本 lane 已离线跑过，见回报）：
- * - M1：`15 * 1024` 改成 `5 * 1024` ⇒ [threeThresholdsAndPartDiscipline] 红；
+ * - M1：准入门禁 `P3AdmitGate.admit(srcFile, false)` 改成 `..., true)`（把来路不明的绝对路径强制 strict shape）
+ *   ⇒ [threeThresholdsAndPartDiscipline] 红；
  * - M2：send 去掉第 6 参 ⇒ [resendFilePassesSixthArg] 红；
  * - M3：删 `p3off` 分支 ⇒ [entryReceiverOpsLocked] 红；
  * - M4：回调不置 `p3BigImgReady = true` ⇒ [p0AsyncResultConsumed] 红；
@@ -166,11 +167,18 @@ class R76P3WireTest {
 
     // ------------------------------------------------ 变异验证（对真实源码做内存变异，跑同一判据）
 
-    /** M1：把 15KB 门槛放宽成 5KB，三门槛判据必须判红。 */
+    /**
+     * M1：把准入门禁从 `admit(srcFile, false)` 改成 `admit(srcFile, true)`（对来路不明的绝对路径
+     * 强制 strict shape 是错误行为），三门槛 + 写入纪律判据必须判红。
+     */
     @Test
     fun mutationRelaxedThresholdIsDetected() {
-        val mutated = codeLines(source(FF)).map { it.replace("15 * 1024", "5 * 1024") }
-        assertFalse("门槛从 15KB 放宽到 5KB 必须被判红", thresholdsAndPartOk(mutated))
+        val code = codeLines(source(FF))
+        val mutated = code.map {
+            it.replace("P3AdmitGate.admit(srcFile, false)", "P3AdmitGate.admit(srcFile, true)")
+        }
+        assertTrue("变异必须真正改动源码", mutated != code)
+        assertFalse("准入门禁被强制 strict shape 必须被判红", thresholdsAndPartOk(mutated))
     }
 
     /** M2：删掉第 6 参，send 判据必须判红。 */
@@ -241,17 +249,21 @@ class R76P3WireTest {
             "kind,target,snap.localPath,snap.imgLocalId,snap,bigImgPath"
     }
 
-    /** 三门槛 + 命名 + .part→flush→rename 写入纪律。 */
+    /**
+     * 三门槛 + 命名 + .part→flush→rename 写入纪律。
+     *
+     * R85 迁移：两处旧字面量三门槛已收敛到 P3AdmitGate —— 准入门禁改认
+     * `P3AdmitGate.admit(srcFile, false)`，复制后复核改认 `P3AdmitGate.admit(temp, false)`；
+     * strictShape=false 对应「记录里来路不明的绝对路径不强制 shape」。.part 写入纪律断言不变。
+     */
     private fun thresholdsAndPartOk(code: List<String>): Boolean =
-        code.any {
-            "srcFile.exists() && srcFile.length() > 15 * 1024 && !srcFile.name.startsWith(\"th_\")" in it
-        } &&
+        code.any { "P3AdmitGate.admit(srcFile, false)" in it } &&
             code.any { "UUID.randomUUID().toString().replace(\"-\", \"\")" in it } &&
             code.any { "File(app.cacheDir, \"\$uuid.part\")" in it } &&
             code.any { "File(app.cacheDir, \"_\$uuid.jpg\")" in it } &&
             code.any { "out.flush()" in it } &&
             code.any { "part.renameTo(temp)" in it } &&
-            code.any { "temp.length() <= 15 * 1024" in it }
+            code.any { "P3AdmitGate.admit(temp, false)" in it }
 
     /** Keys key 名 + 默认 true。 */
     private fun keysOk(code: List<String>): Boolean =

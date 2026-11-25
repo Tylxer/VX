@@ -49,6 +49,9 @@ class StockCdnProbeTest {
             "SCD-B6", "SCD-m1e", "SCD-CDNcb", "SCD-s0b", "SCD-b1j6", "SCD-j2R",
             "SCD-f2C2", "SCD-B8"
         )
+
+        /** R86 B2-a 新增 3 个只读 hook code（E4 复用 SCD-CDNcb，不新增 code）。 */
+        private val NEW_HOOK_CODES = listOf("SCD-x0cb", "SCD-c2c", "SCD-g9c")
     }
 
     /** 契约：object 单例 + 三个函数签名必须逐字存在（探针与接线两侧共同依赖）。 */
@@ -381,4 +384,203 @@ class StockCdnProbeTest {
     /** 某条 hook 安装行是否同时含类变量名与方法名字面量（hookRobust( 与实参分行写，故不断言行首）。 */
     private fun robustCallHas(code: List<String>, clsVar: String, method: String): Boolean =
         code.any { line -> clsVar in line && "\"$method\"" in line }
+
+    // ==================================================== R86 B2-a 新增锁（只追加，原 8 hook 锁一字未动）
+
+    /** R86 B2-a：3 个新 hook code 必须以字符串字面量落在源码（guard 键 / hookLabels / 日志）。 */
+    @Test
+    fun b2aNewHookCodesPresent() {
+        val literals = stringLiterals(source(PROBE))
+        val missing = NEW_HOOK_CODES.filter { code ->
+            val asWord = Regex("\\b${Regex.escape(code)}\\b")
+            literals.none { asWord.containsMatchIn(it) }
+        }
+        assertTrue("R86 B2-a 新增 hook code 缺失：$missing，字面量=$literals", missing.isEmpty())
+    }
+
+    /** E1 SCD-x0cb：挂 onC2CUploadCompleted，只读反射 filemd5/hitCache/existOnSvr/fileid，md5 只前缀 8 + 长度。 */
+    @Test
+    fun b2aE1ReadOnlyAnchors() {
+        val src = source(PROBE)
+        val literals = stringLiterals(src)
+        val code = codeLines(src)
+        assertTrue("E1 必须 hook onC2CUploadCompleted", code.any { "onC2CUploadCompleted" in it })
+        for (f in listOf("filemd5", "hitCache", "existOnSvr", "fileid")) {
+            assertTrue("E1 必须只读反射读 $f", code.any { "getObjectField" in it && "\"$f\"" in it })
+        }
+        assertTrue("E1 日志必须有 md5= 前缀", literals.any { "SCD2 x0cb in md5=" in it })
+        assertTrue("E1 日志必须带 md5Len=", literals.any { "md5Len=" in it })
+        assertTrue("E1 md5 只打前缀 8（take(8)）", code.any { "take(8)" in it })
+        assertTrue("E1 fileid 只打长度 + 前缀（fidLen/fidPre）",
+            literals.any { "fidLen=" in it && "fidPre=" in it })
+    }
+
+    /** E2 SCD-c2c：R10 实测 native 不可 hook，改挂 Java 任务构造点 ok0.m1.e 的 before，只读 tj/k 字段。 */
+    @Test
+    fun b2aE2ReadOnlyAnchors() {
+        val src = source(PROBE)
+        val literals = stringLiterals(src)
+        val code = codeLines(src)
+        assertTrue("E2 必须 hook Java 任务构造点 ok0.m1.e（非 native）",
+            code.any { "ok0.m1" in it && "\"e\"" in it })
+        assertTrue("E2 必须打 SCD2 c2c in 日志", literals.any { "SCD2 c2c in" in it })
+        assertTrue("E2 必须独立 guard code SCD-c2c", code.any { "guard(\"SCD-c2c\")" in it })
+        for (f in listOf("field_fullpath", "field_fileId", "field_filemd5", "field_onlycheckexist",
+                "field_enable_hitcheck", "field_fake_bigfile_signature")) {
+            assertTrue("E2 必须只读反射读 $f",
+                code.any { ("getObjectField" in it || "getBooleanField" in it) && "\"$f\"" in it })
+        }
+        assertTrue("E2 日志必须带 fullpathLen=", literals.any { "fullpathLen=" in it })
+        assertTrue("E2 日志必须带 md5Pre/md5Len（task 初值，非 reqMd5Null）",
+            literals.any { "md5Pre=" in it } && literals.any { "md5Len=" in it } &&
+                literals.none { "reqMd5Null=" in it })
+        assertTrue("E2 日志必须带 fakeSigEmpty=", literals.any { "fakeSigEmpty=" in it })
+        assertTrue("E2 pathTail 只打尾缀 12", code.any { "takeLast(12)" in it })
+        assertTrue("E2 不得把 native 方法名当铁律锁",
+            code.none { "startC2CUpload" in it } && code.none { "startSSUpload" in it })
+    }
+
+    /** E3 SCD-g9c：hook g9.c，只读判断 hasBig/hasAes/bigLen，绝不打完整 xml/aeskey。 */
+    @Test
+    fun b2aE3ReadOnlyAnchors() {
+        val src = source(PROBE)
+        val literals = stringLiterals(src)
+        val code = codeLines(src)
+        assertTrue("E3 必须 hook g9.c",
+            code.any { "com.tencent.mm.sdk.platformtools.g9" in it } &&
+                code.any { "\"c\"" in it && "SCD-g9c" in it })
+        for (k in listOf("hasBig=", "hasAes=", "bigLen=")) {
+            assertTrue("E3 日志必须含 $k", literals.any { k in it })
+        }
+        assertTrue("E3 日志格式必须为 SCD2 g9c in", literals.any { "SCD2 g9c in" in it })
+        assertTrue("E3 必须只读检查 has216b", literals.any { "has216b=" in it })
+        assertTrue("E3 md5 只打前缀 8（take(8)）", code.any { "md5Pre" in it } && code.any { "take(8)" in it })
+        assertTrue("E3 不得主动调 g9.c", code.none { "callStaticMethod" in it })
+    }
+
+    /** E4：复用 SCD-CDNcb 回调扩展 after，读 param.result → retNewLocalId；不新建独立 hook code。 */
+    @Test
+    fun b2aE4ExtendsCdncbAfter() {
+        val src = source(PROBE)
+        val literals = stringLiterals(src)
+        val code = codeLines(src)
+        assertTrue("E4 日志必须含 exist_whencheck + retNewLocalId",
+            literals.any { "SCD2 j0C2 exist_whencheck=" in it && "retNewLocalId=" in it })
+        assertTrue("E4 必须读 param.result 新 localId",
+            code.any { "retNewLocalId" in it } && code.any { "param.result as? Int" in it })
+        assertTrue("E4 exist_whencheck 必须只读反射",
+            code.any { "getObjectField" in it && "\"field_exist_whencheck\"" in it })
+        assertTrue("E4 不得新建独立 hook code SCD-j0C2", "SCD-j0C2" !in literals)
+    }
+
+    /** R86 B2-a 新回调（E1 after / E2 before / E3 before）必须 enabled 首行 return；E4 复用现有 after 已计入原 13。 */
+    @Test
+    fun b2aNewCallbacksEnabledFirstLine() {
+        val guardLines = codeLines(source(PROBE)).count { it == "if (!enabled) return" }
+        assertTrue("新回调必须 enabled 首行 return（实际 $guardLines，期望 ≥16）", guardLines >= 16)
+    }
+
+    /** R86 B2-a 新 hook 只读：不写宿主字段/参数/返回值，不主动调宿主业务方法。 */
+    @Test
+    fun b2aNewHooksReadOnly() {
+        val code = codeLines(source(PROBE))
+        assertTrue("新 hook 严禁写宿主字段",
+            code.none { Regex("set(?:Object|Long|Int|Boolean|Short|Float|Double|Byte|Char)Field").containsMatchIn(it) })
+        assertTrue("新 hook 严禁写 param.args/result（含只读红线汇总判定）", !hasWriteViolation(code))
+        val activeCall = Regex("call(?:Static)?Method")
+        assertTrue("新 hook 严禁主动调宿主业务方法",
+            code.none { activeCall.containsMatchIn(it) &&
+                ("onC2CUploadCompleted" in it || "ok0.m1" in it || "g9" in it) })
+    }
+
+    // ---------------- R86 B2-a 真源码变异验证（证明新锁不是假绿）
+
+    /** 真实变异：把 SCD-x0cb code 字面量改名，必须被 [b2aNewHookCodesPresent] 判红。 */
+    @Test
+    fun mutationB2aNewHookCodeIsDetected() {
+        val src = source(PROBE)
+        val mutated = src.replace("SCD-x0cb", "SCD-x0cbX")
+        assertTrue("变异必须真正改动源码文本", mutated != src)
+        val literals = stringLiterals(mutated)
+        val missing = NEW_HOOK_CODES.filter { code ->
+            val asWord = Regex("\\b${Regex.escape(code)}\\b")
+            literals.none { asWord.containsMatchIn(it) }
+        }
+        assertTrue("真实变异（改掉 SCD-x0cb）必须被新锁判红，实际 missing=$missing", "SCD-x0cb" in missing)
+    }
+
+    /** 真实变异：把 E3 的 hasBig= 改成 hasBigX=，必须被 [b2aE3ReadOnlyAnchors] 判红。 */
+    @Test
+    fun mutationB2aE3HasBigIsDetected() {
+        val src = source(PROBE)
+        val mutated = src.replace("hasBig=", "hasBigX=")
+        assertTrue("变异必须真正改动源码文本", mutated != src)
+        val literals = stringLiterals(mutated)
+        assertTrue("真实变异（E3 hasBig→hasBigX）必须被 E3 锁判红", literals.none { "hasBig=" in it })
+    }
+
+    /**
+     * 真实变异：把 E2 的 SCD2 c2c in 日志 label 改掉，必须被 [b2aE2ReadOnlyAnchors] 判红。
+     * 注意变异串必须真正移除判据锁的子串："inX" 仍含 "in"，是无语义变异（假验证），
+     * 故改用 "zzz" 让 "SCD2 c2c in" 字面量从源码彻底消失。
+     */
+    @Test
+    fun mutationB2aE2JavaLandingIsDetected() {
+        val src = source(PROBE)
+        val mutated = src.replace("SCD2 c2c in ", "SCD2 zzz in ")
+        assertTrue("变异必须真正改动源码文本", mutated != src)
+        val literals = stringLiterals(mutated)
+        assertTrue("真实变异（E2 日志 label 改写）必须被 E2 锁判红", literals.none { "SCD2 c2c in" in it })
+        // 变异体必须仍保留 E2 的 Java 落点/字段，确保判红是 label 这一自变量唯一造成（不是把整个 hook 删了）。
+        assertTrue("变异体须仍含 E2 Java 落点（自变量唯一）",
+            codeLines(mutated).any { "ok0.m1" in it && "\"e\"" in it })
+    }
+
+    // ---------------- R86c Q4 补观测：fullpath 实际字节数 / 内容 MD5 前缀 / 完整 fileId ----------------
+
+    /**
+     * R86c Q4：SCD2 c2c in 必须在路径串长之外追加 4 个只读取证字段——
+     * fexists / fbytes（真实文件字节数）/ fmd5pre（内容 MD5 前 8）/ fidFull（完整 fileId）+ 时间戳 t。
+     * 判据来自收口裁决 `docs/_r86c_fileid_vs_fullpath_verdict.md` Q4 探针落点规格。
+     */
+    @Test
+    fun r86cQ4FileByteForensicsAnchors() {
+        val src = source(PROBE)
+        val literals = stringLiterals(src)
+        val code = codeLines(src)
+        assertTrue("Q4 c2c 日志必须仍以 SCD2 c2c in 开头", literals.any { "SCD2 c2c in " in it })
+        for (k in listOf("fexists=", "fbytes=", "fmd5pre=", "fidFull=", "t=")) {
+            assertTrue("Q4 c2c 日志必须含 $k", literals.any { k in it })
+        }
+        assertTrue("Q4 必须用 java.io.File.length() 读真实字节数",
+            code.any { "java.io.File(path).length()" in it })
+        assertTrue("Q4 必须只读检查 File.exists()",
+            code.any { "java.io.File(path).exists()" in it })
+        assertTrue("Q4 必须用 MessageDigest MD5 算内容前缀",
+            code.any { "MessageDigest.getInstance(\"MD5\")" in it } && code.any { "f.readBytes()" in it })
+        assertTrue("Q4 fmd5pre 只打前 4 字节（8 hex），不打全串",
+            code.any { "copyOfRange(0, 4)" in it })
+        assertTrue("Q4 fidFull 必须打完整 fileId（取证期）",
+            code.any { "val fidFull = fid ?: \"NA\"" in it })
+        assertTrue("Q4 打时间戳用于 A/B-2 对齐",
+            code.any { "System.currentTimeMillis()" in it })
+        // 只读红线不因补观测而放宽：仍不写宿主字段/参数/返回值、不主动调宿主业务方法。
+        assertTrue("Q4 补观测仍严禁写宿主字段",
+            code.none { Regex("set(?:Object|Long|Int|Boolean|Short|Float|Double|Byte|Char)Field").containsMatchIn(it) })
+        assertTrue("Q4 补观测仍严禁写 param.args/result", !hasWriteViolation(code))
+        assertTrue("Q4 读文件属 JDK 只读 API（非宿主业务方法），不得出现 callStaticMethod 读文件",
+            code.none { "callStaticMethod" in it && "File" in it })
+    }
+
+    /** 真实变异：把 fbytes= 改名为 fbytesX=，必须被 [r86cQ4FileByteForensicsAnchors] 判红。 */
+    @Test
+    fun mutationR86cQ4FbytesAnchorIsDetected() {
+        val src = source(PROBE)
+        val mutated = src.replace("fbytes=", "fbytesX=")
+        assertTrue("变异必须真正改动源码文本", mutated != src)
+        val literals = stringLiterals(mutated)
+        assertTrue("真实变异（fbytes→fbytesX）必须被 Q4 锁判红", literals.none { "fbytes=" in it })
+        assertTrue("变异体须仍保留其它 Q4 字段（自变量唯一：只动 fbytes=）",
+            literals.any { "fmd5pre=" in it } && literals.any { "fidFull=" in it })
+    }
 }

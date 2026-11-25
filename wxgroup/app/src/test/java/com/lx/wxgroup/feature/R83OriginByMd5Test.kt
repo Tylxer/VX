@@ -17,7 +17,7 @@ import java.io.File
  * 1. [fallbackFunctionExistsAndStitchesMd5Buckets] 函数存在且拼 image2/<2>/<2>/<md5>.jpg；
  *    1b. [handlesBareMd5WithoutExtension] img 字段两种形态都要吃：带 .jpg/.jpeg/.png/.webp 与纯 32 位 md5（缺省补 .jpg，R76 真机失败形态）；
  *    1c. [preservesExplicitExtension] 带明确扩展名时保留原扩展名，不被默认 .jpg 覆盖；
- * 2. [threeThresholdsLockedInFallback] 三门槛（存在 + >15KB + 非 th_）；
+ * 2. [threeThresholdsLockedInFallback] 三门槛已收敛为单一 gate 判据 P3AdmitGate.admit(f, true)（R85 路线 A）；
  * 3. [rootHashIsDynamicNotHardcoded] MicroMsg/<hash> 从 localPath 正则动态取，不硬编码；
  * 4. [logOnlyTailsNoFullHash] 命中日志只打尾 24 + 长度；
  * 5. [fallbackIsReadOnly] 不写宿主字段 / 不写 param；
@@ -26,7 +26,7 @@ import java.io.File
  *
  * 真实变异验证（对真实源码做内存变异，跑同一判据，确认会红）：
  * - M1 分桶位数 substring(0, 2)→(0, 3) ⇒ [mutationWrongBucketStitchingIsDetected]；
- * - M2 门槛 15KB→5KB          ⇒ [mutationRelaxedThresholdIsDetected]；
+ * - M2 摘掉 strictShape（admit(f,true)→admit(f,false)）⇒ [mutationRelaxedThresholdIsDetected]；
  * - M3 hash 正则改硬编码        ⇒ [mutationHardcodedHashIsDetected]；
  * - M4 fallback 挪到 srcBigImg 之后 ⇒ [mutationReorderedFallbackAfterSrcBigImgIsDetected]；
  * - M5 listener 去掉 fallback   ⇒ [mutationDroppedListenerFallbackIsDetected]；
@@ -147,13 +147,15 @@ class R83OriginByMd5Test {
         assertFalse("分桶位数改错必须被判红", md5PathStitchedOk(mutated))
     }
 
-    /** M2：门槛 15KB→5KB，三门槛判据必须判红。 */
+    /** M2：摘掉 strictShape（admit(f, true)→admit(f, false)），三门槛判据必须判红。 */
     @Test
     fun mutationRelaxedThresholdIsDetected() {
         val body = functionBody(codeLines(source(FF)), SIG)
-        val mutated = body.map { it.replace("f.length() > 15 * 1024", "f.length() > 5 * 1024") }
+        val mutated = body.map {
+            it.replace("P3AdmitGate.admit(f, true)", "P3AdmitGate.admit(f, false)")
+        }
         assertTrue("变异必须真正改动源码", mutated != body)
-        assertFalse("门槛放宽必须被判红", threeThresholdsOk(mutated))
+        assertFalse("strictShape 被摘掉必须被判红", threeThresholdsOk(mutated))
     }
 
     /** M3：把动态 hash 正则改成硬编码，动态根判据必须判红。 */
@@ -234,12 +236,15 @@ class R83OriginByMd5Test {
     private fun extDefaultJpgOk(body: List<String>): Boolean =
         body.any { "ifBlank { \"jpg\" }" in it && "lowercase()" in it }
 
-    /** 三门槛：存在 + >15KB + 非 th_（逐项 + 完整条件行）。 */
+    /**
+     * 三门槛判据（R85 迁移）：旧版锁死字面量 `f.exists() && f.length() > 15*1024 && !f.name.startsWith("th_")`，
+     * 但该字面量已随路线 A 收敛为 [P3AdmitGate.admit] 而从源码消失，旧断言会假红。按 Pro §4.3
+     * 「改判据而非删测试」：body 内出现 `P3AdmitGate.admit(f, true)` 即视为三门槛已被 gate 取代；
+     * 同时保留 `val f = File(path)` 断言（闭环拼出的绝对路径仍喂给 gate 判定）。
+     */
     private fun threeThresholdsOk(body: List<String>): Boolean =
-        body.any { "f.exists()" in it } &&
-            body.any { "f.length() > 15 * 1024" in it } &&
-            body.any { "f.name.startsWith(\"th_\")" in it } &&
-            body.any { "f.exists() && f.length() > 15 * 1024 && !f.name.startsWith(\"th_\")" in it }
+        body.any { "val f = File(path)" in it } &&
+            body.any { "P3AdmitGate.admit(f, true)" in it }
 
     /** 动态根：正则取 MicroMsg/<32位hash>/ + 从 localPath 截到根尾。 */
     private fun dynamicRootOk(body: List<String>): Boolean =

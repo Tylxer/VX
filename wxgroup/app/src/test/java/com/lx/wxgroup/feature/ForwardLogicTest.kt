@@ -1,5 +1,7 @@
 package com.lx.wxgroup.feature
 
+import com.lx.wxgroup.data.Friend
+import com.lx.wxgroup.data.GroupDb
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNotNull
@@ -474,6 +476,101 @@ class ForwardLogicTest {
         assertEquals(
             listOf("wxid_a", "wxid_b"),
             ForwardLogic.resolveTargets(listOf(" g:1 "), buckets)
+        )
+    }
+
+    // ------------------------------------------------------------ 选人器好友白名单（filehelper）
+
+    private fun friend(
+        wxid: String,
+        nickname: String = "",
+        remark: String = "",
+        alias: String = "",
+        type: Int = GroupDb.WxidType.FRIEND,
+    ) = Friend(wxid = wxid, nickname = nickname, remark = remark, alias = alias, type = type)
+
+    @Test
+    fun pickerFriendsWhitelistsFileHelperButNotOtherUnknownOrRooms() {
+        // 混合样本（真好友 + filehelper(UNKNOWN=9) + 另一个 UNKNOWN 系统号 + 群聊 + 公众号），
+        // 各判不同结果：能同时挡住「恒返回全集」「恒返回空」「恒返回单个 filehelper」三类假实现。
+        val fileHelper = friend("filehelper", type = GroupDb.WxidType.UNKNOWN) // nickname 常为空
+        val realA = friend("wxid_a", nickname = "张三")
+        val realB = friend("wxid_b", remark = "李四")
+        val weixin = friend("weixin", type = GroupDb.WxidType.UNKNOWN)
+        val room = friend("12345@chatroom", nickname = "某群", type = GroupDb.WxidType.CHATROOM)
+        val official = friend("gh_abc", nickname = "某公众号", type = GroupDb.WxidType.OFFICIAL_ACCOUNT)
+
+        val all = listOf(realA, weixin, fileHelper, room, realB, official)
+        val result = ForwardLogic.pickerFriends(all, emptySet())
+
+        // filehelper 被放行、真好友放行、顺序保持（realA, fileHelper, realB）；其余全被挡。
+        assertEquals(listOf(realA, fileHelper, realB), result)
+        assertFalse("weixin 不该进好友段", result.any { it.wxid == "weixin" })
+        assertFalse("群聊不该进好友段", result.any { it.wxid == room.wxid })
+        assertFalse("公众号不该进好友段", result.any { it.wxid == official.wxid })
+    }
+
+    @Test
+    fun pickerFriendsHonorsExcludeEvenForFileHelper() {
+        val all = listOf(
+            friend("wxid_a", nickname = "张三"),
+            friend("filehelper", type = GroupDb.WxidType.UNKNOWN),
+        )
+        // exclude 命中 filehelper 时只排除它自己；其它真好友仍在列表里
+        assertEquals(
+            listOf("wxid_a"),
+            ForwardLogic.pickerFriends(all, setOf("filehelper")).map { it.wxid }
+        )
+        // exclude 命中普通好友时该好友被排除，但不影响 filehelper 放行
+        assertEquals(
+            listOf("filehelper"),
+            ForwardLogic.pickerFriends(all, setOf("wxid_a")).map { it.wxid }
+        )
+    }
+
+    @Test
+    fun pickerDisplayNameIsFixedForFileHelper() {
+        // 真机 filehelper 昵称常为空，显示名固定为中文名（空昵称是核心场景）
+        assertEquals(
+            ForwardLogic.PICKER_FILE_HELPER_NAME,
+            ForwardLogic.pickerDisplayName(friend("filehelper", type = GroupDb.WxidType.UNKNOWN))
+        )
+        // 即便带了别的 nickname，filehelper 也必须固定返回（锁住「固定」二字）
+        assertEquals(
+            ForwardLogic.PICKER_FILE_HELPER_NAME,
+            ForwardLogic.pickerDisplayName(
+                friend("filehelper", nickname = "随便什么", type = GroupDb.WxidType.UNKNOWN)
+            )
+        )
+    }
+
+    @Test
+    fun pickerDisplayNameOfNormalFriendUsesRemarkThenNickname() {
+        // 普通好友走 displayName 原有优先级：备注 > 昵称 > 微信号 > wxid
+        assertEquals(
+            "备注李四",
+            ForwardLogic.pickerDisplayName(friend("wxid_b", nickname = "昵称B", remark = "备注李四"))
+        )
+        assertEquals(
+            "昵称张三",
+            ForwardLogic.pickerDisplayName(friend("wxid_a", nickname = "昵称张三"))
+        )
+        assertEquals("wxid_z", ForwardLogic.pickerDisplayName(friend("wxid_z")))
+    }
+
+    @Test
+    fun resolveTargetsBareFileHelperPassesThrough() {
+        // 选人器勾中 filehelper 后裸 id 要原样进目标列表（不被当特殊前缀吞掉）
+        assertEquals(
+            listOf(ForwardLogic.PICKER_FILE_HELPER_WXID),
+            ForwardLogic.resolveTargets(listOf(ForwardLogic.PICKER_FILE_HELPER_WXID))
+        )
+        // exclude 对 filehelper 同样生效（confirm 阶段不排除被排除的会话）
+        assertTrue(
+            ForwardLogic.resolveTargets(
+                listOf(ForwardLogic.PICKER_FILE_HELPER_WXID),
+                exclude = setOf(ForwardLogic.PICKER_FILE_HELPER_WXID)
+            ).isEmpty()
         )
     }
 
