@@ -50,6 +50,10 @@ object StockCdnProbe {
     @Volatile
     var enabled = false
 
+    /** R86c Q4b P-FS 只读探针开关（默认关、冷启静默；与 stockcdn 的 enabled 完全独立）。 */
+    @Volatile
+    var r86cEnabled = false
+
     /** 幂等：install 只跑一次。 */
     @Volatile
     private var installed = false
@@ -68,6 +72,12 @@ object StockCdnProbe {
         "SCD-j2R" to "modelimage/j2.R",
         "SCD-f2C2" to "modelimage/f2.C2",
         "SCD-B8" to "mq/k.B8",
+        // R86 B2-a：3 个新只读 hook（E4 复用 SCD-CDNcb，不新增 code）。
+        "SCD-x0cb" to "ok0/x0.onC2CUploadCompleted",
+        "SCD-c2c" to "ok0/m1.e(fullpath 只读)",
+        "SCD-g9c" to "sdk.platformtools.g9.c",
+        // R86c Q4b：P-FS 独立只读 guard（与 SCD-c2c 同 method、独立 callback，不污染既有日志）。
+        "SCD-r86cfs" to "ok0/m1.e(R86c P-FS 只读)",
     )
 
     // ------------------------------------------------------------------ 安装
@@ -202,6 +212,14 @@ object StockCdnProbe {
                         runCatching {
                             val ret = (param.result as? Int) ?: -1
                             LogX.i("SCD CDNcb out ret=$ret")
+                            // R86 B2-a E4：复用本回调（不新建 hook 实例，避免重复挂 C2）扩展只读观测。
+                            // exist_whencheck 从入参 Ltj/f 只读反射取；param.result 即新 localId。
+                            // 只打布尔/数值，不落完整值。
+                            val existWhenCheck = runCatching {
+                                XposedHelpers.getObjectField(param.args?.getOrNull(3), "field_exist_whencheck")
+                                    ?.toString() ?: "null"
+                            }.getOrDefault("NA")
+                            LogX.i("SCD2 j0C2 exist_whencheck=$existWhenCheck retNewLocalId=$ret")
                         }.onFailure { LogX.w("SCD CDNcb out err: ${it.javaClass.simpleName}") }
                     }
                 }
@@ -362,6 +380,234 @@ object StockCdnProbe {
             )
         }
 
+        // ---- R86 B2-a E1 · SCD-x0cb ok0/x0.onC2CUploadCompleted(String,C2CUploadResult)V @0x3aa9bc（classes13）----
+        // 上传完成回包 = 权威内容判据（md5）。R10 §21/165 同构命名：result 很可能是
+        // com.tencent.mars.cdn.CdnLogic$C2CUploadResult，但精确 sig 不硬猜：hookAllMethods 兜底 + 回调打 msig
+        // （照抄 SCD-f2C2）；字段反射读不到一律打 NA。
+        guard("SCD-x0cb") {
+            hookRobust(
+                "SCD-x0cb", findCls("ok0.x0", cl), "onC2CUploadCompleted",
+                sig(
+                    "onC2CUploadCompleted",
+                    listOf("java.lang.String", "com.tencent.mars.cdn.CdnLogic\$C2CUploadResult"),
+                    "void",
+                ),
+                object : XC_MethodHook() {
+                    override fun afterHookedMethod(param: MethodHookParam) {
+                        if (!enabled) return
+                        runCatching {
+                            val msig = sigOf(param)
+                            val res = param.args?.getOrNull(1)
+                            // md5 只打前缀 8 + 长度；fileid 只打长度 + 前缀；hit/exist 打值。
+                            val md5 = runCatching { XposedHelpers.getObjectField(res, "filemd5") as? String }.getOrNull()
+                            val md5Pre = md5?.take(8) ?: "NA"
+                            val md5Len = md5?.length ?: -1
+                            val hit = runCatching {
+                                XposedHelpers.getObjectField(res, "hitCache")?.toString()
+                            }.getOrDefault("NA")
+                            val exist = runCatching {
+                                XposedHelpers.getObjectField(res, "existOnSvr")?.toString()
+                            }.getOrDefault("NA")
+                            val fid = runCatching { XposedHelpers.getObjectField(res, "fileid") as? String }.getOrNull()
+                            val fidLen = fid?.length ?: -1
+                            val fidPre = fid?.take(8) ?: "NA"
+                            LogX.i(
+                                "SCD2 x0cb in md5=$md5Pre md5Len=$md5Len hit=$hit exist=$exist " +
+                                    "fidLen=$fidLen fidPre=$fidPre msig=$msig"
+                            )
+                        }.onFailure { LogX.w("SCD2 x0cb in err: ${it.javaClass.simpleName}") }
+                    }
+                }
+            )
+        }
+
+        // ---- R86 B2-a E2 · SCD-c2c ok0/m1.e(tj/k)Z @0x7b52b4 —— 上传任务构造点（独立只读 guard）----
+        // R10 实测：CdnLogic.startC2CUpload/startSSUpload 为 native（acc=0x109），Xposed 挂不上；
+        // 故改挂 Java 任务构造点 ok0.m1.e(tj/k)Z 的 before —— param.args[0] 即 tj/k task，
+        // R82 Q4.1 字段映射逐个在 task 上。同一 e 方法另挂一个独立 guard code SCD-c2c，
+        // 不影响现有 SCD-m1e（Xposed 对同一 method 可挂多个 callback）。只读，绝不写 task/调宿主。
+        guard("SCD-c2c") {
+            hookRobust(
+                "SCD-c2c", findCls("ok0.m1", cl), "e",
+                sig("e", listOf("tj.k"), "boolean"),
+                object : XC_MethodHook() {
+                    override fun beforeHookedMethod(param: MethodHookParam) {
+                        if (!enabled) return
+                        runCatching {
+                            val msig = sigOf(param)
+                            val task = param.args?.getOrNull(0)
+                            // fullpath 只打长度 + 尾缀 12；md5 只前缀 8 + 长度。
+                            // R86c Q4 补观测：fileId 本次取证打完整 body+uuid（逐字比对，取证结束回归只打前缀）；
+                            // 并只读追加 fullpath 指向文件的存在/实际字节数/内容 MD5 前 8（本轮缺失量）。
+                            val path = runCatching {
+                                XposedHelpers.getObjectField(task, "field_fullpath") as? String
+                            }.getOrNull()
+                            val fullpathLen = path?.length ?: -1
+                            val pathTail = path?.takeLast(12) ?: "NA"
+                            val fid = runCatching {
+                                XposedHelpers.getObjectField(task, "field_fileId") as? String
+                            }.getOrNull()
+                            val fidLen = fid?.length ?: -1
+                            val fidPre = fid?.take(8) ?: "NA"
+                            val md5 = runCatching {
+                                XposedHelpers.getObjectField(task, "field_filemd5") as? String
+                            }.getOrNull()
+                            val md5Pre = md5?.take(8) ?: "NA"
+                            val md5Len = md5?.length ?: -1
+                            val enableHit = runCatching {
+                                XposedHelpers.getBooleanField(task, "field_enable_hitcheck").toString()
+                            }.getOrDefault("NA")
+                            val only = runCatching {
+                                XposedHelpers.getBooleanField(task, "field_onlycheckexist").toString()
+                            }.getOrDefault("NA")
+                            val fakeSigEmpty = runCatching {
+                                (XposedHelpers.getObjectField(task, "field_fake_bigfile_signature") as? String)
+                                    .isNullOrEmpty().toString()
+                            }.getOrDefault("NA")
+                            // R86c Q4 补观测（收口 no-go 的两 UNKNOWN 之一）：fullpath 指向文件的真实字节数
+                            // 与内容 MD5 前 8；本轮 fullpathLen=124 是路径串长、非字节数，必须另测。
+                            // 只读 java.io.File/MessageDigest（JDK 类，非宿主业务方法），每个字段独立 runCatching。
+                            val fileExists = runCatching {
+                                if (path.isNullOrEmpty()) "NA"
+                                else java.io.File(path).exists().toString()
+                            }.getOrDefault("ERR")
+                            val fileBytes = runCatching {
+                                if (path.isNullOrEmpty()) "NA"
+                                else java.io.File(path).length().toString()
+                            }.getOrDefault("ERR")
+                            val fileMd5Pre = runCatching {
+                                if (path.isNullOrEmpty()) "NA"
+                                else {
+                                    val f = java.io.File(path)
+                                    if (!f.isFile) "NOFILE"
+                                    else if (f.length() > 32L * 1024 * 1024) "BIG"
+                                    else {
+                                        val digest = java.security.MessageDigest.getInstance("MD5")
+                                            .digest(f.readBytes())
+                                        digest.copyOfRange(0, 4)
+                                            .joinToString("") { "%02x".format(it.toInt() and 0xff) }
+                                    }
+                                }
+                            }.getOrDefault("ERR")
+                            // 本次取证允许打完整 fileId（逐字比对 A vs R81 的 0f836cfd/uuid）；取证结束改回前缀。
+                            val fidFull = fid ?: "NA"
+                            LogX.i(
+                                "SCD2 c2c in fullpathLen=$fullpathLen pathTail=$pathTail " +
+                                    "fidLen=$fidLen fidPre=$fidPre md5Pre=$md5Pre md5Len=$md5Len " +
+                                    "enableHit=$enableHit only=$only fakeSigEmpty=$fakeSigEmpty " +
+                                    "fexists=$fileExists fbytes=$fileBytes fmd5pre=$fileMd5Pre " +
+                                    "fidFull=$fidFull t=${System.currentTimeMillis()} msig=$msig"
+                            )
+                        }.onFailure { LogX.w("SCD2 c2c in err: ${it.javaClass.simpleName}") }
+                    }
+                }
+            )
+        }
+
+        // ---- R86c Q4b P-FS · ok0/m1.e(tj/k)Z before —— image2 两级分桶只读扫描 ----
+        // 独立 callback + 独立 flag（同 method 多 callback 范式见 :421-422）；默认关首行 return。
+        // 只读：仅 java.io.File / MessageDigest；不写 task、不调宿主方法、每个量独立 runCatching。
+        guard("SCD-r86cfs") {
+            hookRobust(
+                "SCD-r86cfs", findCls("ok0.m1", cl), "e",
+                sig("e", listOf("tj.k"), "boolean"),
+                object : XC_MethodHook() {
+                    override fun beforeHookedMethod(param: MethodHookParam) {
+                        if (!r86cEnabled) return
+                        runCatching {
+                            val task = param.args?.getOrNull(0)
+                            val fullpath = runCatching {
+                                XposedHelpers.getObjectField(task, "field_fullpath") as? String
+                            }.getOrNull()
+                            if (fullpath.isNullOrEmpty()) {
+                                LogX.w("R86C FS skip reason=no_fullpath")
+                                return@runCatching
+                            }
+                            // 从 fullpath 取 MicroMsg/<32hex> 数据根（不硬编码 hash；范式 ForwardCdnFieldHook:221）。
+                            val hit = Regex("/MicroMsg/[0-9a-fA-F]{32}/").find(fullpath)
+                            if (hit == null) {
+                                LogX.w("R86C FS skip reason=no_root tail=${fullpath.takeLast(16)}")
+                                return@runCatching
+                            }
+                            val root = fullpath.substring(0, hit.range.last + 1)
+                            var scanned = 0; var a45522 = 0; var cff4 = 0; var gohit = 0
+                            runCatching {
+                                java.io.File(root + "image2").listFiles()?.forEach { d1 ->
+                                    if (!d1.isDirectory) return@forEach
+                                    d1.listFiles()?.forEach { d2 ->
+                                        if (!d2.isDirectory) return@forEach
+                                        d2.listFiles()?.forEach { f ->
+                                            if (!f.name.endsWith(".jpg_hevc")) return@forEach
+                                            scanned++
+                                            val len = runCatching { f.length() }.getOrDefault(-1L)
+                                            val md5pre = runCatching {
+                                                if (!f.isFile || f.length() > 32L * 1024 * 1024) "NA"
+                                                else {
+                                                    val dg = java.security.MessageDigest.getInstance("MD5")
+                                                    f.inputStream().use { ins ->
+                                                        val buf = ByteArray(64 * 1024)
+                                                        while (true) {
+                                                            val n = ins.read(buf)
+                                                            if (n <= 0) break
+                                                            dg.update(buf, 0, n)
+                                                        }
+                                                    }
+                                                    dg.digest().copyOfRange(0, 4)
+                                                        .joinToString("") { "%02x".format(it.toInt() and 0xff) }
+                                                }
+                                            }.getOrDefault("ERR")
+                                            if (len == 45522L) a45522++
+                                            if (md5pre == "cff4f5a5") cff4++
+                                            if (len == 45522L && md5pre == "cff4f5a5") gohit++
+                                            LogX.i("R86C FS cand tail=${f.absolutePath.takeLast(16)} " +
+                                                "len=$len md5pre=$md5pre")
+                                        }
+                                    }
+                                }
+                            }
+                            LogX.i("R86C FS verdict scanned=$scanned a45522=$a45522 " +
+                                "cff4=$cff4 hit=$gohit ambiguous=${gohit > 1}")
+                        }.onFailure { LogX.w("R86C FS err: ${it.javaClass.simpleName}") }
+                    }
+                }
+            )
+        }
+
+        // ---- R86 B2-a E3 · SCD-g9c com/tencent/mm/sdk/platformtools/g9.c(String,String,String)Map @0x4fd510 ----
+        // before 只读判断宿主传入的待解析 xml 串（hook 被宿主调用时的入参，绝不主动调 g9.c）。
+        // 各 key 只打是否存在 + 值长度（正则抠 key 后取 length），md5 只打前缀 8；不打完整 xml/aeskey。
+        guard("SCD-g9c") {
+            hookRobust(
+                "SCD-g9c", findCls("com.tencent.mm.sdk.platformtools.g9", cl), "c",
+                sig(
+                    "c",
+                    listOf("java.lang.String", "java.lang.String", "java.lang.String"),
+                    "java.util.Map",
+                ),
+                object : XC_MethodHook() {
+                    override fun beforeHookedMethod(param: MethodHookParam) {
+                        if (!enabled) return
+                        runCatching {
+                            val msig = sigOf(param)
+                            val xml = param.args?.getOrNull(0) as? String ?: ""
+                            val hasBig = xml.contains("cdnbigimgurl")
+                            val bigLen = Regex("cdnbigimgurl=\"([^\"]*)\"")
+                                .find(xml)?.groupValues?.getOrNull(1)?.length ?: -1
+                            val hasAes = xml.contains("aeskey")
+                            val hasMd5 = xml.contains("md5")
+                            val md5Pre = Regex("md5=\"([^\"]*)\"")
+                                .find(xml)?.groupValues?.getOrNull(1)?.take(8) ?: "NA"
+                            val has216b = xml.contains("216b1f7c")
+                            LogX.i(
+                                "SCD2 g9c in hasBig=$hasBig bigLen=$bigLen hasAes=$hasAes " +
+                                    "hasMd5=$hasMd5 md5Pre=$md5Pre has216b=$has216b msig=$msig"
+                            )
+                        }.onFailure { LogX.w("SCD2 g9c in err: ${it.javaClass.simpleName}") }
+                    }
+                }
+            )
+        }
+
         val ok = hookStatus.values.count { it }
         LogX.i("SCD installed ok=$ok fail=${hookStatus.size - ok} enabled=$enabled")
     }
@@ -373,12 +619,19 @@ object StockCdnProbe {
         LogX.i("SCD enabled=$on")
     }
 
+    /** R86c Q4b：P-FS 探针开关（仅本对象用；P-R0/P-R0ID 在 ForwardCdnFieldHook.turnProbe）。 */
+    fun turnR86c(on: Boolean) {
+        r86cEnabled = on
+        LogX.i("R86C FS enabled=$on")
+    }
+
     /** 无 sub 时回显：enabled/installed/ok/fail + 每 hook 一行 `SCD hook <code> OK|FAIL ...`。 */
     fun status(): List<String> {
         val snap = synchronized(hookStatus) { hookStatus.toList() }
         val ok = snap.count { it.second }
         val lines = ArrayList<String>(snap.size + 2)
         lines.add("SCD STATUS enabled=$enabled installed=$installed ok=$ok fail=${snap.size - ok}")
+        lines.add("R86C FS enabled=$r86cEnabled")
         for ((code, success) in snap) {
             val label = hookLabels[code] ?: "?"
             lines.add("SCD hook $code ${if (success) "OK" else "FAIL"} $label")

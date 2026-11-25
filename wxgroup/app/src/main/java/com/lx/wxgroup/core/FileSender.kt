@@ -157,7 +157,16 @@ object FileSender {
         // forwardCtx 为空 / 取不到有效 imgLocalId·msgSvrId ⇒ 不 arm，由 hook 闸门安全降级。
         forwardCtx?.let { ctx ->
             if (ctx.imgLocalId > 0L && ctx.msgSvrId > 0L) {
+                // R86c 第4轮：key 必须是目标会话 wxid（对应 task.field_talker）。
+                // ⛔ 绝不能用 ctx.sourceChat（源会话）—— 否则与 task.field_talker 100% 不匹配、真机零生效。
+                // 且必须在 arm(...) 之前登记：arm 只做只读探针，不登记 pending。
+                ForwardCdnFieldHook.markTarget(wxid)
                 ForwardCdnFieldHook.arm(ctx.sourceChat, ctx.msgSvrId, ctx.imgLocalId)
+                // R86b 态③最小步：b6step 探针开启时，用同款真实 ctx 参数自动 arm 一次 checkExist
+                // （默认关 ⇒ 零动作；只读、不调 j6/不发额外消息）。
+                // R86c armfix：a3 源 talker 用 srcTalkerPrefix.trimEnd(':')（sourceChat 恒空 ⇒ 真机零生效），
+                // field_talker 用目标 wxid（stock「toUser=目标会话」），srcMsgId 供 Q2 回退。
+                com.lx.wxgroup.probe.B6CheckExistProbe.armFromForward(ctx.srcTalkerPrefix.trimEnd(':'), ctx.msgSvrId, wxid, ctx.srcMsgId)
             }
         }
         val f = File(path)
@@ -248,13 +257,14 @@ object FileSender {
             // l1.a() 才是真正 execute（内部 modelbase/p1.g(cgi, 0)），返回是否入队成功
             val queued = XposedHelpers.callMethod(l1, "a") as? Boolean ?: false   // 845812
             if (!queued) {
+                ForwardCdnFieldHook.clear(wxid)   // R86c 第4轮：失败路径按 wxid 精确清 key
                 LogX.w("FileSender l1.a()=false kind=$kind wxid=${wxid.take(24)}")
                 return@runCatching false
             }
             LogX.i("FileSender queued kind=$kind wxid=${wxid.take(24)} path=${path.take(80)}")
             true
         }.onFailure {
-            ForwardCdnFieldHook.clear()   // R80 (a)：发送失败清 pending，防串味
+            ForwardCdnFieldHook.clear(wxid)   // R86c 第4轮：发送失败按 wxid 精确清 key，防串味
             LogX.w("FileSender send failed kind=$kind ${it.javaClass.simpleName}: ${it.message}")
         }.getOrDefault(false)
     }

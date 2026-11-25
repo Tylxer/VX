@@ -268,6 +268,57 @@ object EntryReceiver {
                             }
                         }
                     }
+                    // R86c Q4b 三只读探针（默认关、冷启静默、运行时广播开）。
+                    //   --es op r86c --es sub on|off|stat
+                    //   on/off 同时翻转 P-FS(StockCdnProbe.r86cEnabled) 与 P-R0/P-R0ID(ForwardCdnFieldHook.probeEnabled)。
+                    //   stat 回显两个 flag；取证完务必发 off（否则本进程持续打日志，冷启才复位）。
+                    "r86c" -> {
+                        val sub = intent.getStringExtra("sub") ?: "stat"
+                        when (sub) {
+                            "on" -> {
+                                com.lx.wxgroup.probe.StockCdnProbe.turnR86c(true)
+                                com.lx.wxgroup.core.ForwardCdnFieldHook.turnProbe(true)
+                                LogX.i("R86C OP on fs=true r0=true")
+                            }
+                            "off" -> {
+                                com.lx.wxgroup.probe.StockCdnProbe.turnR86c(false)
+                                com.lx.wxgroup.core.ForwardCdnFieldHook.turnProbe(false)
+                                LogX.i("R86C OP off fs=false r0=false")
+                            }
+                            else -> LogX.i(
+                                "R86C OP stat fs=${com.lx.wxgroup.probe.StockCdnProbe.r86cEnabled} " +
+                                    "r0=${com.lx.wxgroup.core.ForwardCdnFieldHook.probeEnabled}"
+                            )
+                        }
+                    }
+                    // R86b B6 checkExist 最小步只读取证探针（默认关，冷启静默，运行时广播开）。
+                    //   --es op b6step --es sub on|off|stat [--es talker <wxid>] [--el svrid <long>]
+                    //   sub=on：先 turn(true) 再 arm(talker, svrid)；缺 talker/svrid 打 WARN 说明缺参。
+                    //   sub=off：turn(false)；sub=stat/其它：回显 status()。
+                    // ⚠️ talker 用 --es（adb shell 会二次解析，值要包一层单引号）；svrid 用 --el（signed long）。
+                    // 本探针不持久化开关，与 StockCdnProbe 同：关掉后冷启即静默，Keys 不新增键。
+                    "b6step" -> {
+                        val sub = intent.getStringExtra("sub") ?: "stat"
+                        when (sub) {
+                            "on" -> {
+                                val talker = intent.getStringExtra("talker")
+                                val svrid = firstLong(intent, "svrid")
+                                com.lx.wxgroup.probe.B6CheckExistProbe.turn(true)
+                                if (talker.isNullOrBlank() || svrid <= 0L) {
+                                    LogX.w(
+                                        "ENTRY b6step on 缺参 talker=${talker ?: "null"} svrid=$svrid " +
+                                            "(需 --es talker <wxid> --el svrid <long>)"
+                                    )
+                                } else {
+                                    com.lx.wxgroup.probe.B6CheckExistProbe.arm(talker, svrid)
+                                }
+                            }
+                            "off" -> com.lx.wxgroup.probe.B6CheckExistProbe.turn(false)
+                            else -> for (l in com.lx.wxgroup.probe.B6CheckExistProbe.status()) {
+                                LogX.i(l)
+                            }
+                        }
+                    }
                     // R76 P3 字节落盘开关（仿 microimg / inp 写法）：
                     //   --es op p3 --es sub on|off；无 sub → 回显当前 enabled
                     //   --es op p3on / p3off → 直接开/关（真机反向对照用）
@@ -289,6 +340,20 @@ object EntryReceiver {
                     "p3off" -> {
                         Kv.putBool(Keys.FORWARD_P3_BIGIMG, false)
                         LogX.i("PROBE P3 enabled=false")
+                    }
+                    // R86c 第4轮独立开关（m1.e before / field_fullpath / 45522B/cff4f5a5），默认关、冷启静默。
+                    //   --es op hevc --es sub on|off|stat；无 sub/其它 → 回显 enabled + pending 数 + Key。
+                    // 只翻转 ForwardCdnFieldHook 的内存 @Volatile hevcEnabled（不写库、不写宿主）；
+                    // 启动默认值由 Keys.FORWARD_TASK_FULLPATH_HEVC 决定（默认 false）。
+                    "hevc" -> {
+                        val sub = intent.getStringExtra("sub") ?: "stat"
+                        when (sub) {
+                            "on" -> com.lx.wxgroup.core.ForwardCdnFieldHook.turn(true)
+                            "off" -> com.lx.wxgroup.core.ForwardCdnFieldHook.turn(false)
+                            else -> for (l in com.lx.wxgroup.core.ForwardCdnFieldHook.status()) {
+                                LogX.i(l)
+                            }
+                        }
                     }
                     // K9 验证期临时入口：设备里没有 sqlite3，改配置只能从模块内部写 Kv。
                     // 验证完随本分支一起删除。

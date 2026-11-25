@@ -13,6 +13,7 @@ import com.lx.wxgroup.core.ContactSync
 import com.lx.wxgroup.core.DexKitLocator
 import com.lx.wxgroup.core.HostContext
 import com.lx.wxgroup.core.FileSender
+// R86c 第4轮：复用已挂载的 ForwardCdnFieldHook m1.e before（install 在 bootstrap 接线）。
 import com.lx.wxgroup.core.ForwardCdnFieldHook
 import com.lx.wxgroup.core.FileSenderB
 import com.lx.wxgroup.core.TextSender
@@ -133,7 +134,11 @@ class HookEntry : IXposedHookLoadPackage {
         SendProbe.prepare(lpparam)
         TextSender.prepare(lpparam)
         FileSender.prepare(lpparam)
-        // R80 (a)：图片转发上传前补源 CDN fileId/aesKey（全局 m1.e hook，严格闸门只在本次转发生效）。
+        // R86c Q4b：恢复 ForwardCdnFieldHook 写 hook（m1.e before）。
+        // 依据 docs/_r86c_q4b_landing_spec.md：写点 B=m1.e before 复用（j2.O 在 m1.e 前写 fullpath，不覆盖），
+        // R80(a) 只换 fileId 已证伪，本次改为注入「内容 MD5=源图」的 originPath 写 field_fullpath（决定清晰/模糊的字节入口）。
+        // R86c 第4轮：复用既有 m1.e before（已挂，不新增第二 hook），命中目标即写 task.field_fullpath。
+        // 唯一权威规格：../docs/_r86c_r0e_route2_verdict.md 文首 R1-R4 + §3.1~§3.7。
         runCatching { ForwardCdnFieldHook.install(lpparam) }
             .onFailure { LogX.w("ForwardCdnFieldHook install failed: ${it.javaClass.simpleName}") }
         FileSenderB.prepare(lpparam)   // B 档探针：只在 op=forward sub=fileb 手动触发
@@ -361,6 +366,13 @@ class HookEntry : IXposedHookLoadPackage {
         // 只用 XposedHelpers 硬编码混淆名、不依赖 DexKit；全程 runCatching，默认静默。
         runCatching { com.lx.wxgroup.probe.StockCdnProbe.install(lpparam) }
             .onFailure { LogX.w("StockCdnProbe install failed: ${it.javaClass.simpleName}") }
+
+        // ---- R86b B6 checkExist 最小步只读取证探针（广播 op=b6step sub=on 才启用）----
+        // 只存 classLoader + 反射找类 + 记 status，不 hook 任何方法；下发 B8/m1.e 是唯一宿主调用，
+        // C2 回调只读打 field_exist_whencheck/field_filemd5，不调 j6、不发消息、不写宿主字段。
+        // 默认静默（enabled=false），不持久化，冷启即静默；Keys 不新增键。
+        runCatching { com.lx.wxgroup.probe.B6CheckExistProbe.install(lpparam) }
+            .onFailure { LogX.w("B6CheckExistProbe install failed: ${it.javaClass.simpleName}") }
 
         // ---- 6.3 红包：领取界面弹出时自动点「拆红包」（默认关）----
         runCatching {

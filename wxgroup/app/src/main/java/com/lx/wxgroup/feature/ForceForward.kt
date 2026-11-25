@@ -87,6 +87,93 @@ object NativeMenuGate {
 }
 
 /**
+ * R85 路线 A「严格判据止血」：把散在 6 处的三门槛收敛成单一准入判据（零 Android / Xposed
+ * 依赖，供 [R85P3AdmitTest] 纯 JVM 直接调，范式同 [NativeMenuGate]）。
+ *
+ * [admit] 短路判定，返回 null = 放行，非 null = 固定拒绝原因码（便于日志区分 A/B 两类失败）：
+ * 1. [no-exist]        文件不存在；
+ * 2. [th-prefix]       th_ 缩略图；
+ * 3. [below-floor]     大小 <= [FLOOR]（临时止血兜底，非法原图 15906B / 4320B 均落此档）；
+ * 4. [bad-shape]       strictShape 时相对尾段不匹配 [IMAGE2_RE]（路径非 image2 分桶形态）；
+ * 5. [magic-mismatch]  strictShape 时文件头 magic 与扩展名不符；
+ * 6. [thumb-sibling]   同目录存在 `th_<md5>*` 兄弟且 `length < SIBLING_RATIO * max(兄弟长度)`，
+ *                      或与某兄弟字节完全相同。
+ *
+ * 只读：不写任何文件 / 宿主字段，每次判定只做 File / Regex / FileInputStream 读操作。
+ * strictShape 仅在路径由代码自己拼（listener / p3OriginFromMd5）时传 true；接收记录里
+ * 来路不明绝对路径的调用点（p3SrcOf / copyP3Temp / p3ReadyPath）传 false，只走 1/2/3/6。
+ */
+object P3AdmitGate {
+    /** 兜底尺寸下限（临时止血值，非原则值）：真原图 335644B / 882950B 远大于它。 */
+    const val FLOOR = 64 * 1024L
+
+    /** 同桶兄弟比：由 21×（真原图）/ 3.7×（缩略图）标定。 */
+    const val SIBLING_RATIO = 8
+
+    /** 只匹配 MicroMsg/<hash>/ 之后的 image2 尾段；(?i) 让它兼容大写 md5。 */
+    private val IMAGE2_RE = Regex(
+        "(?i)^image2/[0-9a-f]{2}/[0-9a-f]{2}/[0-9a-f]{32}\\.(jpg|jpeg|png|webp)$"
+    )
+
+    /**
+     * 准入判定。null = 放行；非 null = 拒绝原因码。
+     */
+    fun admit(f: File, strictShape: Boolean): String? {
+        if (!f.exists()) return "no-exist"
+        if (f.name.startsWith("th_")) return "th-prefix"
+        if (f.length() <= FLOOR) return "below-floor"
+        if (strictShape) {
+            val tail = relativeImage2Tail(f)
+            if (tail == null || !IMAGE2_RE.matches(tail)) return "bad-shape"
+            if (!magicMatchesExt(f)) return "magic-mismatch"
+        }
+        return siblingReason(f)
+    }
+
+    /** 取绝对路径中 `image2/` 起始的尾段，不硬编码 MicroMsg/<hash>（兼容 \ 与 /）。 */
+    private fun relativeImage2Tail(f: File): String? {
+        val path = f.absolutePath.replace('\\', '/')
+        val idx = path.lastIndexOf("image2/")
+        return if (idx >= 0) path.substring(idx) else null
+    }
+
+    /** 只读前 16 字节判 magic：JPEG FF D8 FF / PNG 89 50 4E 47 / WebP RIFF....WEBP。 */
+    private fun magicMatchesExt(f: File): Boolean {
+        val buf = ByteArray(16)
+        val n = runCatching { FileInputStream(f).use { it.read(buf) } }.getOrDefault(-1)
+        if (n < 3) return false
+        return when (f.name.substringAfterLast('.', "").lowercase()) {
+            "jpg", "jpeg" ->
+                n >= 3 && buf[0] == 0xFF.toByte() && buf[1] == 0xD8.toByte() && buf[2] == 0xFF.toByte()
+            "png" ->
+                n >= 4 && buf[0] == 0x89.toByte() && buf[1] == 0x50.toByte() &&
+                    buf[2] == 0x4E.toByte() && buf[3] == 0x47.toByte()
+            "webp" ->
+                n >= 12 && String(buf, 0, 4, Charsets.US_ASCII) == "RIFF" &&
+                    String(buf, 8, 4, Charsets.US_ASCII) == "WEBP"
+            else -> false
+        }
+    }
+
+    /** 同桶 `th_<md5>*` 兄弟判定：长度比不足或与兄弟字节全同 ⇒ thumb-sibling，否则放行。 */
+    private fun siblingReason(f: File): String? {
+        val md32 = Regex("([0-9a-fA-F]{32})").find(f.name)?.groupValues?.get(1) ?: return null
+        val siblings = f.parentFile?.listFiles()?.filter {
+            it.name.startsWith("th_$md32") && it.name != f.name && it.exists()
+        }?.takeIf { it.isNotEmpty() } ?: return null
+        val siblingMaxLen = siblings.maxOf { it.length() }
+        if (f.length() < SIBLING_RATIO * siblingMaxLen) return "thumb-sibling"
+        if (siblings.any { identical(f, it) }) return "thumb-sibling"
+        return null
+    }
+
+    /** 字节全同：先比长度（廉价），再逐字节比对，任一读失败按「不同」安全处理。 */
+    private fun identical(a: File, b: File): Boolean =
+        a.length() == b.length() &&
+            runCatching { a.readBytes().contentEquals(b.readBytes()) }.getOrDefault(false)
+}
+
+/**
  * 需求 6.6「强制转发」的 hook 侧：聊天页长按消息菜单里追加一项「转发（模块）」。
  *
  * 纯判据（菜单归类 / 目标展开 / 降级策略 / 汇总文案）全部在 [ForwardLogic]（零 Android
@@ -2360,7 +2447,7 @@ object ForceForward {
                         val path = p3SrcOf(img) ?: p3OriginFromMd5(img, p3SrcLocalPath)
                         val ok = !path.isNullOrBlank() && runCatching {
                             val f = File(path)
-                            f.exists() && f.length() > 15 * 1024 && !f.name.startsWith("th_")
+                            P3AdmitGate.admit(f, true) == null
                         }.getOrDefault(false)
                         if (ok && path != null) {
                             // P0-1：先写 path 后置 ready（Volatile 双侧屏障，读者判 ready 时 path 必就位）
@@ -2394,7 +2481,7 @@ object ForceForward {
         }
     }
 
-    /** 从 ImgInfo2 里挑一个存在且 >15KB 的非 th_ 大图路径（只读，不写回）。 */
+    /** 从 ImgInfo2 里挑一个经 P3AdmitGate 准入的大图路径（只读，不写回）。 */
     private fun p3SrcOf(img: Any?): String? {
         if (img == null) return null
         return runCatching {
@@ -2406,7 +2493,7 @@ object ForceForward {
                 .firstOrNull { p ->
                     p.startsWith("/") && runCatching {
                         val f = File(p)
-                        f.exists() && f.length() > 15 * 1024 && !f.name.startsWith("th_")
+                        P3AdmitGate.admit(f, false) == null
                     }.getOrDefault(false)
                 }
         }.getOrNull()
@@ -2444,6 +2531,11 @@ object ForceForward {
             val rootHit = Regex("/MicroMsg/[0-9a-fA-F]{32}/").find(localPath)
                 ?: return@runCatching null
             val root = localPath.substring(0, rootHit.range.last + 1)
+            var lastReason: String? = null
+            // Q6 诊断（只观测，不改逻辑）：与 lastReason 同刻记录，防多候选时张冠李戴
+            var lastAttemptedFile: File? = null
+            var lastMd5: String? = null
+            var lastPath: String? = null
             for (candidate in candidates) {
                 val m = nameRe.find(candidate) ?: continue
                 val md5 = m.groupValues[1]
@@ -2452,14 +2544,27 @@ object ForceForward {
                 val ext = m.groupValues[2].ifBlank { "jpg" }.lowercase()
                 // c. 按 image2 两位分桶拼原图绝对路径
                 val path = root + "image2/${md5.substring(0, 2)}/${md5.substring(2, 4)}/$md5.$ext"
-                // d. 三门槛（存在 + >15KB + 非 th_）通过才认，否则继续找 / 降级
+                // d. 严格判据：gate 放行才认；否则记下 reason 继续找 / 降级，末尾统一打出可区分的码
                 val f = File(path)
-                if (f.exists() && f.length() > 15 * 1024 && !f.name.startsWith("th_")) {
+                val reason = P3AdmitGate.admit(f, true)
+                if (reason == null) {
                     LogX.i("FORWARD P3 origin-by-md5 path=${path.takeLast(24)} size=${f.length()}")
                     return@runCatching path
                 }
+                lastReason = reason
+                lastAttemptedFile = f
+                lastMd5 = md5
+                lastPath = path
             }
-            LogX.w("FORWARD P3 origin-by-md5 miss reason=thresholds")
+            // Q6 诊断：只追加观测字段；reason/gate 同取 lastReason，不打完整 hash/路径
+            val attempt = lastAttemptedFile
+            val gateCode = lastReason ?: "no-candidate"
+            LogX.w("FORWARD P3 origin-by-md5 miss reason=$gateCode " +
+                "md5Head=${lastMd5?.take(8) ?: "-"} " +
+                "pathTail=${lastPath?.takeLast(40) ?: "-"} " +
+                "exists=${attempt?.exists()?.toString() ?: "-"} " +
+                "size=${if (attempt?.exists() == true) attempt.length().toString() else "-"} " +
+                "gate=$gateCode cand=${candidates.size}")
             null
         }.onFailure {
             LogX.w("FORWARD P3 origin-by-md5 err: ${it.javaClass.simpleName}")
@@ -2470,7 +2575,7 @@ object ForceForward {
      * 每目标一份独立临时大图文件：从只读源复制字节到 `cacheDir/_<uuid>.jpg`。
      *
      * 写入用 `<uuid>.part` → flush() + close()（`use`）→ renameTo，避免半截文件被读；
-     * 复制后复核 >15KB，否则删掉返回 null。路径根取宿主 application cacheDir（取不到降级 null，
+     * 复制后走 P3AdmitGate 复核，不通过则删掉返回 null。路径根取宿主 application cacheDir（取不到降级 null，
      * 绝不硬编码 `/data/data/<pkg>/cache`）；文件名 `_<uuid>` 不会被 resolveImagePath 当候选图。
      */
     private fun copyP3Temp(src: String?): String? {
@@ -2480,10 +2585,10 @@ object ForceForward {
             return null
         }
         val srcFile = runCatching { File(src) }.getOrNull() ?: return null
-        // 准入三门槛：存在 + >15KB + 非 th_ 前缀（来源只读可共享）
-        val admitted = srcFile.exists() && srcFile.length() > 15 * 1024 && !srcFile.name.startsWith("th_")
-        if (!admitted) {
-            LogX.w("FORWARD P3 copy skip: source fails thresholds name=${srcFile.name.take(24)}")
+        // 准入判据：接受记录里来路不明的绝对路径，strictShape=false，只走 1/2/3/6（来源只读可共享）
+        val reason = P3AdmitGate.admit(srcFile, false)
+        if (reason != null) {
+            LogX.w("FORWARD P3 copy skip: reason=$reason name=${srcFile.name.take(24)}")
             return null
         }
         val uuid = UUID.randomUUID().toString().replace("-", "")
@@ -2501,9 +2606,10 @@ object ForceForward {
                 runCatching { part.delete() }
                 return@runCatching null
             }
-            // 复制后复核 >15KB，否则删掉返回 null，不留半截文件
-            if (!temp.exists() || temp.length() <= 15 * 1024) {
-                LogX.w("FORWARD P3 verify failed size=${temp.length()}")
+            // 复制后复核，gate 拒绝则删掉返回 null，不留半截文件（仍带具体 reason）
+            val verifyReason = P3AdmitGate.admit(temp, false)
+            if (verifyReason != null) {
+                LogX.w("FORWARD P3 verify failed reason=$verifyReason size=${temp.length()}")
                 runCatching { temp.delete(); part.delete() }
                 return@runCatching null
             }
@@ -2630,14 +2736,14 @@ object ForceForward {
         // R73-转发上下文：追加第 5 参 snap，补齐 m.b/q1.r/q1.j；snap 内三字段取不到时全为空，
         // FileSender 侧逐项跳过 ⇒ 与修复前逐字节相同。
         // R76 P3 字节落盘：本目标独立临时大图路径，作为第 6 参 bigImgPath 传给 FileSender。
-        // P0-1 两态判定（plan §5.3）：回调 ready + 三门槛都过 ⇒ 用「下载后」回读的新路径；
+        // P0-1 两态判定（plan §5.3）：回调 ready + P3AdmitGate 准入 ⇒ 用「下载后」回读的新路径；
         // 否则回退触发当刻的同步快照 p3BigImgSrc（含 snap.srcBigImgPath/null，现状），绝不写坏路径。
         // 开关关 ⇒ null（FileSender 侧整块跳过，逐字节不变）。前 5 参取值一律不动。
         val p3ReadyPath = if (p3BigImgReady) {
             p3BigImgPath?.takeIf { p ->
                 runCatching {
                     val f = File(p)
-                    f.exists() && f.length() > 15 * 1024 && !f.name.startsWith("th_")
+                    P3AdmitGate.admit(f, false) == null
                 }.getOrDefault(false)
             }
         } else null

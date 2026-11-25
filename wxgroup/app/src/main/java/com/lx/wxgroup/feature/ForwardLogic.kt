@@ -1,5 +1,6 @@
 package com.lx.wxgroup.feature
 
+import com.lx.wxgroup.data.Friend
 import com.lx.wxgroup.data.MediaGuardLogic
 
 /**
@@ -223,6 +224,30 @@ object ForwardLogic {
         for (r in roots) walk(r, 0)
         return if (bestDepth >= 0) MenuBoxCandidate(bestBox, bestSample) else null
     }
+
+    // ------------------------------------------------------------------ 选人器好友白名单
+
+    /** 转发选人器「好友」段白名单：文件传输助手在微信库里是 UNKNOWN=9，不是真好友，但要能选 */
+    const val PICKER_FILE_HELPER_WXID = "filehelper"
+    const val PICKER_FILE_HELPER_NAME = "文件传输助手"
+
+    /**
+     * 转发选人器「好友」段的数据源判据：真好友 + 白名单里的文件传输助手。
+     *
+     * 文件传输助手在 rcontact 里 type=UNKNOWN(9)、昵称常为空，`isRealFriend` 恒 false，
+     * 旧的「只看 FRIEND」过滤会把它整个漏掉。这里显式放行它，其余规则不变：
+     * - `exclude`（一般是当前会话）仍排除；
+     * - 其它 UNKNOWN 系统号（如 weixin）、CHATROOM、公众号仍不进好友段；
+     * - 保持 [all] 原顺序；去重由调用方/数据库负责，这里不写库、不新增状态。
+     */
+    fun pickerFriends(all: List<Friend>, exclude: Set<String>): List<Friend> =
+        all.filter { f ->
+            f.wxid !in exclude && (f.isRealFriend || f.wxid == PICKER_FILE_HELPER_WXID)
+        }
+
+    /** 选人器「好友」段显示名：文件传输助手昵称常为空，固定显示中文名，其它行走正常优先级。 */
+    fun pickerDisplayName(f: Friend): String =
+        if (f.wxid == PICKER_FILE_HELPER_WXID) PICKER_FILE_HELPER_NAME else f.displayName
 
     // ------------------------------------------------------------------ 目标去重
 

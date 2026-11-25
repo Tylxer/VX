@@ -190,6 +190,16 @@ object Keys {
     const val FORWARD_P3_BIGIMG = "chat.forward_p3_bigimg"
 
     /**
+     * R86c 第4轮最终规格：复用已挂载的 `ok0/m1.e(tj/k)Z` before，从 `task.field_fullpath`
+     * 现场枚举唯一 45522B / 内容 MD5 前 8 = cff4f5a5 的 `.jpg_hevc` 字节，只写 task.field_fullpath。
+     *
+     * **默认 false（关）**：新链未经真机验证，默认关保证行为与现状逐字节一致。
+     * 广播 `op=hevc sub=on|off|stat` 运行时翻转（不持久化）；冷启按此默认值复位（静默）。
+     * 不经 P3AdmitGate / 不改 FLOOR / 不调 b1.u8 / 不动 q1.j / 不碰 DB。
+     */
+    const val FORWARD_TASK_FULLPATH_HEVC = "chat.forward_task_fullpath_hevc"
+
+    /**
      * 收到图片消息时**自动把原图下载下来**（不用手点「查看原图」）。
      *
      * 判定「是否已有原图」用 `ImgInfo.t == 1`（微信自己的 `AutoGetBigImgLogic` 用的
@@ -523,6 +533,10 @@ object Prefs {
         PrefSpec(
             Keys.FORWARD_P3_BIGIMG, PrefKind.SWITCH, "true", "聊天",
             "P3 字节落盘：转发图片预热下载原图+独立临时大图（修复，默认开；可关掉做反向对照）"
+        ),
+        PrefSpec(
+            Keys.FORWARD_TASK_FULLPATH_HEVC, PrefKind.SWITCH, "false", "聊天",
+            "转发图片清晰度：m1.e before 注入唯一 45522B/cff4f5a5 hevc（实验，默认关；未真机终审）"
         ),
         PrefSpec(
             Keys.CHAT_CONV_MENU_ENABLED, PrefKind.SWITCH, "true", "聊天",

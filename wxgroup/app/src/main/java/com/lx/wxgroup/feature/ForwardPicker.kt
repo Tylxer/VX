@@ -195,12 +195,12 @@ class ForwardPicker(
 
         // Tab1 好友·群聊：一次全量查询后按 wxid_type 拆两段（好友在前、群聊在后）
         val all = runCatching { db.allFriends() }.getOrDefault(emptyList())
-        val friends = all.filter { it.type == GroupDb.WxidType.FRIEND && it.wxid !in exclude }
+        val friends = ForwardLogic.pickerFriends(all, exclude)
         val rooms = all.filter { it.type == GroupDb.WxidType.CHATROOM && it.wxid !in exclude }
         val contact = ArrayList<PickerPage.Section>(2)
         if (friends.isNotEmpty()) {
             contact.add(
-                PickerPage.Section("好友", friends.map { PickerPage.Item(it.wxid, it.displayName, it.wxid) })
+                PickerPage.Section("好友", friends.map { PickerPage.Item(it.wxid, ForwardLogic.pickerDisplayName(it), it.wxid) })
             )
         }
         if (rooms.isNotEmpty()) {
