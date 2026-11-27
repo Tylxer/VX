@@ -327,4 +327,28 @@ class HintBadgeLogicTest {
         val row = node(1440, 188, 0, 206, children = listOf(node(1440, 188, 0, 0)))
         assertFalse(HintBadgeLogic.alignToEnd(listOf(row)))
     }
+
+    // ---------------------------------------------------------------- R21d F3 关开关清理集
+
+    @Test
+    fun f3CleanupTargetsIgnoreEmptyBound() {
+        // ⭐ 现场 bound=0（判据 A 实测）：残留角标所在 view 早已被 `:349` 清出 bound，
+        // 且 `ensure(false)` 在 `:664` 未 attach 静默失败没真摘。
+        // 清集必须仍含这个 view ⇒ 关开关能摘掉；若清集取 bound（旧缺陷）则为空 ⇒ 残留不消失。
+        val boundAtScene = emptySet<String>()
+        val badgedViews = setOf("residual-item-view")
+        assertEquals(
+            setOf("residual-item-view"),
+            HintBadgeLogic.cleanupTargetsOnDisable(boundAtScene, badgedViews)
+        )
+    }
+
+    @Test
+    fun f3CleanupTargetsKeepAllBadgedWhenBoundHasOtherViews() {
+        // bound 非空也不缩减清集：只要挂过角标就清；bound 里那些由 sweep 另行重判。
+        assertEquals(
+            setOf("v1", "v2"),
+            HintBadgeLogic.cleanupTargetsOnDisable(setOf("v2", "v3"), setOf("v1", "v2"))
+        )
+    }
 }
