@@ -135,8 +135,8 @@ object MuteAt {
 internal object QuietNotificationBridge {
 
     private const val ITEM_CLASS = "com.tencent.mm.booter.notification.NotificationItem"
-    private const val MUTE_CHANNEL_ID = "wxgroup_silent"
-    private const val MUTE_CHANNEL_NAME = "静音通知（分组模块）"
+    private val MUTE_CHANNEL_ID get() = MuteChannelId.VALUE
+    private val MUTE_CHANNEL_NAME get() = MuteChannelId.NAME
     private const val MUTE_WINDOW_MS = 1200L
     private const val LOG_THROTTLE_MS = 1000L
     private const val MAX_TRACKED = 256
@@ -371,7 +371,7 @@ internal object QuietNotificationBridge {
                 val channel = NotificationChannel(
                     MUTE_CHANNEL_ID,
                     MUTE_CHANNEL_NAME,
-                    NotificationManager.IMPORTANCE_HIGH,
+                    MuteChannelId.IMPORTANCE_LEVEL,
                 ).apply {
                     setSound(null, null)
                     enableVibration(false)
