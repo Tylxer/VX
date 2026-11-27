@@ -28,7 +28,8 @@ import java.util.concurrent.atomic.AtomicInteger
  *    observer 被动接收。
  * 3. **「置免打扰」怎么落** —— 同样取自「通知静音」章节实证：响铃/震动由系统按
  *    channel 播放，正解是把通知的 `mChannelId` 反射改写成自建静音通道
- *    （IMPORTANCE_HIGH + setSound(null) + enableVibration(false)），通知栏/角标原样。
+ *    （低 importance + setSound(null) + enableVibration(false)），不响不振、不弹横幅、下拉可见。
+ *    通道 id / importance 单一真源见 [MuteChannelId]（现役 `wxgroup_silent_low` / LOW=2）。
  *    → 本类只做「登记」，静音改写完全复用 QuietNotificationBridge（与 DND 时段
  *    / 被@静音同一条通道），**不写微信任何数据、不调任何未实证的微信 API**。
  *
