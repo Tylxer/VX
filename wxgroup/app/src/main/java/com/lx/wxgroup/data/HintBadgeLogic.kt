@@ -86,6 +86,20 @@ object HintBadgeLogic {
         return if (Character.isHighSurrogate(last)) s.substring(0, s.length - 1) else s
     }
 
+    // ---------------------------------------------------------------- R21d F3 修法判据
+
+    /**
+     * F3 关开关时的清理集（R21d 第二缺陷修法）。
+     *
+     * 清集必须是「曾挂过角标的 view」全集 [badgedViews]，**刻意忽略 [boundViews]**：
+     * 现场 `bound=0`，残留角标所在 view 早已被闸门失败路径从 `bound` 移除，
+     * 靠 `bound` 的 sweep 永远扫不到它。若清集取 `boundViews`（= 旧缺陷），
+     * `boundViews` 空 ⇒ 清集空 ⇒ 关开关角标不消失。
+     *
+     * 这里用泛型 Set 而非 View，使「不依赖 bound」这条语义能在 JVM 单测里被变异验证锁住。
+     */
+    fun <T> cleanupTargetsOnDisable(boundViews: Set<T>, badgedViews: Set<T>): Set<T> = badgedViews
+
     // ---------------------------------------------------------------- 角标锚点（纯判据）
 
     /**

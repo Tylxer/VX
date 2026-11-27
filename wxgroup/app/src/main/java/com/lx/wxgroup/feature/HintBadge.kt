@@ -21,9 +21,11 @@ import de.robv.android.xposed.XC_MethodHook
 import de.robv.android.xposed.XposedBridge
 import de.robv.android.xposed.XposedHelpers
 import de.robv.android.xposed.callbacks.XC_LoadPackage
+import java.lang.ref.WeakReference
 import java.lang.reflect.Field
 import java.lang.reflect.Method
 import java.lang.reflect.Modifier
+import java.util.ArrayDeque
 import java.util.Collections
 import java.util.WeakHashMap
 import java.util.concurrent.atomic.AtomicBoolean
@@ -141,6 +143,45 @@ object HintBadge {
     private val bound: MutableMap<View, Long> =
         Collections.synchronizedMap(WeakHashMap<View, Long>())
 
+    /**
+     * F3（R21d 第二缺陷）：「曾真正挂上过角标」的 view 登记，与 [bound] **完全解耦**。
+     *
+     * [bound] 会被每条闸门失败路径（`:349` 等）先 `remove`，而残留角标那一刻
+     * `ensure(false)` 又因 view 未 attach 静默失败（`:664`），于是角标留在子树上、view 却不在
+     * [bound] 里 ⇒ sweep 永远扫不到、关开关也清不掉。本登记只增不减（view 死了由 WeakHashMap
+     * 自行回收），所以关开关时按 MARK tag 清理仍能找到那枚残留角标的宿主。
+     */
+    private val badgedViews: MutableMap<View, Boolean> =
+        Collections.synchronizedMap(WeakHashMap<View, Boolean>())
+
+    // ------------------------------------------------------------------ 观测增强 E（只读，不改判据）
+    //
+    // 核心矛盾（见 docs/_r21d_dump_enhance_note.md）：dump() 原本遍历 bound，而 bound=0 时
+    // 逐条行为空（现场真机实证）。观测数据必须不依赖 bound 存活。
+    // - rvRef/adapterRef：在 bindHook 包装层捕获的弱引用，dump 时据此枚举"屏幕当前可见 child"。
+    // - ring：与 bound 完全独立的**强引用、有界**环形缓冲（仅记命中台账/fake 的 bind），
+    //   作为列表弱引用失效时的兜底数据源。文案一律回 View 实读，不存台账现算文案。
+
+    /** 聊天列表 View（弱引用，绝不钉住宿主） */
+    @Volatile private var rvRef: WeakReference<View>? = null
+
+    /** 聊天 adapter 实例（弱引用），dump 时复用 getItem(pos) 拿 h9 */
+    @Volatile private var adapterRef: WeakReference<Any>? = null
+
+    private class ObsRec(
+        val view: View,          // 强引用，但受 RING_MAX 封顶
+        val msgId: Long,
+        val pos: Int,
+        val type: Int?,
+        val curTalker: String?,
+        val ledTalker: String?,
+        val origType: Int?,
+        val origContent: String?
+    )
+
+    private val ring = ArrayDeque<ObsRec>()
+    private const val RING_MAX = 24
+
     private val mainHandler by lazy { Handler(Looper.getMainLooper()) }
 
     // ------------------------------------------------------------------ 安装
@@ -151,7 +192,10 @@ object HintBadge {
 
         // ① 基类上声明的实现（q0 不覆写 ⇒ 活钩）
         runCatching { XposedHelpers.findClass(ADAPTER_CLASS, cl) }
-            .onSuccess { hooked += hookAdapterClass(it) }
+            .onSuccess {
+                hooked += hookAdapterClass(it)
+                hooked += hookDetachCallbacks(it) // F2：detach/recycled 按 MARK 清残留
+            }
             .onFailure { LogX.w("HINTBADGE: $ADAPTER_CLASS not found") }
 
         // ② 兜底：setAdapter 抓具体 adapter 类再补挂（当前版本 q0 无覆写 ⇒ 预期无新增）
@@ -186,6 +230,34 @@ object HintBadge {
             if (runCatching { XposedBridge.hookMethod(m, bindHook) }.isSuccess) n++
         }
         if (n > 0) LogX.i("HINTBADGE hooked adapter=${c.name} +$n")
+        return n
+    }
+
+    /**
+     * F2：在聊天 adapter 基类 `q3` 自己声明的 detach/recycled 回调上挂钩。
+     *
+     * 【dex 实证·classes4.dex】`q3` 声明了 `onViewDetachedFromWindow(holder)` 与
+     * `onViewRecycled(holder)`（非 native、有方法体、`const-string "holder"` + Intrinsics 空检 +
+     * `invoke-super w1->...` + 委派字段 `f`）；全 dex `q3` 只有 `q0` 一个子类且 `q0` 不覆写这两个
+     * 方法 ⇒ 在 `q3` 上挂钩即活钩。holder 与 `onBind` 同一个 ViewHolder ⇒ 复用 [itemViewOf]。
+     *
+     * `androidx.recyclerview.widget.w1`（重打包 RecyclerView.Adapter）的同名回调是空 `return-void`，
+     * 所以不能挂 `w1`（会命中一堆无关列表）；挂 `q3` 天然限定到聊天列表。
+     */
+    private fun hookDetachCallbacks(c: Class<*>): Int {
+        var n = 0
+        for (name in arrayOf("onViewDetachedFromWindow", "onViewRecycled")) {
+            val m = runCatching {
+                c.methods.firstOrNull {
+                    it.name == name && !Modifier.isStatic(it.modifiers) &&
+                        !it.isBridge && it.parameterTypes.size == 1
+                }
+            }.getOrNull() ?: continue
+            val key = "F2#${m.declaringClass.name}#$name"
+            if (!hookedMethods.add(key)) continue
+            if (runCatching { XposedBridge.hookMethod(m, detachHook) }.isSuccess) n++
+        }
+        if (n > 0) LogX.i("HINTBADGE hooked detach=${c.name} +$n")
         return n
     }
 
@@ -237,7 +309,13 @@ object HintBadge {
         cfgAt = SystemClock.elapsedRealtime()
         setAt = 0L // 顺手让台账也重读
         forceSet = emptySet()
-        if (!enabled) ensureSweep()
+        if (!enabled) {
+            // F3：sweep 只认 bound，而现场 bound=0 ⇒ 残留角标清不掉。
+            // 先按独立登记 badgedViews 全量摘一遍（不依赖 bound），再让 ensureSweep
+            // 处理仍在 bound 里、由 sweep 视角可见的 view。
+            clearAllBadges()
+            ensureSweep()
+        }
     }
 
     private fun on(): Boolean {
@@ -255,6 +333,8 @@ object HintBadge {
             if (d >= 4) return // 只防真递归
             depth.set(d + 1)
             try {
+                // 观测增强 E（钩子包装层，非 onBind 本体；不改贴/摘判定）
+                runCatching { observeBind(param) }
                 runCatching { onBind(param) }
                     .onFailure { t ->
                         if (errLogged.get() < 3 && errLogged.incrementAndGet() <= 3) {
@@ -265,6 +345,29 @@ object HintBadge {
             } finally {
                 if (d == 0) depth.remove() else depth.set(d)
             }
+        }
+    }
+
+    /**
+     * F2：itemView detach / ViewHolder recycled 时按 MARK 清角标（根治 View 复用残留）。
+     *
+     * 与 F1 互为兜底：F1 的 post 重试只在 view「稍后还会 attach」时有效；detach 后若该 view
+     * 被回收到池里、再用于别的消息，残留角标仍挂在子树上。这里直接改 child 列表
+     * （复用 F3 的 [stripBadges]，不检查 attach），detach/recycled 态同样生效。
+     *
+     * 幂等：先看 F3 的独立登记 [badgedViews]（没挂过角标直接跳过）；[stripBadges] 递归摘
+     * 所有 `tag==MARK` 的 TextView，第二次调用自然摘不到，天然幂等。
+     */
+    private val detachHook = object : XC_MethodHook() {
+        override fun afterHookedMethod(param: MethodHookParam) {
+            runCatching {
+                val holder = param.args?.getOrNull(0) ?: return
+                val iv = itemViewOf(holder) ?: return
+                if (!synchronized(badgedViews) { badgedViews.containsKey(iv) }) return
+                val n = stripBadges(iv)
+                synchronized(bound) { bound.remove(iv) }
+                if (n > 0) logOnce("HINTBADGE F2 ${param.method.name} stripped=$n")
+            }.onFailure { logOnce("HINTBADGE F2 detach err: ${it.javaClass.simpleName}") }
         }
     }
 
@@ -280,7 +383,10 @@ object HintBadge {
         val pos = param.args?.getOrNull(1) as? Int ?: return
         chatBinds++
         if (!on()) {
-            runCatching { itemViewOf(holder)?.let { ensure(it, false, "") } }
+            // F1：开关关了也要走 post 重试摘（未 attach 时 ensure 静默失败）。
+            // post 复查 on()：若排队期间开关又被打开，交给新一轮 bind 按台账重判，
+            // 不让这条旧摘请求把刚贴上的角标摘掉。
+            runCatching { itemViewOf(holder)?.let { unbadge(it) { !on() } } }
             return
         }
 
@@ -296,7 +402,7 @@ object HintBadge {
         if (h9 == null) {
             // header/footer 位置：正常跳过（不是失败），但顺手摘掉旧角标
             bound.remove(itemView)
-            runCatching { ensure(itemView, false, "") }
+            unbadge(itemView) { !bound.containsKey(itemView) }
             return
         }
         val msgId = msgIdOf(h9)
@@ -304,7 +410,7 @@ object HintBadge {
             missed++
             lastMiss = "nomsgid(${h9.javaClass.simpleName})"
             bound.remove(itemView)
-            runCatching { ensure(itemView, false, "") }
+            unbadge(itemView) { !bound.containsKey(itemView) }
             return
         }
         val h9Type = typeOf(h9) ?: -1
@@ -315,7 +421,7 @@ object HintBadge {
         if (!forced && rescued == null) {
             // 不是被救消息：摘掉可能残留的旧角标（item 复用）
             bound.remove(itemView)
-            runCatching { ensure(itemView, false, "") }
+            unbadge(itemView) { !bound.containsKey(itemView) }
             return
         }
         hits++ // 命中 rescued（或 fake），在闸门之前自增（诊断用）
@@ -348,7 +454,7 @@ object HintBadge {
                     )
                 }
                 bound.remove(itemView)
-                runCatching { ensure(itemView, false, "") }
+                unbadge(itemView) { !bound.containsKey(itemView) }
                 return
             }
             // 类型闸门：伪装态（restore_view）没有「原文气泡」，抑制角标
@@ -356,7 +462,7 @@ object HintBadge {
                 masked++
                 lastMiss = "masked(type=$h9Type orig=${rescued.origType})"
                 bound.remove(itemView)
-                runCatching { ensure(itemView, false, "") }
+                unbadge(itemView) { !bound.containsKey(itemView) }
                 return
             }
             // 文本对账：只对文本消息，宁可 missed 不打错
@@ -385,7 +491,7 @@ object HintBadge {
                         )
                     }
                     bound.remove(itemView)
-                    runCatching { ensure(itemView, false, "") }
+                    unbadge(itemView) { !bound.containsKey(itemView) }
                     return
                 }
             }
@@ -584,7 +690,19 @@ object HintBadge {
             val show = forced || hit != null
             val text = hit?.let { HintTextLogic.badgeText(it.origType, it.origContent) }
                 ?: HintTextLogic.BADGE_ONLY
-            ensure(v, show, text)
+            if (show) {
+                ensure(v, true, text)
+            } else {
+                // F1：sweep 的摘也走 post 重试；post 复查「此刻仍不该显示」，
+                // 避免排队期间开关打开/台账回来了，还把角标摘掉（下一轮 sweep 会重判）。
+                unbadge(v, text) {
+                    if (!on()) true
+                    else {
+                        val now = rescued()
+                        now[id] == null && id !in forceSet
+                    }
+                }
+            }
         }
     }
 
@@ -613,6 +731,27 @@ object HintBadge {
             // ⚠️ 复核 F1：重试闭包必须**重新查一次开关**。原来无条件重放 ensure(host,true,...)，
             // 若在这条 post 排队期间开关被关掉，会逆着开关把角标贴回去。
             host.post { runCatching { if (on()) ensure(host, true, text) } }
+        }
+    }
+
+    /**
+     * F1：把「摘角标」调用的 post 重试做得和 [apply] 的贴角标重试**对称**。
+     *
+     * `ensure()` 在 `!target.isAttachedToWindow` 时直接 return false（原 `:664`，现 [ensure] 内），
+     * 而六条闸门失败路径都先 `bound.remove(itemView)` 再调 `ensure(false)`：登记先清、View 没摘，
+     * 于是角标随 itemView 复用漂到别的消息。这里对齐 `apply`：`ensure(false)` 失败就 post 一帧再摘。
+     *
+     * ⚠️ `View.post` 在 detach 态 Runnable 进 `HandlerActionQueue`，**等 view 下次 attach 才执行** ——
+     * 这正是 F1 覆盖的「bind 当帧未 attach、稍后 attach」窗口；detach 后永不再 attach 的情况
+     * 交给 F2（按 MARK 直接改 child 列表，不依赖 attach）。
+     *
+     * @param stillWanted post 执行前复查。排队期间开关可能关了 / 该 view 可能已被新一轮 bind
+     *   重新登记，此时放弃这次摘，避免与 F3 关开关清理及新 bind 打架。默认恒真；摘路径只调
+     *   `ensure(view,false,text)`（纯摘），**绝不把角标贴回去**。
+     */
+    private fun unbadge(view: View, text: String = "", stillWanted: () -> Boolean = { true }) {
+        if (!ensure(view, false, text)) {
+            view.post { runCatching { if (stillWanted()) ensure(view, false, text) } }
         }
     }
 
@@ -652,6 +791,7 @@ object HintBadge {
                     .onFailure { logOnce("HINTBADGE relayout failed: ${it.javaClass.simpleName}") }
             }
             if (existing.text?.toString() != text) existing.text = text
+            markBadged(host) // F3：复用路径也确认子树里有角标，登记进独立清理集
             return true
         }
         val tv = TextView(target.context).apply {
@@ -696,6 +836,7 @@ object HintBadge {
         //    `addBadgeBelowMessageRow` 是静默 no-op，若照样自增，验收脚本拿到的
         //    角标数会比屏幕上实际可见的多 ⇒ 判据「角标数 == 被救消息数」假阳性。
         if (!ok) return false
+        markBadged(host) // F3：角标确已挂上 ⇒ 登记，关开关时按 MARK tag 清理要靠它（不依赖 bound）
         val n = added.incrementAndGet()
         if (logged.get() < LOG_MAX && logged.incrementAndGet() <= LOG_MAX) {
             LogX.i("HINTBADGE badge added #$n host=${target.javaClass.name} text=$text")
@@ -703,6 +844,49 @@ object HintBadge {
         // ⚠️ 必须返回 ok 而不是 true：`apply()` 只在 ensure 返回 false 时 post 一帧重试。
         //    返回 true ⇒ 首屏首绑（子节点还没 layout、几何全 0）那一枚要等 2s sweep 才补上。
         return ok
+    }
+
+    // ------------------------------------------------------------------ F3 关开关清理（不依赖 bound）
+
+    /** F3：登记「这棵子树里挂过我们的角标」。只增不减 —— view 死了由 WeakHashMap 自行回收。 */
+    private fun markBadged(host: View) {
+        synchronized(badgedViews) { badgedViews[host] = true }
+    }
+
+    /**
+     * F3：递归摘掉 [root] 子树里所有 `tag == MARK` 的角标 TextView，返回摘掉的枚数。
+     *
+     * ⚠️ 刻意不检查 `isAttachedToWindow`：`ViewGroup.removeViewAt` 直接改自身 child 列表，
+     * detach 态同样生效 —— 这正是解决 `ensure():664` 未 attach 静默失败遗留残留的关键。
+     */
+    private fun stripBadges(root: View): Int {
+        if (root !is ViewGroup) return 0
+        var n = 0
+        for (i in root.childCount - 1 downTo 0) {
+            val c = runCatching { root.getChildAt(i) }.getOrNull() ?: continue
+            if (MARK == c.tag) {
+                runCatching { root.removeViewAt(i) }
+                    .onFailure { logOnce("HINTBADGE stripBadges remove failed: ${it.javaClass.simpleName}") }
+                n++
+            } else if (c is ViewGroup) {
+                n += stripBadges(c)
+            }
+        }
+        return n
+    }
+
+    /**
+     * F3：关开关时全量清残留角标。清理集来自独立登记 [badgedViews]，**不是** [bound]：
+     * 现场 `bound=0`，靠 sweep/bound 一条也清不到；判据 `cleanupTargetsOnDisable`
+     * 把「清集不受 bound 影响」锁成 JVM 可测语义。
+     */
+    private fun clearAllBadges() {
+        val boundKeys = synchronized(bound) { bound.keys.toList() }.toSet()
+        val badged = synchronized(badgedViews) { badgedViews.keys.toList() }.toSet()
+        val targets = HintBadgeLogic.cleanupTargetsOnDisable(boundKeys, badged)
+        var n = 0
+        for (v in targets) n += stripBadges(v)
+        if (n > 0) LogX.i("HINTBADGE F3 clearAllBadges removed=$n badged=${badged.size} bound=${boundKeys.size}")
     }
 
     /**
@@ -1028,22 +1212,168 @@ object HintBadge {
         return "HINTBADGE unfake"
     }
 
-    /** 明细：当前屏幕上每个 item 解析出的 msgId（无符号/有符号都打）+ 可见文字 + 落点 */
+    // ----- 观测增强 E 私有辅助（全部只读，绝不改贴/摘状态） -----
+
+    /**
+     * 在 bindHook 包装层记录观测数据。只记"命中台账或 forceSet"的 bind（数量极少，
+     * 现场 hits=4），避免每帧写缓冲。拿不到就静默跳过 —— 观测失败绝不能影响贴角标。
+     */
+    private fun observeBind(param: XC_MethodHook.MethodHookParam) {
+        val adapter = param.thisObject ?: return
+        if (!adapter.javaClass.name.startsWith(ADAPTER_PREFIX)) return
+        adapterRef = WeakReference(adapter)
+        val holder = param.args?.getOrNull(0) ?: return
+        val pos = param.args?.getOrNull(1) as? Int ?: return
+        val iv = itemViewOf(holder) ?: return
+        if (rvRef?.get() == null) findChatList(iv)?.let { rvRef = WeakReference(it) }
+        val h9 = getItem(adapter, pos) ?: return
+        val id = msgIdOf(h9)
+        if (id <= 0) return
+        val hit = hitMap[id]
+        if (hit == null && id !in forceSet) return
+        val rec = ObsRec(
+            iv, id, pos, typeOf(h9), talkerOf(h9),
+            hit?.talker, hit?.origType, hit?.origContent
+        )
+        synchronized(ring) {
+            ring.addLast(rec)
+            while (ring.size > RING_MAX) ring.removeFirst()
+        }
+    }
+
+    /** 从 itemView 沿 parent 链找聊天列表（按继承链，兼容 ScrollControlRecyclerView 等子类）。 */
+    private fun findChatList(v: View): View? {
+        var node: View? = v
+        var guard = 0
+        while (node != null && guard++ < 14) {
+            var c: Class<*>? = node.javaClass
+            var up = 0
+            while (c != null && up++ < 6) {
+                val n = c.name
+                if (n.endsWith("RecyclerView") || n.endsWith("ListView") ||
+                    n.contains("ChattingRecyclerView") || n.contains("ChattingListView")
+                ) return node
+                c = c.superclass
+            }
+            node = node.parent as? View
+        }
+        return null
+    }
+
+    /**
+     * child → adapter 位置。微信自备 androidx 副本里 `getChildAdapterPosition` 被改名 `F0`、
+     * `getChildLayoutPosition` 改名 `G0`（classes12.dex 反汇编实证，见 ForceForward.kt:3046）。
+     * 原名留作未混淆版本兜底；ListView 形态退 `getPositionForView`。
+     */
+    private fun positionOf(list: View, child: View): Int {
+        for (name in arrayOf("F0", "G0", "getChildAdapterPosition", "getChildLayoutPosition")) {
+            val m = runCatching { list.javaClass.getMethod(name, View::class.java) }.getOrNull()
+                ?: continue
+            val p = runCatching { m.invoke(list, child) as? Int }.getOrNull() ?: continue
+            if (p >= 0) return p
+        }
+        val m = runCatching {
+            list.javaClass.getMethod("getPositionForView", View::class.java)
+        }.getOrNull() ?: return -1
+        return runCatching { m.invoke(list, child) as? Int }.getOrNull() ?: -1
+    }
+
+    /** ⭐ 硬口径：从 View 子树里 tag==MARK 的 TextView 实读角标文案，绝不调 badgeText()。 */
+    private fun badgeOnView(root: View): String {
+        fun walk(v: View, d: Int): String? {
+            if (d > 12) return null
+            if (MARK == v.tag && v is TextView) return v.text?.toString() ?: ""
+            if (v is ViewGroup) {
+                for (i in 0 until v.childCount) {
+                    val c = runCatching { v.getChildAt(i) }.getOrNull() ?: continue
+                    val r = walk(c, d + 1)
+                    if (r != null) return r
+                }
+            }
+            return null
+        }
+        return walk(root, 0) ?: "-"
+    }
+
+    private fun tkLabel(s: String?): String = when {
+        s == null -> "<null>"
+        s.isEmpty() -> "<EMPTY>"
+        s.isBlank() -> "<BLANK>"
+        else -> s.take(24)
+    }
+
+    private fun flat(s: String?): String =
+        (s ?: "").replace('\n', '/').replace('\r', ' ')
+
+    /** 一行观测记录；所有视角字段并排，txt 为当前 item 正文（与 orig 摘要核对同源性）。 */
+    private fun obsLine(
+        id: Long, pos: Int, type: Int?, cur: String?, led: String?,
+        origType: Int?, orig: String?, view: View, host: String
+    ): String {
+        val hit = hitMap[id] != null || id in forceSet
+        return "  u=${java.lang.Long.toUnsignedString(id)} s=$id pos=$pos " +
+            "hit=$hit type=${type ?: -1} origType=${origType ?: -1} " +
+            "curTk=${tkLabel(cur)} ledTk=${tkLabel(led)} " +
+            "tkSkip=${cur.isNullOrBlank() || led.isNullOrBlank()} " +
+            "orig=[${flat(orig).take(40)}] " +
+            "viewBadge=[${flat(badgeOnView(view))}] " +
+            "txt=[${textsOf(view, 3).joinToString("|") { it.take(12) }}] " +
+            "host=$host\n"
+    }
+
+    /**
+     * 明细（增强版）：不依赖 bound。主路径从宿主列表当前可见 child 逐条取数；
+     * 弱引用失效时退到非弱有界环形缓冲；两者都拿不到才退回 bound（并记录 bound=0 的事实）。
+     */
     fun dump(): String {
-        val sb = StringBuilder("HINTBADGE dump force=${forceSet.size} rescued=${hitMap.size}\n")
-        val snap = snapshot()
-        sb.append("  bound(${snap.size}):\n")
-        for ((v, id) in snap) {
-            val hit = hitMap[id]
-            sb.append("    u=").append(java.lang.Long.toUnsignedString(id))
-                .append(" hit=").append(hit != null || id in forceSet)
-                .append(" badge=").append(hit?.let { HintTextLogic.badgeText(it.origType, it.origContent) }
-                    ?: if (id in forceSet) HintTextLogic.BADGE_ONLY else "-")
-                .append(" txt=").append(textsOf(v, 3).joinToString("|") { it.take(12) })
-                .append(" host=").append(v.javaClass.name)
-                .append(" LL=").append(v is LinearLayout)
-                .append(" FL=").append(v is FrameLayout)
-                .append("\n")
+        val rv = rvRef?.get()
+        val rvAlive = runCatching { rv != null && rv.isAttachedToWindow }.getOrDefault(false)
+        val useRv = rvAlive && rv is ViewGroup
+        val ringNonEmpty = synchronized(ring) { ring.isNotEmpty() }
+        val via = if (useRv) "rv" else if (ringNonEmpty) "ring" else "bound"
+        val boundCount = synchronized(bound) { bound.size }
+        val sb = StringBuilder("HINTBADGE dump force=${forceSet.size} rescued=${hitMap.size} " +
+            "via=$via rvCls=${rv?.javaClass?.simpleName ?: "none"} bound=$boundCount\n")
+
+        if (useRv) {
+            val group = rv as ViewGroup
+            val ad = adapterRef?.get()
+            sb.append("  rvChildren=${group.childCount} adapter=${ad?.javaClass?.simpleName ?: "none"}\n")
+            for (i in 0 until group.childCount) {
+                val child = runCatching { group.getChildAt(i) }.getOrNull() ?: continue
+                // 优先用 bind 当时记下的现场（talker 与闸门同帧，最准）；否则实时反解。
+                val rec = synchronized(ring) { ring.lastOrNull { it.view === child } }
+                if (rec != null) {
+                    sb.append(obsLine(rec.msgId, rec.pos, rec.type, rec.curTalker, rec.ledTalker,
+                        rec.origType, rec.origContent, child, child.javaClass.simpleName))
+                } else {
+                    val pos = positionOf(group, child)
+                    val h9 = if (ad != null && pos >= 0) getItem(ad, pos) else null
+                    val id = h9?.let { msgIdOf(it) } ?: 0L
+                    val hit = hitMap[id]
+                    sb.append(obsLine(id, pos, h9?.let { typeOf(it) }, h9?.let { talkerOf(it) },
+                        hit?.talker, hit?.origType, hit?.origContent, child, child.javaClass.simpleName))
+                }
+            }
+        } else {
+            val snap = synchronized(ring) { ring.toList() }.asReversed()
+            if (snap.isNotEmpty()) {
+                sb.append("  ring=${snap.size} (list ref unavailable; fields from bind time)\n")
+                for (rec in snap) {
+                    val attached = runCatching { rec.view.isAttachedToWindow }.getOrDefault(false)
+                    sb.append(obsLine(rec.msgId, rec.pos, rec.type, rec.curTalker, rec.ledTalker,
+                        rec.origType, rec.origContent, rec.view,
+                        rec.view.javaClass.simpleName + (if (attached) "" else "!detached")))
+                }
+            } else {
+                val boundSnap = snapshot()
+                sb.append("  bound(${boundSnap.size}) fallback (no visible list / no ring):\n")
+                for ((v, id) in boundSnap) {
+                    val hit = hitMap[id]
+                    sb.append(obsLine(id, -1, null, "<no-h9>", hit?.talker,
+                        hit?.origType, hit?.origContent, v, v.javaClass.simpleName))
+                }
+            }
         }
         return sb.toString()
     }
