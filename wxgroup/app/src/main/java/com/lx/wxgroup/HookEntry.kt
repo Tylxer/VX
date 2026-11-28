@@ -24,6 +24,7 @@ import com.lx.wxgroup.data.Keys
 import com.lx.wxgroup.data.Kv
 import com.lx.wxgroup.entry.EntryReceiver
 import com.lx.wxgroup.feature.ConvFilter
+import com.lx.wxgroup.feature.ConvSqlHide
 import com.lx.wxgroup.feature.AntiRevoke
 import com.lx.wxgroup.feature.AntiRevokeHint
 import com.lx.wxgroup.feature.AutoHdImg
@@ -154,6 +155,11 @@ class HookEntry : IXposedHookLoadPackage {
 
         val db = GroupDb.open(context)
         LogX.i("db ready, groups=${db.countGroups()} friends=${db.countFriends()}")
+
+        // ---- R89 阶段2：会话列表「查询层隐藏」Hook（lane A）----
+        // 装钩 + 冷启读开关 + 后台读一次已分组快照；必须在 GroupDb.open 之后（install 要读 Kv 和全表）。
+        runCatching { ConvSqlHide.install(lpparam) }
+            .onFailure { LogX.w("ConvSqlHide install failed: ${it.javaClass.simpleName}") }
 
         // 宿主 ClassLoader，缺了它 AvatarLoader 的 Class.forName 必抛 CNFE（真机证）
         AvatarLoader.attach(lpparam.classLoader)

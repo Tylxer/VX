@@ -684,6 +684,9 @@ object ConvFilter {
         // 全部 10 个成员写库入口都收敛到本方法，所以在这里一处就够。
         runCatching { com.lx.wxgroup.core.NotifyMute.invalidateScope() }
         refresh()
+        // R89：成员变更 → 查询层隐藏快照失效 + 补发 event=3。全部 10 个成员写库入口都收敛到本方法。
+        runCatching { com.lx.wxgroup.feature.ConvSqlHide.onMembersChanged() }
+            .onFailure { LogX.w("ConvFilter: ConvSqlHide.onMembersChanged fail: ${it.javaClass.simpleName}") }
     }
 
     /**

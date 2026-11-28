@@ -237,6 +237,22 @@ object EntryReceiver {
                             }
                         }
                     }
+                    // R89：查询层隐藏的**内存 A/B 开关**（不写 Kv）。
+                    //   --es op convsqlhide --es sub on|off|status；无 sub/其它 → status
+                    // 持久化开关是 Keys.GCONV_SQL_HIDE（设置页 / 冷启生效），两者独立：
+                    // 本 op 只在当前进程内存翻转，冷启复位到 Keys.GCONV_SQL_HIDE 决定的值。
+                    "convsqlhide" -> {
+                        val sub = intent.getStringExtra("sub") ?: "status"
+                        runCatching {
+                            when (sub) {
+                                "on" -> com.lx.wxgroup.feature.ConvSqlHide.turn(true)
+                                "off" -> com.lx.wxgroup.feature.ConvSqlHide.turn(false)
+                                else -> for (l in com.lx.wxgroup.feature.ConvSqlHide.status()) {
+                                    LogX.i(l)
+                                }
+                            }
+                        }.onFailure { LogX.w("ENTRY convsqlhide fail: ${it.javaClass.simpleName}") }
+                    }
                     // R73：图片 NetScene 只读取证探针 INP（默认关，冷启静默）。
                     // --es op inp --es sub on|off；无 sub/其它 → 打 enabled + hook 挂没挂上。
                     "inp" -> {

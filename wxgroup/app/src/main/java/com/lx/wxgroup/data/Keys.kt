@@ -117,6 +117,15 @@ object Keys {
     const val GCONV_DELETE_NOTIFY = "chat.gconv_delete_notify"
 
     /**
+     * R89：会话列表查询层隐藏（加入分组的会话不再出现在主列表）。默认关，冷启生效。
+     *
+     * - 与「数据层分组行」[GCONV_MODE] 相互独立，可单开做正反对照。
+     * - 持久化开关由 [Prefs] 里紧随 [GCONV_DELETE_NOTIFY] 的 PrefSpec 登记；
+     *   运行时 `op=convsqlhide` 广播是**内存 A/B**，不写 Kv，冷启复位。
+     */
+    const val GCONV_SQL_HIDE = "chat.gconv_sql_hide"
+
+    /**
      * 长按普通会话时，往**微信自己的菜单**里加「加入分组 / 标记已读」两项。
      *
      * 注入点是微信自己那个菜单 PopupWindow（详见
@@ -525,6 +534,12 @@ object Prefs {
         PrefSpec(
             Keys.GCONV_DELETE_NOTIFY, PrefKind.SWITCH, "false", "聊天",
             "删组后补发宿主删除通知使分组行即时消失（实验，默认关；冷启生效）"
+        ),
+        // R89：查询层隐藏（加入分组的会话不再出现在微信主聊天列表，只有进分组页可见）。
+        // 切换后冷启微信生效；与「数据层分组行」相互独立，可单开做正反对照。
+        PrefSpec(
+            Keys.GCONV_SQL_HIDE, PrefKind.SWITCH, "false", "聊天",
+            "隐藏已分组会话（查询层，实验）"
         ),
         PrefSpec(
             Keys.FORWARD_NATIVE, PrefKind.SWITCH, "false", "聊天",
