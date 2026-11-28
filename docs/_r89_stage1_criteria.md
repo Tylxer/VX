@@ -17,7 +17,7 @@
 
 | 形态 | 真实 SQL 特征（判据依据） | 判据谓词 | 是否改写 | 依据原文片段 |
 |------|--------------------------|----------|----------|--------------|
-| **I 主列表全量** | 20 列显式投影、无 limit、`order by flag desc`、无 `username in` | `message_fold` 命中（`parentRef in ('', 'message_fold')` 折叠条件） | ✅ 改写 | `where ((parentRef is null) or (parentRef in ('', 'message_fold'))) and ( 1 != 1 or ... like '%@chatroom' ... ) ... order by flag desc` |
+| **I 主列表全量** | 19 列显式投影、无 limit、`order by flag desc`、无 `username in` | `message_fold` 命中（`parentRef in ('', 'message_fold')` 折叠条件） | ✅ 改写 | `where ((parentRef is null) or (parentRef in ('', 'message_fold'))) and ( 1 != 1 or ... like '%@chatroom' ... ) ... order by flag desc` |
 | **C 批量明细** | 与 I 同前缀、WHERE 多 `username in ('a','b',…)`、无 order by | `message_fold` 命中 + 无 `username = `（`in` 不是 `=`） | ✅ 改写 | 同 I 前缀 `… and rconversation.username in ('a','b')` |
 | **F 未读聚合（JOIN 版）** | `from rconversation, rcontact`、`unReadCount > 0`、`(type & 512) == 0` | `rcontact` 命中 + `unReadCount > 0` | ✅ 改写 | `from rconversation, rcontact where rconversation.unReadCount > 0 AND … AND (rconversation.parentRef is null or parentRef = '') AND ( type & 512 ) == 0 AND rcontact.username != 'officialaccounts'` |
 | **F 未读聚合（union 版）** | `like 'wx^_^_%' ESCAPE '^'` + `union` + `inner join rcontact` | `rcontact` 命中 + `union` 命中 | ✅ 改写 | `… from rconversation where rconversation.username like 'wx^_^_%' ESCAPE '^' union SELECT … from rconversation inner join rcontact WHERE …` |

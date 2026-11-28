@@ -182,7 +182,7 @@ select unReadCount, status, isSend, conversationTime, username, content, msgType
 
 三个必须记住的偏差（全部推翻 E5 的形态假设）：
 
-1. **不是 `select *`**，是 20 列显式投影 ⇒ 「`select * from rconversation where` 前缀」判据作废；
+1. **不是 `select *`**，是 19 列显式投影 ⇒ 「`select * from rconversation where` 前缀」判据作废；
 2. **没有 `limit`**、**没有 `conversationTime desc`**，只有 `order by flag desc`；
 3. 列清单会漂：这一版**缺** `hasSpecialFollow`，而 `in (…)` 版**带**它
    ⇒ 判据**绝不能比对列清单**，只能判「表名 + 结构特征」。

@@ -93,3 +93,91 @@ summariesDirty = summariesVersion 变
 - 筛选态没有「返回全部」行，退出筛选靠系统返回键。
 - 定位「谁把 App 退出去了」：hook `Activity.moveTaskToBack`/`finish` 打 16 层 stackTrace。
 
+
+## 查询层隐藏（R89 · 复刻微X「加入分组后主列表不显示」）
+
+**需求**：加入分组的会话不再出现在微信主聊天列表，只有进分组页可见。数据一行不删。
+
+### 行为基线（微X 真机实测，2026-11-28）
+加入微X 分组后主 adapter 原始条数 **1581→1580**，移出后回到 **1581**；
+`rconversation` 行仍在（`msgCount=11407, unReadCount=0, parentRef='', attrflag=0`），
+`message` 表该 talker **11407 条全部保留**。
+⇒ 隐藏在**查询层**，不是 `getView` 隐藏、更不是删库。R64 早期「getCount/getItem 注入」推断不适用（R66/R67 已推翻）。
+
+### 宿主查询链与 hook 落点（阶段0 实测）
+所有 `rconversation` 查询都汇聚到 `com.tencent.wcdb.database.SQLiteDatabase.rawQueryWithFactory`：
+- SQL 在 `param.args[1]`；4 参版**内部转发** 5 参版 ⇒ 一次查询可能连进两发；
+- 全 15 dex 无 `SQLiteDatabase` 子类 ⇒ `hookAllMethods` 覆盖完整；
+- 两条入口栈：`e.s <- z.g <- p3.f`（UI adapter 刷新）/ `s4.p <- s4.M <- s4.K`（服务侧同步）。
+  ⛔ 早期记的 `s4.t` 是错的，实测 **`s4.p`**。
+- ⛔ 这条链**不走** `rawQuery`，所以只 hook `rawQuery` 的老探针永远看不到会话列表 SELECT。
+
+### 主列表全量 SQL 原文（606 字符，判据锚点）
+```sql
+select unReadCount, status, isSend, conversationTime, username, content, msgType, flag, digest, digestUser, attrflag, editingMsg, atCount, unReadMuteCount, UnReadInvite, hasTodo, hbMarkRed, remitMarkRed, parentRef from rconversation where ((parentRef is null) or (parentRef in ('', 'message_fold'))) and ( 1 != 1  or rconversation.username like '%@im.chatroom' or rconversation.username like '%@chatroom' or rconversation.username like '%@openim' or rconversation.username not like '%@%' )  and rconversation.username != 'qmessage' and rconversation.username != 'appbrand_notify_message' order by flag desc
+```
+（上为**逐字单行原文**，606 字符，仅供判据比对；日常阅读可按 `where` / `and (` / `order by` 三段拆开看。）
+- **不是 `select *`**：**19 列**显式投影；**无 `limit`**；`order by` **只有 `flag desc`**（没有 conversationTime）。
+- ⛔ **列清单会漂**（另一版带 `hasSpecialFollow`）⇒ 判据**绝不能比对列名**。
+- `1 != 1` 是宿主拼装可选子句的恒假占位（`or` 串条件、缺项留空格）。
+
+### 六种真实形态与判据分流
+| 形态 | 特征指纹 | 过滤 | 理由 |
+|---|---|---|---|
+| I 主列表全量 | `message_fold` | **要** | 主列表数据源 |
+| C 批量明细 | `username in (1~3 个)` + `message_fold`，无 `order by` | **要** | 每屏明细，漏了会话回流 |
+| F 未读聚合 | `rcontact` + (`union` 或 `unReadCount>0`) | **要** | 否则角标虚高；带 JOIN |
+| A/B 点查 | `username=?` / `username='x'` | **不要** | 打开聊天 + 消息到达（`t0.e`，78 条里 42 条） |
+| E `msgCount` | 单列点查 | **不要** | 与列表无关，改影响删聊天统计 |
+| G 折叠页 | `parentRef='conversationboxservice'` | **不要** | 语义不同，本轮不做 |
+
+⛔ **I/C 的指纹必须锚 `message_fold` 一词**，不能锚「有 `parentRef is null`」——F 的 JOIN 版也有 `parentRef is null`，会失去区分度。
+⛔ 注入条件必须**带表名限定** `rconversation.username not in (…)`：F 带 JOIN/union，裸 `username` 会 ambiguous → SQLite 抛错 → 熔断废功能。
+
+### 实现要点（`feature/ConvSqlHide.kt`）
+- 三级短路，热路径零开销：`!enabled||disabled` → `grouped` 为空 → `!isConvSelect(sql)`。
+- `inHook` ThreadLocal + **try/finally** 复位（漏 finally = 该线程后续查询全静默，参照 `AntiRevokeHint.kt:41-51` 的 ANR 血案）。
+- 快照 `@Volatile Set<String>` **整体替换引用**，只在后台线程/成员变更时读 `GroupDb.allMemberWxids()`；读库失败发布**空集**（宁可暂时显示，绝不残留隐藏）。
+- ⛔ **熔断必须按异常类型过滤**：`hasThrowable()` 即熔断的话，一次 `database is locked` 就把功能永久停用。只认结构类（syntax error / no such column / misuse / ambiguous / no such table），瞬态只 WARN。
+- ⛔ **after 里用「对象同一性」匹配被改写的那一发**（`rewrittenParam` ThreadLocal）：因为 4 参转发 5 参，一次查询连进两发 after，只按 `origSql` 会清错层。
+- **首次 refresh 只建基线、不发通知**（`groupedVersion==0` 识别），否则冷启会把全部历史成员当新增、批量发 `s4.b(event=3)`。
+- 成员变更后对**差集**补发 `s4.b(3, s4, wxid)`。依据 `_r65:305-306`：宿主自己发 `s4.b event=3` 后 52ms `p3.e event=3` ⇒ event 3 = 会话更新。
+- 失效挂点只有一个：`ConvFilter.refreshMembers()`（全部 10 个成员写库入口的汇聚点，含 `BackupFlow` 恢复路径）。
+- ⛔ union 形态必须**分段注入**（`injectUnion`）：F 的 union 版第二分支（`inner join rcontact`）才是未读主查询，条件插在顶层 `union` 之前只作用第一分支 ⇒ 角标**必然**虚高。
+
+### 分组页不会被误伤（关键）
+`GconvPage.kt:1128` 的分组页查询（`username in (…)` 为节选，in 里是当前分组的成员）：
+```sql
+select * from rconversation where (username in (…)) and substr(username,1,6)<>'wxgrp_' order by flag desc, conversationTime desc
+```
+`isConvSelect` 第 6 步对含 `wxgrp_` 的 SQL 直接短路 ⇒ 不改写。
+真机确认（`on` 状态下进分组）：标题 `123 (5)`，5 个会话全可见。
+这是「功能自相矛盾」的唯一防线：分组页若也被过滤，会话将无处可见。
+
+### 开关与探针
+- 持久化开关 `Keys.GCONV_SQL_HIDE = "chat.gconv_sql_hide"`，默认 false，**冷启生效**。
+- 内存 A/B：`op=convsqlhide --es sub on|off|status`（不写 Kv，冷启复位）。
+- 取证探针 `op=hcr --es sub sqlwatch|sqlwatchoff`（R89 阶段0，**已收工**，Kv 键 `probe.hcr.sqlwatch` 不进设置页/备份）。
+  ⚠️ 探针 hook 常驻：阶段2 上线后若再开它，看到的是**改写后**的 SQL，不能当原文证据。
+- ⚠️ `turn()` 只翻内存、不刷 UI：切换后不会立刻变，要等宿主周期重查（实测约 4 秒一次）+ adapter notify。
+- ⚠️ `enabled=false` 时 hook 第一行 return **不打日志** ⇒ 「off 后日志无 hit」不能反推宿主没重查。
+
+### 真机验证（微信 8.0.48/2588，2026-11-29）
+| 项 | 结果 |
+|---|---|
+| 默认关零行为变化 | ✅ `kv` 表无该键 ⇒ `getBool` 回落 false；主列表显示与装机前一致、零改写 |
+| 开启命中 | ✅ `HIDE hit n=5 len=606->762`，`606` 与上面原文长度逐字吻合，`762-606=156` 即注入的 NOT IN 子句 |
+| 持续生效 | ✅ hits 累计 74，`disabled` 从未置位（74 次改写无一次被 SQLite 拒绝） |
+| 主列表 | ✅ on → 5 个会话全消失；off → 全部恢复 |
+| 分组页 | ✅ on 时 `123 (5)` 全可见 |
+
+### 排查坑
+- ⛔ **模块库真实路径 = `/data/data/com.tencent.mm/databases/wxgroup.db`**（模块跑在微信进程、用微信 Context），
+  **不在** `com.lx.wxgroup` 包名下 ⇒ 按自身包名 `find` 永远 No such file。读它需 root。
+  ⚠️ `adb shell "su -c id"` 整条用双引号包住；`su -c 'id'` 单引号会被 adb shell 二次解析吞掉。
+- ⛔ **调用栈过滤**：栈首是 `dalvik.system.VMStack.getThreadStackTrace`，不属于任何被排除前缀，
+  `indexOfFirst` 恒返回 0 ⇒ 打出来全是本模块帧、宿主帧 0 条（8 条日志全废）。
+  正解：以本模块**最后一帧**为界、只取其后帧，再滤 Xposed/反射/VMStack。深度 10 不够，用 24。
+- ⛔ 微信库 14GB 且 SQLCipher 加密，**离线读不了**，别指望 pull 出来用 sqlite3 查。
+
+细节全文：`docs/_r89_replica_plan.md`（方案 + 阶段0 取证）、`docs/_r89_stage1_criteria.md`（判据 + 变异表）。
