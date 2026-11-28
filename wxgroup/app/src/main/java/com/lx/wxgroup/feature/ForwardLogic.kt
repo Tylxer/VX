@@ -397,7 +397,7 @@ object ForwardLogic {
         /** 图片/视频/语音/文件的本地路径（微信自己的文件路径），降级重发要用 */
         val localPath: String = "",
         val fileExists: Boolean = false,
-        /** 消息来的那个会话（转发回它自己没意义） */
+        /** 消息来的那个会话（只用于诊断/原生链；2026-11-28 起不再作选人器排除集） */
         val sourceChat: String = "",
         /** 原生转发链路要用到的宿主对象（可能是任意类型，只在 hook 侧传递，不参与比较） */
         val raw: Any? = null,

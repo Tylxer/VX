@@ -43,8 +43,10 @@ import com.lx.wxgroup.util.LogX
  * 选中集与当前 Tab 都是**实例字段**：`Panel.refresh()` 会重建 View 但实例不变，
  * 状态不丢（[PickerPage] 同款机制）。
  *
- * @param exclude 排除集（一般是当前会话自己，转发回原会话没意义）。展开结果里
- *                不会出现它们，列表里也直接不显示，省得勾了才发现没用。
+ * @param exclude 排除集（仍在纯函数层保留此语义：展开结果与列表都不显示它们）。
+ *                注意 2026-11-28 起主入口 [ForceForward.openTargetPicker] 恒传空集 ——
+ *                用户要「所有会话都能转回自己」（含文件传输助手转回文件传输助手）；
+ *                本参数只保留给将来确需要自排除的入口使用。
  */
 class ForwardPicker(
     override val title: String = "转发到多个",

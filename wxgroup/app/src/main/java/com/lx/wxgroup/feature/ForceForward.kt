@@ -71,7 +71,8 @@ object NativeMenuGate {
      * `FF NATIVE gate closed enabled=true age=151 talker= ref=true` 即因 talker 空被挡死。
      * `hasRef=true` 已证明 View 链能拿到 h9 消息对象，而会话列表 / 输入栏 / 图片浏览菜单
      * 的 View 链拿不到 h9，所以 hasRef 单条就足以把聊天消息菜单和别的菜单分开，talker 条件
-     * 冗余且有害，故从门禁移除。talker 仍用于 gate closed 日志诊断和选人器排除集，但不是门禁条件。
+     * 冗余且有害，故从门禁移除。talker 仍用于 gate closed 日志诊断；2026-11-28 起选人器
+     * 不再用它做排除集（`openTargetPicker` 恒传空集），但不是门禁条件。
      *
      * ⚠️ `hasRef` 反射成本最高，调用方务必放最后一步算。
      */
@@ -1855,13 +1856,18 @@ object ForceForward {
      *
      * 三个 Tab（好友·群聊 / 模块分组 / 微信标签）可混选；分组与标签在 [ForwardPicker]
      * 内部展开并去重（同一人被多个分组/标签选中只发一次），回调拿到的已经是最终
-     * wxid 列表。当前会话（[currentChatTalker]）作为排除集传进去：列表里不显示，
-     * 展开结果里也不会出现（转发回原会话没意义）。
+     * wxid 列表。
+     *
+     * 2026-11-28：不再把当前会话作为排除集 —— 用户诉求「所有会话都允许转回自己」
+     * （典型：在文件传输助手会话里转发，选人器要能选回文件传输助手）。旧行为把
+     * `sourceChat` 塞进 exclude，导致从文件传输助手转发时它自己被排掉。纯函数
+     * [ForwardLogic.pickerFriends] / [ForwardLogic.resolveTargets] 的 exclude 语义
+     * 保留不变（单测覆盖），只是本入口不再传它。
      */
     private fun openTargetPicker(snap: ForwardLogic.Snapshot) {
         val sourceChat = snap.sourceChat.ifBlank { currentChatTalker() }
-        val exclude = if (sourceChat.isBlank()) emptySet() else setOf(sourceChat)
-        LogX.i("FF picker open exclude=$sourceChat kind=${snap.kind} textLen=${snap.text.length}")
+        val exclude = emptySet<String>()
+        LogX.i("FF picker open exclude=none source=$sourceChat kind=${snap.kind} textLen=${snap.text.length}")
         Panel.open(
             ForwardPicker(
                 title = "转发到多个",
