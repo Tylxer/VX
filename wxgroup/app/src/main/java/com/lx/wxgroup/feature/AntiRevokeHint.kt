@@ -400,6 +400,118 @@ object SqlHideCond {
         return FROM_MESSAGE.containsMatchIn(s)
     }
 
+    // ------------------------------------------------------------------ 会话列表过滤（R89）
+
+    /**
+     * 会话表点查豁免：`username = ?` 或 `username = '单个值'`（形态 A/B/E）。
+     *
+     * `username in (...)`（形态 C）不是 `=`，`username like '%@chatroom'`（形态 I）也不是 `=`，
+     * 所以只有 `=` 命中「取单行」的语义。可选 `rconversation.` 前缀（微信有的查询带限定）。
+     */
+    private val CONV_POINT_QUERY =
+        Regex("""\b(?:rconversation\.)?username\s*=\s*(\?|'[^']*')""", RegexOption.IGNORE_CASE)
+
+    /** I/C 的折叠条件指纹：`parentRef in ('', 'message_fold')` 里的 `message_fold`（见 R89 判据文档） */
+    private val MESSAGE_FOLD = Regex("""\bmessage_fold\b""", RegexOption.IGNORE_CASE)
+
+    /** F（未读聚合）会 join rcontact 做官方号排重 */
+    private val RCONTACT = Regex("""\brcontact\b""", RegexOption.IGNORE_CASE)
+
+    private val UNION_KW = Regex("""\bunion\b""", RegexOption.IGNORE_CASE)
+
+    /** 顶层 union 分段用：`union` 或 `union all`（含中间空格），大小写不敏感；group(1) 是可选 ` all` */
+    private val UNION_SEG = Regex("""\bunion\b(\s+all\b)?""", RegexOption.IGNORE_CASE)
+
+    private val UNREAD_GT0 = Regex("""\bunreadcount\s*>\s*0\b""", RegexOption.IGNORE_CASE)
+
+    /** I/C 的折叠指纹：只认 `message_fold`，见 docs/_r89_stage1_criteria.md §2.1 */
+    private fun isIC(s: String): Boolean = MESSAGE_FOLD.containsMatchIn(s)
+
+    /** F 的未读聚合指纹：`rcontact` +（`union` 或 `unReadCount > 0`），见 §2.2 */
+    private fun isF(s: String): Boolean =
+        RCONTACT.containsMatchIn(s) &&
+            (UNION_KW.containsMatchIn(s) || UNREAD_GT0.containsMatchIn(s))
+
+    /**
+     * 会话列表过滤判定：只认形态 I（主列表全量）/ C（批量明细）/ F（未读聚合），
+     * 排除 A/B/E（点查）/ G（折叠页）/ 我方诊断查询。
+     *
+     * 判据顺序（升序短路）见 docs/_r89_stage1_criteria.md §2，纯字符串无副作用。
+     */
+    fun isConvSelect(sql: String): Boolean {
+        if (sql.length > MAX_SQL) return false
+        if (sql.contains(MARK)) return false // 已注入过
+        if (sql.contains(AntiRevokeHint.BYPASS)) return false // 我方诊断 SQL 放行
+        val s = sql.trimStart()
+        if (!s.startsWith("select", ignoreCase = true)) return false
+        if (!s.contains("rconversation", ignoreCase = true)) return false
+        if (s.contains("wxgrp_", ignoreCase = true)) return false // 我方分组页查询
+        if (s.contains("conversationboxservice", ignoreCase = true)) return false // G 折叠页本轮不过滤
+        if (CONV_POINT_QUERY.containsMatchIn(s)) return false // A/B/E 点查，动了伤收发
+        return isIC(s) || isF(s)
+    }
+
+    /**
+     * 生成「排除这些会话 username」的条件片段。
+     *
+     * ⚠️ 必须带 `rconversation.` 表名限定：F 带 JOIN（`rconversation, rcontact`）/ union，
+     * 裸 `username` 会 `ambiguous column name`，且该错误在熔断名单里 → 废掉整个功能。
+     * 空集收口成恒真（`NOT IN ()` 是语法错误）；单引号翻倍转义；超 [MAX_IDS] 截断。
+     */
+    fun notInWxids(ids: Collection<String>): String =
+        if (ids.isEmpty()) "$MARK 1=1"
+        else "$MARK rconversation.username NOT IN ('" +
+            ids.take(MAX_IDS).joinToString("','") { it.replace("'", "''") } + "')"
+
+    /**
+     * 会话列表 SQL 改写的组装入口：`isConvSelect` 否 ⇒ null；空集 ⇒ null（等价不过滤）；
+     * 否则 `notInWxids` 生成条件后注入。带顶层 `union` 的走 [injectUnion] 分段注入
+     * （否则第二分支会漏过滤，未读角标必然虚高），其余走 [inject] 单段注入。
+     */
+    fun rewriteConvSql(sql: String, ids: Collection<String>): String? {
+        if (!isConvSelect(sql)) return null
+        if (ids.isEmpty()) return null
+        val cond = notInWxids(ids)
+        return if (UNION_KW.containsMatchIn(sql)) injectUnion(sql, cond) else inject(sql, cond)
+    }
+
+    /**
+     * 顶层 union 分段注入：按顶层 `union` / `union all` 把 SQL 切成若干段，逐段 [inject]，
+     * 再按原关键字拼回去。只切**顶层** union（[scan] 判括号深度 + 字符串内判定），
+     * 括号里 / 子查询里 / 字符串字面量里的 union 一律不算；命中不了顶层 union 就退回单段 [inject]。
+     *
+     * 收口（宁可整体不改，也不能改一半）：
+     * - 任一段 [inject] 返回 null ⇒ 整体 null；
+     * - 段数 > 4（即 4 个以上顶层 union）⇒ null，防拼接形态失控；
+     * - 切分用 [UNION_SEG] 把 `union` 关键字（含 ` all` 与中间空格）完整保留在分段之间，不吞关键字。
+     */
+    private fun injectUnion(raw: String, cond: String): String? {
+        val body = raw.trimEnd()
+        if (body.isBlank()) return null
+
+        val sc = scan(body)
+        val unions = mutableListOf<IntRange>()
+        for (m in UNION_SEG.findAll(body)) {
+            val pos = m.range.first
+            if (sc.depth[pos] == 0 && !sc.inStr[pos]) unions.add(m.range)
+        }
+        // 没有顶层 union：union 全在括号/子查询/字符串里，退回单段 inject（走最外层注入）
+        if (unions.isEmpty()) return inject(raw, cond)
+        if (unions.size + 1 > 4) return null
+
+        val sb = StringBuilder()
+        var prev = 0
+        for (r in unions) {
+            val seg = inject(body.substring(prev, r.first), cond) ?: return null
+            sb.append(seg)
+            sb.append(body, r.first, r.last + 1) // 原关键字及其空格，不得吞掉 union / all
+            prev = r.last + 1
+        }
+        val last = inject(body.substring(prev), cond) ?: return null
+        sb.append(last)
+        return sb.toString()
+    }
+
     /**
      * 在最外层追加/新建过滤条件，返回改写后的 SQL；改不了返回 null（调用方当没事发生）。
      *

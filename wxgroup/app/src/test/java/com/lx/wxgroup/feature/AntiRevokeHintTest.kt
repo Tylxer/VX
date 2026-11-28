@@ -235,4 +235,255 @@ class AntiRevokeHintTest {
             )
         )
     }
+
+    // ------------------------------------------------------------------ R89 会话列表过滤
+
+    /** 形态 I：主列表全量，8.0.48 真机探针逐字（606 字符，列清单会漂，判据不比对列） */
+    private val I_SQL =
+        "select unReadCount, status, isSend, conversationTime, username, content, msgType, flag, " +
+            "digest, digestUser, attrflag, editingMsg, atCount, unReadMuteCount, UnReadInvite, hasTodo, " +
+            "hbMarkRed, remitMarkRed, parentRef from rconversation where " +
+            "((parentRef is null) or (parentRef in ('', 'message_fold'))) and " +
+            "( 1 != 1  or rconversation.username like '%@im.chatroom' " +
+            "or rconversation.username like '%@chatroom' " +
+            "or rconversation.username like '%@openim' " +
+            "or rconversation.username not like '%@%' )  and " +
+            "rconversation.username != 'qmessage' and rconversation.username != 'appbrand_notify_message' " +
+            "order by flag desc"
+
+    /** 形态 C：与 I 同前缀，但 WHERE 多 `username in (...)`，且无 order by */
+    private val C_SQL =
+        "select unReadCount, status, isSend, conversationTime, username, content, msgType, flag, " +
+            "digest, digestUser, attrflag, editingMsg, atCount, unReadMuteCount, UnReadInvite, hasTodo, " +
+            "hbMarkRed, remitMarkRed, parentRef from rconversation where " +
+            "((parentRef is null) or (parentRef in ('', 'message_fold'))) and " +
+            "rconversation.username in ('a','b')"
+
+    /** 形态 F：未读聚合，JOIN 版（逗号 join rcontact + unReadCount > 0） */
+    private val F_JOIN_SQL =
+        "select rconversation.unReadCount, rconversation.username from rconversation, rcontact " +
+            "where rconversation.unReadCount > 0 AND rconversation.username = rcontact.username " +
+            "AND (rconversation.parentRef is null or parentRef = '' ) AND ( type & 512 ) == 0 " +
+            "AND rcontact.username != 'officialaccounts'"
+
+    /** 形态 F：未读聚合，union 版（`wx^_^_%` + union + inner join rcontact） */
+    private val F_UNION_SQL =
+        "SELECT rconversation.username, rconversation.unReadCount, rconversation.conversationTime " +
+            "from rconversation where rconversation.username like 'wx^_^_%' ESCAPE '^' " +
+            "union SELECT rconversation.username, rconversation.unReadCount " +
+            "from rconversation inner join rcontact on rconversation.username = rcontact.username " +
+            "WHERE rcontact.username != 'officialaccounts'"
+
+    private fun rewriteConv(sql: String, ids: List<String> = listOf("wxgrp_a", "wxgrp_b")): String =
+        SqlHideCond.rewriteConvSql(sql, ids) ?: throw AssertionError("rewriteConvSql 返回 null: $sql")
+
+    @Test
+    fun `I 主列表原文：改写成功且 order by flag desc 仍在末尾`() {
+        assertTrue("I 应该被判为会话列表查询", SqlHideCond.isConvSelect(I_SQL))
+        val out = rewriteConv(I_SQL)
+        assertTrue("注入条件必须带表名限定", out.contains("rconversation.username NOT IN ('wxgrp_a','wxgrp_b')"))
+        assertTrue("order by flag desc 必须仍在末尾：$out", out.trimEnd().endsWith("order by flag desc"))
+    }
+
+    @Test
+    fun `I 主列表原文的 OR 都在括号内：不用整段括号化，只 AND 追加`() {
+        val out = rewriteConv(I_SQL)
+        // I 的 WHERE 里所有 or 都被 (…) 包住，inject 不会把整段原条件再括号化
+        assertFalse("I 的原文不该被整段括号化", out.contains("WHERE ((parentRef is null) or"))
+    }
+
+    @Test
+    fun `C 批量明细：带 username in 且无 order by，改写成功`() {
+        assertTrue(SqlHideCond.isConvSelect(C_SQL))
+        val out = rewriteConv(C_SQL, listOf("wxgrp_x"))
+        assertTrue(out.contains("rconversation.username NOT IN ('wxgrp_x')"))
+        // 原来的 in 不能被误伤（它跟注入的 NOT IN 是两段）
+        assertTrue(out.contains("username in ('a','b')"))
+    }
+
+    @Test
+    fun `F 未读聚合 JOIN 版：改写成功且条件是 rconversation username not in`() {
+        assertTrue(SqlHideCond.isConvSelect(F_JOIN_SQL))
+        val out = rewriteConv(F_JOIN_SQL)
+        assertTrue("JOIN 版必须用表名限定，否则 username 歧义", out.contains("rconversation.username NOT IN ('wxgrp_a','wxgrp_b')"))
+    }
+
+    @Test
+    fun `F 未读聚合 union 版：改写成功且条件是 rconversation username not in`() {
+        assertTrue(SqlHideCond.isConvSelect(F_UNION_SQL))
+        val out = rewriteConv(F_UNION_SQL)
+        assertTrue(out.contains("rconversation.username NOT IN ('wxgrp_a','wxgrp_b')"))
+    }
+
+    @Test
+    fun `A 点查 username 等值问号：不改写`() {
+        assertFalse(SqlHideCond.isConvSelect("SELECT * FROM rconversation WHERE username=?"))
+        org.junit.Assert.assertNull(
+            SqlHideCond.rewriteConvSql("SELECT * FROM rconversation WHERE username=?", listOf("wxgrp_a"))
+        )
+    }
+
+    @Test
+    fun `B 点查 username 等值加 unReadCount：不改写`() {
+        assertFalse(
+            SqlHideCond.isConvSelect(
+                "select unReadCount, parentRef from rconversation where username = 'gh_xxx' AND unReadCount > 0"
+            )
+        )
+    }
+
+    @Test
+    fun `E 点查 msgCount：不改写`() {
+        assertFalse(SqlHideCond.isConvSelect("select msgCount from rconversation where username='x'"))
+    }
+
+    @Test
+    fun `我方三种查询：不改写`() {
+        assertFalse(SqlHideCond.isConvSelect("select username,conversationTime from rconversation"))
+        assertFalse(
+            SqlHideCond.isConvSelect(
+                "select username,flag,conversationTime from rconversation where substr(username,1,6)='wxgrp_'"
+            )
+        )
+        assertFalse(
+            SqlHideCond.isConvSelect(
+                "select count(*) from rconversation where substr(username,1,6)='wxgrp_'"
+            )
+        )
+    }
+
+    @Test
+    fun `G 折叠页：本轮不改写`() {
+        assertFalse(
+            SqlHideCond.isConvSelect(
+                "select * from rconversation where parentRef = 'conversationboxservice' " +
+                    "and (unReadCount > 0 or flag > 0) order by flag desc, conversationTime desc"
+            )
+        )
+    }
+
+    @Test
+    fun `空 id 集：notInWxids 恒真，rewriteConvSql 返回 null`() {
+        val cond = SqlHideCond.notInWxids(emptyList())
+        assertTrue("空集必须收口成恒真", cond.contains("1=1"))
+        assertFalse("空集不能出现 NOT IN 空括号", cond.contains("NOT IN"))
+        org.junit.Assert.assertNull(
+            "空 id 集等价于不过滤，rewriteConvSql 应返回 null",
+            SqlHideCond.rewriteConvSql(I_SQL, emptyList())
+        )
+    }
+
+    @Test
+    fun `单引号转义：id 里的引号翻倍`() {
+        val cond = SqlHideCond.notInWxids(listOf("wxgrp_a'b"))
+        assertTrue(cond.contains("'wxgrp_a''b'"))
+    }
+
+    @Test
+    fun `超 200 条截断：第 201 个 id 不进入条件`() {
+        val ids = (0 until 250).map { "wxgrp_$it" }
+        val cond = SqlHideCond.notInWxids(ids)
+        assertTrue("第 1 个 id 必须在", cond.contains("'wxgrp_0'"))
+        assertTrue("第 200 个 id 必须在", cond.contains("'wxgrp_199'"))
+        assertFalse("第 201 个 id 必须被截断", cond.contains("'wxgrp_200'"))
+    }
+
+    @Test
+    fun `超 4096 字符放弃`() {
+        val big = "select * from rconversation where ((parentRef is null) or (parentRef in ('', 'message_fold')))" +
+            " and content like '" + "a".repeat(4096) + "'"
+        assertFalse(SqlHideCond.isConvSelect(big))
+    }
+
+    @Test
+    fun `已含 MARK 不重复注入`() {
+        val already = "select * from rconversation where ((parentRef is null) or (parentRef in ('', 'message_fold')))" +
+            " and /*wr*/ rconversation.username NOT IN ('wxgrp_z') order by flag desc"
+        assertFalse(SqlHideCond.isConvSelect(already))
+        org.junit.Assert.assertNull(
+            SqlHideCond.rewriteConvSql(already, listOf("wxgrp_a"))
+        )
+    }
+
+    @Test
+    fun `带 BYPASS 前缀直接放行`() {
+        assertFalse(
+            SqlHideCond.isConvSelect(
+                AntiRevokeHint.BYPASS + "select username from rconversation where ((parentRef is null) or (parentRef in ('', 'message_fold')))"
+            )
+        )
+    }
+
+    // ------------------------------------------------------------------ R89 顶层 union 分段注入
+
+    /** F union 版实测原文（8.0.48 逐字；第二分支 `inner join rcontact` 正是未读主查询） */
+    private val F_UNION_REAL_SQL =
+        "SELECT rconversation.username, rconversation.unReadCount, rconversation.conversationTime " +
+            "from rconversation where rconversation.username like 'wx^_^_%' ESCAPE '^' " +
+            "union SELECT rconversation.username, rconversation.unReadCount, rconversation.conversationTime " +
+            "from rconversation inner join rcontact WHERE rconversation.username=rcontact.username " +
+            "AND unReadCount > 0 AND (parentRef is null or parentRef = '' ) " +
+            "and ( rcontact.usernameFlag in ( 4 , 2 , 65536 , 0 )  ) " +
+            "and rconversation.username not in ('') and rconversation.username not in ('gh_70c4b93987c4')"
+
+    private fun countOcc(s: String, needle: String): Int {
+        var n = 0
+        var i = s.indexOf(needle)
+        while (i >= 0) {
+            n++
+            i = s.indexOf(needle, i + needle.length)
+        }
+        return n
+    }
+
+    @Test
+    fun `F union 实测原文：两个分支各注入一处，union 不吞，ESCAPE 保留`() {
+        assertTrue(SqlHideCond.isConvSelect(F_UNION_REAL_SQL))
+        val out = rewriteConv(F_UNION_REAL_SQL, listOf("wxgrp_a", "wxgrp_b"))
+        // 两个分支各有且仅有一处 NOT IN（第一分支 + 第二分支 inner join rcontact）
+        assertEquals(2, countOcc(out, "rconversation.username NOT IN ("))
+        // union 出现次数与原文相同（关键字没被吞）
+        assertEquals(countOcc(F_UNION_REAL_SQL, "union"), countOcc(out, "union"))
+        // 第一分支的 ESCAPE '^' 仍在
+        assertTrue(out.contains("ESCAPE '^'"))
+    }
+
+    @Test
+    fun `内层 union 不是顶层：走单段 inject，union 留在子查询原位`() {
+        val sql = "select * from rconversation where ((parentRef is null) or (parentRef in ('', 'message_fold'))) " +
+            "and username in (select username from rconversation union select username from rconversation)"
+        assertTrue(SqlHideCond.isConvSelect(sql))
+        val out = rewriteConv(sql)
+        // 没有按顶层切：只出现 1 处 NOT IN
+        assertEquals(1, countOcc(out, "rconversation.username NOT IN ("))
+        // 原 union 仍在内层原位
+        assertTrue(out.contains("in (select username from rconversation union select username from rconversation)"))
+        assertEquals(1, countOcc(out, "union"))
+    }
+
+    @Test
+    fun `union all 版能正确切分，all 不丢`() {
+        val sql = "SELECT rconversation.username from rconversation " +
+            "where rconversation.username like 'wx^_^_%' ESCAPE '^' " +
+            "union all SELECT rconversation.username from rconversation inner join rcontact " +
+            "on rconversation.username = rcontact.username WHERE rcontact.username != 'officialaccounts'"
+        assertTrue(SqlHideCond.isConvSelect(sql))
+        val out = rewriteConv(sql)
+        // 两分支各一处 NOT IN
+        assertEquals(2, countOcc(out, "rconversation.username NOT IN ("))
+        // union all 关键字整体保留（含 all 与中间空格）
+        assertTrue(out.contains("union all"))
+    }
+
+    @Test
+    fun `段数超过 4 返回 null`() {
+        val sql = "select * from rconversation where ((parentRef is null) or (parentRef in ('', 'message_fold'))) " +
+            "union select * from rconversation " +
+            "union select * from rconversation " +
+            "union select * from rconversation " +
+            "union select * from rconversation"
+        org.junit.Assert.assertNull(
+            SqlHideCond.rewriteConvSql(sql, listOf("wxgrp_a", "wxgrp_b"))
+        )
+    }
 }
