@@ -36,6 +36,15 @@ import java.util.LinkedHashMap
  * 第一行就 return（零反射零字符串拼接）。广播 `op=hcr sub=on|off|status` 即时开关，
  * **不写 Kv、不持久化**——详见 EntryReceiver 分支注释（冷启即恢复静默是探针的期望行为）。
  *
+ * ## `sqlWatch` 是全文件唯一的持久化例外（R89 阶段0）
+ *
+ * 主列表的全量 `rconversation` 查询**只在冷启首屏发生**（之后由
+ * `ConversationStorage` 内存缓存供数，只发 `username in (1~3 个)` 的批量明细查询）。
+ * 探针若仍是「冷启默认关」，这条查询永远抓不到 ⇒ 必须能在**冷启前**已 armed。
+ * 所以 `sqlWatch` 读写在 `Kv` 键 `probe.hcr.sqlwatch`（**不登记 `Prefs`**：不进设置页、
+ * 不进备份导出），`install()` 读一次、`turnSqlWatch()` 写一次。
+ * ⛔ 取证结束**必须显式** `op=hcr sub=sqlwatchoff`，否则每次冷启都会持续抓 SQL。
+ *
  * 落点来源：`docs/_r65_host_cache_refresh_probe.md` §3 P1~P6 + R65 追加的 P7（标题来源）
  * + `docs/_r64_microx_instant_group.md` §4b P1/P2/P3/P5，去重后 H1~H8 + P7。
  */
@@ -52,12 +61,33 @@ object HostCacheRefreshProbe {
     @Volatile
     private var installed = false
 
+    /**
+     * sqlwatch 独立开关：与 [enabled] 完全独立。
+     *
+     * **唯一持久化的开关**（见类注释）：主列表全量查询只在冷启发生，探针必须能
+     * 跨冷启保持 armed。落 `Kv` 未登记键 [KV_SQLWATCH]，`install()` 时读回。
+     */
+    @Volatile
+    var sqlWatch = false
+
+    /** `Kv` 键：不登记 `Prefs.ALL` ⇒ 不进设置页、不进备份导出（`defaultOf` 未知键回落 ""）。 */
+    private const val KV_SQLWATCH = "probe.hcr.sqlwatch"
+
+    /** ThreadLocal 重入守卫（AntiRevokeHint.kt:41-51 ANR 教训） */
+    private val inSqlWatch = ThreadLocal<Boolean>()
+
     // ------------------------------------------------------------------ 安装
 
     fun install(lpparam: XC_LoadPackage.LoadPackageParam) {
         if (installed) return
         installed = true
         val cl = lpparam.classLoader
+
+        // R89 阶段0：跨冷启恢复 sqlwatch。必须在装 hook 之前读 —— 冷启首屏的
+        // 全量 rconversation 查询可能在 hook 装完的下一帧就发生。
+        // 依赖 `HookEntry.kt:155` 的 `GroupDb.open()` 已执行（本探针在 :347 安装）。
+        // 读不到（库没开）就保持 false，`status()` 会回显真实值，不静默猜。
+        sqlWatch = runCatching { com.lx.wxgroup.data.Kv.getBool(KV_SQLWATCH) }.getOrDefault(false)
 
         // H1 通知入口：k74.y0.b(int, k74.y0, Object)。s4 继承它（未覆写），
         // hook 父类即覆盖子类 s4.b —— R65 P1 的精确落点。
@@ -219,6 +249,16 @@ object HostCacheRefreshProbe {
             if (hooked == 0) error("no SQLiteDatabase hook point")
         }
 
+        // H8b-sqlwatch（R89 阶段0）：只读观测宿主会话列表 SQL 原文。
+        // 落点 com.tencent.wcdb.database.SQLiteDatabase.rawQueryWithFactory（E4，4/5 参两重载）。
+        // 常驻安装、单钩失败只记 FAIL + WARN，绝不整体禁用 HCR、绝不崩微信。
+        guard("H8b-sqlwatch") {
+            val cls = XposedHelpers.findClass("com.tencent.wcdb.database.SQLiteDatabase", cl)
+            val set = XposedBridge.hookAllMethods(cls, "rawQueryWithFactory", sqlWatchHook)
+            if (set.isEmpty()) error("no rawQueryWithFactory overload")
+            LogX.i("HCR SQLW installed x${set.size}")
+        }
+
         // P7（R65 追加）：标题来源。q4.n(String, boolean)=ContactStorage.get，
         // 先查内存缓存 q4.i:p4（命中直返），未命中才回查 rcontact 读 nickname。
         // 只打印「我方 wxgrp_ 行取到的 nick 是不是我写进去的组名」——不折腾 cacheHit 布尔。
@@ -280,6 +320,18 @@ object HostCacheRefreshProbe {
         LogX.i(if (on) "HCR PROBE ON" else "HCR PROBE OFF")
     }
 
+    /**
+     * R89 阶段0：独立翻转 sqlWatch（不碰 enabled）。
+     *
+     * **唯一写 Kv 的开关**：主列表全量查询只在冷启发生，必须在冷启前 armed，
+     * 所以这里要落盘（`Kv` 未登记键，见 [KV_SQLWATCH]）。写库失败不影响本次 armed。
+     */
+    fun turnSqlWatch(on: Boolean) {
+        sqlWatch = on
+        runCatching { com.lx.wxgroup.data.Kv.putBool(KV_SQLWATCH, on) }
+        LogX.i(if (on) "HCR SQLW ARMED" else "HCR SQLW DISARMED")
+    }
+
     /** 无 sub 时回显：enabled + 各 hook 安装成功/失败清单。 */
     fun status(): List<String> {
         val snap = synchronized(hookStatus) { hookStatus.toList() }
@@ -290,6 +342,7 @@ object HostCacheRefreshProbe {
             lines.add("HCR hook $name ${if (success) "OK" else "FAIL"}")
         }
         if (snap.isEmpty()) lines.add("HCR hook <none> (install() 还没跑？)")
+        lines.add("HCR SQLW sqlWatch=$sqlWatch")
         return lines
     }
 
@@ -337,6 +390,36 @@ object HostCacheRefreshProbe {
         if (ok.isFailure) {
             val t = ok.exceptionOrNull()
             LogX.w("HCR hook $key FAIL ${t?.javaClass?.simpleName}: ${t?.message?.take(80)}")
+        }
+    }
+
+    /**
+     * R89 阶段0：rawQueryWithFactory 的只读 SQL 原文观测钩子。
+     * ⛔ 纯观测：绝不写 param.args / param.result，绝不主动调宿主方法，绝不写库。
+     * inSqlWatch 重入守卫 + finally 复位是装机安全硬伤（AntiRevokeHint ANR 教训），
+     * 漏了会让本线程后续所有 DB 查询静默 / 递归卡死。
+     */
+    private val sqlWatchHook = object : XC_MethodHook() {
+        override fun beforeHookedMethod(param: MethodHookParam) {
+            if (!sqlWatch) return
+            if (inSqlWatch.get() == true) return
+            inSqlWatch.set(true)
+            try {
+                runCatching {
+                    // SQL 在 args[1]（args[0] 是 CursorFactory）；4/5 参重载都核实过。
+                    val sql = param.args?.getOrNull(1) as? String ?: return
+                    if (!sql.contains("rconversation", true)) return
+                    LogX.i("HCR SQLW sql=$sql")
+                    LogX.i("HCR SQLW stack ${hostStack(24)}")
+                    // getPath 是只读 getter，失败留 "?"，不影响主判据。
+                    val path = runCatching {
+                        XposedHelpers.callMethod(param.thisObject, "getPath") as? String
+                    }.getOrNull()
+                    LogX.i("HCR SQLW db=${path ?: "?"}")
+                }.onFailure { /* 热路径静默，绝不影响宿主查询 */ }
+            } finally {
+                inSqlWatch.set(false)
+            }
         }
     }
 
@@ -458,19 +541,29 @@ object HostCacheRefreshProbe {
         }.getOrDefault("")
     }
 
-    /** 过滤 Xposed/LSPosed 桥接帧 + 本模块帧，取宿主侧前 N 层（判"谁发起通知"）。 */
+    /**
+     * 取宿主侧前 N 层（判「谁发起通知」）。
+     *
+     * ⛔ 别再用「逐条前缀排除 + `indexOfFirst`」：栈首是 `dalvik.system.VMStack.getThreadStackTrace`
+     * （拿栈的实现本身），它不属于任何被排除前缀 ⇒ `indexOfFirst` 恒返回 0，
+     * 打出来的全是本模块自己的帧，**宿主帧一个都没有**（R89 阶段0 实测踩过）。
+     * 正解：以**本模块最后一帧**为分界，只取它之后的帧，再滤掉 Xposed 桥接/反射。
+     */
     private fun hostStack(max: Int): String {
         val frames = Thread.currentThread().stackTrace
-        val first = frames.indexOfFirst { f ->
+        val lastSelf = frames.indexOfLast { it.className.startsWith("com.lx.wxgroup") }
+        val from = if (lastSelf >= 0) lastSelf + 1 else 0
+        val list = frames.drop(from).filter { f ->
             val n = f.className
             !n.startsWith("de.robv.android.xposed") &&
                 !n.startsWith("org.lsposed") &&
                 !n.contains("LSPosed") &&
-                !n.startsWith("com.lx.wxgroup") &&
-                !n.startsWith("java.lang.reflect")
+                !n.startsWith("java.lang.reflect") &&
+                !n.startsWith("dalvik.system.VMStack") &&
+                !(n == "java.lang.Thread" && f.methodName == "getStackTrace")
         }
-        if (first < 0) return "<no host frame>"
-        return frames.drop(first).take(max).joinToString(" <- ") {
+        if (list.isEmpty()) return "<no host frame>"
+        return list.take(max).joinToString(" <- ") {
             "${it.className.substringAfterLast('.')}.${it.methodName}"
         }
     }

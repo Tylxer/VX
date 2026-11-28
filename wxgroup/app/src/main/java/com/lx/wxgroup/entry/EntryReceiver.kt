@@ -218,13 +218,20 @@ object EntryReceiver {
                         }.onFailure { LogX.w("ENTRY gcs fail: ${it.javaClass.simpleName}") }
                     }
                     // R66：统一只读取证探针 HCR（微X即时显示 vs 我方 wxgrp_ 通知链）。
-                    // --es op hcr --es sub on|off；无 sub/其它 → 打 enabled + 各 hook 挂没挂上。
-                    // 探针只打日志、不改 param、不主动调宿主方法；不持久化，冷启即静默。
+                    // --es op hcr --es sub on|off|sqlwatch|sqlwatchoff(或 sqlwatch_off)；无 sub/其它 → 打 enabled + 各 hook 挂没挂上。
+                    // sqlwatch → 开 R89 阶段0 的 SQL 原文探针；sqlwatchoff|sqlwatch_off → 关。
+                    // ⚠️ sqlWatch 是本探针**唯一持久化**的开关（Kv 键 probe.hcr.sqlwatch，不登记 Prefs）：
+                    //    主列表全量查询只在冷启首屏发生，探针必须能在冷启前 armed。
+                    //    ⇒ 取证结束必须显式 sqlwatchoff，否则每次冷启都会持续抓 SQL。
+                    // 两个关闭 sub 都认：docs §0.3/§0.5 用 sqlwatchoff，必须兼容，否则关闭命令静默落入 else→status。
+                    // 探针只打日志、不改 param、不主动调宿主方法；enabled 仍不持久化，冷启即静默。
                     "hcr" -> {
                         val sub = intent.getStringExtra("sub") ?: "status"
                         when (sub) {
                             "on" -> com.lx.wxgroup.probe.HostCacheRefreshProbe.turn(true)
                             "off" -> com.lx.wxgroup.probe.HostCacheRefreshProbe.turn(false)
+                            "sqlwatch" -> com.lx.wxgroup.probe.HostCacheRefreshProbe.turnSqlWatch(true)
+                            "sqlwatchoff", "sqlwatch_off" -> com.lx.wxgroup.probe.HostCacheRefreshProbe.turnSqlWatch(false)
                             else -> for (l in com.lx.wxgroup.probe.HostCacheRefreshProbe.status()) {
                                 LogX.i(l)
                             }
